@@ -29,6 +29,7 @@ Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks
 - **Identifiers.** `[a-z][a-z0-9_]*` (snake_case). Resource labels follow the same rule.
 - **Whitespace** is insignificant except as a token separator.
 - **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`.
+- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `var`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features so v0.1 files remain forward-compatible.
 - **Type literals** use suffixes (`32k`, `$50`, `2s`, `85%`) — see §3.
 
 ---
@@ -324,8 +325,47 @@ The following are explicitly deferred. Do not implement them in the v0.1 compile
 - LSP / IDE plugins
 - Visual editor
 - Any GUI
+- **Dynamic prompt composition** — decorators, `prompt_pipeline`, `guardrail`, `middleware` (see §7.1)
 
 Anything in this list moves to `LANGUAGE-SPEC-v1.md` after launch.
+
+### 7.1 Dynamic prompt composition — deliberately deferred
+
+Decorators, prompt pipelines, and guardrail middleware (reactive injection of date/locale/RAG context, PII redaction, schema enforcement, policy gates) are not in v0.1. The decision and its reasoning are recorded here so it isn't re-litigated under feature-request pressure.
+
+**Why not now**
+
+1. The wedge is *static prompts done right* — versioning, content hashes in the lockfile, file-backed sources. P2 (prompt sprawl) is killed by auditability, not by adding dynamic behavior on top.
+2. Runtimes (Anthropic context management, OpenAI Responses, MCP servers, dedicated guardrail providers) are absorbing these responsibilities. A DSL-level decorator system would reinvent them and age badly.
+3. LangChain's prompt-template chains are the cautionary example — a "good idea" abstraction that became the layer everyone complains about. DSPy succeeded partly by *not* doing this at the language level.
+4. Decorators imply composition rules, application order, conditional application, a type system for inputs/outputs, and a debugger story. That is 4+ weeks of design and implementation work hiding behind innocent-looking syntax.
+5. Committing without user pull turns every example, doc, and breaking change into expensive work. Wait for demand.
+
+**Partial substitute in v0.1**
+
+Prompt *files* (markdown referenced by `prompt` blocks) may contain a closed set of template variables, substituted by the runtime before the prompt is sent:
+
+```
+{{date}}              ISO-8601 date at run time
+{{project.name}}      project label
+{{model.id}}          resolved ModelId from aislang.lock
+{{agent.name}}        agent label
+```
+
+No user-defined variables. No conditionals. No loops. The type checker validates every `{{…}}` against this fixed set at `validate` time. This covers ~80% of "inject context into the prompt" needs without opening the decorator design.
+
+**Reserved syntax for v0.2+**
+
+`decorator`, `prompt_pipeline`, `guardrail`, `middleware` are reserved words (§2). Their grammar and semantics are deferred. Files written for v0.1 will remain valid when these are introduced.
+
+**Signals to revisit**
+
+Design these in Phase 1 *if and only if* one of these fires after launch:
+
+- 5+ unsolicited GitHub issues specifically requesting prompt composition / guardrail middleware from real users.
+- One paying enterprise customer naming this as a procurement requirement (e.g., "every prompt must pass a PII-redaction layer before the model sees it" under EU AI Act or HIPAA).
+
+If neither fires within 6 months of launch, the feature is unnecessary and should be removed from the reserved-word list to free the identifiers.
 
 ---
 
