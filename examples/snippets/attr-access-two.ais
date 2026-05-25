@@ -1,0 +1,5 @@
+# `model.fast` — attribute_access with two segments.
+# Used as a resource ref (here: pointing at a `model "fast"` block).
+# The converter interprets two-segment access against the receiving
+# field's expected `Ref<R>` type.
+model.fast

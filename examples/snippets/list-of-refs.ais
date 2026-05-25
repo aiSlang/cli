@@ -1,0 +1,5 @@
+# `[anthropic.claude_haiku_4_5, openai.gpt_4o_mini]` — list of catalog
+# refs (the shape used by `model.prefer` and `model.fallback` in the demo).
+# Each element is an AttributeAccess of two segments; the converter
+# interprets them as ModelId{provider, name} pairs at week-2 Friday.
+[anthropic.claude_haiku_4_5, openai.gpt_4o_mini]

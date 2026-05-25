@@ -1,0 +1,6 @@
+# `shared.models.fast` — attribute_access with three segments.
+# Forward-looking: this is the v0.3+ module-path syntax (see
+# LANGUAGE-SPEC-v0.md §7.2). The parser already accepts arbitrary depth
+# at the grammar level; in v0.1 the converter restricts use to the
+# two-segment forms (resource refs and catalog refs).
+shared.models.fast

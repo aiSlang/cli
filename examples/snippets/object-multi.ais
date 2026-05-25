@@ -1,0 +1,4 @@
+# `{ port = 8080, host = "localhost" }` — multi-attribute object literal.
+# Comma-separates attributes (compare with block bodies which use
+# whitespace separation — same `attribute` element, different separator).
+{ port = 8080, host = "localhost" }

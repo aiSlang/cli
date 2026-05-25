@@ -60,8 +60,21 @@ enum RawValue {
     Size(Size),
     Percentage(Percentage),
     EnumMember(String),
-    // Week-2 Tuesday additions: AttributeAccess(Vec<String>), List, Object
-    // Week-2 Wednesday addition:  Rate(Box<RawRate>)
+    /// Dot-path identifier reference, e.g. `model.fast` (2 segments) or
+    /// `anthropic.claude_haiku_4_5` (catalog ref, 2 segments) or
+    /// `shared.models.fast` (3 segments, v0.3+ module path). Always at
+    /// least 2 segments (one dot) — bare identifiers go to `EnumMember`
+    /// or `Bool`. The converter interprets the path based on field type
+    /// (resource ref → `ast::Ref`; catalog ref → `ast::ModelId`; etc).
+    AttributeAccess(Vec<String>),
+    /// Comma-separated list literal, `[a, b, c]`. Elements may be any
+    /// `RawValue`, including nested lists/objects.
+    List(Vec<RawValue>),
+    /// Comma-separated attribute set inside braces, `{ k = v, k = v }`.
+    /// Distinct from a `block` body which uses whitespace separation.
+    /// Used for typed-map fields like `deploy.expose = { port = 8080 }`.
+    Object(Vec<RawAttribute>),
+    // Week-2 Wednesday addition: Rate(Box<RawRate>)
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +90,7 @@ enum RawBodyItem {
     Block(RawBlock),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct RawAttribute {
     name:  String,
     value: RawValue,
@@ -207,30 +220,92 @@ fn int_parser<'src>(
 ///   `32k`   → size       (not 32 then leftover `k`)
 ///   `0.85`  → float      (not 0 then leftover `.85`)
 ///   `8080`  → int        (terminal)
-/// Money (`$…`) is unambiguous from numerics. `true`/`false` are
-/// recognized as booleans inside the ident branch — the EBNF treats them
-/// as reserved tokens, but chumsky-side we route them through ident and
-/// dispatch on the matched name.
+/// Money (`$€£¥…`) is unambiguous from numerics.
+///
+/// Bare identifiers: `true`/`false` route to `Bool`; `model.fast`-style
+/// dot-paths route to `AttributeAccess`; everything else routes to
+/// `EnumMember`. The three cases are collapsed into one combinator
+/// (`ident_or_access`) so we never need chumsky to backtrack after
+/// consuming the leading identifier.
+///
+/// `list` and `object` make this parser recursive — a list element is a
+/// value, an object attribute's RHS is a value.
 fn value_parser<'src>(
 ) -> impl Parser<'src, &'src str, RawValue, extra::Err<Rich<'src, char>>> + Clone {
     let pad = padding();
-    let ident_value = ident_parser().map(|s: String| match s.as_str() {
-        "true"  => RawValue::Bool(true),
-        "false" => RawValue::Bool(false),
-        _       => RawValue::EnumMember(s),
-    });
 
-    choice((
-        money_parser().map(RawValue::Money),
-        percentage_parser().map(RawValue::Percentage),
-        duration_parser().map(RawValue::Duration),
-        size_parser().map(RawValue::Size),
-        float_parser().map(RawValue::Float),
-        int_parser().map(RawValue::Int),
-        string_lit_parser().map(RawValue::String),
-        ident_value,
-    ))
-    .padded_by(pad)
+    recursive(move |value| {
+        // Attribute inside an object literal. Same shape as the top-level
+        // `attribute_parser`, but separated by `,` instead of whitespace.
+        let attribute_in_object = ident_parser()
+            .padded_by(pad.clone())
+            .then_ignore(just('=').padded_by(pad.clone()))
+            .then(value.clone())
+            .map(|(name, value)| RawAttribute { name, value });
+
+        // List: `[` (value `,`)* value? `]`. Trailing comma allowed.
+        let list = value
+            .clone()
+            .separated_by(just(',').padded_by(pad.clone()))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(
+                just('[').padded_by(pad.clone()),
+                just(']').padded_by(pad.clone()),
+            )
+            .map(RawValue::List);
+
+        // Object: `{` (attr `,`)* attr? `}`. Trailing comma allowed.
+        let object = attribute_in_object
+            .separated_by(just(',').padded_by(pad.clone()))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(
+                just('{').padded_by(pad.clone()),
+                just('}').padded_by(pad.clone()),
+            )
+            .map(RawValue::Object);
+
+        // Combined ident-or-access. Parse an ident, then zero-or-more
+        // `.ident` segments. If the tail is empty, dispatch on the first
+        // ident's text (true / false / other-enum). If the tail is
+        // non-empty, build an AttributeAccess. Avoids chumsky backtracking.
+        let ident_or_access = ident_parser()
+            .then(
+                just('.')
+                    .ignore_then(ident_parser())
+                    .repeated()
+                    .collect::<Vec<String>>(),
+            )
+            .map(|(first, rest): (String, Vec<String>)| {
+                if rest.is_empty() {
+                    match first.as_str() {
+                        "true"  => RawValue::Bool(true),
+                        "false" => RawValue::Bool(false),
+                        _       => RawValue::EnumMember(first),
+                    }
+                } else {
+                    let mut path = Vec::with_capacity(1 + rest.len());
+                    path.push(first);
+                    path.extend(rest);
+                    RawValue::AttributeAccess(path)
+                }
+            });
+
+        choice((
+            money_parser().map(RawValue::Money),
+            percentage_parser().map(RawValue::Percentage),
+            duration_parser().map(RawValue::Duration),
+            size_parser().map(RawValue::Size),
+            float_parser().map(RawValue::Float),
+            int_parser().map(RawValue::Int),
+            string_lit_parser().map(RawValue::String),
+            list,
+            object,
+            ident_or_access,
+        ))
+        .padded_by(pad.clone())
+    })
 }
 
 // ============================================================================
@@ -527,6 +602,98 @@ mod value_tests {
         // Size(4*1024) with leftover `B`.
         assert_eq!(parse_value("4KB").unwrap(), RawValue::Size(Size { units: 4 * 1024 }));
     }
+
+    // ------------------------------------------------------------------
+    // Compound expressions — Tuesday additions
+    // ------------------------------------------------------------------
+
+    #[test] fn empty_list() {
+        assert_eq!(parse_value("[]").unwrap(), RawValue::List(vec![]));
+    }
+    #[test] fn list_of_ints() {
+        assert_eq!(parse_value("[1, 2, 3]").unwrap(),
+            RawValue::List(vec![RawValue::Int(1), RawValue::Int(2), RawValue::Int(3)]));
+    }
+    #[test] fn list_trailing_comma_allowed() {
+        assert_eq!(parse_value("[1, 2,]").unwrap(),
+            RawValue::List(vec![RawValue::Int(1), RawValue::Int(2)]));
+    }
+    #[test] fn list_with_multiline_whitespace() {
+        let src = "[\n  1,\n  2,\n  3\n]";
+        assert_eq!(parse_value(src).unwrap(),
+            RawValue::List(vec![RawValue::Int(1), RawValue::Int(2), RawValue::Int(3)]));
+    }
+    #[test] fn list_of_mixed_literals() {
+        // Each element is a different RawValue variant — exercises the
+        // choice across the whole expression alphabet.
+        let parsed = parse_value(r#"[$1, 5s, 32k, true, "hello"]"#).unwrap();
+        let RawValue::List(items) = parsed else { panic!("expected List, got {parsed:?}") };
+        assert_eq!(items.len(), 5);
+        assert!(matches!(items[0], RawValue::Money(_)));
+        assert!(matches!(items[1], RawValue::Duration(_)));
+        assert!(matches!(items[2], RawValue::Size(_)));
+        assert!(matches!(items[3], RawValue::Bool(true)));
+        assert!(matches!(items[4], RawValue::String(_)));
+    }
+    #[test] fn nested_list() {
+        let parsed = parse_value("[[1, 2], [3]]").unwrap();
+        let RawValue::List(outer) = parsed else { panic!("expected List") };
+        assert_eq!(outer.len(), 2);
+        match &outer[0] {
+            RawValue::List(inner) => assert_eq!(inner.len(), 2),
+            other => panic!("expected nested List, got {other:?}"),
+        }
+    }
+    #[test] fn empty_object() {
+        assert_eq!(parse_value("{}").unwrap(), RawValue::Object(vec![]));
+    }
+    #[test] fn single_attr_object() {
+        let parsed = parse_value("{ port = 8080 }").unwrap();
+        assert_eq!(parsed, RawValue::Object(vec![
+            RawAttribute { name: "port".into(), value: RawValue::Int(8080) },
+        ]));
+    }
+    #[test] fn multi_attr_object() {
+        let parsed = parse_value(r#"{ port = 8080, host = "localhost" }"#).unwrap();
+        let RawValue::Object(attrs) = parsed else { panic!("expected Object") };
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].name, "port");
+        assert_eq!(attrs[1].name, "host");
+    }
+    #[test] fn object_trailing_comma_allowed() {
+        let parsed = parse_value("{ a = 1, b = 2, }").unwrap();
+        let RawValue::Object(attrs) = parsed else { panic!("expected Object") };
+        assert_eq!(attrs.len(), 2);
+    }
+    #[test] fn attribute_access_two_segments() {
+        assert_eq!(parse_value("model.fast").unwrap(),
+            RawValue::AttributeAccess(vec!["model".into(), "fast".into()]));
+    }
+    #[test] fn attribute_access_catalog_ref() {
+        assert_eq!(parse_value("anthropic.claude_haiku_4_5").unwrap(),
+            RawValue::AttributeAccess(vec!["anthropic".into(), "claude_haiku_4_5".into()]));
+    }
+    #[test] fn attribute_access_three_segments() {
+        // Forward-looking: v0.3+ module path syntax like `shared.models.fast`.
+        // Parser already accepts arbitrary depth (per spec EBNF §8); only
+        // the converter restricts it for v0.1.
+        assert_eq!(parse_value("shared.models.fast").unwrap(),
+            RawValue::AttributeAccess(vec!["shared".into(), "models".into(), "fast".into()]));
+    }
+    #[test] fn bare_ident_is_enum_member_not_access() {
+        // Single ident, no dots → EnumMember (not AttributeAccess of length 1).
+        assert_eq!(parse_value("cost").unwrap(),
+            RawValue::EnumMember("cost".into()));
+    }
+    #[test] fn list_of_attribute_accesses() {
+        // The shape used by `model.prefer` / `model.fallback` in the demo:
+        // a list of catalog refs.
+        let parsed = parse_value("[anthropic.claude_haiku_4_5, openai.gpt_4o_mini]").unwrap();
+        let RawValue::List(items) = parsed else { panic!("expected List") };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], RawValue::AttributeAccess(p) if p.len() == 2));
+        assert!(matches!(&items[1], RawValue::AttributeAccess(p) if p.len() == 2));
+    }
 }
 
 #[cfg(test)]
@@ -604,6 +771,31 @@ mod snippet_tests {
                 RawValue::String("hello".to_string())),
             ("enum-cost.ais",
                 RawValue::EnumMember("cost".to_string())),
+            // Tuesday additions — compound expressions
+            ("list-empty.ais",
+                RawValue::List(vec![])),
+            ("list-of-ints.ais",
+                RawValue::List(vec![
+                    RawValue::Int(1), RawValue::Int(2), RawValue::Int(3),
+                ])),
+            ("list-of-refs.ais",
+                RawValue::List(vec![
+                    RawValue::AttributeAccess(vec!["anthropic".into(), "claude_haiku_4_5".into()]),
+                    RawValue::AttributeAccess(vec!["openai".into(),    "gpt_4o_mini".into()]),
+                ])),
+            ("object-single.ais",
+                RawValue::Object(vec![
+                    RawAttribute { name: "port".into(), value: RawValue::Int(8080) },
+                ])),
+            ("object-multi.ais",
+                RawValue::Object(vec![
+                    RawAttribute { name: "port".into(), value: RawValue::Int(8080) },
+                    RawAttribute { name: "host".into(), value: RawValue::String("localhost".into()) },
+                ])),
+            ("attr-access-two.ais",
+                RawValue::AttributeAccess(vec!["model".into(), "fast".into()])),
+            ("attr-access-three.ais",
+                RawValue::AttributeAccess(vec!["shared".into(), "models".into(), "fast".into()])),
         ]
     }
 
