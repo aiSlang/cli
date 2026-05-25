@@ -16,7 +16,7 @@ Design principles, in order of precedence when they conflict:
 2. **Intent over implementation.** Users describe what they need (capabilities, constraints); the planner picks how (which provider, which model, which fallback).
 3. **Reproducibility.** Plans are deterministic given the same source + lockfile + catalog.
 4. **Standards-only output.** The compiled artifact is plain Docker Compose YAML. No proprietary runtime.
-5. **Single file by default.** A project compiles from one `.ais` file. Multi-file is Phase 1.
+5. **Single file by default.** A project compiles from one `.ais` file. Multi-file is Phase 1+ (§7.2). The v0.1 grammar reserves the syntactic room so multi-file additions are backward-compatible.
 
 Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks.
 
@@ -29,7 +29,7 @@ Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks
 - **Identifiers.** `[a-z][a-z0-9_]*` (snake_case). Resource labels follow the same rule.
 - **Whitespace** is insignificant except as a token separator.
 - **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`.
-- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `var`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features so v0.1 files remain forward-compatible.
+- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2) so v0.1 files remain forward-compatible.
 - **Type literals** use suffixes (`32k`, `$50`, `2s`, `85%`) — see §3.
 
 ---
@@ -80,7 +80,7 @@ Enum members are bare identifiers in expression position, looked up in the enum 
 ```
 Capability     = chat | embedding | tool_use | vision | audio | reasoning | large_context | structured_output
 Residency      = us | eu | uk | apac
-DeployTarget   = compose                                   # v0.1 — k8s/helm/ecs are Phase 1
+DeployTarget   = compose                                   # v0.1 — non-exhaustive across versions (see note below)
 Currency       = usd | eur | gbp | jpy                     # implied by Money literal symbol
 OptimizeFor    = cost | latency | quality
 EvalMetric     = exact_match | f1 | bleu | rouge_l | llm_judge
@@ -93,6 +93,8 @@ The catalog (§5) defines two additional pseudo-enums populated at compile time 
 ProviderId  = anthropic | openai | google | ollama | …       # one per catalog entry
 ModelId     = anthropic.claude_haiku_4_5 | openai.gpt_4o_mini | …
 ```
+
+**Enum extensibility across versions.** All closed enums above are exhaustive *within a single version of the spec* but **non-exhaustive across versions** — future spec versions may add new members. `DeployTarget` in particular is expected to grow (`k8s`, `helm`, `ecs` in Phase 1; `databricks`, `fabric`, `spark` in Phase 2 — see §7.3). Adding a new member never invalidates an existing v0.1 file. The type-checker error message for an unknown enum member must include the version that introduced new alternatives so users know whether to upgrade.
 
 ### 3.5 Type coercion
 
@@ -255,6 +257,19 @@ Ship with at least these ten entries (placeholder list; freeze actual values dur
 
 In v0.1 the catalog is binary-bundled and immutable until the next `aislang` release. Remote catalog (`aislang catalog update`) is Phase 1.
 
+### 5.4 File formats — JSON now, YAML later
+
+| Surface | Format in v0.1 | Notes |
+|---|---|---|
+| `.ais` source | HCL-like (neither JSON nor YAML) | Typed literals (`$50`, `32k`, `2s`, `85%`) lose their type under YAML/JSON quoting; HCL-like is non-negotiable |
+| Model catalog | JSON only | YAML acceptance added in v0.2 via `serde_yaml`; same Rust struct, zero spec change |
+| Lockfile (`aislang.lock`) | JSON only | Machine-generated, PR-diffable; never hand-edited |
+| State file (`.aislang/state.json`) | JSON only | Same reasoning as the lockfile |
+| `aislang plan` output | Human text by default; JSON via `--format json` | The JSON shape is stable for agent consumption |
+| Compose / K8s / Helm output | YAML | Format forced by the target tool, not chosen by aiSlang |
+
+JSON and YAML coexistence costs one line of code (`serde` deserializes either into the same struct). Source-language format is the only one that materially matters — see Principle 1 in §1.
+
 ---
 
 ## 6. Model resolution algorithm
@@ -316,16 +331,17 @@ The following are explicitly deferred. Do not implement them in the v0.1 compile
 
 - Functions, expressions beyond literals + references
 - Variables / interpolation (`${var.name}`)
-- Modules / imports
 - Conditional resources (`count`, `for_each`)
-- Multi-file projects
 - Remote state / shared lockfile
 - Catalog updates over the network
-- `k8s`, `helm`, `ecs` deploy targets
 - LSP / IDE plugins
 - Visual editor
 - Any GUI
-- **Dynamic prompt composition** — decorators, `prompt_pipeline`, `guardrail`, `middleware` (see §7.1)
+- **Dynamic prompt composition** — decorators, `prompt_pipeline`, `guardrail`, `middleware` — see §7.1
+- **Multi-file projects** — `include`, `import`, `module`, `package` — see §7.2
+- **Non-Compose deploy targets** — `k8s`, `helm`, `ecs`, `databricks`, `fabric`, `spark`, etc. — see §7.3
+- **Binary IR / wire format** — flatBuffers/protobuf/cap'n proto for AST, lockfile, state, or plan — see §7.4
+- **JSON Schema export of the AST** — via `schemars`; targeted as first Phase 1 task — see §7.4
 
 Anything in this list moves to `LANGUAGE-SPEC-v1.md` after launch.
 
@@ -367,11 +383,67 @@ Design these in Phase 1 *if and only if* one of these fires after launch:
 
 If neither fires within 6 months of launch, the feature is unnecessary and should be removed from the reserved-word list to free the identifiers.
 
+### 7.2 Multi-file projects — deferred with locked backward-compat invariants
+
+v0.1 compiles exactly one `.ais` file per project. Multi-file composition (sharing a `budget` block across projects, distributing reusable `model` declarations, etc.) is Phase 1+.
+
+To guarantee any v0.1 file remains valid under every future spec version, the parser and AST design must hold these three invariants forever:
+
+1. **A complete `project "name" { ... }` block always means exactly what it means today.** No future feature redefines what a top-level project block produces.
+2. **Resource block syntax (`model "fast" { ... }`, `prompt "x" { ... }`, etc.) never changes meaning.** Adding new fields with sensible defaults is allowed; renaming, removing, or repurposing existing fields is not.
+3. **Multi-file constructs are added *above* or *alongside* the `project` block, never inside it.** Cross-module references use a new namespaced syntax (e.g. `shared.models.fast`) and don't repurpose v0.1 reference syntax.
+
+Concrete v0.1 parser obligation: the **file-level production must be a list of top-level statements**, not just a single `project` block (even though only one statement form — `project` — is legal in v0.1). This leaves the door open for `import`, `module`, `package`, `include` statements at the top level in later versions without changing the v0.1 grammar.
+
+**Three-stage evolution after launch**
+
+| Phase | Capability | Sketch | Backward-compat |
+|---|---|---|---|
+| v0.2 | **Includes** (Terraform-style) | `include "./shared/budget.ais"` at top level; injects blocks into the surrounding project | ✅ additive |
+| v0.3 | **Modules with explicit exports** (Rust-style) | `module shared.models { export model "fast" { … } }` + `import shared.models` | ✅ uses reserved `module` / `import` / `export` |
+| v1.0+ | **Package registry** (npm-style) | `package "myorg/aislang-stdlib" version "^1.2.0"` + registry-backed resolution | ✅ uses reserved `package` |
+
+Reserved keywords for all three are already claimed in §2.
+
+### 7.3 Multi-platform deploy targets — emitter-first, additive resources later
+
+v0.1 supports `target = compose` only. Future targets fall into two categories with different cost profiles:
+
+| Target | Conceptual match to v0.1 resources | Strategy |
+|---|---|---|
+| Kubernetes, Helm, ECS, Nomad | Direct — containers, services, ports, volumes | **New emitter only; zero spec change.** Add `k8s`, `helm`, `ecs`, `nomad` to the `DeployTarget` enum and write the emitter. |
+| Databricks, MS Fabric, Spark, Vertex AI, Bedrock Agents | Conceptual mismatch — endpoints, MLflow artifacts, lakehouse-native primitives | **New emitter + additive resource types.** Most v0.1 resources map with caveats; some platform-native concepts (Unity Catalog, MLflow registry, Databricks Functions) need new resource types like `databricks.endpoint`, `unity_catalog`, `mlflow_artifact`. These are introduced via the v0.3 modules/packages mechanism (§7.2) — `databricks.*` lives in an importable module, not in the language core. |
+
+This keeps the v0.1 language small and stable while leaving room for the long tail of platforms. The `expose` field on `deploy` blocks is intentionally typed as `Map<String, Int>?` rather than something container-specific, so platform-specific emitters can reinterpret it (e.g. on Databricks, `expose = { endpoint_name = ... }` registers a model-serving endpoint).
+
+### 7.4 Binary IR / wire format — not in v0.1
+
+aiSlang has no execution VM. The compiled artifact is consumed by external tools (Docker, K8s, LiteLLM, OTel) that speak YAML/JSON. There is no aiSlang-specific bytecode target, so flatBuffers/protobuf/cap'n proto bring no benefit at v0.1 scale.
+
+Decisions:
+
+- **Internal AST:** Rust structs + `serde` + JSON. No separate IR.
+- **Lockfile, state, plan output:** JSON. Diffable, inspectable, no schema compiler required.
+- **Source language:** HCL-like (see §5.4).
+
+Where binary IR *would* pay back, deferred until the use case appears:
+
+- A **fleet-management plane** in Phase 2 that ships compiled plans to many remote agents — binary format would reduce wire size and parse cost. Decide when the use case is concrete, not before.
+- A **machine-readable schema for the `.ais` language itself**, generated from the Rust AST via the `schemars` crate (JSON Schema output). Pays for LSP autocomplete, generated docs, and other-language SDKs. **Targeted for first Phase 1 task; not in v0.1.**
+
 ---
 
 ## 8. EBNF (skeleton — finalize Friday of week 1)
 
 ```
+# File-level production: a list of top-level statements.
+# v0.1 only legal statement form is `project`, but the production
+# is a list so v0.2+ can add include/import/module/package without
+# changing the v0.1 grammar (see §7.2 backward-compat invariants).
+file           = top_level_stmt*
+top_level_stmt = project
+                # | include | import | module | package      # v0.2+
+
 project       = "project" StringLit "{" project_body "}"
 project_body  = (budget | model | prompt | mcp_server | agent | eval | secret | deploy)+
 
