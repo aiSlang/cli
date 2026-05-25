@@ -1,0 +1,4 @@
+# `$5 per 1h` — Rate literal, Money numerator + Duration denominator.
+# Not currently used by any v0.1 field, but the EBNF allows it. Likely
+# applicable to hourly compute budgets in a future spec extension.
+$5 per 1h

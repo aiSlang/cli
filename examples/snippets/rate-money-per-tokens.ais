@@ -1,0 +1,5 @@
+# `$0.001 per 1k_tokens` — Rate literal, Money numerator + unit_quantity
+# denominator. This is the only rate use case in support-agent.ais (for
+# `model.cost_max`). The `_tokens` suffix is descriptive metadata; the
+# AST stores only the Size (1024). See LANGUAGE-SPEC-v0.md §8 EBNF.
+$0.001 per 1k_tokens

@@ -74,7 +74,20 @@ enum RawValue {
     /// Distinct from a `block` body which uses whitespace separation.
     /// Used for typed-map fields like `deploy.expose = { port = 8080 }`.
     Object(Vec<RawAttribute>),
-    // Week-2 Wednesday addition: Rate(Box<RawRate>)
+    /// Composite value formed by the `per` infix keyword, e.g.
+    /// `$0.001 per 1k_tokens`. Boxed because `RawRate` contains
+    /// two `RawValue` fields and Rust requires indirection for the
+    /// recursive size to be finite.
+    Rate(Box<RawRate>),
+}
+
+/// Numerator + denominator. Per spec EBNF §8: numerator is one of
+/// Money/Int/Float; denominator is one of Size/Duration/unit_quantity
+/// (where `1k_tokens` parses to Size with the unit-name dropped).
+#[derive(Debug, Clone, PartialEq)]
+struct RawRate {
+    numerator:   RawValue,
+    denominator: RawValue,
 }
 
 #[derive(Debug, Clone)]
@@ -232,9 +245,14 @@ fn int_parser<'src>(
 /// value, an object attribute's RHS is a value.
 fn value_parser<'src>(
 ) -> impl Parser<'src, &'src str, RawValue, extra::Err<Rich<'src, char>>> + Clone {
-    let pad = padding();
+    recursive(|value| {
+        // Define `pad` inside the recursive closure so the closure is
+        // self-contained (no captures from outer scope). Capturing an
+        // 'src-lifetime parser from outside makes type inference push the
+        // recursive return type toward `'static`, which then fails to
+        // unify with `'src`. Internal definition avoids the issue.
+        let pad = padding();
 
-    recursive(move |value| {
         // Attribute inside an object literal. Same shape as the top-level
         // `attribute_parser`, but separated by `,` instead of whitespace.
         let attribute_in_object = ident_parser()
@@ -266,6 +284,74 @@ fn value_parser<'src>(
             )
             .map(RawValue::Object);
 
+        // -------------------------------------------------------------
+        // Rate (the `per` infix keyword) — Wednesday's novel production
+        // -------------------------------------------------------------
+        //
+        // Implementation note on `just("per")` vs `text::ascii::keyword`:
+        // `text::ascii::keyword` would enforce word-boundary (rejecting
+        // `permission` as accidental match), but combining it with our
+        // custom padding inside `recursive(...)` triggers a chumsky-0.10
+        // type-inference bug that demands `'src: 'static` on the parser's
+        // closure body. `just("per")` composes cleanly. The v0.1 user
+        // impact is bounded: the only rate use site is `cost_max = $X
+        // per Y` where `Y` always starts with a digit, so an unintended
+        // `per`-prefix identifier would fail loudly at the denominator
+        // parse (no digit start) rather than silently succeed.
+        // Revisit in v0.2 once chumsky lifetimes settle or boxed-parser
+        // alternatives are explored.
+
+        // `unit_quantity`: `<digits><size_unit>_<identifier>` — the
+        // `1k_tokens` form. Only legal in rate-denominator position.
+        // Emits the Size part; the unit name is descriptive metadata
+        // dropped per spec EBNF §8.
+        let size_unit_for_quantity = choice((
+            just("KB"), just("MB"), just("GB"),
+            just("k"),  just("K"),
+        ));
+        let unit_quantity = text::int(10)
+            .then(size_unit_for_quantity)
+            .then(just('_'))
+            .then(text::ascii::ident())
+            .to_slice()
+            .try_map(|s: &str, span| {
+                // Captured slice is e.g. `1k_tokens`; Size part is the
+                // prefix up to the underscore.
+                let underscore_pos = s.find('_').expect("matched pattern has `_`");
+                let size_text = &s[..underscore_pos];
+                Size::from_literal(size_text)
+                    .map_err(|e| Rich::custom(span, e.reason))
+            });
+
+        // Rate denominator: try unit_quantity first (most specific —
+        // requires an underscore segment), then fall back to bare size /
+        // duration.
+        let rate_denominator = choice((
+            unit_quantity.map(RawValue::Size),
+            size_parser().map(RawValue::Size),
+            duration_parser().map(RawValue::Duration),
+        ));
+
+        // `per` + denominator with padding around the keyword. See note
+        // above re: `just("per")` vs `text::ascii::keyword`.
+        let per_clause = just("per")
+            .padded_by(pad.clone())
+            .ignore_then(rate_denominator);
+
+        // Money is wrapped with optional per-clause. Per the EBNF, Int
+        // and Float can also be numerators, but no v0.1 spec field uses
+        // them, so they're left as plain literals to keep the type-
+        // inference graph tractable for rustc + chumsky-0.10.
+        let money_or_rate = money_parser()
+            .then(per_clause.or_not())
+            .map(|(m, denom)| match denom {
+                Some(d) => RawValue::Rate(Box::new(RawRate {
+                    numerator: RawValue::Money(m),
+                    denominator: d,
+                })),
+                None => RawValue::Money(m),
+            });
+
         // Combined ident-or-access. Parse an ident, then zero-or-more
         // `.ident` segments. If the tail is empty, dispatch on the first
         // ident's text (true / false / other-enum). If the tail is
@@ -293,7 +379,7 @@ fn value_parser<'src>(
             });
 
         choice((
-            money_parser().map(RawValue::Money),
+            money_or_rate,
             percentage_parser().map(RawValue::Percentage),
             duration_parser().map(RawValue::Duration),
             size_parser().map(RawValue::Size),
@@ -305,6 +391,12 @@ fn value_parser<'src>(
             ident_or_access,
         ))
         .padded_by(pad.clone())
+        // .boxed() collapses the nested impl-Parser type into a concrete
+        // Boxed<...> with explicit 'src lifetime. Without it, the
+        // compiler can't reconcile the inferred bounds from all the
+        // try_map / map closures and the recursive call site, producing
+        // a spurious "must outlive 'static" error.
+        .boxed()
     })
 }
 
@@ -694,6 +786,81 @@ mod value_tests {
         assert!(matches!(&items[0], RawValue::AttributeAccess(p) if p.len() == 2));
         assert!(matches!(&items[1], RawValue::AttributeAccess(p) if p.len() == 2));
     }
+
+    // ------------------------------------------------------------------
+    // Rate + unit_quantity — Wednesday additions
+    // ------------------------------------------------------------------
+
+    #[test] fn rate_money_per_unit_quantity() {
+        // The single rate use case in support-agent.ais.
+        let parsed = parse_value("$0.001 per 1k_tokens").unwrap();
+        let RawValue::Rate(r) = parsed else { panic!("expected Rate, got {parsed:?}") };
+        assert_eq!(r.numerator,
+            RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 }));
+        assert_eq!(r.denominator,
+            RawValue::Size(Size { units: 1024 }));
+    }
+
+    #[test] fn rate_money_per_bare_size() {
+        // Rate denominator can also be a bare size (no unit-name).
+        let parsed = parse_value("$0.01 per 1k").unwrap();
+        let RawValue::Rate(r) = parsed else { panic!("expected Rate") };
+        assert_eq!(r.denominator, RawValue::Size(Size { units: 1024 }));
+    }
+
+    #[test] fn rate_money_per_duration() {
+        let parsed = parse_value("$5 per 1h").unwrap();
+        let RawValue::Rate(r) = parsed else { panic!("expected Rate") };
+        assert_eq!(r.denominator,
+            RawValue::Duration(Duration { nanos: 3_600_000_000_000 }));
+    }
+
+    // NOTE: `rate_int_per_duration` (Int-numerator rate) and the
+    // matching Float-numerator case are in the EBNF (spec §8) but
+    // intentionally NOT wired up in the v0.1 parser. No v0.1 field uses
+    // them; enabling them in `value_parser` doubles the type-inference
+    // load on rustc + chumsky 0.10 past what currently compiles cleanly.
+    // The grammar reserves the syntactic room — they're additive in
+    // v0.2 when chumsky lifetime ergonomics improve.
+
+    #[test] fn money_alone_is_not_rate() {
+        // Crucial: bare Money without `per` must still parse as Money,
+        // not as a malformed Rate. The optional per-clause via or_not()
+        // is what enables this.
+        let parsed = parse_value("$50").unwrap();
+        assert_eq!(parsed,
+            RawValue::Money(Money { currency: Currency::Usd, micro_units: 50_000_000 }));
+    }
+
+    #[test] fn int_alone_is_not_rate() {
+        // Same invariant for Int — bare `8080` stays Int, not Rate(8080, _).
+        assert_eq!(parse_value("8080").unwrap(), RawValue::Int(8080));
+    }
+
+    #[test] fn per_prefix_in_ident_fails_loudly_not_silently() {
+        // `permission` starts with `per` but is one identifier. In v0.1,
+        // `just("per")` (used instead of `text::ascii::keyword("per")` —
+        // see implementation note in parser.rs) doesn't enforce a word
+        // boundary. The protection comes from the *denominator* parser:
+        // after consuming `per`, we need a Size/Duration/unit_quantity
+        // (all start with digits). `mission` doesn't, so the parse
+        // fails. The test pins this LOUD failure — the contract is "no
+        // silent consumption", not "no `per` prefix in idents".
+        let pad = padding();
+        let result: Result<RawValue, String> = {
+            let src = "$50 permission";
+            value_parser()
+                .padded_by(pad)
+                .then_ignore(end())
+                .parse(src)
+                .into_result()
+                .map_err(|errs| {
+                    errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")
+                })
+        };
+        assert!(result.is_err(),
+            "expected error on `$50 permission`, got Ok({result:?})");
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +963,17 @@ mod snippet_tests {
                 RawValue::AttributeAccess(vec!["model".into(), "fast".into()])),
             ("attr-access-three.ais",
                 RawValue::AttributeAccess(vec!["shared".into(), "models".into(), "fast".into()])),
+            // Wednesday additions — Rate + unit_quantity
+            ("rate-money-per-tokens.ais",
+                RawValue::Rate(Box::new(RawRate {
+                    numerator:   RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 }),
+                    denominator: RawValue::Size(Size { units: 1024 }),
+                }))),
+            ("rate-money-per-duration.ais",
+                RawValue::Rate(Box::new(RawRate {
+                    numerator:   RawValue::Money(Money { currency: Currency::Usd, micro_units: 5_000_000 }),
+                    denominator: RawValue::Duration(Duration { nanos: 3_600_000_000_000 }),
+                }))),
         ]
     }
 
