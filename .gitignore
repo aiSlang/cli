@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# aiSlang local state
+.aislang/
+
+# Secrets / env
+.env
+.env.*
+.secrets/
+*.key
+*.pem
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Allow lockfile (this is a binary crate — Cargo.lock should be committed)
+!Cargo.lock

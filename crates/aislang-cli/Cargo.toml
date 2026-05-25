@@ -1,0 +1,20 @@
+[package]
+name = "aislang-cli"
+description = "Declarative AI infrastructure — CLI"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aislang"
+path = "src/main.rs"
+
+[dependencies]
+aislang-core    = { workspace = true }
+aislang-catalog = { workspace = true }
+aislang-compose = { workspace = true }
+clap            = { workspace = true }
+anyhow          = { workspace = true }

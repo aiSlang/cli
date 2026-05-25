@@ -1,0 +1,5 @@
+{"input": "What is the return policy?", "expected": "30 days from purchase, original packaging required."}
+{"input": "How do I reset my password?", "expected": "Visit the account settings page and click 'Reset password'."}
+{"input": "What payment methods do you accept?", "expected": "Visa, Mastercard, American Express, PayPal."}
+{"input": "Where are you headquartered?", "expected": "Berlin, Germany."}
+{"input": "How can I contact support?", "expected": "Email support@example.com or open a ticket from the help page."}

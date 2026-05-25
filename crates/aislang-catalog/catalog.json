@@ -1,0 +1,125 @@
+{
+  "version": "2026-05-25",
+  "models": [
+    {
+      "id": "anthropic.claude_opus_4_7",
+      "provider": "anthropic",
+      "litellm_name": "anthropic/claude-opus-4-7",
+      "capabilities": ["chat", "tool_use", "reasoning", "structured_output", "vision", "large_context"],
+      "context_max": "1000k",
+      "cost_input_per_1k_tokens": "$0.015",
+      "cost_output_per_1k_tokens": "$0.075",
+      "latency_p95": "8s",
+      "residency": ["us"],
+      "deprecated": false
+    },
+    {
+      "id": "anthropic.claude_sonnet_4_6",
+      "provider": "anthropic",
+      "litellm_name": "anthropic/claude-sonnet-4-6",
+      "capabilities": ["chat", "tool_use", "structured_output", "vision", "large_context"],
+      "context_max": "200k",
+      "cost_input_per_1k_tokens": "$0.003",
+      "cost_output_per_1k_tokens": "$0.015",
+      "latency_p95": "3s",
+      "residency": ["us"],
+      "deprecated": false
+    },
+    {
+      "id": "anthropic.claude_haiku_4_5",
+      "provider": "anthropic",
+      "litellm_name": "anthropic/claude-haiku-4-5",
+      "capabilities": ["chat", "tool_use", "structured_output"],
+      "context_max": "200k",
+      "cost_input_per_1k_tokens": "$0.0008",
+      "cost_output_per_1k_tokens": "$0.004",
+      "latency_p95": "1.5s",
+      "residency": ["us"],
+      "deprecated": false
+    },
+    {
+      "id": "openai.gpt_4o",
+      "provider": "openai",
+      "litellm_name": "openai/gpt-4o",
+      "capabilities": ["chat", "tool_use", "structured_output", "vision"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0.005",
+      "cost_output_per_1k_tokens": "$0.015",
+      "latency_p95": "3s",
+      "residency": ["us", "eu"],
+      "deprecated": false
+    },
+    {
+      "id": "openai.gpt_4o_mini",
+      "provider": "openai",
+      "litellm_name": "openai/gpt-4o-mini",
+      "capabilities": ["chat", "tool_use", "structured_output"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0.00015",
+      "cost_output_per_1k_tokens": "$0.0006",
+      "latency_p95": "1.5s",
+      "residency": ["us", "eu"],
+      "deprecated": false
+    },
+    {
+      "id": "openai.o1_mini",
+      "provider": "openai",
+      "litellm_name": "openai/o1-mini",
+      "capabilities": ["chat", "reasoning", "structured_output"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0.003",
+      "cost_output_per_1k_tokens": "$0.012",
+      "latency_p95": "10s",
+      "residency": ["us"],
+      "deprecated": false
+    },
+    {
+      "id": "google.gemini_2_0_pro",
+      "provider": "google",
+      "litellm_name": "gemini/gemini-2.0-pro",
+      "capabilities": ["chat", "tool_use", "structured_output", "vision", "large_context"],
+      "context_max": "2000k",
+      "cost_input_per_1k_tokens": "$0.00125",
+      "cost_output_per_1k_tokens": "$0.005",
+      "latency_p95": "4s",
+      "residency": ["us", "eu"],
+      "deprecated": false
+    },
+    {
+      "id": "google.gemini_2_0_flash",
+      "provider": "google",
+      "litellm_name": "gemini/gemini-2.0-flash",
+      "capabilities": ["chat", "tool_use", "structured_output", "vision"],
+      "context_max": "1000k",
+      "cost_input_per_1k_tokens": "$0.000075",
+      "cost_output_per_1k_tokens": "$0.0003",
+      "latency_p95": "1s",
+      "residency": ["us", "eu"],
+      "deprecated": false
+    },
+    {
+      "id": "ollama.llama_3_1_8b",
+      "provider": "ollama",
+      "litellm_name": "ollama/llama3.1:8b",
+      "capabilities": ["chat", "tool_use"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0",
+      "cost_output_per_1k_tokens": "$0",
+      "latency_p95": "2s",
+      "residency": ["us", "eu", "uk", "apac"],
+      "deprecated": false
+    },
+    {
+      "id": "ollama.llama_3_1_70b",
+      "provider": "ollama",
+      "litellm_name": "ollama/llama3.1:70b",
+      "capabilities": ["chat", "tool_use", "structured_output"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0",
+      "cost_output_per_1k_tokens": "$0",
+      "latency_p95": "5s",
+      "residency": ["us", "eu", "uk", "apac"],
+      "deprecated": false
+    }
+  ]
+}

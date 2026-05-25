@@ -1,0 +1,18 @@
+[package]
+name = "aislang-core"
+description = "aiSlang language: parser, AST, types, type-checker, resolver"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+aislang-catalog = { workspace = true }
+chumsky    = { workspace = true }
+petgraph   = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+semver     = { workspace = true }
