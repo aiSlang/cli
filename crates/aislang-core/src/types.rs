@@ -324,6 +324,95 @@ pub struct OciImage {
     pub digest:     Option<String>,
 }
 
+impl OciImage {
+    /// Parse an `OciImage` literal of the form
+    /// `<registry>/<repository>[:<tag>][@<algo>:<hex>]`.
+    ///
+    /// **v0.1 simplifications:**
+    /// - Registry must look like a hostname (contain `.`). Docker Hub
+    ///   shorthand (`nginx:latest`) and port-only addresses
+    ///   (`localhost:5000/foo`) are rejected — defer to v0.2.
+    /// - At least one of `tag` or `digest` is required. Implicit
+    ///   `:latest` is rejected for reproducibility.
+    /// - Digest is `<algorithm>:<hex>` with hex-only payload.
+    pub fn from_literal(s: &str) -> Result<Self, LiteralParseError> {
+        let err = |reason: &str| LiteralParseError::new("OciImage", s, reason);
+
+        if s.is_empty() {
+            return Err(err("empty input"));
+        }
+
+        // Split off digest at the rightmost `@` (registry/repository never
+        // contain `@`, so rsplit is safe).
+        let (before_digest, digest) = match s.rsplit_once('@') {
+            Some((before, dig)) => (before, Some(dig.to_string())),
+            None => (s, None),
+        };
+
+        if let Some(ref d) = digest {
+            if d.is_empty() {
+                return Err(err("digest after `@` is empty"));
+            }
+            let (algo, hex) = d.split_once(':').ok_or_else(|| {
+                err("digest must be `<algorithm>:<hex>` (e.g. `sha256:abc…`)")
+            })?;
+            if algo.is_empty() || hex.is_empty() {
+                return Err(err("digest algorithm or hex part is empty"));
+            }
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(err("digest hex part must be hexadecimal"));
+            }
+        }
+
+        // First `/` separates registry from repository.
+        let first_slash = before_digest.find('/').ok_or_else(|| {
+            err("missing `/` between registry and repository \
+                 (e.g. `ghcr.io/owner/repo:tag`)")
+        })?;
+        let registry = &before_digest[..first_slash];
+        let rest     = &before_digest[first_slash + 1..];
+
+        if registry.is_empty() {
+            return Err(err("registry segment before `/` is empty"));
+        }
+        if !registry.contains('.') {
+            return Err(err(
+                "registry must look like a hostname (contain `.`); \
+                 Docker Hub shorthand and port-only registries deferred to v0.2",
+            ));
+        }
+
+        // Last `:` in the post-registry segment separates repository from tag.
+        // (OCI tags never contain `:`, so rsplit is safe.)
+        let (repository, tag) = match rest.rsplit_once(':') {
+            Some((repo, t)) => (repo.to_string(), Some(t.to_string())),
+            None            => (rest.to_string(), None),
+        };
+
+        if repository.is_empty() {
+            return Err(err("repository segment is empty"));
+        }
+        if let Some(ref t) = tag {
+            if t.is_empty() {
+                return Err(err("tag after `:` is empty"));
+            }
+        }
+        if tag.is_none() && digest.is_none() {
+            return Err(err(
+                "must specify a tag (e.g. `:1.0.0`) or digest (e.g. `@sha256:…`); \
+                 implicit `:latest` is rejected for reproducibility",
+            ));
+        }
+
+        Ok(OciImage {
+            registry: registry.to_string(),
+            repository,
+            tag,
+            digest,
+        })
+    }
+}
+
 // ============================================================================
 // Closed enums (LANGUAGE-SPEC-v0.md §3.4)
 // ============================================================================
@@ -499,6 +588,83 @@ mod size_tests {
     #[test] fn lowercase_mb_rejected()     { rejected("1mb",   "unknown unit"); }
     #[test] fn bare_m_rejected()           { rejected("1M",    "unknown unit"); }
     #[test] fn space_rejected()            { rejected("32 k",  "unknown unit"); }
+}
+
+#[cfg(test)]
+mod oci_image_tests {
+    use super::*;
+
+    fn ok(input: &str, registry: &str, repository: &str, tag: Option<&str>, digest: Option<&str>) {
+        let parsed = OciImage::from_literal(input)
+            .unwrap_or_else(|e| panic!("expected `{input}` to parse, got: {e}"));
+        assert_eq!(parsed.registry,   registry);
+        assert_eq!(parsed.repository, repository);
+        assert_eq!(parsed.tag.as_deref(),    tag);
+        assert_eq!(parsed.digest.as_deref(), digest);
+    }
+    fn rejected(input: &str, substring: &str) {
+        let err = OciImage::from_literal(input)
+            .err()
+            .unwrap_or_else(|| panic!("expected `{input}` to be rejected"));
+        assert!(err.reason.contains(substring),
+            "reason `{}` did not contain `{substring}`", err.reason);
+    }
+
+    #[test] fn simple_tag() {
+        ok("ghcr.io/example/mcp_filesystem:0.3.1",
+           "ghcr.io", "example/mcp_filesystem", Some("0.3.1"), None);
+    }
+    #[test] fn digest_only() {
+        ok("ghcr.io/foo/bar@sha256:abc123",
+           "ghcr.io", "foo/bar", None, Some("sha256:abc123"));
+    }
+    #[test] fn tag_and_digest() {
+        ok("ghcr.io/foo/bar:1.0@sha256:abcdef",
+           "ghcr.io", "foo/bar", Some("1.0"), Some("sha256:abcdef"));
+    }
+    #[test] fn dockerhub_library_explicit() {
+        ok("docker.io/library/nginx:1.21",
+           "docker.io", "library/nginx", Some("1.21"), None);
+    }
+    #[test] fn deep_repository_path() {
+        ok("registry.example.com/team/app/component:v2",
+           "registry.example.com", "team/app/component", Some("v2"), None);
+    }
+
+    #[test] fn missing_registry_hostname_rejected() {
+        // `localhost/foo:tag` has a `/` (so passes the slash check) but the
+        // registry segment `localhost` has no `.` — fails the hostname check.
+        rejected("localhost/foo:tag", "hostname");
+    }
+    #[test] fn dockerhub_shorthand_rejected() {
+        // Docker Hub library shorthand (`nginx:latest`) has no `/` at all
+        // and thus fails the slash check before getting to hostname validation.
+        rejected("nginx:latest", "missing `/`");
+    }
+    #[test] fn missing_slash_rejected() {
+        rejected("ghcr.io", "missing `/`");
+    }
+    #[test] fn missing_tag_and_digest_rejected() {
+        rejected("ghcr.io/foo/bar", "must specify a tag");
+    }
+    #[test] fn empty_tag_rejected() {
+        rejected("ghcr.io/foo/bar:", "tag after `:` is empty");
+    }
+    #[test] fn empty_digest_rejected() {
+        rejected("ghcr.io/foo/bar@", "digest after `@` is empty");
+    }
+    #[test] fn malformed_digest_rejected() {
+        rejected("ghcr.io/foo/bar@sha256-abcd", "digest must be");
+    }
+    #[test] fn non_hex_digest_rejected() {
+        rejected("ghcr.io/foo/bar@sha256:xyzzy", "hexadecimal");
+    }
+    #[test] fn empty_repository_rejected() {
+        rejected("ghcr.io/:tag", "repository segment is empty");
+    }
+    #[test] fn empty_input_rejected() {
+        rejected("", "empty input");
+    }
 }
 
 #[cfg(test)]
