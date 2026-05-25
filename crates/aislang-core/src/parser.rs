@@ -22,6 +22,8 @@ use crate::ast::*;
 use crate::types::*;
 use chumsky::prelude::*;
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 // ============================================================================
 // Public entry point
@@ -573,12 +575,20 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
                 }
                 project.budget = Some(to_budget(block)?);
             }
-            // Week-2: model | prompt | mcp_server | agent | eval | secret | deploy
+            "prompt"     => project.prompts.push(to_prompt(block)?),
+            "mcp_server" => project.mcp_servers.push(to_mcp_server(block)?),
+            "agent"      => project.agents.push(to_agent(block)?),
+            "eval"       => project.evals.push(to_eval(block)?),
+            "secret"     => project.secrets.push(to_secret(block)?),
+            "deploy"     => project.deploys.push(to_deploy(block)?),
+            // Week-2 Friday: model converter (the complex one — Rate,
+            // multi-list, residency, ModelId resolution).
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
-                     v0.1 week-1 skeleton supports: budget. \
-                     Other resource types arrive in week 2."
+                     v0.1 supports: budget, prompt, mcp_server, agent, \
+                     eval, secret, deploy. The `model` converter arrives \
+                     Friday of week 2."
                 ));
             }
         }
@@ -665,6 +675,469 @@ fn expect_optimize_for(v: RawValue) -> Result<OptimizeFor, String> {
             "`optimize_for` expects a bare enum member (cost / latency / quality); got {other:?}"
         )),
     }
+}
+
+// ============================================================================
+// Thursday converters: prompt, mcp_server, deploy, eval, secret, agent
+// (the "leaf" resources — no Rate, no Vec<ModelId>, no constraints). The
+// complex `to_model` converter is Friday's work.
+// ============================================================================
+
+fn to_prompt(raw: RawBlock) -> Result<Prompt, String> {
+    let label = require_single_label("prompt", raw.labels)?;
+    let mut file:    Option<PathBuf> = None;
+    let mut version: Option<SemVer>  = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("prompt", item)?;
+        match attr.name.as_str() {
+            "file"    => file    = Some(expect_path(&attr.name, attr.value)?),
+            "version" => version = Some(expect_semver(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in prompt block; allowed: file, version"
+            )),
+        }
+    }
+
+    Ok(Prompt {
+        label,
+        file: file.ok_or_else(||
+            "prompt missing required attribute `file`".to_string())?,
+        version: version.ok_or_else(||
+            "prompt missing required attribute `version`".to_string())?,
+    })
+}
+
+fn to_mcp_server(raw: RawBlock) -> Result<McpServer, String> {
+    let label = require_single_label("mcp_server", raw.labels)?;
+    let mut image:   Option<OciImage>             = None;
+    let mut mount:   Option<PathBuf>              = None;
+    let mut env:     Option<Vec<(String, String)>> = None;
+    let mut secrets: Option<Vec<Ref>>             = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("mcp_server", item)?;
+        match attr.name.as_str() {
+            "image"   => image   = Some(expect_oci_image(&attr.name, attr.value)?),
+            "mount"   => mount   = Some(expect_path(&attr.name, attr.value)?),
+            "env"     => env     = Some(expect_env_map(&attr.name, attr.value)?),
+            "secrets" => secrets = Some(expect_list_of_refs(
+                &attr.name, RefKind::Secret, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in mcp_server block; \
+                 allowed: image, mount, env, secrets"
+            )),
+        }
+    }
+
+    Ok(McpServer {
+        label,
+        image: image.ok_or_else(||
+            "mcp_server missing required attribute `image`".to_string())?,
+        mount,
+        env,
+        secrets,
+    })
+}
+
+fn to_deploy(raw: RawBlock) -> Result<Deploy, String> {
+    let label = require_single_label("deploy", raw.labels)?;
+    let mut target: Option<DeployTarget>           = None;
+    let mut expose: Option<BTreeMap<String, u16>>  = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("deploy", item)?;
+        match attr.name.as_str() {
+            "target" => target = Some(expect_deploy_target(&attr.name, attr.value)?),
+            "expose" => expose = Some(expect_port_map(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in deploy block; allowed: target, expose"
+            )),
+        }
+    }
+
+    Ok(Deploy {
+        label,
+        target: target.ok_or_else(||
+            "deploy missing required attribute `target`".to_string())?,
+        expose,
+    })
+}
+
+fn to_eval(raw: RawBlock) -> Result<Eval, String> {
+    let label = require_single_label("eval", raw.labels)?;
+    let mut dataset:    Option<PathBuf>        = None;
+    let mut metric:     Option<EvalMetric>     = None;
+    let mut threshold:  Option<Percentage>     = None;
+    let mut aggregator: EvalAggregator         = EvalAggregator::Mean;   // default
+    let mut agent:      Option<Ref>            = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("eval", item)?;
+        match attr.name.as_str() {
+            "dataset"    => dataset    = Some(expect_path(&attr.name, attr.value)?),
+            "metric"     => metric     = Some(expect_eval_metric(&attr.name, attr.value)?),
+            "threshold"  => threshold  = Some(expect_percentage(&attr.name, attr.value)?),
+            "aggregator" => aggregator = expect_eval_aggregator(&attr.name, attr.value)?,
+            "agent"      => agent      = Some(expect_ref(
+                &attr.name, RefKind::Agent, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in eval block; \
+                 allowed: dataset, metric, threshold, aggregator, agent"
+            )),
+        }
+    }
+
+    Ok(Eval {
+        label,
+        dataset: dataset.ok_or_else(||
+            "eval missing required attribute `dataset`".to_string())?,
+        metric: metric.ok_or_else(||
+            "eval missing required attribute `metric`".to_string())?,
+        threshold: threshold.ok_or_else(||
+            "eval missing required attribute `threshold`".to_string())?,
+        aggregator,
+        agent,
+    })
+}
+
+fn to_secret(raw: RawBlock) -> Result<Secret, String> {
+    let label = require_single_label("secret", raw.labels)?;
+    let mut source: Option<String>   = None;
+    let mut scope:  Option<Vec<Ref>> = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("secret", item)?;
+        match attr.name.as_str() {
+            "source" => source = Some(expect_string(&attr.name, attr.value)?),
+            "scope"  => scope  = Some(expect_scope_list(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in secret block; allowed: source, scope"
+            )),
+        }
+    }
+
+    Ok(Secret {
+        label,
+        source: source.ok_or_else(||
+            "secret missing required attribute `source`".to_string())?,
+        scope:  scope.ok_or_else(||
+            "secret missing required attribute `scope`".to_string())?,
+    })
+}
+
+fn to_agent(raw: RawBlock) -> Result<Agent, String> {
+    let label = require_single_label("agent", raw.labels)?;
+    let mut model:         Option<Ref>      = None;
+    let mut system_prompt: Option<Ref>      = None;
+    let mut tools:         Option<Vec<Ref>> = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("agent", item)?;
+        match attr.name.as_str() {
+            "model"         => model         = Some(expect_ref(
+                &attr.name, RefKind::Model, attr.value)?),
+            "system_prompt" => system_prompt = Some(expect_ref(
+                &attr.name, RefKind::Prompt, attr.value)?),
+            "tools"         => tools         = Some(expect_list_of_refs(
+                &attr.name, RefKind::McpServer, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in agent block; \
+                 allowed: model, system_prompt, tools"
+            )),
+        }
+    }
+
+    Ok(Agent {
+        label,
+        model: model.ok_or_else(||
+            "agent missing required attribute `model`".to_string())?,
+        system_prompt: system_prompt.ok_or_else(||
+            "agent missing required attribute `system_prompt`".to_string())?,
+        // tools defaults to empty if absent — an agent with no tools is a
+        // valid pure-chat agent.
+        tools: tools.unwrap_or_default(),
+    })
+}
+
+// ============================================================================
+// Shared converter helpers
+// ============================================================================
+
+fn require_single_label(block_name: &str, labels: Vec<String>)
+    -> Result<String, String>
+{
+    match labels.len() {
+        0 => Err(format!(
+            "`{block_name}` block requires a name label, \
+             e.g. `{block_name} \"foo\" {{ … }}`"
+        )),
+        1 => Ok(labels.into_iter().next().unwrap()),
+        n => Err(format!(
+            "`{block_name}` block takes exactly one label; got {n}"
+        )),
+    }
+}
+
+fn expect_attr_only(block_name: &str, item: RawBodyItem)
+    -> Result<RawAttribute, String>
+{
+    match item {
+        RawBodyItem::Attribute(a) => Ok(a),
+        RawBodyItem::Block(b) => Err(format!(
+            "nested block `{}` not allowed inside `{block_name}` body \
+             (spec §8.1: resource bodies are attribute-only)",
+            b.block_type
+        )),
+    }
+}
+
+fn expect_string(field: &str, v: RawValue) -> Result<String, String> {
+    match v {
+        RawValue::String(s) => Ok(s),
+        other => Err(format!(
+            "`{field}` expects a quoted string; got {other:?}"
+        )),
+    }
+}
+
+fn expect_path(field: &str, v: RawValue) -> Result<PathBuf, String> {
+    match v {
+        RawValue::String(s) => Ok(PathBuf::from(s)),
+        other => Err(format!(
+            "`{field}` expects a Path (quoted string like `\"./file\"`); got {other:?}"
+        )),
+    }
+}
+
+fn expect_semver(field: &str, v: RawValue) -> Result<SemVer, String> {
+    match v {
+        RawValue::String(s) => SemVer::from_literal(&s)
+            .map_err(|e| format!("`{field}` SemVer parse failed: {}", e.reason)),
+        other => Err(format!(
+            "`{field}` expects a SemVer string (quoted, e.g. `\"1.0.0\"`); got {other:?}"
+        )),
+    }
+}
+
+fn expect_oci_image(field: &str, v: RawValue) -> Result<OciImage, String> {
+    match v {
+        RawValue::String(s) => OciImage::from_literal(&s)
+            .map_err(|e| format!("`{field}` OciImage parse failed: {}", e.reason)),
+        other => Err(format!(
+            "`{field}` expects an OciImage (quoted string like \
+             `\"ghcr.io/owner/repo:tag\"`); got {other:?}"
+        )),
+    }
+}
+
+fn expect_percentage(field: &str, v: RawValue) -> Result<Percentage, String> {
+    match v {
+        RawValue::Percentage(p) => Ok(p),
+        other => Err(format!(
+            "`{field}` expects a Percentage literal (e.g. `85%`); got {other:?}"
+        )),
+    }
+}
+
+fn expect_eval_metric(field: &str, v: RawValue) -> Result<EvalMetric, String> {
+    match v {
+        RawValue::EnumMember(e) => match e.as_str() {
+            "exact_match" => Ok(EvalMetric::ExactMatch),
+            "f1"          => Ok(EvalMetric::F1),
+            "bleu"        => Ok(EvalMetric::Bleu),
+            "rouge_l"     => Ok(EvalMetric::RougeL),
+            "llm_judge"   => Ok(EvalMetric::LlmJudge),
+            other => Err(format!(
+                "`{field}` unknown metric `{other}`; \
+                 allowed: exact_match, f1, bleu, rouge_l, llm_judge"
+            )),
+        },
+        other => Err(format!(
+            "`{field}` expects a bare EvalMetric identifier; got {other:?}"
+        )),
+    }
+}
+
+fn expect_eval_aggregator(field: &str, v: RawValue) -> Result<EvalAggregator, String> {
+    match v {
+        RawValue::EnumMember(e) => match e.as_str() {
+            "mean"           => Ok(EvalAggregator::Mean),
+            "min"            => Ok(EvalAggregator::Min),
+            "max"            => Ok(EvalAggregator::Max),
+            "percentile_p95" => Ok(EvalAggregator::PercentileP95),
+            other => Err(format!(
+                "`{field}` unknown aggregator `{other}`; \
+                 allowed: mean, min, max, percentile_p95"
+            )),
+        },
+        other => Err(format!(
+            "`{field}` expects a bare EvalAggregator identifier; got {other:?}"
+        )),
+    }
+}
+
+fn expect_deploy_target(field: &str, v: RawValue) -> Result<DeployTarget, String> {
+    match v {
+        RawValue::EnumMember(e) => match e.as_str() {
+            "compose" => Ok(DeployTarget::Compose),
+            other => Err(format!(
+                "`{field}` must be `compose` in v0.1; got `{other}` \
+                 (k8s/helm/ecs deploy targets arrive in Phase 1 — see spec §7.3)"
+            )),
+        },
+        other => Err(format!(
+            "`{field}` expects a bare DeployTarget identifier; got {other:?}"
+        )),
+    }
+}
+
+fn parse_ref_from_access(path: &[String]) -> Result<Ref, String> {
+    if path.len() != 2 {
+        return Err(format!(
+            "expected a 2-segment reference like `kind.label`; got `{}` ({} segment(s))",
+            path.join("."),
+            path.len()
+        ));
+    }
+    let kind = match path[0].as_str() {
+        "model"      => RefKind::Model,
+        "prompt"     => RefKind::Prompt,
+        "mcp_server" => RefKind::McpServer,
+        "agent"      => RefKind::Agent,
+        "secret"     => RefKind::Secret,
+        other => return Err(format!(
+            "unknown resource kind `{other}` in reference `{}`; \
+             expected one of: model, prompt, mcp_server, agent, secret",
+            path.join(".")
+        )),
+    };
+    Ok(Ref { kind, label: path[1].clone() })
+}
+
+fn ref_kind_str(k: RefKind) -> &'static str {
+    match k {
+        RefKind::Model     => "model",
+        RefKind::Prompt    => "prompt",
+        RefKind::McpServer => "mcp_server",
+        RefKind::Agent     => "agent",
+        RefKind::Secret    => "secret",
+    }
+}
+
+fn expect_ref(field: &str, expected_kind: RefKind, v: RawValue) -> Result<Ref, String> {
+    let prefix = ref_kind_str(expected_kind);
+    let path = match v {
+        RawValue::AttributeAccess(p) => p,
+        other => return Err(format!(
+            "`{field}` expects a {prefix} reference (e.g. `{prefix}.label`); got {other:?}"
+        )),
+    };
+    let r = parse_ref_from_access(&path)
+        .map_err(|e| format!("`{field}`: {e}"))?;
+    if r.kind != expected_kind {
+        return Err(format!(
+            "`{field}` expects a `{prefix}` reference; got a `{}` reference (`{}`)",
+            ref_kind_str(r.kind), path.join(".")
+        ));
+    }
+    Ok(r)
+}
+
+fn expect_list_of_refs(field: &str, expected_kind: RefKind, v: RawValue)
+    -> Result<Vec<Ref>, String>
+{
+    let items = match v {
+        RawValue::List(items) => items,
+        other => return Err(format!(
+            "`{field}` expects a list of {} references; got {other:?}",
+            ref_kind_str(expected_kind)
+        )),
+    };
+    items.into_iter().enumerate().map(|(i, item)| {
+        let indexed = format!("{field}[{i}]");
+        expect_ref(&indexed, expected_kind, item)
+    }).collect()
+}
+
+/// `secret.scope` allows refs to *either* `agent` or `mcp_server` — the two
+/// runtime carriers that can read a secret. This is the only union-kind
+/// list in v0.1; everything else uses `expect_list_of_refs` with a single
+/// expected kind.
+fn expect_scope_list(field: &str, v: RawValue) -> Result<Vec<Ref>, String> {
+    let items = match v {
+        RawValue::List(items) => items,
+        other => return Err(format!(
+            "`{field}` expects a list of `agent` or `mcp_server` references; got {other:?}"
+        )),
+    };
+    items.into_iter().enumerate().map(|(i, item)| {
+        let path = match item {
+            RawValue::AttributeAccess(p) => p,
+            other => return Err(format!(
+                "`{field}[{i}]` expects a resource reference; got {other:?}"
+            )),
+        };
+        let r = parse_ref_from_access(&path)
+            .map_err(|e| format!("`{field}[{i}]`: {e}"))?;
+        if !matches!(r.kind, RefKind::Agent | RefKind::McpServer) {
+            return Err(format!(
+                "`{field}[{i}]` must reference an `agent` or `mcp_server`; \
+                 got a `{}` reference (`{}`)",
+                ref_kind_str(r.kind), path.join(".")
+            ));
+        }
+        Ok(r)
+    }).collect()
+}
+
+fn expect_env_map(field: &str, v: RawValue) -> Result<Vec<(String, String)>, String> {
+    let attrs = match v {
+        RawValue::Object(a) => a,
+        other => return Err(format!(
+            "`{field}` expects an object literal like `{{ KEY = \"value\" }}`; got {other:?}"
+        )),
+    };
+    attrs.into_iter().map(|attr| {
+        let val = match attr.value {
+            RawValue::String(s) => s,
+            other => return Err(format!(
+                "`{field}.{}` must be a quoted string; got {other:?}", attr.name
+            )),
+        };
+        Ok((attr.name, val))
+    }).collect()
+}
+
+fn expect_port_map(field: &str, v: RawValue) -> Result<BTreeMap<String, u16>, String> {
+    let attrs = match v {
+        RawValue::Object(a) => a,
+        other => return Err(format!(
+            "`{field}` expects an object literal like `{{ port = 8080 }}`; got {other:?}"
+        )),
+    };
+    let mut map = BTreeMap::new();
+    for attr in attrs {
+        let port: u16 = match attr.value {
+            RawValue::Int(i) => {
+                if !(0..=65535).contains(&i) {
+                    return Err(format!(
+                        "`{field}.{}` port out of range [0, 65535]: {i}", attr.name
+                    ));
+                }
+                i as u16
+            }
+            other => return Err(format!(
+                "`{field}.{}` expects an integer port; got {other:?}", attr.name
+            )),
+        };
+        if map.insert(attr.name.clone(), port).is_some() {
+            return Err(format!(
+                "`{field}` has duplicate port mapping for `{}`", attr.name
+            ));
+        }
+    }
+    Ok(map)
 }
 
 // ============================================================================
@@ -1229,6 +1702,193 @@ mod project_tests {
         "#;
         assert_parse_err_contains(src, "chaos");
     }
+
+    // ------------------------------------------------------------------
+    // Six new resource types — Thursday: end-to-end full-parse tests
+    // ------------------------------------------------------------------
+
+    fn project_with(body: &str) -> String {
+        format!(
+            r#"project "p" {{
+                budget {{ hard_cap_per_day = $1   hard_cap_per_run = $0.01 }}
+                {body}
+            }}"#
+        )
+    }
+
+    #[test] fn prompt_block_parses() {
+        let src = project_with(r#"prompt "system" { file = "./p.md"  version = "1.0.0" }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.prompts.len(), 1);
+        assert_eq!(p.prompts[0].label, "system");
+        assert_eq!(p.prompts[0].file.to_str().unwrap(), "./p.md");
+    }
+
+    #[test] fn prompt_missing_file_fails() {
+        let src = project_with(r#"prompt "p" { version = "1.0.0" }"#);
+        assert_parse_err_contains(&src, "missing required attribute `file`");
+    }
+
+    #[test] fn prompt_with_range_version_fails() {
+        // Strict SemVer — ^/~/>= rejected by SemVer::from_literal
+        let src = project_with(r#"prompt "p" { file = "./p.md"  version = "^1.0.0" }"#);
+        assert_parse_err_contains(&src, "range operators");
+    }
+
+    #[test] fn mcp_server_block_parses() {
+        let src = project_with(
+            r#"mcp_server "docs" { image = "ghcr.io/x/y:1.0"  mount = "./k/" }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.mcp_servers.len(), 1);
+        let m = &p.mcp_servers[0];
+        assert_eq!(m.label, "docs");
+        assert_eq!(m.image.registry,   "ghcr.io");
+        assert_eq!(m.image.repository, "x/y");
+        assert_eq!(m.image.tag.as_deref(), Some("1.0"));
+        assert_eq!(m.mount.as_ref().unwrap().to_str().unwrap(), "./k/");
+    }
+
+    #[test] fn mcp_server_unquoted_image_fails() {
+        // OciImage MUST be quoted (spec §3.2). The bare `ghcr.io/x/y:1.0`
+        // would not even parse as a single value at the grammar level.
+        let src = project_with(
+            r#"mcp_server "docs" { image = ghcr.io/x/y:1.0 }"#);
+        assert!(parse(&src).is_err());
+    }
+
+    #[test] fn mcp_server_bad_image_fails_with_oci_diagnostic() {
+        let src = project_with(
+            r#"mcp_server "docs" { image = "nginx:latest" }"#);
+        assert_parse_err_contains(&src, "OciImage");
+    }
+
+    #[test] fn deploy_block_parses() {
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose = { port = 8080 } }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.deploys.len(), 1);
+        let d = &p.deploys[0];
+        assert_eq!(d.target, DeployTarget::Compose);
+        assert_eq!(d.expose.as_ref().unwrap().get("port"), Some(&8080u16));
+    }
+
+    #[test] fn deploy_port_out_of_range_fails() {
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose = { port = 99999 } }"#);
+        assert_parse_err_contains(&src, "out of range");
+    }
+
+    #[test] fn deploy_unknown_target_fails() {
+        // `k8s` is not in v0.1's DeployTarget enum — gets EnumMember at
+        // parse time, rejected at convert time with a helpful diagnostic
+        // pointing at Phase 1.
+        let src = project_with(r#"deploy "x" { target = k8s }"#);
+        assert_parse_err_contains(&src, "k8s");
+    }
+
+    #[test] fn eval_block_parses() {
+        let src = project_with(
+            r#"eval "acc" { dataset = "./q.jsonl"  metric = exact_match  threshold = 85% }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.evals.len(), 1);
+        let e = &p.evals[0];
+        assert_eq!(e.label, "acc");
+        assert_eq!(e.metric, EvalMetric::ExactMatch);
+        assert_eq!(e.aggregator, EvalAggregator::Mean);   // default applied
+        assert!((e.threshold.ratio - 0.85).abs() < 1e-12);
+    }
+
+    #[test] fn eval_with_explicit_aggregator() {
+        let src = project_with(
+            r#"eval "acc" { dataset = "./q.jsonl"  metric = f1  threshold = 90%  aggregator = percentile_p95 }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.evals[0].aggregator, EvalAggregator::PercentileP95);
+    }
+
+    #[test] fn eval_threshold_must_be_percentage_not_float() {
+        // `0.85` parses as Float, but eval.threshold requires Percentage.
+        // Converter rejects with a useful error pointing at the type.
+        let src = project_with(
+            r#"eval "x" { dataset = "./q"  metric = exact_match  threshold = 0.85 }"#);
+        assert_parse_err_contains(&src, "Percentage");
+    }
+
+    #[test] fn secret_block_parses() {
+        let src = project_with(
+            r#"secret "key" { source = "env://OPENAI_API_KEY"  scope = [agent.support] }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.secrets.len(), 1);
+        let s = &p.secrets[0];
+        assert_eq!(s.source, "env://OPENAI_API_KEY");
+        assert_eq!(s.scope.len(), 1);
+        assert_eq!(s.scope[0].kind, RefKind::Agent);
+        assert_eq!(s.scope[0].label, "support");
+    }
+
+    #[test] fn secret_scope_accepts_mcp_server_refs() {
+        let src = project_with(
+            r#"secret "k" { source = "env://X"  scope = [agent.a, mcp_server.b] }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.secrets[0].scope[0].kind, RefKind::Agent);
+        assert_eq!(p.secrets[0].scope[1].kind, RefKind::McpServer);
+    }
+
+    #[test] fn secret_scope_rejects_model_refs() {
+        // model.X is a valid AttributeAccess at parse time, but secret.scope
+        // only allows agent/mcp_server kinds — the converter rejects.
+        let src = project_with(
+            r#"secret "k" { source = "env://X"  scope = [model.fast] }"#);
+        assert_parse_err_contains(&src, "agent` or `mcp_server");
+    }
+
+    #[test] fn agent_block_parses() {
+        let src = project_with(
+            r#"agent "support" { model = model.fast  system_prompt = prompt.system  tools = [mcp_server.docs] }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.agents.len(), 1);
+        let a = &p.agents[0];
+        assert_eq!(a.label, "support");
+        assert_eq!(a.model.kind, RefKind::Model);
+        assert_eq!(a.model.label, "fast");
+        assert_eq!(a.system_prompt.kind, RefKind::Prompt);
+        assert_eq!(a.tools.len(), 1);
+        assert_eq!(a.tools[0].kind, RefKind::McpServer);
+    }
+
+    #[test] fn agent_with_no_tools_defaults_to_empty() {
+        let src = project_with(
+            r#"agent "support" { model = model.fast  system_prompt = prompt.system }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.agents[0].tools.len(), 0);
+    }
+
+    #[test] fn agent_wrong_ref_kind_fails() {
+        // `agent.model` expects a model.X reference; giving prompt.X is wrong
+        let src = project_with(
+            r#"agent "a" { model = prompt.system  system_prompt = prompt.system }"#);
+        assert_parse_err_contains(&src, "expects a `model` reference");
+    }
+
+    #[test] fn agent_tools_must_be_mcp_server_refs() {
+        let src = project_with(
+            r#"agent "a" { model = model.fast  system_prompt = prompt.system  tools = [agent.other] }"#);
+        assert_parse_err_contains(&src, "expects a `mcp_server` reference");
+    }
+
+    #[test] fn unknown_attribute_in_resource_block_fails() {
+        let src = project_with(r#"prompt "p" { file = "./x"  version = "1.0.0"  flavor = vanilla }"#);
+        assert_parse_err_contains(&src, "unknown attribute `flavor`");
+    }
+
+    #[test] fn nested_block_in_resource_body_rejected() {
+        // spec §8.1: resource bodies are attribute-only in v0.1
+        let src = project_with(r#"prompt "p" { file = "./x"  version = "1.0.0"  budget { } }"#);
+        assert_parse_err_contains(&src, "nested block");
+    }
+
+    // ------------------------------------------------------------------
+    // Original Friday tests follow
+    // ------------------------------------------------------------------
 
     #[test] fn money_string_in_money_field_fails() {
         let src = r#"
