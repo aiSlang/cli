@@ -246,9 +246,11 @@ fn parser_produces_expected_minimal() {
 }
 
 #[test]
-#[ignore = "parser skeleton handles only `project` + `budget` so far — \
-            enable when week 2 adds the remaining resource types"]
 fn parser_produces_expected_support_agent() {
+    // Enabled at end of week 2 Friday: all nine resource types convert.
+    // This is the v0.1 parser milestone — parser output for the full
+    // demo equals the Rust-side `expected_support_agent()` byte-for-byte
+    // after JSON serialization.
     assert_parser_matches_expected("support-agent", &expected_support_agent());
 }
 

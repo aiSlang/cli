@@ -575,20 +575,18 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
                 }
                 project.budget = Some(to_budget(block)?);
             }
+            "model"      => project.models.push(to_model(block)?),
             "prompt"     => project.prompts.push(to_prompt(block)?),
             "mcp_server" => project.mcp_servers.push(to_mcp_server(block)?),
             "agent"      => project.agents.push(to_agent(block)?),
             "eval"       => project.evals.push(to_eval(block)?),
             "secret"     => project.secrets.push(to_secret(block)?),
             "deploy"     => project.deploys.push(to_deploy(block)?),
-            // Week-2 Friday: model converter (the complex one — Rate,
-            // multi-list, residency, ModelId resolution).
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
-                     v0.1 supports: budget, prompt, mcp_server, agent, \
-                     eval, secret, deploy. The `model` converter arrives \
-                     Friday of week 2."
+                     v0.1 supports: budget, model, prompt, mcp_server, \
+                     agent, eval, secret, deploy"
                 ));
             }
         }
@@ -858,6 +856,223 @@ fn to_agent(raw: RawBlock) -> Result<Agent, String> {
         // valid pure-chat agent.
         tools: tools.unwrap_or_default(),
     })
+}
+
+// ============================================================================
+// Friday converter: model (the complex one — Rate, multi-list, residency,
+// ModelId resolution against the catalog).
+// ============================================================================
+
+fn to_model(raw: RawBlock) -> Result<Model, String> {
+    let label = require_single_label("model", raw.labels)?;
+    let mut requires:    Option<Vec<Capability>>     = None;
+    let mut context_min: Option<Size>                = None;
+    let mut cost_max:    Option<Rate<Money, Size>>   = None;
+    let mut latency_p95: Option<Duration>            = None;
+    let mut residency:   Option<Vec<Residency>>      = None;
+    let mut prefer:      Option<Vec<ModelId>>        = None;
+    let mut fallback:    Option<Vec<ModelId>>        = None;
+    let mut pin:         Option<ModelId>             = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("model", item)?;
+        match attr.name.as_str() {
+            "requires"    => requires    = Some(expect_capability_list(&attr.name, attr.value)?),
+            "context_min" => context_min = Some(expect_size(&attr.name, attr.value)?),
+            "cost_max"    => cost_max    = Some(expect_rate_money_per_size(&attr.name, attr.value)?),
+            "latency_p95" => latency_p95 = Some(expect_duration(&attr.name, attr.value)?),
+            "residency"   => residency   = Some(expect_residency_list(&attr.name, attr.value)?),
+            "prefer"      => prefer      = Some(expect_model_id_list(&attr.name, attr.value)?),
+            "fallback"    => fallback    = Some(expect_model_id_list(&attr.name, attr.value)?),
+            "pin"         => pin         = Some(expect_model_id(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in model block; allowed: \
+                 requires, context_min, cost_max, latency_p95, residency, \
+                 prefer, fallback, pin"
+            )),
+        }
+    }
+
+    Ok(Model {
+        label,
+        requires: requires.ok_or_else(||
+            "model missing required attribute `requires` (list of capabilities)".to_string())?,
+        context_min: context_min.ok_or_else(||
+            "model missing required attribute `context_min` (e.g. `32k`)".to_string())?,
+        cost_max,
+        latency_p95,
+        residency,
+        // prefer/fallback are Vec<ModelId> in the AST (not Option), so
+        // absence means "empty list". The model resolver (week 4) is the
+        // one that errors if BOTH are empty — at the parser layer we stay
+        // permissive.
+        prefer:   prefer.unwrap_or_default(),
+        fallback: fallback.unwrap_or_default(),
+        pin,
+    })
+}
+
+// ============================================================================
+// Model-specific value helpers
+// ============================================================================
+
+fn expect_size(field: &str, v: RawValue) -> Result<Size, String> {
+    match v {
+        RawValue::Size(s) => Ok(s),
+        // Bare digits without a suffix are emitted as Int by the parser
+        // (Monday's design); the converter promotes them to Size here.
+        // `context_min = 1024` and `context_min = 1k` both yield Size{1024}.
+        RawValue::Int(i) => {
+            if i < 0 {
+                return Err(format!(
+                    "`{field}` Size value must be non-negative; got {i}"
+                ));
+            }
+            Ok(Size { units: i as u64 })
+        }
+        other => Err(format!(
+            "`{field}` expects a Size literal (e.g. `32k`, `1MB`) or bare \
+             non-negative integer; got {other:?}"
+        )),
+    }
+}
+
+fn expect_duration(field: &str, v: RawValue) -> Result<Duration, String> {
+    match v {
+        RawValue::Duration(d) => Ok(d),
+        other => Err(format!(
+            "`{field}` expects a Duration literal (e.g. `2s`, `500ms`); got {other:?}"
+        )),
+    }
+}
+
+fn expect_rate_money_per_size(field: &str, v: RawValue)
+    -> Result<Rate<Money, Size>, String>
+{
+    let rate = match v {
+        RawValue::Rate(r) => r,
+        other => return Err(format!(
+            "`{field}` expects a Rate literal (e.g. `$0.001 per 1k_tokens`); got {other:?}"
+        )),
+    };
+    let numerator = match rate.numerator {
+        RawValue::Money(m) => m,
+        other => return Err(format!(
+            "`{field}` Rate numerator must be Money; got {other:?}"
+        )),
+    };
+    let denominator = match rate.denominator {
+        RawValue::Size(s) => s,
+        other => return Err(format!(
+            "`{field}` Rate denominator must be Size (e.g. `1k_tokens`, `1k`); got {other:?}"
+        )),
+    };
+    Ok(Rate { numerator, denominator })
+}
+
+fn expect_capability_list(field: &str, v: RawValue)
+    -> Result<Vec<Capability>, String>
+{
+    let items = match v {
+        RawValue::List(items) => items,
+        other => return Err(format!(
+            "`{field}` expects a list of capability identifiers \
+             (e.g. `[chat, tool_use]`); got {other:?}"
+        )),
+    };
+    items.into_iter().enumerate().map(|(i, item)| {
+        let s = match item {
+            RawValue::EnumMember(s) => s,
+            other => return Err(format!(
+                "`{field}[{i}]` expects a bare capability identifier; got {other:?}"
+            )),
+        };
+        match s.as_str() {
+            "chat"              => Ok(Capability::Chat),
+            "embedding"         => Ok(Capability::Embedding),
+            "tool_use"          => Ok(Capability::ToolUse),
+            "vision"            => Ok(Capability::Vision),
+            "audio"             => Ok(Capability::Audio),
+            "reasoning"         => Ok(Capability::Reasoning),
+            "large_context"     => Ok(Capability::LargeContext),
+            "structured_output" => Ok(Capability::StructuredOutput),
+            other => Err(format!(
+                "`{field}[{i}]` unknown capability `{other}`; allowed: \
+                 chat, embedding, tool_use, vision, audio, reasoning, \
+                 large_context, structured_output"
+            )),
+        }
+    }).collect()
+}
+
+fn expect_residency_list(field: &str, v: RawValue)
+    -> Result<Vec<Residency>, String>
+{
+    let items = match v {
+        RawValue::List(items) => items,
+        other => return Err(format!(
+            "`{field}` expects a list of residency identifiers \
+             (e.g. `[us, eu]`); got {other:?}"
+        )),
+    };
+    items.into_iter().enumerate().map(|(i, item)| {
+        let s = match item {
+            RawValue::EnumMember(s) => s,
+            other => return Err(format!(
+                "`{field}[{i}]` expects a bare residency identifier; got {other:?}"
+            )),
+        };
+        match s.as_str() {
+            "us"   => Ok(Residency::Us),
+            "eu"   => Ok(Residency::Eu),
+            "uk"   => Ok(Residency::Uk),
+            "apac" => Ok(Residency::Apac),
+            other => Err(format!(
+                "`{field}[{i}]` unknown residency `{other}`; allowed: us, eu, uk, apac"
+            )),
+        }
+    }).collect()
+}
+
+/// Catalog model identifier — `provider.model_name`. Distinct from
+/// `expect_ref`: ModelId's "provider" is an open string (any catalog
+/// entry's provider), not a closed RefKind enum. Validation that the
+/// ModelId actually exists in the catalog is the resolver's job (week 4),
+/// not the parser's.
+fn expect_model_id(field: &str, v: RawValue) -> Result<ModelId, String> {
+    let path = match v {
+        RawValue::AttributeAccess(p) => p,
+        other => return Err(format!(
+            "`{field}` expects a catalog model ID like \
+             `provider.model_name`; got {other:?}"
+        )),
+    };
+    if path.len() != 2 {
+        return Err(format!(
+            "`{field}` expects a 2-segment ID like `provider.model_name`; \
+             got `{}` ({} segment(s))",
+            path.join("."),
+            path.len()
+        ));
+    }
+    Ok(ModelId {
+        provider: path[0].clone(),
+        name:     path[1].clone(),
+    })
+}
+
+fn expect_model_id_list(field: &str, v: RawValue) -> Result<Vec<ModelId>, String> {
+    let items = match v {
+        RawValue::List(items) => items,
+        other => return Err(format!(
+            "`{field}` expects a list of catalog model IDs \
+             (e.g. `[anthropic.claude_haiku_4_5]`); got {other:?}"
+        )),
+    };
+    items.into_iter().enumerate().map(|(i, item)| {
+        let indexed = format!("{field}[{i}]");
+        expect_model_id(&indexed, item)
+    }).collect()
 }
 
 // ============================================================================
@@ -1884,6 +2099,119 @@ mod project_tests {
         // spec §8.1: resource bodies are attribute-only in v0.1
         let src = project_with(r#"prompt "p" { file = "./x"  version = "1.0.0"  budget { } }"#);
         assert_parse_err_contains(&src, "nested block");
+    }
+
+    // ------------------------------------------------------------------
+    // to_model — Friday: the complex converter
+    // ------------------------------------------------------------------
+
+    #[test] fn model_block_minimal_parses() {
+        let src = project_with(
+            r#"model "fast" {
+                 requires    = [chat]
+                 context_min = 32k
+            }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.models.len(), 1);
+        let m = &p.models[0];
+        assert_eq!(m.label, "fast");
+        assert_eq!(m.requires, vec![Capability::Chat]);
+        assert_eq!(m.context_min, Size { units: 32 * 1024 });
+        assert_eq!(m.cost_max,    None);
+        assert_eq!(m.latency_p95, None);
+        assert_eq!(m.residency,   None);
+        assert_eq!(m.prefer.len(),   0);
+        assert_eq!(m.fallback.len(), 0);
+        assert_eq!(m.pin, None);
+    }
+
+    #[test] fn model_block_full_parses() {
+        // Mirror the support-agent.ais model block — every field exercised.
+        let src = project_with(
+            r#"model "fast" {
+                 requires    = [chat, tool_use]
+                 context_min = 32k
+                 cost_max    = $0.001 per 1k_tokens
+                 latency_p95 = 2s
+                 residency   = [eu, us]
+                 prefer      = [anthropic.claude_haiku_4_5, openai.gpt_4o_mini]
+                 fallback    = [ollama.llama_3_1_8b]
+            }"#);
+        let p = assert_parse_ok(&src);
+        let m = &p.models[0];
+        assert_eq!(m.requires, vec![Capability::Chat, Capability::ToolUse]);
+        assert_eq!(m.context_min, Size { units: 32 * 1024 });
+        let cost = m.cost_max.as_ref().expect("cost_max set");
+        assert_eq!(cost.numerator,
+            Money { currency: Currency::Usd, micro_units: 1_000 });
+        assert_eq!(cost.denominator, Size { units: 1024 });
+        assert_eq!(m.latency_p95, Some(Duration { nanos: 2_000_000_000 }));
+        assert_eq!(m.residency, Some(vec![Residency::Eu, Residency::Us]));
+        assert_eq!(m.prefer, vec![
+            ModelId { provider: "anthropic".into(), name: "claude_haiku_4_5".into() },
+            ModelId { provider: "openai".into(),    name: "gpt_4o_mini".into() },
+        ]);
+        assert_eq!(m.fallback, vec![
+            ModelId { provider: "ollama".into(), name: "llama_3_1_8b".into() },
+        ]);
+    }
+
+    #[test] fn model_with_pin_parses() {
+        let src = project_with(
+            r#"model "compliance" {
+                 requires    = [chat]
+                 context_min = 200k
+                 pin         = anthropic.claude_sonnet_4_6
+            }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.models[0].pin,
+            Some(ModelId { provider: "anthropic".into(), name: "claude_sonnet_4_6".into() }));
+    }
+
+    #[test] fn model_context_min_accepts_bare_int() {
+        // Spec §3.2: bare digits are valid Size literals (interpreted as
+        // base units). Parser emits Int; converter promotes to Size.
+        let src = project_with(
+            r#"model "fast" { requires = [chat]  context_min = 1024 }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.models[0].context_min, Size { units: 1024 });
+    }
+
+    #[test] fn model_missing_requires_fails() {
+        let src = project_with(r#"model "fast" { context_min = 32k }"#);
+        assert_parse_err_contains(&src, "required attribute `requires`");
+    }
+
+    #[test] fn model_missing_context_min_fails() {
+        let src = project_with(r#"model "fast" { requires = [chat] }"#);
+        assert_parse_err_contains(&src, "required attribute `context_min`");
+    }
+
+    #[test] fn model_unknown_capability_fails() {
+        let src = project_with(
+            r#"model "fast" { requires = [chat, telepathy]  context_min = 32k }"#);
+        assert_parse_err_contains(&src, "unknown capability `telepathy`");
+    }
+
+    #[test] fn model_unknown_residency_fails() {
+        let src = project_with(
+            r#"model "f" { requires = [chat]  context_min = 32k  residency = [mars] }"#);
+        assert_parse_err_contains(&src, "unknown residency `mars`");
+    }
+
+    #[test] fn model_cost_max_must_be_rate_not_bare_money() {
+        // Bare Money is valid as a value but not for cost_max which
+        // expects a Rate.
+        let src = project_with(
+            r#"model "f" { requires = [chat]  context_min = 32k  cost_max = $0.001 }"#);
+        assert_parse_err_contains(&src, "Rate");
+    }
+
+    #[test] fn model_prefer_must_be_two_segment_attr_access() {
+        // `prefer = [anthropic]` — bare identifier, no provider.name shape
+        let src = project_with(
+            r#"model "f" { requires = [chat]  context_min = 32k  prefer = [anthropic] }"#);
+        assert_parse_err_contains(&src, "catalog model ID");
     }
 
     // ------------------------------------------------------------------
