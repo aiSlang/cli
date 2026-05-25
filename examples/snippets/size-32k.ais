@@ -1,0 +1,4 @@
+# `32k` — Size literal, 1024-based (per LANGUAGE-SPEC-v0.md §3.2)
+# Stored as u64 units: 32 × 1024 = 32_768
+# `k`, `K`, and `KB` all map to the same 1024 multiplier in v0.1.
+32k

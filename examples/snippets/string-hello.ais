@@ -1,0 +1,5 @@
+# `"hello"` — string literal.
+# v0.1 supports no escape sequences (deferred to week 2 Tue). For
+# Path / URI / SemVer / OciImage typed fields, the receiving converter
+# parses the string content via the respective `from_literal` method.
+"hello"

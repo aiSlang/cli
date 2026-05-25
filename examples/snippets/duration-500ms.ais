@@ -1,0 +1,5 @@
+# `500ms` — Duration literal, milliseconds
+# Critical disambiguation: the two-char unit `ms` MUST be tried before the
+# single-char `m`/`s` units, or `500ms` would parse as Duration(500 minutes)
+# with a leftover `s`. Pinned by the parser test `ms_not_split_to_m`.
+500ms

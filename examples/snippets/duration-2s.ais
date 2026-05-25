@@ -1,0 +1,3 @@
+# `2s` — Duration literal, seconds
+# Stored as i64 nanoseconds: 2 × 10⁹
+2s

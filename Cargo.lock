@@ -30,6 +30,7 @@ dependencies = [
  "aislang-core",
  "anyhow",
  "clap",
+ "serde_json",
 ]
 
 [[package]]

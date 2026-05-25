@@ -1,0 +1,3 @@
+# `$0.001` — Money literal, sub-cent precision (typical LLM per-token pricing)
+# Stored as i64 micro-units: 1_000 (one milli-dollar)
+$0.001

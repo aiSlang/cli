@@ -1,0 +1,5 @@
+# `8080` — bare integer literal (no suffix). Stored as i64.
+# Bare digits without a typed suffix always parse as Int. The converter
+# promotes Int to Size when the receiving field's type is Size (e.g. a Size
+# field accepts both `1024` and `1k` → both yield Size{units: 1024}).
+8080

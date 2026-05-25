@@ -1,0 +1,5 @@
+# `1MB` — Size literal, 1024² bytes
+# Two-char unit `MB` MUST be tried before single-char `k`/`K` to avoid
+# parsing `1MB` as Size(1)×something. Pinned by parser test `kb_not_split_to_k`
+# (same disambiguation invariant).
+1MB

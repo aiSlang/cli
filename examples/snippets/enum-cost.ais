@@ -1,0 +1,7 @@
+# `cost` — bare identifier interpreted as EnumMember at parse time.
+# At convert-time, the receiving field's enum type decides validity:
+#   - in `budget.optimize_for`: `cost` is one of {cost, latency, quality}
+#   - in `deploy.target`:       `cost` would be rejected (DeployTarget = {compose})
+# This split is intentional — the parser knows nothing of which enum the
+# identifier belongs to; the converter has the field-type context.
+cost

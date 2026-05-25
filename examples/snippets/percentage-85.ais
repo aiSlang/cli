@@ -1,0 +1,4 @@
+# `85%` — Percentage literal
+# Stored as f64 ratio in [0.0, 1.0]: 0.85. Out-of-range values (`-1%`, `150%`)
+# are rejected by `Percentage::from_literal`.
+85%

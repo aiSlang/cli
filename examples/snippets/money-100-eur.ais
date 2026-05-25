@@ -1,0 +1,3 @@
+# `€100` — Money literal, euros (multi-byte currency symbol; parser uses
+# `chars()` not `bytes()` for symbol detection)
+€100

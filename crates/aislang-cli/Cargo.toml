@@ -18,3 +18,4 @@ aislang-catalog = { workspace = true }
 aislang-compose = { workspace = true }
 clap            = { workspace = true }
 anyhow          = { workspace = true }
+serde_json      = { workspace = true }   # for -vvv JSON-IR rendering

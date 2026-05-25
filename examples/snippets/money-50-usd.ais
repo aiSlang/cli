@@ -1,0 +1,3 @@
+# `$50` — Money literal, US dollars (integer amount)
+# Stored as i64 micro-units: 50 × 10⁶ = 50_000_000
+$50

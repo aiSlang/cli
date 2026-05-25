@@ -117,7 +117,10 @@ fn string_lit_parser<'src>(
 
 fn money_parser<'src>(
 ) -> impl Parser<'src, &'src str, Money, extra::Err<Rich<'src, char>>> + Clone {
-    just('$')
+    // All four currency symbols supported by Money::from_literal; €/£/¥
+    // are multi-byte UTF-8 but `one_of` matches at the char level so the
+    // distinction is transparent.
+    one_of("$€£¥")
         .then(text::int(10))
         .then(just('.').then(text::digits(10).to_slice()).or_not())
         .to_slice()
@@ -523,6 +526,126 @@ mod value_tests {
         // Same disambiguation for size: `4KB` must be Size(4*1024), not
         // Size(4*1024) with leftover `B`.
         assert_eq!(parse_value("4KB").unwrap(), RawValue::Size(Size { units: 4 * 1024 }));
+    }
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    //! Round-trip every `examples/snippets/*.ais` fragment through the
+    //! value parser. Fragments are not full projects — they're single
+    //! value expressions, paired with this test so the parser-side
+    //! invariant for each literal kind has a human-readable source-of-
+    //! truth file (see `examples/snippets/README.md`).
+    //!
+    //! Tests also assert no snippet file is left without a corresponding
+    //! test case, so the two sides stay in sync when literal kinds are
+    //! added in future phases.
+
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn snippets_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..")
+            .join("examples").join("snippets")
+    }
+
+    fn parse_snippet(filename: &str) -> RawValue {
+        let path = snippets_dir().join(filename);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // Bind the parsed result to a local before returning. The chumsky
+        // parser temporary borrows `source`; if the parse chain is the
+        // function's tail expression, the temporary outlives `source` at
+        // function return. Binding to `result` forces the temp to drop at
+        // the end of the let-statement, while `source` is still alive.
+        let result: Result<RawValue, String> = {
+            let pad = padding();
+            value_parser()
+                .padded_by(pad)
+                .then_ignore(end())
+                .parse(&source)
+                .into_result()
+                .map_err(|errs| {
+                    errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")
+                })
+        };
+        result.unwrap_or_else(|e| panic!("parse {} failed:\n{e}", path.display()))
+    }
+
+    // Snippet → expected RawValue. Adding a new snippet file without
+    // adding a row here trips `every_snippet_has_a_test` below.
+    fn snippet_cases() -> Vec<(&'static str, RawValue)> {
+        vec![
+            ("money-50-usd.ais",
+                RawValue::Money(Money { currency: Currency::Usd, micro_units: 50_000_000 })),
+            ("money-001-usd.ais",
+                RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 })),
+            ("money-100-eur.ais",
+                RawValue::Money(Money { currency: Currency::Eur, micro_units: 100_000_000 })),
+            ("duration-2s.ais",
+                RawValue::Duration(Duration { nanos: 2_000_000_000 })),
+            ("duration-500ms.ais",
+                RawValue::Duration(Duration { nanos: 500_000_000 })),
+            ("size-32k.ais",
+                RawValue::Size(Size { units: 32 * 1024 })),
+            ("size-1mb.ais",
+                RawValue::Size(Size { units: 1024 * 1024 })),
+            ("percentage-85.ais",
+                RawValue::Percentage(Percentage { ratio: 0.85 })),
+            ("int-8080.ais",
+                RawValue::Int(8080)),
+            ("float-half.ais",
+                RawValue::Float(0.5)),
+            ("bool-true.ais",
+                RawValue::Bool(true)),
+            ("string-hello.ais",
+                RawValue::String("hello".to_string())),
+            ("enum-cost.ais",
+                RawValue::EnumMember("cost".to_string())),
+        ]
+    }
+
+    #[test]
+    fn every_snippet_parses_to_expected_value() {
+        for (filename, expected) in snippet_cases() {
+            let parsed = parse_snippet(filename);
+            // Special-case Percentage / Float — f64 PartialEq is exact but
+            // brittle; the literal forms here are bit-exact so equality
+            // works, but if a future snippet uses imprecise decimals this
+            // assertion is the right place to add epsilon tolerance.
+            assert_eq!(parsed, expected,
+                "snippet {filename}: parsed {parsed:?}, expected {expected:?}");
+        }
+    }
+
+    #[test]
+    fn every_snippet_has_a_test() {
+        // Scan the directory and assert every `.ais` file is named in
+        // snippet_cases(). Forces the two sides to stay in sync when a
+        // new literal kind lands.
+        let dir = snippets_dir();
+        let mut on_disk: Vec<String> = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.ends_with(".ais").then_some(name)
+            })
+            .collect();
+        on_disk.sort();
+
+        let mut in_test: Vec<String> = snippet_cases()
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        in_test.sort();
+
+        assert_eq!(on_disk, in_test,
+            "snippet files on disk and snippet_cases() are out of sync — \
+             every `.ais` file in examples/snippets/ must have a matching \
+             entry in snippet_cases(), and vice versa");
     }
 }
 

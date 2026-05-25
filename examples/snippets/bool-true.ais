@@ -1,0 +1,5 @@
+# `true` — boolean literal.
+# `true` and `false` are the only bare identifier values that route to
+# RawValue::Bool. Every other bare identifier becomes RawValue::EnumMember
+# (validated against the receiving field's enum type by the converter).
+true
