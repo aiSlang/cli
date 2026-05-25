@@ -21,12 +21,12 @@ use std::collections::HashMap;
 // ============================================================================
 
 /// Run all available semantic checks on the project. Today: duplicate-
-/// label detection across the seven named-resource block kinds. The
-/// signature stays `Result<(), String>` until Wednesday — when warnings
-/// land, this becomes `Result<Vec<Warning>, String>`.
+/// label detection (Mon) + cross-resource reference resolution (Tue).
+/// The signature stays `Result<(), String>` until Wednesday — when
+/// warnings land, this becomes `Result<Vec<Warning>, String>`.
 pub fn check(project: &Project) -> Result<(), String> {
-    let _graph = build_resource_graph(project)?;
-    // Tuesday: validate every Ref in the project against _graph
+    let graph = build_resource_graph(project)?;
+    check_refs(project, &graph)?;
     // Wednesday: validate ModelIds against the bundled catalog
     Ok(())
 }
@@ -140,6 +140,136 @@ fn add_block(
     });
     nodes.insert(key, idx);
     Ok(())
+}
+
+// ============================================================================
+// Cross-resource reference resolution — Tuesday
+// ============================================================================
+
+/// Walk every `Ref` field on the project and verify the target block
+/// is declared in the resource graph. Errors include a "did you mean
+/// `X`?" suggestion when a label within Levenshtein distance ≤2 exists,
+/// otherwise list the available labels of the expected kind (or note
+/// none are declared at all).
+fn check_refs(project: &Project, graph: &ResourceGraph) -> Result<(), String> {
+    for agent in &project.agents {
+        check_one_ref(graph, &agent.model,
+            "agent", &agent.label, "model")?;
+        check_one_ref(graph, &agent.system_prompt,
+            "agent", &agent.label, "system_prompt")?;
+        for (i, tool) in agent.tools.iter().enumerate() {
+            check_one_ref(graph, tool,
+                "agent", &agent.label, &format!("tools[{i}]"))?;
+        }
+    }
+    for secret in &project.secrets {
+        for (i, scope_ref) in secret.scope.iter().enumerate() {
+            check_one_ref(graph, scope_ref,
+                "secret", &secret.label, &format!("scope[{i}]"))?;
+        }
+    }
+    for eval in &project.evals {
+        if let Some(agent_ref) = &eval.agent {
+            check_one_ref(graph, agent_ref,
+                "eval", &eval.label, "agent")?;
+        }
+    }
+    for mcp in &project.mcp_servers {
+        if let Some(secrets) = &mcp.secrets {
+            for (i, sec_ref) in secrets.iter().enumerate() {
+                check_one_ref(graph, sec_ref,
+                    "mcp_server", &mcp.label, &format!("secrets[{i}]"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `Ref` against the resource graph. On miss, produce a
+/// diagnostic that ends with one of:
+///   - `; did you mean `X`?`           — if a near-match exists
+///   - `; available `kind` labels: …`  — if no near-match but the kind
+///                                       has some declared blocks
+///   - `; no `kind` block is declared` — if the kind has zero blocks
+fn check_one_ref(
+    graph:     &ResourceGraph,
+    r:         &Ref,
+    src_kind:  &str,
+    src_label: &str,
+    src_field: &str,
+) -> Result<(), String> {
+    let target_kind = BlockKind::from_ref_kind(r.kind);
+    let key: NodeKey = (target_kind, r.label.clone());
+    if graph.nodes.contains_key(&key) {
+        return Ok(());
+    }
+
+    let tail = suggest_or_list(graph, target_kind, &r.label);
+    Err(format!(
+        "{src_kind} `{src_label}` field `{src_field}` references \
+         undeclared {} `{}`{tail}",
+        target_kind.as_str(),
+        r.label,
+    ))
+}
+
+fn suggest_or_list(graph: &ResourceGraph, kind: BlockKind, target: &str) -> String {
+    // Closest match within Levenshtein distance ≤2.
+    let mut best: Option<(usize, &str)> = None;
+    for ((node_kind, label), _) in &graph.nodes {
+        if *node_kind != kind { continue; }
+        let dist = levenshtein(target, label);
+        if dist == 0 || dist > 2 { continue; }
+        match best {
+            None                       => best = Some((dist, label)),
+            Some((d, _)) if dist < d   => best = Some((dist, label)),
+            _ => {}
+        }
+    }
+    if let Some((_, suggestion)) = best {
+        return format!("; did you mean `{suggestion}`?");
+    }
+
+    // No near-match — list what's available, or note nothing is declared.
+    let mut available: Vec<&str> = graph.nodes.iter()
+        .filter(|((k, _), _)| *k == kind)
+        .map(|((_, label), _)| label.as_str())
+        .collect();
+    if available.is_empty() {
+        format!("; no `{}` block is declared in the project", kind.as_str())
+    } else {
+        available.sort();
+        format!("; available `{}` labels: {:?}", kind.as_str(), available)
+    }
+}
+
+/// Standard Levenshtein distance. Allocations: two Vec<char> for the
+/// inputs + one Vec<usize> of size n+1 for the DP row. O(m·n) time,
+/// O(n) space. Adequate for v0.1 — labels are short (typically <30
+/// chars) and the candidate set per kind is small.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+
+    let mut dp: Vec<usize> = (0..=n).collect();
+    for i in 1..=m {
+        let mut prev = dp[0];
+        dp[0] = i;
+        for j in 1..=n {
+            let temp = dp[j];
+            dp[j] = if a[i - 1] == b[j - 1] {
+                prev
+            } else {
+                1 + dp[j - 1].min(dp[j]).min(prev)
+            };
+            prev = temp;
+        }
+    }
+    dp[n]
 }
 
 // ============================================================================
@@ -290,5 +420,146 @@ mod tests {
             agent "x"  { model = model.x  system_prompt = prompt.x }
         "#;
         assert!(check_src(body).is_ok());
+    }
+
+    // ----------------------------------------------------------------
+    // Cross-resource reference resolution — Tuesday
+    // ----------------------------------------------------------------
+
+    fn assert_unresolved_ref(body: &str, needle: &str) {
+        let err = check_src(body).err().unwrap_or_else(||
+            panic!("expected unresolved-ref error containing `{needle}`, got Ok"));
+        assert!(err.contains(needle),
+            "error did not contain `{needle}`; got:\n{err}");
+    }
+
+    #[test] fn agent_model_ref_to_nonexistent_model_fails() {
+        let body = r#"
+            prompt "p" { file = "./x"  version = "1.0.0" }
+            agent "a" { model = model.nonexistent  system_prompt = prompt.p }
+        "#;
+        assert_unresolved_ref(body,
+            "agent `a` field `model` references undeclared model `nonexistent`");
+    }
+
+    #[test] fn agent_system_prompt_ref_to_nonexistent_prompt_fails() {
+        let body = r#"
+            model "m" { requires = [chat]  context_min = 32k }
+            agent "a" { model = model.m  system_prompt = prompt.gone }
+        "#;
+        assert_unresolved_ref(body,
+            "field `system_prompt` references undeclared prompt `gone`");
+    }
+
+    #[test] fn agent_tools_indexed_in_error_message() {
+        // Position of the bad ref inside the tools list is named.
+        let body = r#"
+            model "m" { requires = [chat]  context_min = 32k }
+            prompt "p" { file = "./x"  version = "1.0.0" }
+            mcp_server "good" { image = "ghcr.io/a/b:1" }
+            agent "a" {
+                model = model.m
+                system_prompt = prompt.p
+                tools = [mcp_server.good, mcp_server.bad]
+            }
+        "#;
+        assert_unresolved_ref(body, "field `tools[1]`");
+    }
+
+    #[test] fn typo_suggests_did_you_mean() {
+        // Levenshtein-distance-1 typo: `fust` → `fast`.
+        let body = r#"
+            model "fast" { requires = [chat]  context_min = 32k }
+            prompt "p"   { file = "./x"  version = "1.0.0" }
+            agent "a"    { model = model.fust  system_prompt = prompt.p }
+        "#;
+        assert_unresolved_ref(body, "did you mean `fast`?");
+    }
+
+    #[test] fn typo_distance_2_still_suggests() {
+        // Two character changes within the threshold.
+        let body = r#"
+            model "fast" { requires = [chat]  context_min = 32k }
+            prompt "p"   { file = "./x"  version = "1.0.0" }
+            agent "a"    { model = model.fxst  system_prompt = prompt.p }
+        "#;
+        assert_unresolved_ref(body, "did you mean `fast`?");
+    }
+
+    #[test] fn no_close_match_lists_available_labels() {
+        // Distance > 2 — no suggestion; instead list what's there.
+        let body = r#"
+            model "fast" { requires = [chat]  context_min = 32k }
+            prompt "p"   { file = "./x"  version = "1.0.0" }
+            agent "a"    { model = model.qrtxyz  system_prompt = prompt.p }
+        "#;
+        assert_unresolved_ref(body, "available `model` labels: [\"fast\"]");
+    }
+
+    #[test] fn no_blocks_declared_says_so() {
+        // The agent references a model, but the project has no model
+        // blocks at all.
+        let body = r#"
+            prompt "p" { file = "./x"  version = "1.0.0" }
+            agent "a"  { model = model.fast  system_prompt = prompt.p }
+        "#;
+        assert_unresolved_ref(body, "no `model` block is declared in the project");
+    }
+
+    #[test] fn secret_scope_unresolved_agent_fails() {
+        let body = r#"
+            secret "k" { source = "env://X"  scope = [agent.missing] }
+        "#;
+        assert_unresolved_ref(body,
+            "secret `k` field `scope[0]` references undeclared agent `missing`");
+    }
+
+    #[test] fn eval_agent_ref_optional_but_validated_when_present() {
+        let body = r#"
+            eval "e" {
+                dataset = "./q"
+                metric = exact_match
+                threshold = 80%
+                agent = agent.missing
+            }
+        "#;
+        assert_unresolved_ref(body,
+            "eval `e` field `agent` references undeclared agent `missing`");
+    }
+
+    #[test] fn mcp_server_secrets_ref_validated() {
+        let body = r#"
+            mcp_server "docs" {
+                image = "ghcr.io/x/y:1"
+                secrets = [secret.absent]
+            }
+        "#;
+        assert_unresolved_ref(body,
+            "mcp_server `docs` field `secrets[0]` references undeclared secret `absent`");
+    }
+
+    #[test] fn forward_reference_is_fine() {
+        // Refs to a block declared LATER in the source — parser
+        // accepts them, checker validates against the complete graph
+        // (built before refs are walked), so forward refs work.
+        let body = r#"
+            agent "a" { model = model.later  system_prompt = prompt.later }
+            model "later" { requires = [chat]  context_min = 32k }
+            prompt "later" { file = "./x"  version = "1.0.0" }
+        "#;
+        assert!(check_src(body).is_ok());
+    }
+
+    // White-box on the Levenshtein helper itself — small unit checks
+    // pinning the table on which the "did you mean" suggestions rest.
+    #[test] fn levenshtein_basics() {
+        assert_eq!(super::levenshtein("", ""), 0);
+        assert_eq!(super::levenshtein("a", ""), 1);
+        assert_eq!(super::levenshtein("", "abc"), 3);
+        assert_eq!(super::levenshtein("fast", "fast"), 0);
+        assert_eq!(super::levenshtein("fast", "fust"), 1);   // sub
+        assert_eq!(super::levenshtein("fast", "fasts"), 1);  // ins
+        assert_eq!(super::levenshtein("fast", "fas"), 1);    // del
+        assert_eq!(super::levenshtein("kitten", "sitting"), 3);   // classic
     }
 }
