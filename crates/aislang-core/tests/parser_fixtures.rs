@@ -238,13 +238,16 @@ fn update_fixtures() {
 // ============================================================================
 
 #[test]
-#[ignore = "parser stub — enable when chumsky grammar lands in week 2"]
 fn parser_produces_expected_minimal() {
+    // Enabled at end of week 1: the chumsky skeleton handles the
+    // budget-only minimal fixture. support-agent stays ignored
+    // until week 2 grammar work covers all nine resource types.
     assert_parser_matches_expected("minimal", &expected_minimal());
 }
 
 #[test]
-#[ignore = "parser stub — enable when chumsky grammar lands in week 2"]
+#[ignore = "parser skeleton handles only `project` + `budget` so far — \
+            enable when week 2 adds the remaining resource types"]
 fn parser_produces_expected_support_agent() {
     assert_parser_matches_expected("support-agent", &expected_support_agent());
 }

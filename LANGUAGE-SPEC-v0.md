@@ -25,7 +25,7 @@ Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks
 ## 2. Lexical structure
 
 - **Encoding.** UTF-8 only.
-- **Comments.** `#` to end of line. Block comments deferred.
+- **Comments.** Line comments: either `#` or `//` to end of line (both accepted, HCL convention). Block comments (`/* … */`) deferred to v0.2.
 - **Identifiers.** `[a-z][a-z0-9_]*` (snake_case). Resource labels follow the same rule.
 - **Whitespace** is insignificant except as a token separator.
 - **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`.
@@ -586,8 +586,9 @@ percentage_literal  = number_value , "%" ;
 
 (* ========== comments ========== *)
 
-(*  Line comments: `#` to end of line; consumed by the lexer and not
-    visible to the parser.  Block comments are deferred (§2). *)
+(*  Line comments: `#` or `//` to end of line (HCL convention).
+    Consumed by the lexer and not visible to the parser.  Block
+    comments `/* … */` are deferred (§2). *)
 
 (* ========== character classes ========== *)
 
