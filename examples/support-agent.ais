@@ -36,7 +36,7 @@ project "support-agent" {
   }
 
   mcp_server "docs" {
-    image = ghcr.io/example/mcp_filesystem:0.3.1
+    image = "ghcr.io/example/mcp_filesystem:0.3.1"
     mount = "./knowledge/"
   }
 

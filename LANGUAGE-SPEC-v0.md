@@ -60,7 +60,7 @@ These are the types that move the needle. Each has a literal syntax and a normal
 | `Percentage` | `85%`, `0.5%` | `ratio: f64` ∈ [0.0, 1.0] |
 | `SemVer` | `"1.0.0"`, `"1.2.3-alpha"`, `"2.0.0+build.123"` | exact semver-2.0 version; range operators (`^`, `~`, `>=`) deferred to v0.2 |
 | `Path` | `"./prompts/system.md"` | resolved relative to the `.ais` file at validate time; existence checked |
-| `OciImage` | `ghcr.io/foo/bar:1.2.3`, `ghcr.io/foo/bar:1.2.3@sha256:…` | parsed registry/repo/tag/digest; digest preferred |
+| `OciImage` | `"ghcr.io/foo/bar:1.2.3"`, `"ghcr.io/foo/bar@sha256:…"` | string-literal at the grammar level; parsed into registry/repo/tag/digest by `OciImage::from_literal` based on field type. Quoted form is consistent with the other complex string types (`Path`, `URI`, `SemVer`) and keeps the lexer simple |
 | `URI` | `"https://…"`, `"s3://…"` | scheme-aware parsed URL |
 
 **Money** and **Duration** support unit composition for rates: `$0.001 per 1k_tokens`, `5 per minute`. The `per` keyword constructs a `Rate<Num, Denom>`.
@@ -447,46 +447,165 @@ Where binary IR *would* pay back, deferred until the use case appears:
 
 ---
 
-## 8. EBNF (skeleton — finalize Friday of week 1)
+## 8. EBNF (finalized, week 1 Friday)
 
+Aligned with HCL conventions where applicable — every resource in v0.1 (project, budget, model, prompt, mcp_server, agent, eval, secret, deploy) is grammatically *the same* construct: a `block`. This is the structural symmetry the parser exploits, and it lets future block-typed features (`decorator`, `catalog_model`, `include`, `module`, `package`) land without grammar changes — only with new entries in the semantic-recognition tables.
+
+aiSlang-specific deviations from pure HCL: typed value literals (Money/Duration/Size/Percentage), the `per` infix keyword for `Rate` composition, and identifier-paths of arbitrary depth in `attribute_access` (HCL is single-dot; we keep the door open for v0.3+ module paths like `shared.models.fast`).
+
+```ebnf
+(* ========== file structure ========== *)
+
+file              = { top_level_block } ;
+
+top_level_block   = block ;
+                       (* v0.1 semantic restriction: block_type must
+                          be `project`. v0.2+ may also permit `include`,
+                          `import`, `module`, `package` — reserved
+                          keywords in §2. *)
+
+block             = block_type , { label } , "{" , body , "}" ;
+block_type        = identifier ;
+label             = string_literal ;
+                       (* v0.1: labels are quoted strings only.
+                          HCL also permits identifier labels; aiSlang
+                          defers that to v0.2+. *)
+
+body              = { attribute | block } ;
+                       (* whitespace (including newlines) separates
+                          attributes and nested blocks inside a body.
+                          v0.1 semantic restrictions:
+                            • inside `project { }`: only blocks of the
+                              nine resource types are valid
+                            • inside resource bodies (budget / model /
+                              prompt / mcp_server / agent / eval /
+                              secret / deploy): only attributes, no
+                              nested blocks. *)
+
+attribute         = identifier , "=" , expression ;
+
+(* ========== expressions ========== *)
+
+expression        = literal
+                  | attribute_access
+                  | list
+                  | object
+                  | rate ;
+
+literal           = string_literal
+                  | integer_literal
+                  | float_literal
+                  | boolean_literal
+                  | money_literal
+                  | duration_literal
+                  | size_literal
+                  | percentage_literal
+                  | enum_member ;
+
+list              = "[" , [ expression , { "," , expression } ] , "]" ;
+
+object            = "{" , [ attribute , { "," , attribute } ] , "}" ;
+                       (* attributes inside an object literal are
+                          comma-separated; attributes inside a block
+                          body are whitespace-separated.  Object
+                          literals appear as attribute values, e.g.
+                          `expose = { port = 8080 }`. *)
+
+attribute_access  = identifier , "." , identifier , { "." , identifier } ;
+                       (* always at least one dot — distinguishes from
+                          a bare-identifier `enum_member`.  v0.1 forms:
+                            resource ref:   `model.fast`
+                            catalog ref:    `anthropic.claude_haiku_4_5`
+                          v0.3+ module path:`shared.models.fast` (the
+                          variable-depth tail is reserved for this). *)
+
+rate              = ( money_literal | integer_literal | float_literal ) ,
+                    "per" ,
+                    ( size_literal | duration_literal | unit_quantity ) ;
+
+unit_quantity     = integer_literal , "_" , identifier ;
+                       (* the only place a digit-then-underscore-then-
+                          identifier token is legal.  Parses `1k_tokens`
+                          as a Size literal `1k` bound to the unit name
+                          `tokens`; the name is descriptive metadata
+                          (the AST stores only the Size). *)
+
+enum_member       = identifier ;
+                       (* the type-checker validates the identifier is
+                          a member of the enum type expected by the
+                          enclosing attribute's declared field type —
+                          e.g. `cost` is valid for `OptimizeFor`,
+                          `chat` for `Capability`, `compose` for
+                          `DeployTarget`.  See §3.4. *)
+
+(* ========== ambiguity resolution ========== *)
+
+(*  A bare identifier in expression position may be one of:
+      1. boolean_literal — if the identifier is `true` or `false`
+         (reserved tokens; the lexer never emits them as Ident)
+      2. attribute_access — if the next token is "."
+      3. enum_member — otherwise, validated against type context
+    Reserved keywords from §2 (`project`, `budget`, `model`, ...)
+    are tokenized as keywords and cannot appear as bare identifiers
+    in expression position; their use there is a parse error. *)
+
+(* ========== tokens (lexer level) ========== *)
+
+identifier        = lowercase_letter , { lowercase_letter | digit | "_" } ;
+                       (* strict snake_case; uppercase prefix reserved
+                          for future type-name syntax. *)
+
+string_literal    = '"' , { string_char | escape_sequence } , '"' ;
+string_char       = ? any UTF-8 char other than `"`, `\`, or newline ? ;
+escape_sequence   = "\" , ( '"' | "\" | "n" | "t" | "r" ) ;
+
+integer_literal   = digit , { digit } ;
+float_literal     = digit , { digit } , "." , digit , { digit } ;
+boolean_literal   = "true" | "false" ;
+
+(* --- Typed value literals (see §3.2; parsers in
+       aislang_core::types::*::from_literal) --- *)
+
+money_literal       = currency_symbol , number_value ;
+currency_symbol     = "$" | "€" | "£" | "¥" ;
+number_value        = digit , { digit } , [ "." , digit , { digit } ] ;
+
+duration_literal    = digit , { digit } , duration_unit ;
+duration_unit       = "ns" | "us" | "ms" | "s" | "m" | "h" | "d" ;
+
+size_literal        = digit , { digit } , [ size_unit ] ;
+size_unit           = "k" | "K" | "KB" | "MB" | "GB" ;
+
+percentage_literal  = number_value , "%" ;
+
+(*  Strings interpreted by the type-checker as `Path`, `URI`,
+    `SemVer`, or `OciImage` based on the receiving field's declared
+    type are *not* their own grammatical productions — they are
+    `string_literal` at the grammar level.  See §3.2 for which
+    domain types use this string-then-type-context pattern. *)
+
+(* ========== comments ========== *)
+
+(*  Line comments: `#` to end of line; consumed by the lexer and not
+    visible to the parser.  Block comments are deferred (§2). *)
+
+(* ========== character classes ========== *)
+
+lowercase_letter  = "a" | "b" | ... | "z" ;
+digit             = "0" | "1" | ... | "9" ;
 ```
-# File-level production: a list of top-level statements.
-# v0.1 only legal statement form is `project`, but the production
-# is a list so v0.2+ can add include/import/module/package without
-# changing the v0.1 grammar (see §7.2 backward-compat invariants).
-file           = top_level_stmt*
-top_level_stmt = project
-                # | include | import | module | package      # v0.2+
 
-project       = "project" StringLit "{" project_body "}"
-project_body  = (budget | model | prompt | mcp_server | agent | eval | secret | deploy)+
+### 8.1 What "semantic restriction" means in practice
 
-budget        = "budget" "{" assignments "}"
-model         = "model" StringLit "{" assignments "}"
-prompt        = "prompt" StringLit "{" assignments "}"
-mcp_server    = "mcp_server" StringLit "{" assignments "}"
-agent         = "agent" StringLit "{" assignments "}"
-eval          = "eval" StringLit "{" assignments "}"
-secret        = "secret" StringLit "{" assignments "}"
-deploy        = "deploy" StringLit "{" assignments "}"
+Several places above say a v0.1 source file is rejected by *semantic* checks rather than by the grammar:
 
-assignments   = (assignment)*
-assignment    = Ident "=" expr
+| Restriction | Where checked | Why not in the grammar |
+|---|---|---|
+| Top-level block_type must be `project` | type-checker (week 3) | Lets v0.2+ add `include`/`module`/etc. without grammar changes |
+| Inside `project {}`: only the 9 resource block_types | type-checker | Same — additive future block_types stay backward-compatible |
+| Inside resource bodies: attributes only, no nested blocks | type-checker | A future resource type might want nested blocks (e.g. `agent { tool_choice {} }`); keeping it permissive in the grammar costs nothing |
+| Enum member validity (e.g. `cost` is in `OptimizeFor`) | type-checker | Bare identifier is grammatical anywhere; only the type context decides if a particular identifier is valid |
+| Reference resolution (e.g. `model.fast` resolves to an actual `model` block in the same project) | type-checker | Pure structural ref; resolution requires the full project tree |
+| Catalog-ID validity (e.g. `anthropic.claude_haiku_4_5` is in the catalog) | resolver (week 4) | Catalog is loaded at resolution time, not parse time |
 
-expr          = literal | reference | list | map | rate
-literal       = string | int | float | bool | money | duration | size | percentage
-                | semver | path | oci_image | uri | enum_member
-reference     = Ident ("." Ident)+
-list          = "[" (expr ("," expr)*)? "]"
-map           = "{" (Ident "=" expr ("," Ident "=" expr)*)? "}"
-rate          = (money | int | float) "per" (size | duration | int Ident)
-
-# Tokens
-money         = ("$" | "€" | "£" | "¥") Number
-duration      = Number ("ns"|"us"|"ms"|"s"|"m"|"h"|"d")
-size          = Number ("k"|"K"|"MB"|"GB"|"KB")
-percentage    = Number "%"
-…
-```
-
-Finalize and commit by Friday of week 1.
+This separation means the parser is small (one block production for every resource type) and the type-checker / resolver hold all the domain knowledge.
