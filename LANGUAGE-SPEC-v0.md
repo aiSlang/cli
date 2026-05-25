@@ -29,7 +29,7 @@ Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks
 - **Identifiers.** `[a-z][a-z0-9_]*` (snake_case). Resource labels follow the same rule.
 - **Whitespace** is insignificant except as a token separator.
 - **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`.
-- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2) so v0.1 files remain forward-compatible.
+- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`, `catalog`, `catalog_model`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2; possible `.ais`-native model catalog — see §5.5) so v0.1 files remain forward-compatible.
 - **Type literals** use suffixes (`32k`, `$50`, `2s`, `85%`) — see §3.
 
 ---
@@ -269,6 +269,20 @@ In v0.1 the catalog is binary-bundled and immutable until the next `aislang` rel
 | Compose / K8s / Helm output | YAML | Format forced by the target tool, not chosen by aiSlang |
 
 JSON and YAML coexistence costs one line of code (`serde` deserializes either into the same struct). Source-language format is the only one that materially matters — see Principle 1 in §1.
+
+### 5.5 Possible `.ais`-native catalog (deferred, not committed)
+
+In v0.1 the catalog is JSON because no IaC predecessor (Terraform, Pulumi, Helm, Crossplane) actually dogfoods its main DSL for its provider/registry metadata — the registry has a different audience (provider authors), different lifecycle, and different schema, so the friction of mixing them outweighs the elegance. v0.1 follows that pattern.
+
+That said, the *value-level* type-safety of an `.ais` catalog is captured today: every JSON value string in the catalog (`"$0.0008"`, `"200k"`, `"5s"`) is deserialized through the same `from_literal` parsers the language uses, so malformed values fail at binary build time, not at runtime.
+
+The `catalog` and `catalog_model` keywords are reserved (§2) so a future migration to an `.ais`-native catalog remains possible. Concrete criteria for adopting it:
+
+- Catalog grows to ≥20 fields per entry, or
+- Catalog gains complex inter-entry constraints that a JSON schema can't express, or
+- Real user demand for catalog-side LSP / typeahead / refactoring tools emerges.
+
+If none of these triggers fires by 6 months post-launch, the keywords can be unreserved.
 
 ---
 

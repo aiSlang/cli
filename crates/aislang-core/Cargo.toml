@@ -9,7 +9,12 @@ authors.workspace      = true
 rust-version.workspace = true
 
 [dependencies]
-aislang-catalog = { workspace = true }
+# NOTE: aislang-catalog is *not* a dependency of aislang-core in v0.1, even
+# though the model resolver (week 4) will need catalog data. To keep the
+# dependency graph acyclic — catalog now depends on core for typed value
+# shims (see crates/aislang-catalog) — the resolver will be hosted in
+# aislang-cli or extracted to a new aislang-resolver crate. Decide at
+# week 4. See LANGUAGE-SPEC-v0.md §5.5 for the catalog-format rationale.
 chumsky    = { workspace = true }
 petgraph   = { workspace = true }
 serde      = { workspace = true }

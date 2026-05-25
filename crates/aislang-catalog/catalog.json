@@ -33,7 +33,7 @@
       "context_max": "200k",
       "cost_input_per_1k_tokens": "$0.0008",
       "cost_output_per_1k_tokens": "$0.004",
-      "latency_p95": "1.5s",
+      "latency_p95": "1500ms",
       "residency": ["us"],
       "deprecated": false
     },
@@ -57,7 +57,7 @@
       "context_max": "128k",
       "cost_input_per_1k_tokens": "$0.00015",
       "cost_output_per_1k_tokens": "$0.0006",
-      "latency_p95": "1.5s",
+      "latency_p95": "1500ms",
       "residency": ["us", "eu"],
       "deprecated": false
     },

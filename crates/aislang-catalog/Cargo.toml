@@ -9,6 +9,7 @@ authors.workspace      = true
 rust-version.workspace = true
 
 [dependencies]
-serde      = { workspace = true }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
+aislang-core = { workspace = true }    # for typed value shims (Money/Size/Duration) and closed enums
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }

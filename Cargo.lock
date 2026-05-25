@@ -15,6 +15,7 @@ dependencies = [
 name = "aislang-catalog"
 version = "0.1.0-dev"
 dependencies = [
+ "aislang-core",
  "serde",
  "serde_json",
  "thiserror",
@@ -45,7 +46,6 @@ dependencies = [
 name = "aislang-core"
 version = "0.1.0-dev"
 dependencies = [
- "aislang-catalog",
  "chumsky",
  "petgraph",
  "semver",

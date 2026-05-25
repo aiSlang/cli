@@ -3,7 +3,16 @@
 //! Defines the universe of `ModelId` values the language can reference.
 //! In v0.1 the catalog is bundled in the binary via [`include_str!`]; a
 //! remote update mechanism is Phase 1 (see LANGUAGE-SPEC-v0.md §5.3).
+//!
+//! Every value-typed field in [`CatalogModel`] is deserialized through
+//! the same `from_literal` parsers the language uses (see
+//! `aislang_core::types`). A malformed value in `catalog.json` fails at
+//! binary build time (the `bundled_catalog_parses` test trips), not at
+//! runtime — see LANGUAGE-SPEC-v0.md §5.5 for the rationale.
 
+use aislang_core::types::{
+    Capability, Duration, Money, Percentage, Residency, Size,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,7 +27,7 @@ pub enum CatalogError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
-    /// Catalog version (ISO-8601 date, e.g. `"2026-05-22"`).
+    /// Catalog version (ISO-8601 date, e.g. `"2026-05-25"`).
     pub version: String,
     pub models:  Vec<CatalogModel>,
 }
@@ -27,19 +36,41 @@ pub struct Catalog {
 pub struct CatalogModel {
     /// Canonical aiSlang ID, e.g. `"anthropic.claude_haiku_4_5"`.
     pub id: String,
+
+    /// Provider identifier, e.g. `"anthropic"`.
     pub provider: String,
-    /// The string passed to LiteLLM at runtime.
+
+    /// The string passed to LiteLLM at runtime, e.g. `"anthropic/claude-haiku-4-5"`.
     pub litellm_name: String,
-    pub capabilities: Vec<String>,
-    /// Maximum context window, expressed in the aiSlang `Size` literal form
-    /// (e.g. `"200k"`).
-    pub context_max: String,
-    pub cost_input_per_1k_tokens:  String,
-    pub cost_output_per_1k_tokens: String,
-    pub latency_p95: String,
-    pub residency:   Vec<String>,
+
+    /// Capabilities the model satisfies. Deserialized from JSON `["chat", "tool_use"]`
+    /// via the `rename_all = "snake_case"` derive on [`Capability`].
+    pub capabilities: Vec<Capability>,
+
+    /// Maximum context window. Parsed via `Size::from_literal` (e.g. `"200k"` → 200·1024).
+    #[serde(deserialize_with = "shims::deserialize_size", serialize_with = "shims::serialize_size")]
+    pub context_max: Size,
+
+    /// Input price per 1k tokens. Parsed via `Money::from_literal`.
+    #[serde(rename = "cost_input_per_1k_tokens")]
+    #[serde(deserialize_with = "shims::deserialize_money", serialize_with = "shims::serialize_money")]
+    pub cost_input: Money,
+
+    /// Output price per 1k tokens.
+    #[serde(rename = "cost_output_per_1k_tokens")]
+    #[serde(deserialize_with = "shims::deserialize_money", serialize_with = "shims::serialize_money")]
+    pub cost_output: Money,
+
+    /// p95 first-token latency. Parsed via `Duration::from_literal` (integer-only;
+    /// use `1500ms` rather than `1.5s` — see LANGUAGE-SPEC-v0.md §3.2 note).
+    #[serde(deserialize_with = "shims::deserialize_duration", serialize_with = "shims::serialize_duration")]
+    pub latency_p95: Duration,
+
+    /// Data residencies where the provider hosts the model.
+    pub residency: Vec<Residency>,
+
     #[serde(default)]
-    pub deprecated:  bool,
+    pub deprecated: bool,
 }
 
 /// Load and parse the catalog bundled with this binary.
@@ -48,9 +79,65 @@ pub fn bundled() -> Result<Catalog, CatalogError> {
     Ok(cat)
 }
 
+// ---------------------------------------------------------------------- //
+// Serde shims — route value strings through the language's literal parsers
+// so the catalog and `.ais` source share one source of truth for value
+// formats. See LANGUAGE-SPEC-v0.md §5.5.
+// ---------------------------------------------------------------------- //
+
+mod shims {
+    use super::*;
+    use serde::{de, ser, Deserialize, Deserializer, Serializer};
+
+    pub fn deserialize_money<'de, D>(de: D) -> Result<Money, D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(de)?;
+        Money::from_literal(&s).map_err(de::Error::custom)
+    }
+
+    pub fn deserialize_size<'de, D>(de: D) -> Result<Size, D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(de)?;
+        Size::from_literal(&s).map_err(de::Error::custom)
+    }
+
+    pub fn deserialize_duration<'de, D>(de: D) -> Result<Duration, D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(de)?;
+        Duration::from_literal(&s).map_err(de::Error::custom)
+    }
+
+    // Serialize routes are stubbed — the v0.1 binary never writes the catalog,
+    // it only reads. Provided so Catalog stays round-trippable for future tools
+    // (catalog editor, registry sync). Format intentionally matches input.
+    pub fn serialize_money<S: Serializer>(m: &Money, s: S) -> Result<S::Ok, S::Error> {
+        let _ = m; let _ = s;
+        Err(ser::Error::custom("Money serialization not implemented in v0.1"))
+    }
+    pub fn serialize_size<S: Serializer>(_: &Size, s: S) -> Result<S::Ok, S::Error> {
+        let _ = s;
+        Err(ser::Error::custom("Size serialization not implemented in v0.1"))
+    }
+    pub fn serialize_duration<S: Serializer>(_: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        let _ = s;
+        Err(ser::Error::custom("Duration serialization not implemented in v0.1"))
+    }
+
+    // Silence unused-import warning in v0.1 — Percentage isn't currently in
+    // the catalog schema but is exported by aislang_core::types alongside the
+    // others. Remove this when Percentage gains a catalog field.
+    #[allow(dead_code)]
+    fn _percentage_referenced(_: Percentage) {}
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aislang_core::types::Currency;
 
     #[test]
     fn bundled_catalog_parses() {
@@ -67,5 +154,101 @@ mod tests {
         let len_before = ids.len();
         ids.dedup();
         assert_eq!(len_before, ids.len(), "duplicate model id in catalog");
+    }
+
+    #[test]
+    fn known_entry_has_expected_typed_values() {
+        // Haiku is a useful anchor: known capabilities, sub-cent pricing,
+        // sub-second latency (now expressed as `1500ms` post-Tuesday-parser).
+        let cat = bundled().expect("bundled catalog must parse");
+        let haiku = cat
+            .models
+            .iter()
+            .find(|m| m.id == "anthropic.claude_haiku_4_5")
+            .expect("Haiku entry must exist in bundled catalog");
+
+        assert_eq!(haiku.provider, "anthropic");
+        assert!(haiku.capabilities.contains(&Capability::Chat));
+        assert!(haiku.capabilities.contains(&Capability::ToolUse));
+        assert!(haiku.capabilities.contains(&Capability::StructuredOutput));
+
+        // Size: "200k" → 200 * 1024
+        assert_eq!(haiku.context_max, Size { units: 200 * 1024 });
+
+        // Money: "$0.0008" → 800 micro-USD
+        assert_eq!(
+            haiku.cost_input,
+            Money { currency: Currency::Usd, micro_units: 800 }
+        );
+
+        // Duration: "1500ms" → 1.5 billion nanos. The integer-only Duration
+        // parser would reject "1.5s"; this asserts the catalog has been
+        // migrated to integer units.
+        assert_eq!(haiku.latency_p95, Duration { nanos: 1_500_000_000 });
+
+        // Residency
+        assert_eq!(haiku.residency, vec![Residency::Us]);
+    }
+
+    #[test]
+    fn every_money_value_parses() {
+        // Defense-in-depth: the bundled catalog deserialization above already
+        // routes every Money string through `Money::from_literal`, but make
+        // the contract explicit. If this test fires, look at the corresponding
+        // catalog entry.
+        let cat = bundled().expect("bundled catalog must parse");
+        for m in &cat.models {
+            assert!(m.cost_input.micro_units >= 0,
+                "cost_input must be non-negative for {}", m.id);
+            assert!(m.cost_output.micro_units >= 0,
+                "cost_output must be non-negative for {}", m.id);
+        }
+    }
+
+    #[test]
+    fn malformed_money_string_fails_deserialization() {
+        // Sanity-check: a bad Money string in JSON must produce a serde error,
+        // not silently default. This is the property §5.5 promises.
+        let bad = r#"{
+            "version": "test",
+            "models": [{
+                "id": "x.y", "provider": "x", "litellm_name": "x",
+                "capabilities": ["chat"],
+                "context_max": "100k",
+                "cost_input_per_1k_tokens": "0.001",
+                "cost_output_per_1k_tokens": "$0.001",
+                "latency_p95": "1s",
+                "residency": ["us"]
+            }]
+        }"#;
+        let err = serde_json::from_str::<Catalog>(bad).err()
+            .expect("missing currency symbol must fail deserialization");
+        let msg = err.to_string();
+        assert!(msg.contains("Money") || msg.contains("currency"),
+            "error must mention the offending type, got: {msg}");
+    }
+
+    #[test]
+    fn malformed_duration_string_fails_deserialization() {
+        // Decimal duration ("1.5s") was the exact problem the bundled catalog
+        // had before the Wednesday migration to "1500ms". This pins the
+        // behavior so the integer-only Duration invariant is enforced at the
+        // catalog level, not just the language level.
+        let bad = r#"{
+            "version": "test",
+            "models": [{
+                "id": "x.y", "provider": "x", "litellm_name": "x",
+                "capabilities": ["chat"],
+                "context_max": "100k",
+                "cost_input_per_1k_tokens": "$0.001",
+                "cost_output_per_1k_tokens": "$0.001",
+                "latency_p95": "1.5s",
+                "residency": ["us"]
+            }]
+        }"#;
+        let err = serde_json::from_str::<Catalog>(bad).err()
+            .expect("decimal duration must fail deserialization");
+        assert!(err.to_string().contains("Duration"),
+            "error must mention Duration, got: {err}");
     }
 }
