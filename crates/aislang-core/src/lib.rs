@@ -8,6 +8,7 @@
 //!   week 4: model resolver + lockfile
 
 pub mod ast;
+pub mod checker;
 pub mod parser;
 pub mod types;
 
@@ -23,12 +24,20 @@ pub enum ValidateError {
     UnresolvedRef(String),
 }
 
-/// Parse + type-check + resolve references in a source string.
+/// Parse + type-check the source string.
 ///
-/// Returns the validated [`ast::Project`] on success.
+/// Pipeline (week 3 day 1 — duplicate-label detection lives in the
+/// checker; ref resolution and catalog validation arrive Tue/Wed):
+///   1. `parser::parse`  — chumsky grammar + per-resource converters
+///   2. `checker::check` — duplicate-label detection (Mon),
+///                         cross-resource ref resolution (Tue),
+///                         catalog ID validation (Wed)
+///
+/// Returns the validated [`ast::Project`] on success. Wednesday's
+/// warning infrastructure will change the return shape to
+/// `Result<(Project, Vec<Warning>), ValidateError>`.
 pub fn validate(source: &str) -> Result<ast::Project, ValidateError> {
     let project = parser::parse(source).map_err(ValidateError::Parse)?;
-    // TODO week 3: typecheck(&project)?;
-    // TODO week 3: resolve_refs(&project)?;
+    checker::check(&project).map_err(ValidateError::Type)?;
     Ok(project)
 }
