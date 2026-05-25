@@ -119,7 +119,13 @@ fn expected_support_agent() -> Project {
     let deploy_local = Deploy {
         label:  "local".into(),
         target: DeployTarget::Compose,
-        expose: Some(BTreeMap::from([("port".to_string(), 8080u16)])),
+        // Turbofish on BTreeMap::from to make the array element types
+        // (`(String, u16)`) determined locally rather than by backward
+        // inference through `Some<Option<...>>` — older RustRover analyzer
+        // bundles fail the latter and flag a mismatched-type error here.
+        expose: Some(BTreeMap::<String, u16>::from([
+            ("port".to_string(), 8080u16),
+        ])),
     };
 
     Project {
