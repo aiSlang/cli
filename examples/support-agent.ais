@@ -1,8 +1,16 @@
-// examples/support-agent.ais — the v0.1 reference example.
+// examples/support-agent.ais — the v0.1 canonical reference example.
 //
-// This file is the parser fixture and the demo on the landing page.
-// If the v0.1 compiler can apply this file end-to-end on a clean
-// machine in under 60 seconds, v0.1 ships.
+// Three jobs at once:
+//   1. Demo: the .ais file shown on the landing page and in `aislang --help`.
+//   2. Acceptance gate: if `aislang apply` doesn't produce a working stack
+//      from this file in <60s on a clean machine, v0.1 is not done
+//      (see PLAN-90-days.md §Definition of done).
+//   3. Parser fixture: paired with `examples/support-agent.expected-ast.json`,
+//      which is the AST the parser must produce. Tested in
+//      `crates/aislang-core/tests/parser_fixtures.rs`.
+//
+// Treat any change to this file as a fixture migration: regenerate the
+// expected-AST JSON in the same commit (see test header for the procedure).
 
 project "support-agent" {
   budget {

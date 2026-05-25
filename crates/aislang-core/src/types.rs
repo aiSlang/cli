@@ -32,6 +32,7 @@ impl LiteralParseError {
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]   // ISO 4217: USD/EUR/GBP/JPY
 pub enum Currency {
     Usd,
     Eur,

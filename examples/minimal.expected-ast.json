@@ -1,0 +1,21 @@
+{
+  "name": "minimal",
+  "budget": {
+    "hard_cap_per_day": {
+      "currency": "USD",
+      "micro_units": 10000000
+    },
+    "hard_cap_per_run": {
+      "currency": "USD",
+      "micro_units": 100000
+    },
+    "optimize_for": "cost"
+  },
+  "models": [],
+  "prompts": [],
+  "mcp_servers": [],
+  "agents": [],
+  "evals": [],
+  "secrets": [],
+  "deploys": []
+}

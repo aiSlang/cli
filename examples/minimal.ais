@@ -1,0 +1,15 @@
+// examples/minimal.ais — smallest valid v0.1 project.
+//
+// Companion fixture to support-agent.ais: exercises the parser bottom-up
+// (project header + budget block only). When the parser arrives in week 2,
+// build it incrementally — make this file parse first, then layer in the
+// remaining resource types until support-agent.ais parses too.
+//
+// Paired with examples/minimal.expected-ast.json.
+
+project "minimal" {
+  budget {
+    hard_cap_per_day = $10
+    hard_cap_per_run = $0.10
+  }
+}

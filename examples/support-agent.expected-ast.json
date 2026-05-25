@@ -1,0 +1,120 @@
+{
+  "name": "support-agent",
+  "budget": {
+    "hard_cap_per_day": {
+      "currency": "USD",
+      "micro_units": 50000000
+    },
+    "hard_cap_per_run": {
+      "currency": "USD",
+      "micro_units": 500000
+    },
+    "optimize_for": "cost"
+  },
+  "models": [
+    {
+      "label": "fast",
+      "requires": [
+        "chat",
+        "tool_use"
+      ],
+      "context_min": {
+        "units": 32768
+      },
+      "cost_max": {
+        "numerator": {
+          "currency": "USD",
+          "micro_units": 1000
+        },
+        "denominator": {
+          "units": 1024
+        }
+      },
+      "latency_p95": {
+        "nanos": 2000000000
+      },
+      "residency": [
+        "eu",
+        "us"
+      ],
+      "prefer": [
+        {
+          "provider": "anthropic",
+          "name": "claude_haiku_4_5"
+        },
+        {
+          "provider": "openai",
+          "name": "gpt_4o_mini"
+        }
+      ],
+      "fallback": [
+        {
+          "provider": "ollama",
+          "name": "llama_3_1_8b"
+        }
+      ]
+    }
+  ],
+  "prompts": [
+    {
+      "label": "system",
+      "file": "./prompts/system.md",
+      "version": "^1.0.0"
+    }
+  ],
+  "mcp_servers": [
+    {
+      "label": "docs",
+      "image": {
+        "registry": "ghcr.io",
+        "repository": "example/mcp_filesystem",
+        "tag": "0.3.1",
+        "digest": null
+      },
+      "mount": "./knowledge/"
+    }
+  ],
+  "agents": [
+    {
+      "label": "support",
+      "model": {
+        "kind": "model",
+        "label": "fast"
+      },
+      "system_prompt": {
+        "kind": "prompt",
+        "label": "system"
+      },
+      "tools": [
+        {
+          "kind": "mcp_server",
+          "label": "docs"
+        }
+      ]
+    }
+  ],
+  "evals": [
+    {
+      "label": "factual_accuracy",
+      "dataset": "./evals/qa.jsonl",
+      "metric": "exact_match",
+      "threshold": {
+        "ratio": 0.85
+      },
+      "aggregator": "mean"
+    }
+  ],
+  "secrets": [],
+  "deploys": [
+    {
+      "label": "local",
+      "target": "compose",
+      "expose": [
+        [
+          "port",
+          8080
+        ]
+      ]
+    }
+  ]
+}
