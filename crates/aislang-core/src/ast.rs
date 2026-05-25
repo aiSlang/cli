@@ -10,8 +10,8 @@
 //! for each `.ais` example. See `crates/aislang-core/tests/parser_fixtures.rs`.
 
 use crate::types::*;
-use semver::VersionReq;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// A reference to another resource by label. Resolved during validation.
@@ -83,7 +83,9 @@ pub struct Model {
 pub struct Prompt {
     pub label:   String,
     pub file:    PathBuf,
-    pub version: VersionReq,
+    /// Strict exact-version pin (LANGUAGE-SPEC-v0.md §3.2 SemVer row). Range
+    /// operators are rejected by the literal parser; revisit in v0.2.
+    pub version: SemVer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +130,9 @@ pub struct Secret {
 pub struct Deploy {
     pub label:  String,
     pub target: DeployTarget,
+    /// Port mappings as a `BTreeMap` for deterministic JSON ordering. Source
+    /// syntax `expose = { port = 8080 }` mirrors the map form directly.
+    /// Spec §4.9: `Map<String, Int>`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expose: Option<Vec<(String, u16)>>,
+    pub expose: Option<BTreeMap<String, u16>>,
 }

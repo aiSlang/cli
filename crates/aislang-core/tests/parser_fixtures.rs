@@ -16,12 +16,12 @@
 //! The week-2 parser will plug into [`assert_parser_matches_expected`] —
 //! marked `#[ignore]` until then.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use aislang_core::ast::*;
 use aislang_core::types::*;
-use semver::VersionReq;
 
 // ============================================================================
 // Path helpers
@@ -84,7 +84,7 @@ fn expected_support_agent() -> Project {
     let prompt_system = Prompt {
         label:   "system".into(),
         file:    PathBuf::from("./prompts/system.md"),
-        version: VersionReq::parse("1.0.0").expect("valid SemVer"),
+        version: SemVer::from_literal("1.0.0").expect("valid SemVer"),
     };
 
     let mcp_docs = McpServer {
@@ -119,7 +119,7 @@ fn expected_support_agent() -> Project {
     let deploy_local = Deploy {
         label:  "local".into(),
         target: DeployTarget::Compose,
-        expose: Some(vec![("port".into(), 8080)]),
+        expose: Some(BTreeMap::from([("port".to_string(), 8080u16)])),
     };
 
     Project {

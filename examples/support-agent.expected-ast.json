@@ -59,7 +59,7 @@
     {
       "label": "system",
       "file": "./prompts/system.md",
-      "version": "^1.0.0"
+      "version": "1.0.0"
     }
   ],
   "mcp_servers": [
@@ -109,12 +109,9 @@
     {
       "label": "local",
       "target": "compose",
-      "expose": [
-        [
-          "port",
-          8080
-        ]
-      ]
+      "expose": {
+        "port": 8080
+      }
     }
   ]
 }

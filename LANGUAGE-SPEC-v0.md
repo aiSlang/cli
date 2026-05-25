@@ -58,7 +58,7 @@ These are the types that move the needle. Each has a literal syntax and a normal
 | `Duration` | `5s`, `2m`, `1h`, `1d`, `500ms` | `nanoseconds: i64` |
 | `Size` | `32k`, `1MB`, `8GB`, `1024` | `bytes: u64` (k=1024, M=1024², G=1024³); `k` also accepted for token counts |
 | `Percentage` | `85%`, `0.5%` | `ratio: f64` ∈ [0.0, 1.0] |
-| `SemVer` | `1.0.0`, `^2.1`, `~3.0.5` | parsed semver range |
+| `SemVer` | `"1.0.0"`, `"1.2.3-alpha"`, `"2.0.0+build.123"` | exact semver-2.0 version; range operators (`^`, `~`, `>=`) deferred to v0.2 |
 | `Path` | `"./prompts/system.md"` | resolved relative to the `.ais` file at validate time; existence checked |
 | `OciImage` | `ghcr.io/foo/bar:1.2.3`, `ghcr.io/foo/bar:1.2.3@sha256:…` | parsed registry/repo/tag/digest; digest preferred |
 | `URI` | `"https://…"`, `"s3://…"` | scheme-aware parsed URL |

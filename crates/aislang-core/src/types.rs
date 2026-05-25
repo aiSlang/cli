@@ -265,6 +265,44 @@ impl Percentage {
 }
 
 // ============================================================================
+// SemVer — exact-version domain type (strict semantics)
+// ============================================================================
+
+/// An exact semver 2.0 version. v0.1 deliberately *rejects* range operators
+/// (`^`, `~`, `>=`, `=`, `<`) — a `prompt.version` or other pinned reference
+/// must name one specific version. Range syntax is deferred to v0.2; see
+/// LANGUAGE-SPEC-v0.md §3.2.
+///
+/// `#[serde(transparent)]` makes this serialize as a bare string `"1.2.3"`
+/// rather than `{"0": "1.2.3"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SemVer(pub semver::Version);
+
+impl SemVer {
+    /// Parse a `SemVer` literal — the textual semver 2.0 version, with no
+    /// range operators.
+    pub fn from_literal(s: &str) -> Result<Self, LiteralParseError> {
+        let err = |reason: &str| LiteralParseError::new("SemVer", s, reason);
+
+        if let Some(first) = s.chars().next() {
+            if matches!(first, '^' | '~' | '>' | '<' | '=') {
+                return Err(err(
+                    "v0.1 requires an exact version (e.g. `\"1.0.0\"`); \
+                     range operators (^, ~, >=, =, <) are deferred to v0.2",
+                ));
+            }
+        } else {
+            return Err(err("empty input"));
+        }
+
+        semver::Version::parse(s)
+            .map(SemVer)
+            .map_err(|e| err(&e.to_string()))
+    }
+}
+
+// ============================================================================
 // Rate — composition of two domain types via the `per` keyword
 // ============================================================================
 
@@ -461,6 +499,40 @@ mod size_tests {
     #[test] fn lowercase_mb_rejected()     { rejected("1mb",   "unknown unit"); }
     #[test] fn bare_m_rejected()           { rejected("1M",    "unknown unit"); }
     #[test] fn space_rejected()            { rejected("32 k",  "unknown unit"); }
+}
+
+#[cfg(test)]
+mod semver_tests {
+    use super::*;
+
+    fn ok(input: &str, major: u64, minor: u64, patch: u64) {
+        let parsed = SemVer::from_literal(input)
+            .unwrap_or_else(|e| panic!("expected `{input}` to parse, got: {e}"));
+        assert_eq!(parsed.0.major, major);
+        assert_eq!(parsed.0.minor, minor);
+        assert_eq!(parsed.0.patch, patch);
+    }
+    fn rejected(input: &str, substring: &str) {
+        let err = SemVer::from_literal(input)
+            .err()
+            .unwrap_or_else(|| panic!("expected `{input}` to be rejected"));
+        assert!(err.reason.contains(substring),
+            "reason `{}` did not contain `{substring}`", err.reason);
+    }
+
+    #[test] fn basic_version()    { ok("1.0.0",                1, 0, 0); }
+    #[test] fn prerelease()       { ok("1.2.3-alpha",          1, 2, 3); }
+    #[test] fn build_metadata()   { ok("2.0.0+build.123",      2, 0, 0); }
+    #[test] fn prerelease_build() { ok("1.0.0-rc.1+sha.abcdef",1, 0, 0); }
+    #[test] fn zero_version()     { ok("0.0.0",                0, 0, 0); }
+
+    #[test] fn caret_rejected()           { rejected("^1.0.0",  "range operators"); }
+    #[test] fn tilde_rejected()           { rejected("~1.2.0",  "range operators"); }
+    #[test] fn gte_rejected()             { rejected(">=1.0.0", "range operators"); }
+    #[test] fn equals_rejected()          { rejected("=1.0.0",  "range operators"); }
+    #[test] fn empty()                    { rejected("",        "empty input"); }
+    #[test] fn missing_patch_rejected()   { rejected("1.0",     "minor"); }    // semver crate error contains "minor"/"patch"
+    #[test] fn non_numeric_rejected()     { rejected("abc",     "expected"); }
 }
 
 #[cfg(test)]
