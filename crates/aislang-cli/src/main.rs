@@ -87,32 +87,90 @@ fn run() -> Result<()> {
 
 fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
     let source = std::fs::read_to_string(&file)?;
-    let project = aislang_core::validate(&source)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Success line always goes to stdout (machine-readable surface).
-    println!("OK: {} parsed and type-checked", file.display());
+    match aislang_core::validate(&source) {
+        Ok(project) => {
+            // Success line always goes to stdout (machine-readable surface).
+            println!("OK: {} parsed and type-checked", file.display());
 
-    // Verbose output goes to stderr so stdout stays clean for callers
-    // that pipe `aislang validate` into other tools.
-    if verbose >= 1 {
-        print_summary(&project);
-    }
-    if verbose >= 2 {
-        eprintln!();
-        eprintln!("AST (Debug):");
-        eprintln!("{project:#?}");
-    }
-    if verbose >= 3 {
-        eprintln!();
-        eprintln!("AST (JSON IR):");
-        match serde_json::to_string_pretty(&project) {
-            Ok(json) => eprintln!("{json}"),
-            Err(e)   => eprintln!("(JSON serialization failed: {e})"),
+            // Verbose output goes to stderr so stdout stays clean for
+            // callers that pipe `aislang validate` into other tools.
+            if verbose >= 1 {
+                print_summary(&project);
+            }
+            if verbose >= 2 {
+                eprintln!();
+                eprintln!("AST (Debug):");
+                eprintln!("{project:#?}");
+            }
+            if verbose >= 3 {
+                eprintln!();
+                eprintln!("AST (JSON IR):");
+                match serde_json::to_string_pretty(&project) {
+                    Ok(json) => eprintln!("{json}"),
+                    Err(e)   => eprintln!("(JSON serialization failed: {e})"),
+                }
+            }
+            Ok(())
+        }
+        Err(validate_err) => {
+            // Verbose diagnostics on the failure path. When a converter
+            // rejects something, the grammar parse itself succeeded —
+            // show the partial RawBlock tree that was being converted.
+            if verbose >= 1 {
+                emit_failure_diagnostic(&source, verbose);
+            }
+            Err(anyhow::anyhow!("{validate_err}"))
         }
     }
+}
 
-    Ok(())
+/// On validate failure, try the grammar-only `parse_raw_*` path. If it
+/// succeeds, the failure was at conversion time and we have a partial
+/// tree to show. If the grammar fails too, there's no tree to render —
+/// the user already saw the grammar error in the main message.
+fn emit_failure_diagnostic(source: &str, verbose: u8) {
+    if verbose >= 3 {
+        match aislang_core::parser::parse_raw_json(source) {
+            Ok(json) => {
+                eprintln!();
+                eprintln!("diagnostic: grammar parse succeeded; conversion to typed AST failed.");
+                eprintln!("partial RawBlock tree (what got parsed before the converter rejected):");
+                eprintln!("{json}");
+            }
+            Err(_) => emit_grammar_level_note(),
+        }
+    } else if verbose >= 2 {
+        match aislang_core::parser::parse_raw_debug(source) {
+            Ok(dbg) => {
+                eprintln!();
+                eprintln!("diagnostic: grammar parse succeeded; conversion to typed AST failed.");
+                eprintln!("partial RawBlock tree (Debug):");
+                eprintln!("{dbg}");
+            }
+            Err(_) => emit_grammar_level_note(),
+        }
+    } else {
+        // verbose == 1: brief summary only
+        match aislang_core::parser::parse_raw_summary(source) {
+            Ok(summary) => {
+                eprintln!();
+                eprintln!("diagnostic: grammar parse succeeded; conversion to typed AST failed.");
+                eprintln!("partial parse summary:");
+                eprintln!("{summary}");
+                eprintln!();
+                eprintln!("(re-run with -vv for the Debug tree, -vvv for the full JSON RawBlock)");
+            }
+            Err(_) => emit_grammar_level_note(),
+        }
+    }
+}
+
+fn emit_grammar_level_note() {
+    eprintln!();
+    eprintln!("diagnostic: grammar-level parse error — no partial AST available.");
+    eprintln!("the main error above carries the most specific information chumsky produced.");
+    eprintln!("(line/column highlighting is not yet implemented — see PLAN week-3+)");
 }
 
 fn print_summary(project: &aislang_core::ast::Project) {

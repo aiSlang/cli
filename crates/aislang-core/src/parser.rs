@@ -21,6 +21,7 @@
 use crate::ast::*;
 use crate::types::*;
 use chumsky::prelude::*;
+use serde::Serialize;
 
 // ============================================================================
 // Public entry point
@@ -28,7 +29,16 @@ use chumsky::prelude::*;
 
 /// Parse a source string into a typed [`Project`] AST.
 pub fn parse(source: &str) -> Result<Project, String> {
-    let raw = parser()
+    let raw = parse_raw_internal(source)?;
+    to_project(raw)
+}
+
+/// Internal grammar-only parse — returns the RawBlock tree without
+/// running semantic conversion. Used by `parse` (above) and by the
+/// diagnostic helpers below. Keeps the chumsky parser construction in
+/// one place.
+fn parse_raw_internal(source: &str) -> Result<RawBlock, String> {
+    parser()
         .parse(source)
         .into_result()
         .map_err(|errs| {
@@ -36,8 +46,69 @@ pub fn parse(source: &str) -> Result<Project, String> {
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
                 .join("\n")
-        })?;
-    to_project(raw)
+        })
+}
+
+// ============================================================================
+// Diagnostic helpers (consumed by `aislang validate -v / -vv / -vvv` on
+// the failure path — when a converter rejects something, the partial
+// RawBlock tree is what got parsed before the rejection)
+// ============================================================================
+
+/// Brief structural summary of the parsed RawBlock tree. Used at
+/// `validate -v` on conversion failure to show what the grammar saw.
+pub fn parse_raw_summary(source: &str) -> Result<String, String> {
+    let raw = parse_raw_internal(source)?;
+    let mut out = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(out, "  top-level block_type: `{}`", raw.block_type);
+    let _ = writeln!(out, "  labels:               {:?}", raw.labels);
+    let (attrs, blocks) = count_body_items(&raw);
+    let _ = writeln!(out, "  body items:           {} attribute(s), {} nested block(s)", attrs, blocks);
+    let block_types = body_block_types(&raw);
+    if !block_types.is_empty() {
+        let _ = writeln!(out, "  nested block_types:   {:?}", block_types);
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// Debug (Rust pretty-printed) form of the parsed RawBlock tree.
+/// Used at `validate -vv` on conversion failure.
+pub fn parse_raw_debug(source: &str) -> Result<String, String> {
+    let raw = parse_raw_internal(source)?;
+    Ok(format!("{raw:#?}"))
+}
+
+/// JSON form of the parsed RawBlock tree. Used at `validate -vvv` on
+/// conversion failure. The shape is the *internal* RawBlock — not the
+/// typed Project — so the JSON differs from `validate -vvv` on success.
+pub fn parse_raw_json(source: &str) -> Result<String, String> {
+    let raw = parse_raw_internal(source)?;
+    serde_json::to_string_pretty(&raw)
+        .map_err(|e| format!("JSON serialization failed: {e}"))
+}
+
+fn count_body_items(block: &RawBlock) -> (usize, usize) {
+    let mut attrs = 0usize;
+    let mut blocks = 0usize;
+    for item in &block.body {
+        match item {
+            RawBodyItem::Attribute(_) => attrs  += 1,
+            RawBodyItem::Block(_)     => blocks += 1,
+        }
+    }
+    (attrs, blocks)
+}
+
+fn body_block_types(block: &RawBlock) -> Vec<String> {
+    block
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            RawBodyItem::Block(b) => Some(b.block_type.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -48,7 +119,12 @@ pub fn parse(source: &str) -> Result<Project, String> {
 /// them yet (the budget converter only needs Money / EnumMember). The
 /// remaining variants get their converters across weeks 2 Wed–Fri; until
 /// then `dead_code` is silenced on the whole enum.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` is derived so the CLI's `validate -vvv` (on failure) can
+/// dump the partial RawBlock tree as JSON — the type stays internal
+/// (`pub(crate)`-equivalent: only reachable via the public helpers
+/// `parse_raw_summary` / `parse_raw_debug` / `parse_raw_json`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[allow(dead_code)]
 enum RawValue {
     String(String),
@@ -84,26 +160,26 @@ enum RawValue {
 /// Numerator + denominator. Per spec EBNF §8: numerator is one of
 /// Money/Int/Float; denominator is one of Size/Duration/unit_quantity
 /// (where `1k_tokens` parses to Size with the unit-name dropped).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct RawRate {
     numerator:   RawValue,
     denominator: RawValue,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct RawBlock {
     block_type: String,
     labels:     Vec<String>,
     body:       Vec<RawBodyItem>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 enum RawBodyItem {
     Attribute(RawAttribute),
     Block(RawBlock),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct RawAttribute {
     name:  String,
     value: RawValue,
