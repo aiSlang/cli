@@ -586,16 +586,39 @@ fn smoke_test_live_tier(
         }
         eprintln!("  up:                ✓ stack started");
 
-        // Tier 4a: wait for LiteLLM to bind :4000.
+        // Tier 4a: TCP bind check — cheap "did the container start?"
+        // probe. Catches container exits at boot.
         wait_for_port("127.0.0.1", 4000, std::time::Duration::from_secs(30))
             .map_err(|e| anyhow::anyhow!(
-                "litellm did not become ready on :4000 within 30s: {e}\n\
+                "litellm did not bind :4000 within 30s: {e}\n\
                  (run `docker compose --project-name {} -f {} logs litellm` \
                  for boot diagnostics)",
                 SMOKE_TEST_PROJECT, stack_path.display()))?;
-        eprintln!("  litellm ready:     ✓ tcp 127.0.0.1:4000 reachable");
+        eprintln!("  litellm port:      ✓ tcp 127.0.0.1:4000 reachable");
 
-        // Tier 4b: fire one real chat completion.
+        // Tier 4b: HTTP readiness check.
+        //
+        // The TCP bind happens FAST — FastAPI binds the listener in
+        // ~1s. But LiteLLM's nested startup events (router init,
+        // model_list parsing, fallback validation) take several more
+        // seconds. During that window, TCP connections succeed but
+        // any actual HTTP request gets `Connection reset by peer`
+        // (server kills the conn before the route handlers exist).
+        //
+        // `/health/liveness` returns 200 ONLY after all startup
+        // events complete — i.e. after the proxy is ready to route
+        // chat completions. Poll until it's 200, then proceed.
+        wait_for_litellm_ready(
+            "http://localhost:4000",
+            std::time::Duration::from_secs(30),
+        ).map_err(|e| anyhow::anyhow!(
+            "litellm /health/liveness did not return 200 within 30s: {e}\n\
+             (run `docker compose --project-name {} -f {} logs litellm` \
+             for boot diagnostics)",
+            SMOKE_TEST_PROJECT, stack_path.display()))?;
+        eprintln!("  litellm ready:     ✓ /health/liveness returned 200");
+
+        // Tier 4c: fire one real chat completion.
         let first_model = resolved.model_bindings.keys().next()
             .ok_or_else(|| anyhow::anyhow!(
                 "no resolved models — nothing to call /v1/chat/completions against"))?;
@@ -661,6 +684,61 @@ fn wait_for_port(host: &str, port: u16, timeout: std::time::Duration) -> Result<
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     Err(anyhow::anyhow!("timed out polling tcp {host}:{port}"))
+}
+
+/// Poll `<base_url>/health/liveness` until it returns 200, or
+/// `timeout` elapses. LiteLLM's liveness endpoint returns 200 only
+/// after all startup events complete — which is the actual
+/// readiness signal for chat completions.
+///
+/// Why this exists alongside `wait_for_port`: TCP bind happens
+/// fast (~1s) but startup events take several more seconds. During
+/// that window TCP connects succeed but HTTP requests get
+/// "Connection reset by peer" because the route handlers aren't
+/// registered yet. The HTTP probe catches the actual ready state.
+///
+/// Uses shell `curl` (universal, same reason as `try_chat_completion`).
+/// Each probe has a 2s connect-timeout so we don't hang on a single
+/// slow attempt. Polls every 500ms.
+fn wait_for_litellm_ready(
+    base_url: &str,
+    timeout:  std::time::Duration,
+) -> Result<()> {
+    use std::process::Command;
+    use std::time::Instant;
+    let url      = format!("{base_url}/health/liveness");
+    let deadline = Instant::now() + timeout;
+    let mut last_status = String::from("(no response yet)");
+    while Instant::now() < deadline {
+        let out = Command::new("curl")
+            .args([
+                "--silent", "--max-time", "2",
+                "-o", "/dev/null",
+                "-w", "%{http_code}",
+                &url,
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if code == "200" {
+                    return Ok(());
+                }
+                last_status = format!("HTTP {code}");
+            }
+            Ok(o) => {
+                let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let exit = o.status.code();
+                last_status = format!("curl exit {exit:?} (http={code})");
+            }
+            Err(e) => {
+                last_status = format!("spawn curl: {e}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(anyhow::anyhow!(
+        "timed out polling {url}; last attempt: {last_status}"))
 }
 
 /// Fire one minimal `/v1/chat/completions` request via `curl`. We
