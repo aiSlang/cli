@@ -201,8 +201,8 @@ mod tests {
         // migrated to integer units.
         assert_eq!(haiku.latency_p95, Duration { nanos: 1_500_000_000 });
 
-        // Residency
-        assert_eq!(haiku.residency, vec![Residency::Us]);
+        // Residency — Anthropic serves Claude in both US and EU
+        assert_eq!(haiku.residency, vec![Residency::Us, Residency::Eu]);
     }
 
     #[test]

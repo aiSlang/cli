@@ -10,7 +10,7 @@
       "cost_input_per_1k_tokens": "$0.015",
       "cost_output_per_1k_tokens": "$0.075",
       "latency_p95": "8s",
-      "residency": ["us"],
+      "residency": ["us", "eu"],
       "deprecated": false
     },
     {
@@ -22,7 +22,7 @@
       "cost_input_per_1k_tokens": "$0.003",
       "cost_output_per_1k_tokens": "$0.015",
       "latency_p95": "3s",
-      "residency": ["us"],
+      "residency": ["us", "eu"],
       "deprecated": false
     },
     {
@@ -34,7 +34,7 @@
       "cost_input_per_1k_tokens": "$0.0008",
       "cost_output_per_1k_tokens": "$0.004",
       "latency_p95": "1500ms",
-      "residency": ["us"],
+      "residency": ["us", "eu"],
       "deprecated": false
     },
     {

@@ -11,3 +11,5 @@ rust-version.workspace = true
 [dependencies]
 aislang-core    = { workspace = true }
 aislang-catalog = { workspace = true }
+serde           = { workspace = true }   # ResolvedProject Serialize for IR display
+thiserror       = { workspace = true }   # structured ResolveError variants
