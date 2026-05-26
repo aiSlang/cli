@@ -79,9 +79,16 @@ enum Command {
         file: PathBuf,
     },
     /// Open a CLI chat session against a deployed agent
+    ///
+    /// v0.1 (week 6 Mon): validates the agent exists in the source
+    /// project and prints a placeholder line. Chat loop (LiteLLM +
+    /// MCP) lands Wednesday; tool-use loop lands Thursday.
     Chat {
         /// Agent label (e.g. `support`)
         agent: String,
+        /// Path to the .ais project file. v0.2 may infer this from
+        /// `aislang.lock` in the current directory.
+        file:  PathBuf,
     },
 }
 
@@ -112,7 +119,7 @@ fn run() -> Result<()> {
         Command::Destroy { file: _ } => stub("destroy", 10),
         Command::Eval { file: _ }    => stub("eval",    8),
         Command::Cost { file: _ }    => stub("cost",    7),
-        Command::Chat { agent: _ }   => stub("chat",    6),
+        Command::Chat { agent, file } => run_chat(agent, file),
     }
 }
 
@@ -480,6 +487,100 @@ fn run_smoke_test(compose_yaml: &str) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// `aislang chat` — Monday of week 6 (stub) → Wednesday onwards (live loop)
+// ============================================================================
+
+/// Validate the project parses, find the named agent, then print a
+/// placeholder line. Real chat loop lands week 6 Wednesday.
+///
+/// v0.1 only checks: (1) source file readable; (2) parses cleanly;
+/// (3) agent label exists. The latter uses Levenshtein-style "did you
+/// mean…?" suggestions reusing the checker's `nearest_label` helper —
+/// same error UX as cross-resource ref lookups elsewhere.
+fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    // Find the agent by label.
+    let exists = project.agents.iter().any(|a| a.label == agent_label);
+    if !exists {
+        let mut available: Vec<&str> = project.agents.iter()
+            .map(|a| a.label.as_str())
+            .collect();
+        available.sort();
+        let hint = nearest_agent_label(&agent_label, &available);
+        let hint_line = match hint {
+            Some(h) => format!(" — did you mean `{h}`?"),
+            None    => String::new(),
+        };
+        let avail_line = if available.is_empty() {
+            "  (no agents declared in this project)".to_string()
+        } else {
+            format!("  available: {}", available.join(", "))
+        };
+        return Err(anyhow::anyhow!(
+            "no agent named `{agent_label}` in {}{hint_line}\n{avail_line}",
+            file.display()
+        ));
+    }
+
+    // v0.1 Monday stub.
+    println!("aislang chat: agent `{agent_label}` resolved in {}.",
+             file.display());
+    println!("chat loop arrives Wednesday — see PLAN-90-days.md week 6.");
+    println!();
+    println!("scheduled days:");
+    println!("  Tue: rmcp client wiring (aislang-runtime crate)");
+    println!("  Wed: LiteLLM HTTP client + non-streaming chat loop");
+    println!("  Thu: MCP tool-use loop (8-iter cap)");
+    println!("  Fri: end-to-end demo + `aislang apply` promoted from stub");
+    Ok(())
+}
+
+/// Levenshtein-style "closest match" heuristic. Threshold ≤2 edits;
+/// shorter than that and we'd suggest random labels.
+///
+/// Lives in the CLI rather than `aislang-core` because the chat-time
+/// error UX is the only consumer in v0.1; if more callers want it,
+/// promote later.
+fn nearest_agent_label<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    candidates.iter()
+        .map(|c| (c, levenshtein(target, c)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| *c)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    let (m, n) = (av.len(), bv.len());
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur:  Vec<usize> = vec![0; n + 1];
+    for i in 1..=m {
+        cur[0] = i;
+        for j in 1..=n {
+            let cost = if av[i - 1] == bv[j - 1] { 0 } else { 1 };
+            cur[j] = (cur[j - 1] + 1)         // insertion
+                .min(prev[j] + 1)             // deletion
+                .min(prev[j - 1] + cost);     // substitution
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[n]
+}
+
 /// On validate failure, try the grammar-only `parse_raw_*` path. If it
 /// succeeds, the failure was at conversion time and we have a partial
 /// tree to show. If the grammar fails too, there's no tree to render —
@@ -552,4 +653,74 @@ fn print_summary(project: &aislang_core::ast::Project) {
 fn stub(cmd: &str, week: u8) -> Result<()> {
     println!("aislang {cmd}: not implemented yet (scheduled for week {week} — see PLAN-90-days.md)");
     Ok(())
+}
+
+// ============================================================================
+// Tests (unit-level only — CLI integration lives in tests/cli_chat.rs)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- levenshtein ----
+
+    #[test] fn lev_identical_strings_distance_zero() {
+        assert_eq!(levenshtein("support", "support"), 0);
+    }
+
+    #[test] fn lev_single_edit_distance_one() {
+        assert_eq!(levenshtein("support", "suport"),  1);  // deletion
+        assert_eq!(levenshtein("support", "supports"), 1); // insertion
+        assert_eq!(levenshtein("support", "suppart"), 1);  // substitution
+    }
+
+    #[test] fn lev_two_edits_distance_two() {
+        // "support" → "sport"   : two deletes (u, p).
+        assert_eq!(levenshtein("support", "sport"),  2);
+        // "support" → "suppurts": one substitute (o→u) + one insert (s).
+        assert_eq!(levenshtein("support", "suppurts"), 2);
+    }
+
+    #[test] fn lev_classic_kitten_sitting_distance_three() {
+        // The textbook Wagner-Fischer example. Pins correctness of
+        // the table-walking loop independent of our specific inputs.
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    #[test] fn lev_empty_strings() {
+        assert_eq!(levenshtein("",        ""),        0);
+        assert_eq!(levenshtein("support", ""),        7);
+        assert_eq!(levenshtein("",        "support"), 7);
+    }
+
+    // ---- nearest_agent_label ----
+
+    #[test] fn nearest_picks_close_match_within_threshold() {
+        let cands = ["support", "billing", "analytics"];
+        assert_eq!(nearest_agent_label("suport",  &cands), Some("support"));
+        assert_eq!(nearest_agent_label("billng",  &cands), Some("billing"));
+    }
+
+    #[test] fn nearest_returns_none_when_no_match_within_threshold() {
+        let cands = ["support", "billing"];
+        // 6+ edits from any candidate — well beyond the ≤2 cap.
+        assert_eq!(nearest_agent_label("zzzzzzzzz", &cands), None);
+    }
+
+    #[test] fn nearest_returns_none_for_empty_candidates() {
+        let cands: [&str; 0] = [];
+        assert_eq!(nearest_agent_label("support", &cands), None);
+    }
+
+    #[test] fn nearest_picks_minimum_distance_when_multiple_match() {
+        // Both "support" and "supports" are within threshold of
+        // "suporrt" (dist 2 and 2). Tie-broken by iteration order
+        // (min_by_key keeps the first). Either is acceptable; pin
+        // behaviour so a refactor doesn't silently flip it.
+        let cands = ["billing", "support", "supports"];
+        let pick = nearest_agent_label("suporrt", &cands);
+        assert!(pick == Some("support") || pick == Some("supports"),
+            "expected close-match; got {pick:?}");
+    }
 }
