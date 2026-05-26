@@ -25,6 +25,8 @@
 //! `BTreeMap` for deterministic key ordering (lockfile-style
 //! reproducibility on unchanged input).
 
+pub mod litellm;
+
 use aislang_core::ast::McpServer;
 use aislang_core::types::OciImage;
 use aislang_resolver::ResolvedProject;

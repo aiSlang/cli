@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 aislang-core     = { workspace = true }
+aislang-catalog  = { workspace = true }   # Catalog::find for LiteLLM litellm_name lookup
 aislang-resolver = { workspace = true }   # consumes ResolvedProject
 serde            = { workspace = true }
 serde_json       = { workspace = true }   # model-bindings JSON for LiteLLM env

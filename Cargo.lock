@@ -38,6 +38,7 @@ dependencies = [
 name = "aislang-compose"
 version = "0.1.0-dev"
 dependencies = [
+ "aislang-catalog",
  "aislang-core",
  "aislang-resolver",
  "serde",
