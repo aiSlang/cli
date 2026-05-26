@@ -295,6 +295,29 @@ fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
     env.insert("AISLANG_CATALOG_VERSION".to_string(),
                resolved.catalog_version.clone());
 
+    // Forward every provider env var the project references into the
+    // litellm container so LiteLLM's `os.environ/X` lookups in the
+    // mounted config resolve. We use `${X}` syntax — Docker Compose
+    // substitutes from the .env file next to the compose YAML at
+    // `docker compose up` time. If the var is missing from .env,
+    // compose warns ("variable not set, defaulting to blank") and
+    // continues; LiteLLM then fails to call the provider with a clean
+    // "missing api_key" / "missing api_base" error at request time.
+    //
+    // Without this, LiteLLM resolves `os.environ/OLLAMA_API_BASE` to
+    // the empty string and falls back to its default `localhost:11434`
+    // — which from inside the container means LiteLLM itself, not the
+    // host. Net effect: "Cannot connect to host localhost:11434" boot
+    // failures even when the user's .env has the correct
+    // `host.docker.internal` value.
+    //
+    // The var set comes from `litellm::referenced_env_vars`, which
+    // ALSO drives `.env.example` generation — guarantees the user
+    // sees exactly the vars that'll be forwarded.
+    for var in litellm::referenced_env_vars(resolved) {
+        env.insert(var.clone(), format!("${{{var}}}"));
+    }
+
     // Mount the generated config file at /app/config.yaml. The host
     // path is absolute to keep `docker compose -f -` portable across
     // the user's CWD.
@@ -528,6 +551,99 @@ mod tests {
             "host path must be absolute; got `{host_side}` in `{mount}`");
         assert!(host_side.ends_with("/litellm_config.yaml"),
             "host path must point at litellm_config.yaml; got `{host_side}`");
+    }
+
+    #[test] fn litellm_forwards_resolved_provider_env_vars() {
+        // The bug this prevents: LiteLLM reads `os.environ/OLLAMA_API_BASE`
+        // from its own env, but if our compose YAML doesn't FORWARD
+        // OLLAMA_API_BASE from .env into the container, it resolves to
+        // the empty string and LiteLLM falls back to `localhost:11434`
+        // — which from inside the container means LiteLLM itself.
+        // Result: "Cannot connect to host localhost:11434" at the
+        // first /v1/chat/completions call.
+        //
+        // For the demo (resolved primary = ollama), we expect the
+        // litellm service's environment block to include the line
+        //   OLLAMA_API_BASE=${OLLAMA_API_BASE}
+        // — the `${X}` syntax triggers Docker Compose substitution
+        // from the user's .env at `up` time.
+        let yaml = emit_demo_yaml();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let env = value["services"]["litellm"]["environment"].as_sequence()
+            .expect("litellm.environment is a list");
+        let strs: Vec<&str> = env.iter()
+            .filter_map(|v| v.as_str()).collect();
+        assert!(strs.contains(&"OLLAMA_API_BASE=${OLLAMA_API_BASE}"),
+            "OLLAMA_API_BASE must be forwarded via Compose interpolation; \
+             got env: {strs:?}");
+    }
+
+    #[test] fn litellm_env_forwarding_covers_all_referenced_providers() {
+        // Synthetic multi-provider project — confirm EACH referenced
+        // provider's env var gets forwarded. Pin the rule that the
+        // forwarding set matches `referenced_env_vars` (which is
+        // the same set surfaced in .env.example, so the two never
+        // drift).
+        use aislang_core::ast::{ModelId, Project};
+        let mut bindings = BTreeMap::new();
+        bindings.insert("smart".to_string(),
+            ModelId { provider: "anthropic".into(), name: "claude_haiku_4_5".into() });
+        bindings.insert("alt".to_string(),
+            ModelId { provider: "openai".into(),    name: "gpt_4o_mini".into() });
+        bindings.insert("local".to_string(),
+            ModelId { provider: "ollama".into(),    name: "llama_3_1_8b".into() });
+        let resolved = aislang_resolver::ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  bindings,
+            prompt_hashes:   BTreeMap::new(),
+        };
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&artifacts.docker_compose).unwrap();
+        let env = value["services"]["litellm"]["environment"].as_sequence()
+            .expect("env list");
+        let strs: Vec<&str> = env.iter().filter_map(|v| v.as_str()).collect();
+        for expected in [
+            "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}",
+            "OPENAI_API_KEY=${OPENAI_API_KEY}",
+            "OLLAMA_API_BASE=${OLLAMA_API_BASE}",
+        ] {
+            assert!(strs.contains(&expected),
+                "expected forwarded var `{expected}` in litellm env; \
+                 got: {strs:?}");
+        }
+    }
+
+    #[test] fn litellm_env_forwarding_empty_when_no_providers() {
+        // Project with no model bindings → no provider creds → only
+        // AISLANG_CATALOG_VERSION in the env list. Pins that we
+        // don't emit empty `=${VAR}` lines for unreferenced providers
+        // (would be harmless but noisy).
+        use aislang_core::ast::Project;
+        let resolved = aislang_resolver::ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+        };
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&artifacts.docker_compose).unwrap();
+        let env = value["services"]["litellm"]["environment"].as_sequence()
+            .expect("env list");
+        let strs: Vec<&str> = env.iter().filter_map(|v| v.as_str()).collect();
+        // Only the catalog-version line; no forwarded provider vars.
+        assert!(strs.iter().any(|s| s.starts_with("AISLANG_CATALOG_VERSION=")));
+        for s in &strs {
+            assert!(!s.contains("${"),
+                "no `${{VAR}}` substitution lines expected when no \
+                 providers referenced; got `{s}`");
+        }
     }
 
     #[test] fn litellm_carries_host_docker_internal_extra_host() {

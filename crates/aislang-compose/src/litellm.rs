@@ -271,6 +271,39 @@ fn provider_creds(provider: &str) -> ProviderCreds {
 // `.env.example` generator
 // ============================================================================
 
+/// Compute the union of env-var names the project's resolved
+/// provider stack will consult at runtime.
+///
+/// Two sources merged + deduplicated:
+///   1. Provider-derived creds (`anthropic` → ANTHROPIC_API_KEY,
+///      `ollama` → OLLAMA_API_BASE, …) for every resolved primary
+///      `ModelId`.
+///   2. User-declared `secret { source = "env://X" }` blocks (X
+///      contributed verbatim).
+///
+/// Returned `BTreeSet<String>` is alphabetically sorted — both
+/// `generate_env_example` (the .env.example template) and
+/// `build_litellm_service` (the runtime container's env-forwarding
+/// list) consume the same set, so .env.example and what actually
+/// reaches LiteLLM at runtime stay in lockstep. If they ever
+/// diverge the user gets a silent "variable empty, can't reach
+/// provider" error — which is what shipped before this helper
+/// landed.
+pub fn referenced_env_vars(resolved: &ResolvedProject) -> BTreeSet<String> {
+    let mut vars: BTreeSet<String> = BTreeSet::new();
+    for model_id in resolved.model_bindings.values() {
+        let creds = provider_creds(&model_id.provider);
+        if let Some(v) = creds.api_key  { vars.insert(v.to_string()); }
+        if let Some(v) = creds.api_base { vars.insert(v.to_string()); }
+    }
+    for s in &resolved.project.secrets {
+        if let Some(var) = s.source.strip_prefix("env://") {
+            vars.insert(var.to_string());
+        }
+    }
+    vars
+}
+
 /// Build the `.env.example` content listing every env var the
 /// project's resolved providers will consult at runtime. Sorted +
 /// deterministic. The user copies this to `.env`, fills in the
@@ -300,28 +333,19 @@ fn provider_creds(provider: &str) -> ProviderCreds {
 /// become the canonical credential surface; the provider-creds table
 /// here becomes a fallback for projects that don't declare them.
 pub fn generate_env_example(resolved: &ResolvedProject) -> String {
-    use std::collections::BTreeSet;
     use std::fmt::Write;
 
-    // (1) provider-derived env vars (implicit path).
-    let mut vars: BTreeSet<String> = BTreeSet::new();
-    for model_id in resolved.model_bindings.values() {
-        let creds = provider_creds(&model_id.provider);
-        if let Some(v) = creds.api_key  { vars.insert(v.to_string()); }
-        if let Some(v) = creds.api_base { vars.insert(v.to_string()); }
-    }
+    // Env vars come from `referenced_env_vars` — shared with the
+    // litellm container env-forwarding logic so .env.example and
+    // what reaches LiteLLM at runtime stay in lockstep.
+    let vars = referenced_env_vars(resolved);
 
-    // (2) user-declared secret blocks (declared path). `env://X` adds
-    //     X to the env-var list (deduped against (1) — first occurrence
-    //     wins, which under BTreeSet semantics means the var is just
-    //     present, regardless of which source named it first).
-    //     Anything else (file://, future vault://…) goes into the
-    //     informational footer.
+    // Non-env-backed secret sources (file://, future vault://…) get
+    // listed in the informational footer block. Not part of the
+    // env-var set; can't be forwarded as runtime env.
     let mut other_sources: Vec<(&str, &str)> = Vec::new();
     for s in &resolved.project.secrets {
-        if let Some(var) = s.source.strip_prefix("env://") {
-            vars.insert(var.to_string());
-        } else {
+        if s.source.strip_prefix("env://").is_none() {
             other_sources.push((s.label.as_str(), s.source.as_str()));
         }
     }
