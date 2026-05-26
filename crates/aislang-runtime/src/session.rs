@@ -64,6 +64,9 @@ pub enum SessionError {
     #[error("MCP error: {0}")]
     Mcp(#[from] McpError),
 
+    #[error("spend tracker error: {0}")]
+    Spend(#[from] crate::spend::SpendError),
+
     #[error("model invoked unknown tool `{name}`. Known tools: {known}")]
     UnknownTool { name: String, known: String },
 
@@ -186,6 +189,12 @@ pub struct BudgetConfig {
     /// Cap from `budget.hard_cap_per_run`. `Money::Unlimited` means
     /// no cap (cap check always passes).
     pub per_run_cap:        Money,
+    /// Cap from `budget.hard_cap_per_day` (week 7 Thu). Enforced
+    /// against the persistent `SpendTracker` running total when one
+    /// is attached. `Money::Unlimited` means no daily cap. Without
+    /// a tracker, this field is informational only — the daily
+    /// check is skipped.
+    pub per_day_cap:        Money,
     /// Resolved primary model's `cost_input_per_1k_tokens` from the
     /// catalog. `Money::Unlimited` means the model's cost is
     /// unbounded → first non-zero-token completion busts any
@@ -221,6 +230,13 @@ pub struct Session {
     /// `Some(_)` → cost accumulated after each LiteLLM call;
     /// turn aborts when running total exceeds the cap.
     budget:        Option<BudgetConfig>,
+
+    /// Optional persistent daily-spend tracker (week 7 Thu). When
+    /// attached, each call's cost is added to `~/.aislang/spend.json`
+    /// (or test path) for the (project, utc_date) pair AND the
+    /// running today-spend is checked against `budget.per_day_cap`.
+    /// Detached (`None`) → no per-day persistence, no per-day cap.
+    tracker:       Option<crate::spend::SpendTracker>,
 }
 
 impl Session {
@@ -261,6 +277,7 @@ impl Session {
             mcp_clients,
             tools,
             budget:        None,
+            tracker:       None,
         })
     }
 
@@ -271,18 +288,26 @@ impl Session {
     /// let session = Session::open_with_tools(...)?
     ///     .with_budget(BudgetConfig {
     ///         per_run_cap:        Money::usd(500_000),  // $0.50
+    ///         per_day_cap:        Money::usd(50_000_000), // $50
     ///         cost_input_per_1k:  catalog_entry.cost_input,
     ///         cost_output_per_1k: catalog_entry.cost_output,
     ///     });
     /// ```
-    ///
-    /// Pass `None` (via not calling this) for no enforcement; pass
-    /// `Some(budget)` with `per_run_cap = Money::Unlimited` if you
-    /// want the cost-tracking accumulator to run but never trip
-    /// (useful for telemetry — though v0.1 doesn't expose the
-    /// accumulator yet; that's Thu's daily-spend tracker).
     pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Attach a persistent daily-spend tracker (week 7 Thu). Each
+    /// LiteLLM call's cost is added to the tracker after the per-run
+    /// cap check; if the resulting today-spend exceeds
+    /// `budget.per_day_cap`, the turn aborts with a synthetic
+    /// `"daily budget exceeded: <today> of <cap>"` reply.
+    ///
+    /// Without a tracker, the `per_day_cap` field in `BudgetConfig`
+    /// is informational only — the daily check is skipped.
+    pub fn with_tracker(mut self, tracker: crate::spend::SpendTracker) -> Self {
+        self.tracker = Some(tracker);
         self
     }
 
@@ -332,19 +357,33 @@ impl Session {
             let usage = response.usage.clone();
             let assistant = first_choice_message(response)?;
 
-            // ── Per-run cap check ─────────────────────────────────
-            // Add this call's cost to the running total, then test
-            // `running > cap`. Post-call (not pre-call) because we
-            // can't accurately project an as-yet-unmade call's
-            // tokens. The cap is a soft ceiling — exceeded by at
-            // most the last call's worth, which is acceptable per
-            // the v0.1 design discussion.
+            // ── Per-run + per-day cap checks ──────────────────────
+            // Order:
+            //   1. Compute this call's cost via the catalog prices.
+            //   2. Record the cost in the persistent daily tracker
+            //      FIRST (so even an about-to-abort call is paid for
+            //      — the provider charged us regardless of our cap
+            //      reaction).
+            //   3. Per-run cap check (Wed semantics).
+            //   4. Per-day cap check (Thu — only when both
+            //      `BudgetConfig.per_day_cap` AND a `SpendTracker`
+            //      are attached).
+            //
+            // Both caps use strict `>` — exactly-at-cap doesn't abort.
             if let (Some(budget), Some(u)) = (self.budget.as_ref(), usage.as_ref()) {
                 let call_cost = cost_of_usage(
                     &budget.cost_input_per_1k,
                     &budget.cost_output_per_1k,
                     u,
                 );
+
+                // (2) Daily tracker: persist BEFORE cap checks so
+                // even an aborting turn's cost lands on disk.
+                if let Some(tracker) = self.tracker.as_ref() {
+                    tracker.add(&call_cost)?;
+                }
+
+                // (3) Per-run cap (Wed)
                 running_cost = money_sum(&running_cost, &call_cost);
                 if running_cost > budget.per_run_cap {
                     return Ok(format!(
@@ -352,6 +391,19 @@ impl Session {
                         format_money(&running_cost),
                         format_money(&budget.per_run_cap),
                     ));
+                }
+
+                // (4) Per-day cap (Thu) — requires tracker for the
+                // running today-spend.
+                if let Some(tracker) = self.tracker.as_ref() {
+                    let today = tracker.today_spend();
+                    if today > budget.per_day_cap {
+                        return Ok(format!(
+                            "daily budget exceeded: {} of {} per-day cap",
+                            format_money(&today),
+                            format_money(&budget.per_day_cap),
+                        ));
+                    }
                 }
             }
             // ──────────────────────────────────────────────────────
@@ -947,8 +999,9 @@ mod tests {
     fn haiku_budget(per_run_cap: Money) -> BudgetConfig {
         BudgetConfig {
             per_run_cap,
-            cost_input_per_1k:  Money::usd(800),    // $0.0008/1k
-            cost_output_per_1k: Money::usd(4_000),  // $0.004/1k
+            per_day_cap:        Money::Unlimited,    // no daily cap by default
+            cost_input_per_1k:  Money::usd(800),     // $0.0008/1k
+            cost_output_per_1k: Money::usd(4_000),   // $0.004/1k
         }
     }
 
@@ -1087,6 +1140,7 @@ mod tests {
         mount_completion_with_usage(&server, 5_000, 10_000, "free response").await;
         let ollama_budget = BudgetConfig {
             per_run_cap:        Money::usd(0),
+            per_day_cap:        Money::Unlimited,
             cost_input_per_1k:  Money::usd(0),
             cost_output_per_1k: Money::usd(0),
         };
@@ -1103,5 +1157,149 @@ mod tests {
         let s = Session::open("fast", "sys", None).unwrap()
             .with_budget(haiku_budget(Money::usd(5_000)));
         assert!(s.budget.is_some());
+    }
+
+    // ================================================================
+    // Per-day cap enforcement (week 7 Thu)
+    // ================================================================
+
+    /// Helper: build a SpendTracker against a tempfile with a
+    /// pre-seeded today-spend (in µ-USD).
+    fn tracker_with_seed(project: &str, today_micro: i64) -> (crate::spend::SpendTracker, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aislang-session-spend-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spend.json");
+        if today_micro > 0 {
+            let today = crate::spend::utc_today();
+            let seed = format!(
+                r#"{{"schema_version": 1, "projects": {{ "{project}": {{ "{today}": {{ "micro_units": {today_micro} }} }} }} }}"#);
+            std::fs::write(&path, seed).unwrap();
+        }
+        let t = crate::spend::SpendTracker::at(project, path.clone()).unwrap();
+        (t, dir)
+    }
+
+    fn haiku_budget_with_day_cap(per_run: Money, per_day: Money) -> BudgetConfig {
+        BudgetConfig {
+            per_run_cap:        per_run,
+            per_day_cap:        per_day,
+            cost_input_per_1k:  Money::usd(800),
+            cost_output_per_1k: Money::usd(4_000),
+        }
+    }
+
+    // ---- per-day cap basic behavior ----
+
+    #[tokio::test]
+    async fn per_day_cap_triggers_when_pre_seed_pushes_over() {
+        // Pre-seed the tracker at $0.0095 (9_500 µ-USD), use a daily
+        // cap of $0.01 (10_000 µ-USD). A single Haiku call at
+        // 1k prompt + 500 completion = $0.0028 (2_800 µ-USD) pushes
+        // today's total to $0.0123 → over the daily cap → abort.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "real answer").await;
+        let (tracker, dir) = tracker_with_seed("demo", 9_500);
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget_with_day_cap(
+                Money::usd(1_000_000),  // huge per-run (no per-run abort)
+                Money::usd(10_000),     // $0.01 per-day
+            ))
+            .with_tracker(tracker);
+        let out = s.turn("hi").await.expect("turn ok");
+        assert!(out.starts_with("daily budget exceeded: "),
+            "expected daily-cap synthetic message; got: {out}");
+        assert!(out.contains("per-day cap"),
+            "message must mark it as the per-day cap; got: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn per_day_cap_not_triggered_when_under() {
+        // Pre-seed at $0.005, cap = $0.05. One call adds $0.0028 →
+        // total $0.0078 still under → no abort.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "real answer").await;
+        let (tracker, dir) = tracker_with_seed("demo", 5_000);
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget_with_day_cap(
+                Money::usd(1_000_000),
+                Money::usd(50_000),
+            ))
+            .with_tracker(tracker);
+        let out = s.turn("hi").await.expect("turn ok");
+        assert_eq!(out, "real answer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn per_day_cap_skipped_without_tracker() {
+        // BudgetConfig has a finite per_day_cap but no tracker
+        // attached → the daily check is silently skipped (the
+        // tracker is what carries the running today-spend; without
+        // it we have nothing to compare against).
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "real answer").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget_with_day_cap(
+                Money::usd(1_000_000),
+                Money::usd(1),   // crazy-tight $0.000001 cap
+            ));
+            // No .with_tracker() — daily check skipped.
+        let out = s.turn("hi").await.expect("turn ok");
+        assert_eq!(out, "real answer",
+            "without a tracker, per_day_cap is informational only");
+    }
+
+    #[tokio::test]
+    async fn tracker_persists_cost_even_on_per_run_abort() {
+        // Order-of-operations contract: cost lands on disk BEFORE
+        // the per-run cap aborts the turn. The provider charged us
+        // for the call; we record it.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "ignored").await;
+        let (tracker, dir) = tracker_with_seed("demo", 0);
+        let tracker_path = tracker.path().to_path_buf();
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget_with_day_cap(
+                Money::usd(1_000),       // $0.001 — per-run will trip
+                Money::Unlimited,         // no per-day cap
+            ))
+            .with_tracker(tracker);
+        let out = s.turn("hi").await.expect("turn ok");
+        assert!(out.starts_with("budget exceeded: "),
+            "expected per-run abort; got: {out}");
+        // The $0.0028 cost lands in the spend file despite the abort.
+        let re_opened = crate::spend::SpendTracker::at("demo", tracker_path).unwrap();
+        assert_eq!(re_opened.today_spend(), Money::usd(2_800),
+            "tracker must persist cost even when per-run cap aborts the turn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unlimited_per_day_cap_never_aborts() {
+        // Daily cap = Unlimited (matches `hard_cap_per_day = unlimited`
+        // in source). Tracker fills up arbitrarily; no abort.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1_000_000, 1_000_000, "unbounded").await;
+        let (tracker, dir) = tracker_with_seed("demo", i64::MAX / 2);
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget_with_day_cap(
+                Money::Unlimited,
+                Money::Unlimited,
+            ))
+            .with_tracker(tracker);
+        let out = s.turn("hi").await.expect("turn ok");
+        assert_eq!(out, "unbounded");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1164,6 +1164,7 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
                     model_id.provider, model_id.name))?;
             Some(BudgetConfig {
                 per_run_cap:        b.hard_cap_per_run,
+                per_day_cap:        b.hard_cap_per_day,
                 cost_input_per_1k:  entry.cost_input,
                 cost_output_per_1k: entry.cost_output,
             })
@@ -1171,7 +1172,19 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         None => None,
     };
 
-    // ── 7. open session, run interactive loop ──
+    // ── 7. open per-day spend tracker (week 7 Thu) ─────────────
+    // Only attach a tracker when a budget block is present — there's
+    // no point persisting spend for projects that don't declare
+    // caps. Failures to open the tracker (missing $HOME, corrupt
+    // file, future schema_version) bubble; the CLI surfaces the
+    // error and the user fixes the file.
+    let tracker = match budget_cfg.as_ref() {
+        Some(_) => Some(aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?),
+        None => None,
+    };
+
+    // ── 8. open session, run interactive loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1182,6 +1195,7 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         system_prompt,
         mcp_specs,
         budget_cfg,
+        tracker,
     ))
 }
 
@@ -1208,6 +1222,7 @@ async fn chat_interactive(
     system_prompt: String,
     mcp_specs:     Vec<(String, aislang_runtime::SpawnConfig)>,
     budget_cfg:    Option<aislang_runtime::BudgetConfig>,
+    tracker:       Option<aislang_runtime::SpendTracker>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1238,8 +1253,12 @@ async fn chat_interactive(
             mcp_clients,
             tool_registry,
         ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
-        match budget_cfg {
+        let s = match budget_cfg {
             Some(b) => s.with_budget(b),
+            None    => s,
+        };
+        match tracker {
+            Some(t) => s.with_tracker(t),
             None    => s,
         }
     };
