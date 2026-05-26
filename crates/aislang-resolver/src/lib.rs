@@ -16,6 +16,9 @@
 //! Week 4 Tue–Fri (planned): prompt file hashing, OCI image
 //! tag-to-digest pinning, lockfile reconciliation, Compose emission.
 
+pub mod lockfile;
+pub use lockfile::{Lockfile, LockfileDiff, LockfileError};
+
 use aislang_catalog::{Catalog, CatalogModel};
 use aislang_core::ast::{Model, ModelId, Project};
 use aislang_core::types::OptimizeFor;
