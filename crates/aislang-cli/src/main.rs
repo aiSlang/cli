@@ -328,6 +328,13 @@ fn run_plan(
     std::fs::write(&litellm_config_path, &artifacts.litellm_config)
         .map_err(|e| anyhow::anyhow!("write {}: {e}",
             litellm_config_path.display()))?;
+    // .env.example: regenerate freely (it's a template). Distinct from
+    // `.env` (user's secrets) — aislang plan must NEVER touch the
+    // latter; that file is governed by docker compose at runtime.
+    let env_example_path = output_dir.join(aislang_compose::ENV_EXAMPLE_FILENAME);
+    std::fs::write(&env_example_path, &artifacts.env_example)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}",
+            env_example_path.display()))?;
     let t_emit = t.elapsed();
 
     let t_total = t_total_start.elapsed();
@@ -339,6 +346,7 @@ fn run_plan(
     eprintln!();
     eprintln!("generated:");
     eprintln!("  litellm config:  {}", litellm_config_path.display());
+    eprintln!("  env example:     {}", env_example_path.display());
     if !no_lock {
         eprintln!("  lockfile:        {}", lock_path.display());
     }

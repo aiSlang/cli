@@ -36,21 +36,23 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
 
-/// Bundle of files emitted per plan run. v0.1 always emits both —
-/// `docker_compose` to stdout / `aislang plan` consumers, `litellm_config`
-/// to a file the user mounts into the LiteLLM container at runtime.
-///
-/// CLI writes both. Path embedded in the compose YAML for the LiteLLM
-/// volume mount points at the location the user has written
-/// `litellm_config` to (controlled by `aislang plan --output-dir`).
+/// Bundle of files emitted per plan run. CLI writes each to disk.
+/// `docker_compose` also goes to stdout for the `aislang plan | docker
+/// compose -f - up` pattern.
 pub struct ComposeArtifacts {
     pub docker_compose: String,
     pub litellm_config: String,
+    /// `.env.example` template listing every env var the user must
+    /// populate in their own `.env` before `docker compose up`. v0.1
+    /// (Wednesday) covers provider API keys / base URLs derived from
+    /// the resolved providers.
+    pub env_example:    String,
 }
 
-/// File name used for the LiteLLM config inside `output_dir`. Mirrored
-/// in the emitted compose YAML's volume mount so the two stay in sync.
+/// Filenames used inside `output_dir`. Mirrored in the emitted compose
+/// YAML's volume mount so the two stay in sync.
 pub const LITELLM_CONFIG_FILENAME: &str = "litellm_config.yaml";
+pub const ENV_EXAMPLE_FILENAME:    &str = ".env.example";
 
 // ============================================================================
 // Public entry point
@@ -84,9 +86,14 @@ pub fn emit(
     output_dir: &Path,
 ) -> Result<ComposeArtifacts, EmitError> {
     let litellm_config = litellm::generate_config(resolved, catalog)?;
+    let env_example    = litellm::generate_env_example(resolved);
     let compose        = build_compose(resolved, output_dir)?;
     let docker_compose = serde_yaml::to_string(&compose)?;
-    Ok(ComposeArtifacts { docker_compose, litellm_config })
+    Ok(ComposeArtifacts {
+        docker_compose,
+        litellm_config,
+        env_example,
+    })
 }
 
 // ============================================================================

@@ -2,3 +2,4 @@ model_list:
 - model_name: fast
   litellm_params:
     model: ollama/llama3.1:8b
+    api_base: os.environ/OLLAMA_API_BASE
