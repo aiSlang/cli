@@ -66,8 +66,22 @@ struct ComposeFile {
 #[derive(Serialize, Default)]
 struct Service {
     image: String,
+    /// Environment as a list of `KEY=value` strings — *not* a map.
+    ///
+    /// Rationale: Docker Compose's Go YAML 1.1 parser interprets
+    /// unquoted scalar values per YAML's implicit-typing rules. A
+    /// value like `2026-05-25` parses as `time.Time` and Compose
+    /// then rejects it with "invalid jsonType time.Time" because
+    /// env values must be strings. serde_yaml correctly quotes
+    /// numeric- and bool-shaped strings (`'true'`, `'50000000'`)
+    /// but misses date-shaped ones.
+    ///
+    /// List-form (`- KEY=value`) makes the whole pair a single
+    /// string token; YAML scalar-type ambiguity vanishes because
+    /// no unquoted scalar ever stands alone as the value. Compose
+    /// explicitly supports both forms.
     #[serde(skip_serializing_if = "Option::is_none")]
-    environment: Option<BTreeMap<String, String>>,
+    environment: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     volumes:     Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +92,13 @@ struct Service {
     command:     Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels:      Option<BTreeMap<String, String>>,
+}
+
+/// Convert a `BTreeMap<KEY, value>` into a sorted `Vec<"KEY=value">`
+/// for the env-list form. BTreeMap iteration order is already sorted,
+/// so the resulting Vec is deterministic.
+fn env_list(map: BTreeMap<String, String>) -> Vec<String> {
+    map.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
 #[derive(Serialize, Default)]
@@ -122,13 +143,11 @@ fn build_compose(resolved: &ResolvedProject) -> Result<ComposeFile, EmitError> {
 // ============================================================================
 
 fn build_mcp_service(mcp: &McpServer) -> Service {
-    let mut env: Option<BTreeMap<String, String>> = mcp.env.as_ref().map(|pairs| {
-        pairs.iter().cloned().collect()
+    let environment = mcp.env.as_ref().and_then(|pairs| {
+        if pairs.is_empty() { return None; }
+        let map: BTreeMap<String, String> = pairs.iter().cloned().collect();
+        Some(env_list(map))
     });
-    // Filter empty env down to None so YAML is tidy.
-    if let Some(m) = &env {
-        if m.is_empty() { env = None; }
-    }
 
     let volumes: Option<Vec<String>> = mcp.mount.as_ref().map(|p| {
         // Bind-mount the host directory into /data inside the container.
@@ -140,7 +159,7 @@ fn build_mcp_service(mcp: &McpServer) -> Service {
 
     Service {
         image:       format_image(&mcp.image),
-        environment: env,
+        environment,
         volumes,
         ports:       None,
         depends_on:  None,
@@ -162,7 +181,7 @@ fn build_litellm_service(resolved: &ResolvedProject) -> Result<Service, EmitErro
 
     Ok(Service {
         image:       "ghcr.io/berriai/litellm:main-stable".to_string(),
-        environment: Some(env),
+        environment: Some(env_list(env)),
         volumes:     None,
         ports:       Some(vec!["4000:4000".to_string()]),  // LiteLLM default
         depends_on:  None,
@@ -176,7 +195,7 @@ fn build_jaeger_service() -> Service {
     env.insert("COLLECTOR_OTLP_ENABLED".to_string(), "true".to_string());
     Service {
         image:       "jaegertracing/all-in-one:latest".to_string(),
-        environment: Some(env),
+        environment: Some(env_list(env)),
         volumes:     None,
         ports:       Some(vec![
             "16686:16686".to_string(),   // Jaeger UI
@@ -203,7 +222,7 @@ fn build_budget_counter_service(resolved: &ResolvedProject) -> Service {
     }
     Service {
         image:       "alpine:3.19".to_string(),
-        environment: Some(env),
+        environment: Some(env_list(env)),
         volumes:     None,
         ports:       None,
         depends_on:  None,
@@ -256,7 +275,7 @@ fn build_agent_runtime_service(resolved: &ResolvedProject) -> Service {
 
     Service {
         image:       "alpine:3.19".to_string(),
-        environment: Some(env),
+        environment: Some(env_list(env)),
         volumes:     None,
         ports,
         depends_on:  Some(depends),
@@ -398,6 +417,34 @@ mod tests {
                 "service `{}` missing aislang.generated label",
                 name.as_str().unwrap_or("?"));
         }
+    }
+
+    #[test] fn env_emitted_as_list_form_not_map() {
+        // Pins the fix for the Docker Compose
+        // "invalid jsonType time.Time" error: env values like
+        // `2026-05-25` (catalog version) were being emitted as
+        // unquoted YAML scalars and parsed as YAML 1.1 timestamps
+        // by Docker's Go YAML parser. List-form (`- KEY=value`)
+        // makes each pair one string token, bypassing scalar-type
+        // ambiguity entirely.
+        let yaml = emit_demo();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let litellm = &value["services"]["litellm"];
+        let env = litellm["environment"].as_sequence()
+            .expect("environment must be a YAML sequence (list-form), \
+                     not a mapping — see Docker Compose YAML 1.1 \
+                     date-shape bug doc on Service::environment field");
+        // Each element should be a string `KEY=value` with the value
+        // intact and no YAML-type coercion.
+        let any_catalog_ver = env.iter()
+            .filter_map(|s| s.as_str())
+            .find(|s| s.starts_with("AISLANG_CATALOG_VERSION="))
+            .expect("AISLANG_CATALOG_VERSION env var must be present");
+        // The literal "2026-05-25" must survive serialization round-
+        // trip as a plain string — no parsing to time.Time, no
+        // reformatting.
+        assert!(any_catalog_ver.ends_with("=2026-05-25"),
+            "catalog version must round-trip verbatim as a string; got `{any_catalog_ver}`");
     }
 
     #[test] fn project_without_agents_omits_agent_runtime() {
