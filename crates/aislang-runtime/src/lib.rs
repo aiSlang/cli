@@ -29,7 +29,7 @@ pub mod session;
 pub mod cost;
 
 pub use session::{
-    Session, SessionError, ToolRegistry, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
+    Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
     load_system_prompt, hex_sha256,
 };
 pub use litellm::{
@@ -37,4 +37,4 @@ pub use litellm::{
     Tool, ToolCall, ToolFunction, FunctionCall, UsageStats,
 };
 pub use mcp::{StdioChild, SpawnConfig, ToolSpec, ToolContent, McpError};
-pub use cost::{cost_of_usage, sum as money_sum};
+pub use cost::{cost_of_usage, sum as money_sum, format_money};

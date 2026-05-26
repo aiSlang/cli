@@ -34,6 +34,43 @@ use aislang_core::types::{Currency, Money};
 use crate::litellm::UsageStats;
 
 // ============================================================================
+// Money formatting — used by Session for the per-run cap synthetic message
+// ============================================================================
+
+/// Render a `Money` value as a human-readable currency string. Used
+/// in the "budget exceeded" synthetic message emitted by
+/// `Session::turn` (week 7 Wed) so users see the actual amounts in
+/// the failed-cap notice.
+///
+/// Format:
+///   - `Money::Unlimited` → `"unlimited"`.
+///   - `Money::Capped`:    `<symbol><decimal>`, e.g. `$0.0028`, `$50`,
+///     `€100.5`. Trailing zeros + lone trailing decimal point are
+///     trimmed for readability (`$50.000000` would be noise).
+pub fn format_money(m: &Money) -> String {
+    let (currency, micro_units) = match (m.currency(), m.micro_units()) {
+        (Some(c), Some(mu)) => (c, mu),
+        _                    => return "unlimited".to_string(),
+    };
+    let sym = match currency {
+        Currency::Usd => "$",
+        Currency::Eur => "€",
+        Currency::Gbp => "£",
+        Currency::Jpy => "¥",
+    };
+    // Format with 6 decimal places (the precision the Money parser
+    // accepts), then trim trailing zeros so `$50.000000` reads as
+    // `$50` and `$0.002800` reads as `$0.0028`.
+    let abs       = micro_units.abs();
+    let sign      = if micro_units < 0 { "-" } else { "" };
+    let whole     = abs / 1_000_000;
+    let frac      = abs % 1_000_000;
+    let raw       = format!("{whole}.{:06}", frac);
+    let trimmed   = raw.trim_end_matches('0').trim_end_matches('.');
+    format!("{sign}{sym}{trimmed}")
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -262,5 +299,36 @@ mod tests {
         // but the contract is: saturate, don't panic. Pin it.
         let total = sum(&Money::usd(i64::MAX), &Money::usd(i64::MAX));
         assert_eq!(total, Money::usd(i64::MAX));
+    }
+
+    // ---------------------------------------------------------------
+    // format_money
+    // ---------------------------------------------------------------
+
+    #[test] fn format_unlimited() {
+        assert_eq!(format_money(&Money::Unlimited), "unlimited");
+    }
+
+    #[test] fn format_round_dollar_trims_decimals() {
+        assert_eq!(format_money(&Money::usd(50_000_000)), "$50");
+    }
+
+    #[test] fn format_typical_sub_cent() {
+        // $0.0028 — the Anthropic Haiku 1k+500-tok cost from the
+        // cost_of_usage test. Pin the display.
+        assert_eq!(format_money(&Money::usd(2_800)), "$0.0028");
+    }
+
+    #[test] fn format_zero() {
+        assert_eq!(format_money(&Money::usd(0)), "$0");
+    }
+
+    #[test] fn format_one_decimal_kept() {
+        assert_eq!(format_money(&Money::usd(50_500_000)), "$50.5");
+    }
+
+    #[test] fn format_eur_currency_symbol() {
+        let m = Money::Capped { currency: Currency::Eur, micro_units: 100_000_000 };
+        assert_eq!(format_money(&m), "€100");
     }
 }

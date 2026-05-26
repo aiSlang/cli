@@ -15,11 +15,13 @@
 //! across turns is intentional (Decision rationale lives in PLAN
 //! week-6 Architectural Decisions).
 
+use crate::cost::{cost_of_usage, format_money, sum as money_sum};
 use crate::litellm::{
     ChatMessage, ChatRequest, ChatResponse, LiteLlmClient,
     LiteLlmError, Role, Tool, ToolCall, ToolFunction,
 };
 use crate::mcp::{McpError, StdioChild, ToolContent, ToolSpec};
+use aislang_core::types::Money;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -158,6 +160,42 @@ impl ToolRegistry {
 }
 
 // ============================================================================
+// `BudgetConfig` — per-run cap + the prices needed to enforce it
+// ============================================================================
+
+/// Per-run budget enforcement parameters (Decision 6, week 7 Wed).
+///
+/// `Session` carries an optional `BudgetConfig`. When set:
+///   1. After each LiteLLM call returns, the session computes the
+///      call's cost via `cost::cost_of_usage` using these two
+///      per-1k-token prices and the response's `UsageStats`.
+///   2. The cost rolls into a per-turn running total.
+///   3. If `running_total > per_run_cap` (Money's Ord — `Unlimited`
+///      as absorbing top), the current turn aborts with a synthetic
+///      `"budget exceeded: <total> of <cap> per-run cap"` reply.
+///      The session stays open — only this turn ends. The user can
+///      try a shorter prompt.
+///
+/// Construction lives in the CLI: pull `hard_cap_per_run` from the
+/// `.ais` source's budget block; pull the two prices from the
+/// catalog entry that matches the resolved primary `ModelId`. The
+/// runtime crate stays unaware of `aislang-catalog`'s struct shape
+/// — it just takes the two `Money` prices as data.
+#[derive(Debug, Clone)]
+pub struct BudgetConfig {
+    /// Cap from `budget.hard_cap_per_run`. `Money::Unlimited` means
+    /// no cap (cap check always passes).
+    pub per_run_cap:        Money,
+    /// Resolved primary model's `cost_input_per_1k_tokens` from the
+    /// catalog. `Money::Unlimited` means the model's cost is
+    /// unbounded → first non-zero-token completion busts any
+    /// `Capped` cap (correct: caller probably misconfigured).
+    pub cost_input_per_1k:  Money,
+    /// Resolved primary model's `cost_output_per_1k_tokens`.
+    pub cost_output_per_1k: Money,
+}
+
+// ============================================================================
 // `Session`
 // ============================================================================
 
@@ -176,6 +214,13 @@ pub struct Session {
     /// entries.
     mcp_clients:   Vec<StdioChild>,
     tools:         ToolRegistry,
+
+    /// Optional per-run cap configuration. `None` → no cap
+    /// enforcement (Money::Unlimited in the .ais source surfaces as
+    /// `None` here so the hot path skips cost computation entirely).
+    /// `Some(_)` → cost accumulated after each LiteLLM call;
+    /// turn aborts when running total exceeds the cap.
+    budget:        Option<BudgetConfig>,
 }
 
 impl Session {
@@ -215,7 +260,30 @@ impl Session {
             system_prompt: system_prompt.into(),
             mcp_clients,
             tools,
+            budget:        None,
         })
+    }
+
+    /// Attach a `BudgetConfig` to enable per-run cap enforcement.
+    /// Builder-style — chains off either constructor:
+    ///
+    /// ```ignore
+    /// let session = Session::open_with_tools(...)?
+    ///     .with_budget(BudgetConfig {
+    ///         per_run_cap:        Money::usd(500_000),  // $0.50
+    ///         cost_input_per_1k:  catalog_entry.cost_input,
+    ///         cost_output_per_1k: catalog_entry.cost_output,
+    ///     });
+    /// ```
+    ///
+    /// Pass `None` (via not calling this) for no enforcement; pass
+    /// `Some(budget)` with `per_run_cap = Money::Unlimited` if you
+    /// want the cost-tracking accumulator to run but never trip
+    /// (useful for telemetry — though v0.1 doesn't expose the
+    /// accumulator yet; that's Thu's daily-spend tracker).
+    pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Run one user turn → final assistant response.
@@ -238,6 +306,12 @@ impl Session {
             ChatMessage::text(Role::User,   user_input),
         ];
 
+        // Per-turn running cost (week 7 Wed). Initialized to $0; only
+        // mutated when `self.budget` is Some. Currency follows the
+        // catalog prices' currency (USD in the v0.1 catalog) — see
+        // `cost_of_usage`'s "Currency handling" doc.
+        let mut running_cost = Money::usd(0);
+
         for _iter in 0..MAX_TOOL_ITERS {
             let req = ChatRequest {
                 model:    self.model_label.clone(),
@@ -247,7 +321,40 @@ impl Session {
                 timeout:  None,
             };
             let response = self.litellm.send_chat_full(&req).await?;
+
+            // Capture usage BEFORE consuming the response into the
+            // assistant message. LiteLLM emits per-completion token
+            // counts at the top-level `usage` field; if missing
+            // (rare, but some upstream providers omit it) we can't
+            // attribute cost to this call and the running total
+            // doesn't move — cap stays effective for any future
+            // calls that DO report usage.
+            let usage = response.usage.clone();
             let assistant = first_choice_message(response)?;
+
+            // ── Per-run cap check ─────────────────────────────────
+            // Add this call's cost to the running total, then test
+            // `running > cap`. Post-call (not pre-call) because we
+            // can't accurately project an as-yet-unmade call's
+            // tokens. The cap is a soft ceiling — exceeded by at
+            // most the last call's worth, which is acceptable per
+            // the v0.1 design discussion.
+            if let (Some(budget), Some(u)) = (self.budget.as_ref(), usage.as_ref()) {
+                let call_cost = cost_of_usage(
+                    &budget.cost_input_per_1k,
+                    &budget.cost_output_per_1k,
+                    u,
+                );
+                running_cost = money_sum(&running_cost, &call_cost);
+                if running_cost > budget.per_run_cap {
+                    return Ok(format!(
+                        "budget exceeded: {} of {} per-run cap",
+                        format_money(&running_cost),
+                        format_money(&budget.per_run_cap),
+                    ));
+                }
+            }
+            // ──────────────────────────────────────────────────────
 
             // Did the model emit tool calls?
             let calls = match assistant.tool_calls.as_ref() {
@@ -352,6 +459,9 @@ impl Session {
     pub fn tool_count(&self)      -> usize { self.tools.len() }
     /// Number of MCP servers attached.
     pub fn mcp_server_count(&self) -> usize { self.mcp_clients.len() }
+    /// `true` iff a `BudgetConfig` is attached. Used by the CLI to
+    /// decide whether to advertise budget enforcement in the chat banner.
+    pub fn has_budget(&self)      -> bool  { self.budget.is_some() }
 }
 
 /// Extract the first choice's message; error on empty `choices[]`.
@@ -797,5 +907,201 @@ mod tests {
         };
         let m = first_choice_message(r).unwrap();
         assert_eq!(m.content.as_deref(), Some("x"));
+    }
+
+    // ================================================================
+    // Per-run cap enforcement (week 7 Wed)
+    // ================================================================
+
+    /// Helper: mount a wiremock that always returns a single
+    /// completion with the given (prompt, completion) token counts
+    /// and a fixed text content. Used by the cap tests below to
+    /// drive predictable per-call costs.
+    async fn mount_completion_with_usage(
+        server: &wiremock::MockServer,
+        prompt_tok: u32,
+        completion_tok: u32,
+        text: &str,
+    ) {
+        use wiremock::{Mock, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": text}
+            }],
+            "usage": {
+                "prompt_tokens":     prompt_tok,
+                "completion_tokens": completion_tok,
+                "total_tokens":      prompt_tok + completion_tok,
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server).await;
+    }
+
+    /// Helper: Anthropic-Haiku-shaped prices ($0.0008/1k input,
+    /// $0.004/1k output). Same numbers as `anthropic_haiku_typical_completion`
+    /// in `cost::tests` so the arithmetic is cross-checked.
+    fn haiku_budget(per_run_cap: Money) -> BudgetConfig {
+        BudgetConfig {
+            per_run_cap,
+            cost_input_per_1k:  Money::usd(800),    // $0.0008/1k
+            cost_output_per_1k: Money::usd(4_000),  // $0.004/1k
+        }
+    }
+
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn turn_with_no_budget_never_caps() {
+        // Existing Wed contract: no budget = no enforcement, even
+        // if the response carries massive usage stats. The session
+        // returns the model's content verbatim.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1_000_000, 1_000_000, "hi").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap();
+        // No `.with_budget(...)` — budget stays None.
+        let out = s.turn("hello").await.expect("turn ok");
+        assert_eq!(out, "hi",
+            "no budget → no cap check; model content returned verbatim");
+    }
+
+    #[tokio::test]
+    async fn turn_under_cap_returns_model_content() {
+        // Single call: $0.0008 × 1000/1000 + $0.004 × 500/1000 = $0.0028
+        // Cap: $0.005 → under → no abort.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "real answer").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget(Money::usd(5_000)));  // $0.005
+        let out = s.turn("hello").await.expect("turn ok");
+        assert_eq!(out, "real answer");
+    }
+
+    #[tokio::test]
+    async fn turn_over_cap_aborts_with_synthetic_message() {
+        // Same single call costs $0.0028; cap = $0.001 → exceeds →
+        // synthetic message replaces the model's content.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "real answer").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget(Money::usd(1_000)));  // $0.001
+        let out = s.turn("hello").await.expect("turn ok");
+        assert!(out.starts_with("budget exceeded: "),
+            "expected synthetic budget-exceeded message; got: {out}");
+        assert!(out.contains("$0.0028"),
+            "message must include running total; got: {out}");
+        assert!(out.contains("$0.001"),
+            "message must include the cap; got: {out}");
+        assert!(out.contains("per-run cap"),
+            "message must mark it as the per-run cap; got: {out}");
+    }
+
+    #[tokio::test]
+    async fn turn_at_exactly_cap_is_under() {
+        // running == cap → NOT over → no abort (strict `>` comparison).
+        // 1k input + 500 output @ Haiku rates = $0.0028 exactly.
+        // Cap = $0.0028 → running == cap → must NOT abort.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "still ok").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget(Money::usd(2_800)));  // $0.0028
+        let out = s.turn("hello").await.expect("turn ok");
+        assert_eq!(out, "still ok",
+            "running_total exactly at cap must NOT abort (strict `>`); got: {out}");
+    }
+
+    #[tokio::test]
+    async fn turn_with_unlimited_cap_never_aborts() {
+        // BudgetConfig is set (so cost accumulator runs) but the cap
+        // is Money::Unlimited. With Money's Ord, `Capped(X) >
+        // Unlimited` is always false → cap never trips, no matter
+        // how expensive the call.
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1_000_000, 1_000_000, "unbounded").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget(Money::Unlimited));
+        let out = s.turn("hello").await.expect("turn ok");
+        assert_eq!(out, "unbounded");
+    }
+
+    #[tokio::test]
+    async fn turn_without_usage_does_not_move_running_total() {
+        // Some providers don't populate `usage`. The session must
+        // gracefully accept the call (don't bust the loop) without
+        // accumulating cost. Effectively: skip cost-tracking for this
+        // call; cap stays enforceable against future calls that DO
+        // report usage.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "no usage"}}]
+            // No `usage` field.
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server).await;
+        // Tiny cap — would normally bust on any non-zero-cost call.
+        // Without usage, running_total stays at $0 → no abort.
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget(Money::usd(1)));  // 1 µ-USD
+        let out = s.turn("hello").await.expect("turn ok");
+        assert_eq!(out, "no usage",
+            "missing usage → no cost accumulated → no abort");
+    }
+
+    #[tokio::test]
+    async fn turn_synthetic_message_format_is_stable() {
+        // Pin the message format for any external tooling that
+        // grep's for it. The format is:
+        //   `budget exceeded: <running> of <cap> per-run cap`
+        // Both amounts use `format_money` (no trailing zeros).
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 1000, 500, "ignored").await;
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(haiku_budget(Money::usd(1_000)));
+        let out = s.turn("hi").await.expect("turn ok");
+        assert_eq!(out, "budget exceeded: $0.0028 of $0.001 per-run cap",
+            "format drift detected — update any external tooling that \
+             pattern-matches this line");
+    }
+
+    #[tokio::test]
+    async fn ollama_zero_cost_never_caps() {
+        // Bundled catalog has Ollama at $0/$0. Even with a hard zero
+        // cap ($0), a zero-cost completion stays at running == 0 == cap
+        // → strict `>` is false → no abort. Free local-model path is
+        // always safe under any Capped cap (including $0).
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_completion_with_usage(&server, 5_000, 10_000, "free response").await;
+        let ollama_budget = BudgetConfig {
+            per_run_cap:        Money::usd(0),
+            cost_input_per_1k:  Money::usd(0),
+            cost_output_per_1k: Money::usd(0),
+        };
+        let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
+            .with_budget(ollama_budget);
+        let out = s.turn("hello").await.expect("turn ok");
+        assert_eq!(out, "free response",
+            "Ollama zero-cost path must work under ANY Capped cap");
+    }
+
+    #[test] fn with_budget_chains_off_open() {
+        // Builder ergonomics: with_budget returns the session, so
+        // construction can be one-liner. Verify the field is set.
+        let s = Session::open("fast", "sys", None).unwrap()
+            .with_budget(haiku_budget(Money::usd(5_000)));
+        assert!(s.budget.is_some());
     }
 }

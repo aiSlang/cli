@@ -1139,7 +1139,39 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         }));
     }
 
-    // ── 6. open session, run interactive loop ──
+    // ── 6. resolve model + build per-run budget config (week 7 Wed) ──
+    // The session needs catalog-derived per-1k-token prices to compute
+    // running cost. We run the resolver inline (same logic as `plan`)
+    // to find the primary `ModelId` for this agent's model, then look
+    // up its catalog entry. Resolution failures bubble — same UX as
+    // `aislang plan` on the same source.
+    use aislang_runtime::BudgetConfig;
+    let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
+        Some(b) => {
+            let resolved = aislang_resolver::resolve_against_bundled_catalog(
+                &project, source_dir,
+            ).map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+            let model_id = resolved.model_bindings.get(&model_label)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "model `{model_label}` has no resolved binding — \
+                     resolver returned an empty set?"))?;
+            let catalog = aislang_catalog::bundled()
+                .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
+            let entry = catalog.find(model_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "catalog entry `{}.{}` (resolved primary for `{model_label}`) \
+                     not found in bundled catalog",
+                    model_id.provider, model_id.name))?;
+            Some(BudgetConfig {
+                per_run_cap:        b.hard_cap_per_run,
+                cost_input_per_1k:  entry.cost_input,
+                cost_output_per_1k: entry.cost_output,
+            })
+        }
+        None => None,
+    };
+
+    // ── 7. open session, run interactive loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1149,6 +1181,7 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         &model_label,
         system_prompt,
         mcp_specs,
+        budget_cfg,
     ))
 }
 
@@ -1174,6 +1207,7 @@ async fn chat_interactive(
     model_label:   &str,
     system_prompt: String,
     mcp_specs:     Vec<(String, aislang_runtime::SpawnConfig)>,
+    budget_cfg:    Option<aislang_runtime::BudgetConfig>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1196,13 +1230,19 @@ async fn chat_interactive(
     let tool_registry = aislang_runtime::ToolRegistry::from_servers(&server_tools);
     let tool_count    = tool_registry.len();
 
-    let session = aislang_runtime::Session::open_with_tools(
-        model_label,
-        system_prompt,
-        None, // default http://localhost:4000
-        mcp_clients,
-        tool_registry,
-    ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
+    let session = {
+        let s = aislang_runtime::Session::open_with_tools(
+            model_label,
+            system_prompt,
+            None, // default http://localhost:4000
+            mcp_clients,
+            tool_registry,
+        ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
+        match budget_cfg {
+            Some(b) => s.with_budget(b),
+            None    => s,
+        }
+    };
 
     // Banner — stderr so stdout stays pipe-clean for the model output.
     eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`)");
@@ -1210,6 +1250,9 @@ async fn chat_interactive(
     if tool_count > 0 {
         eprintln!("tools: {tool_count} available across {} MCP server{}",
             mcp_specs.len(), if mcp_specs.len() == 1 { "" } else { "s" });
+    }
+    if session.has_budget() {
+        eprintln!("budget: per-run cap enforcement enabled");
     }
     eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
     eprintln!();
