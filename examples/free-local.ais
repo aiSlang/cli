@@ -1,0 +1,58 @@
+// examples/free-local.ais — the "no caps, free local model" demo.
+//
+// Companion to support-agent.ais (cloud-first, capped budget). This file
+// showcases:
+//   1. `hard_cap_per_day = unlimited` + `hard_cap_per_run = unlimited`
+//      (Decision 10, week 7 Mon) — the Money::Unlimited literal.
+//   2. Pin to ollama.llama_3_1_8b — zero-cost in the v0.1 catalog
+//      ($0/$0), so even with caps, this would never trigger them.
+//   3. Tool-less agent (`tools = []`) — no MCP children spawned by
+//      `aislang chat`, so the live path works without Docker pulling
+//      mcp/filesystem.
+//
+// Run:
+//   aislang validate examples/free-local.ais
+//   aislang apply examples/free-local.ais
+//   echo "say hi" | aislang chat assistant examples/free-local.ais
+//
+// Prereqs: Ollama running on the host with llama3.1:8b downloaded.
+// Set `OLLAMA_API_BASE=http://host.docker.internal:11434` in the
+// generated .env (or copy from .env.example).
+
+project "free-local" {
+  budget {
+    hard_cap_per_day = unlimited
+    hard_cap_per_run = unlimited
+    optimize_for     = cost
+  }
+
+  model "local" {
+    requires    = [chat]
+    context_min = 32k
+    // Pin to Ollama directly — no cloud failover. The resolver
+    // requires pin to also appear in prefer/fallback (a v0.1
+    // invariant ensuring pinned IDs are always candidate-eligible).
+    // Catalog cost for this entry is $0/$0, so the running spend
+    // stays at zero regardless of token volume.
+    prefer = [ollama.llama_3_1_8b]
+    pin    = ollama.llama_3_1_8b
+  }
+
+  prompt "system" {
+    file    = "./prompts/system.md"
+    version = "1.0.0"
+  }
+
+  agent "assistant" {
+    model         = model.local
+    system_prompt = prompt.system
+    // No tools — keeps the v0.1 chat path Docker-free except for the
+    // LiteLLM container itself. Add `mcp_server` refs here when you
+    // need filesystem / git / database tool use.
+    tools = []
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}

@@ -77,6 +77,7 @@ dependencies = [
 name = "aislang-runtime"
 version = "0.1.0-dev"
 dependencies = [
+ "aislang-core",
  "reqwest",
  "rmcp",
  "serde",

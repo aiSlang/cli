@@ -12,14 +12,17 @@ rust-version.workspace = true
 # rmcp gives us the official MCP client + child-process transport.
 # Decision 5 (PLAN week 6): v0.1 spawns MCP servers as `docker run -i`
 # stdio children; rmcp's TokioChildProcess is the wire integration.
-rmcp        = { workspace = true }
-tokio       = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-thiserror   = { workspace = true }
+rmcp         = { workspace = true }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
 # week-6 Wed
-reqwest     = { workspace = true }
-sha2        = { workspace = true }
+reqwest      = { workspace = true }
+sha2         = { workspace = true }
+# week-7 Tue: cost arithmetic needs Money + Currency from core's types.
+# Decision 6: budget enforcement lives in this crate, not LiteLLM config.
+aislang-core = { workspace = true }
 
 [dev-dependencies]
 # wiremock — Rust port of WireMock; lets us spin up a fake HTTP server
