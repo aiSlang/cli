@@ -48,6 +48,12 @@ enum Command {
         /// `aislang.lock`.
         #[arg(long)]
         no_lock: bool,
+        /// Directory to write generated artifacts (litellm_config.yaml,
+        /// aislang.lock). Defaults to the source file's directory. The
+        /// emitted Compose YAML embeds absolute paths so the user can
+        /// `docker compose -f - up` from anywhere.
+        #[arg(short = 'o', long)]
+        output_dir: Option<PathBuf>,
     },
     /// Apply the plan — deploy the stack via Docker Compose
     Apply {
@@ -93,7 +99,8 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate { file, verbose }            => run_validate(file, verbose),
-        Command::Plan     { file, verbose, no_lock }   => run_plan(file, verbose, no_lock),
+        Command::Plan { file, verbose, no_lock, output_dir } =>
+            run_plan(file, verbose, no_lock, output_dir),
         Command::Apply { file: _ }   => stub("apply",   6),
         Command::Destroy { file: _ } => stub("destroy", 10),
         Command::Eval { file: _ }    => stub("eval",    8),
@@ -218,10 +225,28 @@ fn render_validate_error(source: &str, err: &aislang_core::ValidateError) {
 // `aislang plan` — Friday of week 4
 // ============================================================================
 
-fn run_plan(file: PathBuf, verbose: u8, no_lock: bool) -> Result<()> {
+fn run_plan(
+    file:       PathBuf,
+    verbose:    u8,
+    no_lock:    bool,
+    output_dir: Option<PathBuf>,
+) -> Result<()> {
     let source = std::fs::read_to_string(&file)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
     let source_dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    // Resolve the output dir: explicit --output-dir wins; otherwise
+    // default to the source file's directory. Canonicalised to an
+    // absolute path so the emitted Compose YAML embeds an unambiguous
+    // host-side mount path (works regardless of `docker compose`'s CWD).
+    let output_dir: PathBuf = match output_dir {
+        Some(p) => p,
+        None    => source_dir.to_path_buf(),
+    };
+    let output_dir = std::fs::canonicalize(&output_dir).map_err(|e| {
+        anyhow::anyhow!("output dir `{}` doesn't exist or unreadable: {e}",
+            output_dir.display())
+    })?;
 
     let t_total_start = std::time::Instant::now();
 
@@ -253,8 +278,9 @@ fn run_plan(file: PathBuf, verbose: u8, no_lock: bool) -> Result<()> {
     let t_resolve = t.elapsed();
 
     // ── Stage 4: lockfile reconcile (unless --no-lock) ──
+    // Lockfile and litellm config both live under `output_dir`.
     let t = std::time::Instant::now();
-    let lock_path = source_dir.join("aislang.lock");
+    let lock_path = output_dir.join("aislang.lock");
     let lockfile_status: &str = if no_lock {
         "skipped (--no-lock)"
     } else {
@@ -292,16 +318,30 @@ fn run_plan(file: PathBuf, verbose: u8, no_lock: bool) -> Result<()> {
     };
     let t_lock = t.elapsed();
 
-    // ── Stage 5: emit Compose YAML ──
+    // ── Stage 5: emit Compose + LiteLLM config; write the latter ──
     let t = std::time::Instant::now();
-    let compose_yaml = aislang_compose::emit(&resolved)
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
+    let artifacts = aislang_compose::emit(&resolved, &catalog, &output_dir)
         .map_err(|e| anyhow::anyhow!("compose emit error: {e}"))?;
+    let litellm_config_path = output_dir.join(aislang_compose::LITELLM_CONFIG_FILENAME);
+    std::fs::write(&litellm_config_path, &artifacts.litellm_config)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}",
+            litellm_config_path.display()))?;
     let t_emit = t.elapsed();
 
     let t_total = t_total_start.elapsed();
 
-    // ── Output: YAML on stdout (pipeable into `docker compose -f - up`) ──
-    print!("{compose_yaml}");
+    // ── Output: Compose YAML on stdout (pipeable into `docker compose -f - up`) ──
+    print!("{}", artifacts.docker_compose);
+
+    // ── Generated-file paths on stderr (so stdout stays pipe-clean) ──
+    eprintln!();
+    eprintln!("generated:");
+    eprintln!("  litellm config:  {}", litellm_config_path.display());
+    if !no_lock {
+        eprintln!("  lockfile:        {}", lock_path.display());
+    }
 
     // ── Warnings on stderr after the YAML (so stdout stays clean) ──
     if !warnings.is_empty() {

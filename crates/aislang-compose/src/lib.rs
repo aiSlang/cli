@@ -27,12 +27,30 @@
 
 pub mod litellm;
 
+use aislang_catalog::Catalog;
 use aislang_core::ast::McpServer;
 use aislang_core::types::OciImage;
 use aislang_resolver::ResolvedProject;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 use thiserror::Error;
+
+/// Bundle of files emitted per plan run. v0.1 always emits both —
+/// `docker_compose` to stdout / `aislang plan` consumers, `litellm_config`
+/// to a file the user mounts into the LiteLLM container at runtime.
+///
+/// CLI writes both. Path embedded in the compose YAML for the LiteLLM
+/// volume mount points at the location the user has written
+/// `litellm_config` to (controlled by `aislang plan --output-dir`).
+pub struct ComposeArtifacts {
+    pub docker_compose: String,
+    pub litellm_config: String,
+}
+
+/// File name used for the LiteLLM config inside `output_dir`. Mirrored
+/// in the emitted compose YAML's volume mount so the two stay in sync.
+pub const LITELLM_CONFIG_FILENAME: &str = "litellm_config.yaml";
 
 // ============================================================================
 // Public entry point
@@ -45,13 +63,30 @@ pub enum EmitError {
 
     #[error("JSON serialization failed (LiteLLM env): {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("LiteLLM config generation failed: {0}")]
+    LitellmConfig(#[from] litellm::ConfigError),
 }
 
-/// Emit the docker-compose YAML for the resolved project. Returns the
-/// YAML as a String suitable for `docker compose -f - up`.
-pub fn emit(resolved: &ResolvedProject) -> Result<String, EmitError> {
-    let compose = build_compose(resolved)?;
-    Ok(serde_yaml::to_string(&compose)?)
+/// Emit the docker-compose YAML + the LiteLLM config YAML for the
+/// resolved project. The compose YAML embeds an absolute volume-mount
+/// path pointing at `<output_dir>/litellm_config.yaml` — the caller
+/// (typically `aislang plan`) is responsible for writing the config
+/// file there.
+///
+/// `output_dir` should already be an absolute path (callers obtain
+/// this by canonicalising the source directory or the user-supplied
+/// `--output-dir`). Absolute paths in the compose YAML mean
+/// `docker compose -f - up` works regardless of the user's CWD.
+pub fn emit(
+    resolved:   &ResolvedProject,
+    catalog:    &Catalog,
+    output_dir: &Path,
+) -> Result<ComposeArtifacts, EmitError> {
+    let litellm_config = litellm::generate_config(resolved, catalog)?;
+    let compose        = build_compose(resolved, output_dir)?;
+    let docker_compose = serde_yaml::to_string(&compose)?;
+    Ok(ComposeArtifacts { docker_compose, litellm_config })
 }
 
 // ============================================================================
@@ -110,7 +145,7 @@ struct Volume {}
 // Top-level builder
 // ============================================================================
 
-fn build_compose(resolved: &ResolvedProject) -> Result<ComposeFile, EmitError> {
+fn build_compose(resolved: &ResolvedProject, output_dir: &Path) -> Result<ComposeFile, EmitError> {
     let mut services: BTreeMap<String, Service> = BTreeMap::new();
 
     // (a) one service per mcp_server block.
@@ -118,8 +153,10 @@ fn build_compose(resolved: &ResolvedProject) -> Result<ComposeFile, EmitError> {
         services.insert(format!("mcp_{}", mcp.label), build_mcp_service(mcp));
     }
 
-    // (b) LiteLLM sidecar — central provider router.
-    services.insert("litellm".to_string(), build_litellm_service(resolved)?);
+    // (b) LiteLLM sidecar — central provider router. Reads its routing
+    // table from `output_dir/litellm_config.yaml`, mounted in.
+    services.insert("litellm".to_string(),
+                    build_litellm_service(resolved, output_dir)?);
 
     // (c) Jaeger sidecar — OTLP receiver + UI.
     services.insert("jaeger".to_string(), build_jaeger_service());
@@ -170,24 +207,36 @@ fn build_mcp_service(mcp: &McpServer) -> Service {
     }
 }
 
-fn build_litellm_service(resolved: &ResolvedProject) -> Result<Service, EmitError> {
-    // Model bindings surfaced as an env-var JSON blob. Week 5 will
-    // mount a real config file from a generated litellm-config.yaml;
-    // env-var passthrough keeps the v0.1 skeleton dependency-free.
-    let bindings_json = serde_json::to_string(&resolved.model_bindings)?;
-
+fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
+    -> Result<Service, EmitError>
+{
+    // Catalog version stays as an env var for traceability — useful
+    // when debugging "which catalog version was the running stack
+    // resolved against?" — and also keeps env-as-list-form coverage
+    // (one of our regression tests pins the YAML-1.1-date workaround
+    // and needs SOMETHING with a date-shaped value here).
     let mut env = BTreeMap::new();
-    env.insert("AISLANG_MODEL_BINDINGS".to_string(), bindings_json);
     env.insert("AISLANG_CATALOG_VERSION".to_string(),
                resolved.catalog_version.clone());
+
+    // Mount the generated config file at /app/config.yaml. The host
+    // path is absolute to keep `docker compose -f -` portable across
+    // the user's CWD.
+    let host_config = output_dir.join(LITELLM_CONFIG_FILENAME);
+    let volume_spec = format!("{}:/app/config.yaml:ro", host_config.display());
 
     Ok(Service {
         image:       "ghcr.io/berriai/litellm:main-stable".to_string(),
         environment: Some(env_list(env)),
-        volumes:     None,
+        volumes:     Some(vec![volume_spec]),
         ports:       Some(vec!["4000:4000".to_string()]),  // LiteLLM default
         depends_on:  None,
-        command:     None,
+        command:     Some(vec![
+            "--config".to_string(),
+            "/app/config.yaml".to_string(),
+            "--port".to_string(),
+            "4000".to_string(),
+        ]),
         labels:      Some(aislang_labels("litellm")),
     })
 }
@@ -326,7 +375,7 @@ mod tests {
     /// structural properties of the emitted compose YAML; the demo
     /// fixture provides one model, one prompt, one mcp_server, one
     /// agent, one eval, one deploy.
-    fn emit_demo() -> String {
+    fn emit_demo() -> ComposeArtifacts {
         let src_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..").join("..")
             .join("examples").join("support-agent.ais");
@@ -336,37 +385,80 @@ mod tests {
         let resolved = aislang_resolver::resolve_against_bundled_catalog(
             &project, examples_dir,
         ).expect("resolve");
-        emit(&resolved).expect("emit")
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        emit(&resolved, &catalog, examples_dir).expect("emit")
+    }
+
+    fn emit_demo_yaml() -> String {
+        emit_demo().docker_compose
     }
 
     #[test] fn emitted_yaml_round_trips() {
         // Structural validity: parse the emitted YAML back into a
         // generic structure. If serde_yaml accepts it, downstream
         // `docker compose -f - config -q` will too.
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         let _: serde_yaml::Value = serde_yaml::from_str(&yaml)
             .expect("emitted YAML must parse back via serde_yaml");
     }
 
     #[test] fn emits_one_service_per_mcp_server() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         // demo has mcp_server "docs"
         assert!(yaml.contains("mcp_docs:"),
             "expected `mcp_docs:` service in output; got:\n{yaml}");
     }
 
-    #[test] fn emits_litellm_sidecar_with_model_bindings_env() {
-        let yaml = emit_demo();
+    #[test] fn emits_litellm_with_mounted_config() {
+        // Week-5-Tuesday change: LiteLLM no longer carries the
+        // model bindings as an env-var JSON blob. They live in a
+        // YAML file mounted at /app/config.yaml; the service's
+        // command points at it via --config.
+        let yaml = emit_demo_yaml();
         assert!(yaml.contains("litellm:"));
         assert!(yaml.contains("ghcr.io/berriai/litellm:main-stable"));
-        assert!(yaml.contains("AISLANG_MODEL_BINDINGS"));
-        // The demo resolves to ollama.llama_3_1_8b under cost-opt;
-        // the JSON blob should contain that.
-        assert!(yaml.contains("llama_3_1_8b"));
+
+        // Mount of the host config file at the container path.
+        assert!(yaml.contains("litellm_config.yaml:/app/config.yaml:ro"),
+            "expected litellm to mount the generated config:\n{yaml}");
+
+        // Command points at the mounted file.
+        assert!(yaml.contains("--config"));
+        assert!(yaml.contains("/app/config.yaml"));
+
+        // Placeholder env var that used to carry the JSON blob is gone.
+        assert!(!yaml.contains("AISLANG_MODEL_BINDINGS"),
+            "AISLANG_MODEL_BINDINGS env var should be removed in week-5 Tue:\n{yaml}");
+    }
+
+    #[test] fn emit_returns_litellm_config_alongside_compose() {
+        let artifacts = emit_demo();
+        // Both files generated.
+        assert!(!artifacts.docker_compose.is_empty());
+        assert!(!artifacts.litellm_config.is_empty());
+        // litellm_config has the expected shape — one entry for `fast`.
+        assert!(artifacts.litellm_config.contains("model_list:"));
+        assert!(artifacts.litellm_config.contains("model_name: fast"));
+        assert!(artifacts.litellm_config.contains("model: ollama/llama3.1:8b"));
+    }
+
+    #[test] fn litellm_volume_uses_absolute_host_path() {
+        // The host-side path in the volume mount must be absolute so
+        // `docker compose -f - up` works regardless of the user's CWD.
+        let yaml = emit_demo_yaml();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let volumes = value["services"]["litellm"]["volumes"]
+            .as_sequence().expect("litellm.volumes is a list");
+        let mount = volumes[0].as_str().expect("first volume is a string");
+        let host_side = mount.split(':').next().expect("split on ':'");
+        assert!(host_side.starts_with('/'),
+            "host path must be absolute; got `{host_side}` in `{mount}`");
+        assert!(host_side.ends_with("/litellm_config.yaml"),
+            "host path must point at litellm_config.yaml; got `{host_side}`");
     }
 
     #[test] fn emits_jaeger_with_otlp_ports() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         assert!(yaml.contains("jaeger:"));
         assert!(yaml.contains("jaegertracing/all-in-one"));
         assert!(yaml.contains("16686:16686"));   // UI
@@ -374,7 +466,7 @@ mod tests {
     }
 
     #[test] fn emits_budget_counter_with_cap_env_vars() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         assert!(yaml.contains("budget_counter:"));
         assert!(yaml.contains("AISLANG_HARD_CAP_PER_DAY_MICRO"));
         assert!(yaml.contains("AISLANG_HARD_CAP_PER_RUN_MICRO"));
@@ -383,7 +475,7 @@ mod tests {
     }
 
     #[test] fn agent_runtime_depends_on_sidecars() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         assert!(yaml.contains("agent_runtime:"));
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let agent = &value["services"]["agent_runtime"];
@@ -396,19 +488,19 @@ mod tests {
     }
 
     #[test] fn agent_runtime_carries_prompt_hashes_as_env() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         // Demo prompt is labelled "system" → AISLANG_PROMPT_HASH_SYSTEM
         assert!(yaml.contains("AISLANG_PROMPT_HASH_SYSTEM"));
     }
 
     #[test] fn agent_runtime_exposes_deploy_ports() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         // Demo's deploy.expose has { port = 8080 } → "8080:8080"
         assert!(yaml.contains("8080:8080"));
     }
 
     #[test] fn all_services_labelled_aislang() {
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let services = value["services"].as_mapping().expect("services map");
         for (name, svc) in services {
@@ -429,7 +521,7 @@ mod tests {
         // by Docker's Go YAML parser. List-form (`- KEY=value`)
         // makes each pair one string token, bypassing scalar-type
         // ambiguity entirely.
-        let yaml = emit_demo();
+        let yaml = emit_demo_yaml();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let litellm = &value["services"]["litellm"];
         let env = litellm["environment"].as_sequence()
@@ -459,8 +551,11 @@ mod tests {
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
         };
-        let yaml = emit(&resolved).expect("emit");
-        assert!(!yaml.contains("agent_runtime:"),
-            "expected no agent_runtime when project has no agents;\n{yaml}");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        assert!(!artifacts.docker_compose.contains("agent_runtime:"),
+            "expected no agent_runtime when project has no agents;\n{}",
+            artifacts.docker_compose);
     }
 }
