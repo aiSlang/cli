@@ -66,7 +66,14 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("aislang: {e:#}");
+            let msg = format!("{e:#}");
+            // The sentinel "(see error above)" signals: subcommand
+            // already rendered its own diagnostic (e.g. validate's
+            // source-aware snippet output); skip the redundant
+            // "aislang: …" prefix.
+            if msg != "(see error above)" {
+                eprintln!("aislang: {msg}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -135,13 +142,44 @@ fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
             Ok(())
         }
         Err(validate_err) => {
-            // Verbose diagnostics on the failure path. When a converter
-            // rejects something, the grammar parse itself succeeded —
-            // show the partial RawBlock tree that was being converted.
+            // Source-aware error rendering (week-3 Thursday).
+            //
+            // For Parse(Vec<ParseError>): grammar-level errors carry
+            // span info → render with line:col + 2-3-line snippet +
+            // caret pointer. Converter-level errors carry span = None
+            // → render as plain message.
+            //
+            // For Type/UnresolvedRef errors: no AST-side span info
+            // tracked yet (per-AST-node span propagation is a future-
+            // week enhancement) → plain message.
+            match &validate_err {
+                aislang_core::ValidateError::Parse(errors) => {
+                    for err in errors {
+                        match &err.span {
+                            Some(span) => {
+                                eprint!("{}", aislang_core::diagnostic::render_with_source(
+                                    &source,
+                                    span.clone(),
+                                    aislang_core::diagnostic::Severity::Error,
+                                    &err.message,
+                                ));
+                            }
+                            None => eprintln!("aislang: parse error: {}", err.message),
+                        }
+                    }
+                }
+                other => eprintln!("aislang: {other}"),
+            }
+
+            // Failure-path verbose diagnostic from week-2 Wed —
+            // partial RawBlock tree when grammar succeeded but
+            // conversion failed. Independent of source rendering.
             if verbose >= 1 {
                 emit_failure_diagnostic(&source, verbose);
             }
-            Err(anyhow::anyhow!("{validate_err}"))
+            // We've already rendered the error message above; bubble a
+            // sentinel up so main() exits non-zero without re-printing.
+            Err(anyhow::anyhow!("(see error above)"))
         }
     }
 }

@@ -26,29 +26,62 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 // ============================================================================
+// Parse-error type — preserves chumsky span info for source-aware
+// rendering (week-3 Thursday). Converter errors (to_project / to_budget
+// / …) have no AST-side span info today, so they carry `span = None`;
+// the renderer falls back to plain message printing for those.
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub message: String,
+    pub span:    Option<std::ops::Range<usize>>,
+}
+
+impl ParseError {
+    pub fn unspanned(message: impl Into<String>) -> Self {
+        Self { message: message.into(), span: None }
+    }
+}
+
+// ============================================================================
 // Public entry point
 // ============================================================================
 
-/// Parse a source string into a typed [`Project`] AST.
-pub fn parse(source: &str) -> Result<Project, String> {
+/// Parse a source string into a typed [`Project`] AST. Returns a list
+/// of errors — grammar-level errors carry span info; converter-level
+/// errors don't (yet). Single-error responses are common but not
+/// guaranteed; chumsky may produce multiple grammar errors per parse.
+pub fn parse(source: &str) -> Result<Project, Vec<ParseError>> {
     let raw = parse_raw_internal(source)?;
-    to_project(raw)
+    to_project(raw).map_err(|msg| vec![ParseError::unspanned(msg)])
 }
 
 /// Internal grammar-only parse — returns the RawBlock tree without
 /// running semantic conversion. Used by `parse` (above) and by the
-/// diagnostic helpers below. Keeps the chumsky parser construction in
-/// one place.
-fn parse_raw_internal(source: &str) -> Result<RawBlock, String> {
-    parser()
-        .parse(source)
-        .into_result()
-        .map_err(|errs| {
-            errs.iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
+/// diagnostic helpers below.
+fn parse_raw_internal(source: &str) -> Result<RawBlock, Vec<ParseError>> {
+    parser().parse(source).into_result().map_err(|errs| {
+        errs.iter()
+            .map(|e| {
+                let span = e.span();
+                ParseError {
+                    message: e.to_string(),
+                    span:    Some(span.start..span.end),
+                }
+            })
+            .collect()
+    })
+}
+
+/// Flatten a Vec<ParseError> into a single string. Used by the
+/// diagnostic helpers (parse_raw_summary/debug/json) which keep their
+/// String-error signature for CLI callers that don't need spans.
+fn flatten_errors(errs: Vec<ParseError>) -> String {
+    errs.into_iter()
+        .map(|e| e.message)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ============================================================================
@@ -60,7 +93,7 @@ fn parse_raw_internal(source: &str) -> Result<RawBlock, String> {
 /// Brief structural summary of the parsed RawBlock tree. Used at
 /// `validate -v` on conversion failure to show what the grammar saw.
 pub fn parse_raw_summary(source: &str) -> Result<String, String> {
-    let raw = parse_raw_internal(source)?;
+    let raw = parse_raw_internal(source).map_err(flatten_errors)?;
     let mut out = String::new();
     use std::fmt::Write;
     let _ = writeln!(out, "  top-level block_type: `{}`", raw.block_type);
@@ -77,7 +110,7 @@ pub fn parse_raw_summary(source: &str) -> Result<String, String> {
 /// Debug (Rust pretty-printed) form of the parsed RawBlock tree.
 /// Used at `validate -vv` on conversion failure.
 pub fn parse_raw_debug(source: &str) -> Result<String, String> {
-    let raw = parse_raw_internal(source)?;
+    let raw = parse_raw_internal(source).map_err(flatten_errors)?;
     Ok(format!("{raw:#?}"))
 }
 
@@ -85,7 +118,7 @@ pub fn parse_raw_debug(source: &str) -> Result<String, String> {
 /// conversion failure. The shape is the *internal* RawBlock — not the
 /// typed Project — so the JSON differs from `validate -vvv` on success.
 pub fn parse_raw_json(source: &str) -> Result<String, String> {
-    let raw = parse_raw_internal(source)?;
+    let raw = parse_raw_internal(source).map_err(flatten_errors)?;
     serde_json::to_string_pretty(&raw)
         .map_err(|e| format!("JSON serialization failed: {e}"))
 }
@@ -1790,13 +1823,19 @@ mod project_tests {
     use super::*;
 
     fn assert_parse_ok(src: &str) -> Project {
-        parse(src).unwrap_or_else(|e| panic!("expected ok, got error:\n{e}"))
+        parse(src).unwrap_or_else(|errs| {
+            let joined = errs.iter().map(|e| e.message.as_str())
+                .collect::<Vec<_>>().join("\n");
+            panic!("expected ok, got errors:\n{joined}")
+        })
     }
     fn assert_parse_err_contains(src: &str, needle: &str) {
-        let err = parse(src).err().unwrap_or_else(|| panic!("expected error"));
+        let errs = parse(src).err().unwrap_or_else(|| panic!("expected error"));
+        let joined = errs.iter().map(|e| e.message.as_str())
+            .collect::<Vec<_>>().join("\n");
         assert!(
-            err.contains(needle),
-            "error did not contain `{needle}`; full error:\n{err}"
+            joined.contains(needle),
+            "error did not contain `{needle}`; full error:\n{joined}"
         );
     }
 
