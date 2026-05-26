@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-05-25",
+  "source_hash": "6328497fc91f10581959c0fd93edcd0efd77dc8aa3345f2d476cc29fc25bff8f",
+  "model_bindings": {
+    "fast": {
+      "provider": "ollama",
+      "name": "llama_3_1_8b"
+    }
+  },
+  "prompt_hashes": {
+    "system": "f4a6e305925a233f1b4d04f2215efd1da199dbbb6c530b3623308c8481ef1cb3"
+  },
+  "oci_digests": {
+    "docs": ""
+  }
+}

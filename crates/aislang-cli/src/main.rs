@@ -35,9 +35,19 @@ enum Command {
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
     },
-    /// Resolve models + emit the deployment plan (no side effects)
+    /// Resolve models + reconcile lockfile + emit Compose YAML to stdout
     Plan {
+        /// Path to the .ais project file
         file: PathBuf,
+        /// Increase output verbosity (-v stage timings; -vv ResolvedProject
+        /// Debug; -vvv combined JSON IR with ast+graph+resolution)
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+        /// Skip lockfile read/write — always re-resolve. Useful when
+        /// debugging or producing a one-off plan without touching
+        /// `aislang.lock`.
+        #[arg(long)]
+        no_lock: bool,
     },
     /// Apply the plan — deploy the stack via Docker Compose
     Apply {
@@ -82,8 +92,8 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Validate { file, verbose } => run_validate(file, verbose),
-        Command::Plan { file: _ }    => stub("plan",    4),
+        Command::Validate { file, verbose }            => run_validate(file, verbose),
+        Command::Plan     { file, verbose, no_lock }   => run_plan(file, verbose, no_lock),
         Command::Apply { file: _ }   => stub("apply",   6),
         Command::Destroy { file: _ } => stub("destroy", 10),
         Command::Eval { file: _ }    => stub("eval",    8),
@@ -162,34 +172,7 @@ fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
             Ok(())
         }
         Err(validate_err) => {
-            // Source-aware error rendering (week-3 Thursday).
-            //
-            // For Parse(Vec<ParseError>): grammar-level errors carry
-            // span info → render with line:col + 2-3-line snippet +
-            // caret pointer. Converter-level errors carry span = None
-            // → render as plain message.
-            //
-            // For Type/UnresolvedRef errors: no AST-side span info
-            // tracked yet (per-AST-node span propagation is a future-
-            // week enhancement) → plain message.
-            match &validate_err {
-                aislang_core::ValidateError::Parse(errors) => {
-                    for err in errors {
-                        match &err.span {
-                            Some(span) => {
-                                eprint!("{}", aislang_core::diagnostic::render_with_source(
-                                    &source,
-                                    span.clone(),
-                                    aislang_core::diagnostic::Severity::Error,
-                                    &err.message,
-                                ));
-                            }
-                            None => eprintln!("aislang: parse error: {}", err.message),
-                        }
-                    }
-                }
-                other => eprintln!("aislang: {other}"),
-            }
+            render_validate_error(&source, &validate_err);
 
             // Failure-path verbose diagnostic from week-2 Wed —
             // partial RawBlock tree when grammar succeeded but
@@ -202,6 +185,166 @@ fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
             Err(anyhow::anyhow!("(see error above)"))
         }
     }
+}
+
+/// Render a `ValidateError` using the source-aware diagnostic pipeline.
+/// Shared by `run_validate` and `run_plan` so error output is identical
+/// regardless of which command the user invoked.
+///
+/// - `Parse(errors)` with `Some(span)` → `diagnostic::render_with_source`
+///   (line:col + 2-3-line snippet + caret).
+/// - `Parse(errors)` with `None` (converter errors) → plain message.
+/// - `Type` / `UnresolvedRef` → plain message (no AST spans yet).
+fn render_validate_error(source: &str, err: &aislang_core::ValidateError) {
+    match err {
+        aislang_core::ValidateError::Parse(errors) => {
+            for e in errors {
+                match &e.span {
+                    Some(span) => eprint!("{}", aislang_core::diagnostic::render_with_source(
+                        source,
+                        span.clone(),
+                        aislang_core::diagnostic::Severity::Error,
+                        &e.message,
+                    )),
+                    None => eprintln!("aislang: parse error: {}", e.message),
+                }
+            }
+        }
+        other => eprintln!("aislang: {other}"),
+    }
+}
+
+// ============================================================================
+// `aislang plan` — Friday of week 4
+// ============================================================================
+
+fn run_plan(file: PathBuf, verbose: u8, no_lock: bool) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let source_dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    let t_total_start = std::time::Instant::now();
+
+    // ── Stage 1: validate (parse + checker) ──
+    let t = std::time::Instant::now();
+    let validate_result = aislang_core::validate(&source);
+    let t_validate = t.elapsed();
+    let (project, mut warnings) = match validate_result {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    // ── Stage 2: catalog ID validation ──
+    let t = std::time::Instant::now();
+    let cat_result = aislang_resolver::check_against_bundled_catalog(&project);
+    let t_catalog = t.elapsed();
+    match cat_result {
+        Ok(cat_warnings) => warnings.extend(cat_warnings),
+        Err(e) => return Err(anyhow::anyhow!("catalog error: {e}")),
+    }
+
+    // ── Stage 3: resolve (model selection + prompt hashing) ──
+    let t = std::time::Instant::now();
+    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
+        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+    let t_resolve = t.elapsed();
+
+    // ── Stage 4: lockfile reconcile (unless --no-lock) ──
+    let t = std::time::Instant::now();
+    let lock_path = source_dir.join("aislang.lock");
+    let lockfile_status: &str = if no_lock {
+        "skipped (--no-lock)"
+    } else {
+        let existing = aislang_resolver::lockfile::read(&lock_path)
+            .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
+        let diff = aislang_resolver::lockfile::reconcile(
+            &source,
+            existing.as_ref(),
+            &resolved.catalog_version,
+        );
+        match diff {
+            aislang_resolver::LockfileDiff::Match => {
+                "match — reused cached bindings"
+            }
+            aislang_resolver::LockfileDiff::Fresh => {
+                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                aislang_resolver::lockfile::write(&lock_path, &new_lock)
+                    .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
+                "fresh — wrote new lockfile"
+            }
+            aislang_resolver::LockfileDiff::Stale { reasons } => {
+                if verbose >= 1 {
+                    eprintln!();
+                    eprintln!("lockfile stale — re-resolving. reasons:");
+                    for r in &reasons {
+                        eprintln!("  - {r}");
+                    }
+                }
+                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                aislang_resolver::lockfile::write(&lock_path, &new_lock)
+                    .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
+                "stale — rewrote lockfile"
+            }
+        }
+    };
+    let t_lock = t.elapsed();
+
+    // ── Stage 5: emit Compose YAML ──
+    let t = std::time::Instant::now();
+    let compose_yaml = aislang_compose::emit(&resolved)
+        .map_err(|e| anyhow::anyhow!("compose emit error: {e}"))?;
+    let t_emit = t.elapsed();
+
+    let t_total = t_total_start.elapsed();
+
+    // ── Output: YAML on stdout (pipeable into `docker compose -f - up`) ──
+    print!("{compose_yaml}");
+
+    // ── Warnings on stderr after the YAML (so stdout stays clean) ──
+    if !warnings.is_empty() {
+        eprintln!();
+        eprintln!("warnings:");
+        for w in &warnings {
+            eprintln!("  - {}", w.message);
+        }
+    }
+
+    // ── Verbose output on stderr ──
+    if verbose >= 1 {
+        eprintln!();
+        eprintln!("plan stages:");
+        eprintln!("  validate   {:>10.2?}", t_validate);
+        eprintln!("  catalog    {:>10.2?}", t_catalog);
+        eprintln!("  resolve    {:>10.2?}", t_resolve);
+        eprintln!("  lockfile   {:>10.2?}   {}", t_lock, lockfile_status);
+        eprintln!("  emit       {:>10.2?}", t_emit);
+        eprintln!("  ───────────────────");
+        eprintln!("  total      {:>10.2?}", t_total);
+    }
+    if verbose >= 2 {
+        eprintln!();
+        eprintln!("ResolvedProject (Debug):");
+        eprintln!("{resolved:#?}");
+    }
+    if verbose >= 3 {
+        eprintln!();
+        eprintln!("Full IR (JSON — ast + graph + resolution):");
+        let graph = aislang_core::checker::graph_summary(&project).ok();
+        let combined = serde_json::json!({
+            "ast":        &project,
+            "graph":      graph,
+            "resolution": &resolved,
+        });
+        match serde_json::to_string_pretty(&combined) {
+            Ok(json) => eprintln!("{json}"),
+            Err(e)   => eprintln!("(JSON serialization failed: {e})"),
+        }
+    }
+
+    Ok(())
 }
 
 /// On validate failure, try the grammar-only `parse_raw_*` path. If it
