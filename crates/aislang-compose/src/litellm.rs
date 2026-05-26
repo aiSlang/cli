@@ -11,8 +11,10 @@
 //! API-key plumbing (Wed) or fallback routing (Thu) yet.
 
 use aislang_catalog::Catalog;
+use aislang_core::ast::ModelId;
 use aislang_resolver::ResolvedProject;
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 // ============================================================================
@@ -24,7 +26,25 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LiteLlmConfig {
     pub model_list: Vec<ModelEntry>,
-    // Thursday: pub router_settings: Option<RouterSettings>,
+    /// Router settings. Currently carries the per-primary fallback
+    /// chain only (other LiteLLM router knobs — retries, rate-limits,
+    /// timeouts — are deferred to later weeks). `None` when no
+    /// fallback was declared on any model block (clean YAML output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_settings: Option<RouterSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouterSettings {
+    /// Map from a primary `model_name` (the alias users invoke) to
+    /// the ordered list of alternate `model_name` aliases LiteLLM
+    /// will try in turn if the primary errors. v0.1 only the
+    /// fallbacks knob is wired; v0.2+ may grow this struct.
+    ///
+    /// Ordering of the inner `Vec` is significant — first alternate
+    /// is tried first. Outer `BTreeMap` sorts by key for diff-stable
+    /// YAML output.
+    pub fallbacks: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,30 +95,115 @@ pub enum ConfigError {
 // ============================================================================
 
 /// Build the typed `LiteLlmConfig` from a resolution + a catalog.
-/// Each entry in `resolved.model_bindings` becomes one `model_list`
-/// row. Order is deterministic — iteration over the `BTreeMap` is
-/// sorted by label, so generated YAML is diff-stable.
+///
+/// For every `model.label` in the resolved bindings:
+///   1. Emit a primary `model_list` entry using the resolved catalog
+///      entry's `litellm_name` + provider credentials.
+///   2. Walk the source's `prefer ∪ fallback` lists (in that order),
+///      emit one secondary `model_list` entry per *alternate* catalog
+///      entry (i.e. not the resolved primary), and accumulate their
+///      aliases into a `router_settings.fallbacks[label]` chain.
+///
+/// Three behaviors locked in by user-direction (Thursday plan):
+///   - Alias scheme is `{primary_label}-fb-{provider}-{model-name}`
+///     where the catalog model name's underscores become hyphens (LiteLLM
+///     convention).
+///   - The resolved primary never appears in its own fallback list (no
+///     self-reference).
+///   - Duplicate ModelIds across prefer and fallback are deduplicated;
+///     first occurrence wins (so a `prefer = [X, Y, X]` produces
+///     `[X, Y]`, not `[X, Y, X]`).
+///
+/// Order is deterministic throughout: outer iteration via BTreeMap
+/// (sorted by label), inner walking preserves the source's
+/// prefer-then-fallback order, dedup via BTreeSet, output via BTreeMap.
 pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
     -> Result<LiteLlmConfig, ConfigError>
 {
-    let mut model_list = Vec::with_capacity(resolved.model_bindings.len());
-    for (label, model_id) in &resolved.model_bindings {
-        let entry = catalog.find(model_id).ok_or_else(||
-            ConfigError::MissingCatalogEntry(
-                model_id.provider.clone(),
-                model_id.name.clone(),
-            ))?;
-        let creds = provider_creds(&model_id.provider);
-        model_list.push(ModelEntry {
-            model_name: label.clone(),
-            litellm_params: LiteLlmParams {
-                model:    entry.litellm_name.clone(),
-                api_key:  creds.api_key.map(|v|  format!("os.environ/{v}")),
-                api_base: creds.api_base.map(|v| format!("os.environ/{v}")),
-            },
-        });
+    let mut model_list:    Vec<ModelEntry>                  = Vec::new();
+    let mut fallbacks_map: BTreeMap<String, Vec<String>>    = BTreeMap::new();
+
+    for (label, primary_id) in &resolved.model_bindings {
+        // (a) primary entry — uses the label as model_name
+        add_model_entry(&mut model_list, catalog, label.clone(), primary_id)?;
+
+        // (b) walk the source model block's prefer+fallback for this label
+        let model_block = match resolved.project.models.iter()
+            .find(|m| &m.label == label)
+        {
+            Some(b) => b,
+            // No matching block in the typed AST? That would mean the
+            // ResolvedProject was constructed weirdly. Skip fallback
+            // generation — primary still emitted above.
+            None => continue,
+        };
+
+        let mut fallback_aliases: Vec<String>               = Vec::new();
+        let mut seen:             BTreeSet<(String,String)> = BTreeSet::new();
+
+        for cand in model_block.prefer.iter().chain(model_block.fallback.iter()) {
+            // (i) skip the resolved primary — no self-reference per
+            //     locked design decision
+            if cand == primary_id {
+                continue;
+            }
+            // (ii) dedup by dotted ID, first-occurrence-wins
+            let id_key = (cand.provider.clone(), cand.name.clone());
+            if !seen.insert(id_key) {
+                continue;
+            }
+            // (iii) emit secondary entry + record its alias
+            let alias = fallback_alias(label, cand);
+            add_model_entry(&mut model_list, catalog, alias.clone(), cand)?;
+            fallback_aliases.push(alias);
+        }
+
+        if !fallback_aliases.is_empty() {
+            fallbacks_map.insert(label.clone(), fallback_aliases);
+        }
     }
-    Ok(LiteLlmConfig { model_list })
+
+    let router_settings = if fallbacks_map.is_empty() {
+        None
+    } else {
+        Some(RouterSettings { fallbacks: fallbacks_map })
+    };
+
+    Ok(LiteLlmConfig { model_list, router_settings })
+}
+
+/// Build a single `ModelEntry` from a catalog lookup + provider creds.
+/// Used for both primary entries and secondary fallback entries.
+fn add_model_entry(
+    model_list: &mut Vec<ModelEntry>,
+    catalog:    &Catalog,
+    alias:      String,
+    model_id:   &ModelId,
+) -> Result<(), ConfigError> {
+    let entry = catalog.find(model_id).ok_or_else(|| {
+        ConfigError::MissingCatalogEntry(
+            model_id.provider.clone(),
+            model_id.name.clone(),
+        )
+    })?;
+    let creds = provider_creds(&model_id.provider);
+    model_list.push(ModelEntry {
+        model_name: alias,
+        litellm_params: LiteLlmParams {
+            model:    entry.litellm_name.clone(),
+            api_key:  creds.api_key.map(|v|  format!("os.environ/{v}")),
+            api_base: creds.api_base.map(|v| format!("os.environ/{v}")),
+        },
+    });
+    Ok(())
+}
+
+/// Per-fallback alias: `{primary_label}-fb-{provider}-{model-name}`
+/// where the catalog model_name's underscores become hyphens (LiteLLM
+/// convention; matches the `litellm_name` style of `provider/model-name`).
+fn fallback_alias(primary_label: &str, model_id: &ModelId) -> String {
+    let name_part = model_id.name.replace('_', "-");
+    format!("{primary_label}-fb-{}-{name_part}", model_id.provider)
 }
 
 // ============================================================================
@@ -214,16 +319,31 @@ mod tests {
 
     // ---------- happy path ----------
 
-    #[test] fn demo_emits_one_entry_per_model_block() {
+    #[test] fn demo_emits_primary_plus_fallbacks() {
+        // Week-5 Thursday: each model block produces ONE primary entry
+        // + one secondary entry per alternate (de-duplicated, no self-
+        // reference). Demo has prefer=[haiku, gpt_4o_mini],
+        // fallback=[llama_3_1_8b]; resolves to llama (primary).
+        // So we expect:
+        //   primary entry: "fast"   → ollama/llama3.1:8b
+        //   alt entry #1:  "fast-fb-anthropic-claude-haiku-4-5"
+        //   alt entry #2:  "fast-fb-openai-gpt-4o-mini"
+        // Llama isn't an alt — it IS the primary.
         let (resolved, catalog) = resolve_demo();
         let cfg = build_config(&resolved, &catalog).expect("build");
-        // Demo has exactly one `model` block: `fast`.
-        assert_eq!(cfg.model_list.len(), 1);
-        let entry = &cfg.model_list[0];
-        assert_eq!(entry.model_name, "fast");
-        // Demo resolves to ollama.llama_3_1_8b under cost-opt → its
-        // catalog `litellm_name` is `ollama/llama3.1:8b`.
-        assert_eq!(entry.litellm_params.model, "ollama/llama3.1:8b");
+        assert_eq!(cfg.model_list.len(), 3,
+            "expected primary + 2 alternates; got {:?}", cfg.model_list);
+
+        let names: Vec<&str> = cfg.model_list.iter()
+            .map(|e| e.model_name.as_str()).collect();
+        assert!(names.contains(&"fast"));
+        assert!(names.contains(&"fast-fb-anthropic-claude-haiku-4-5"));
+        assert!(names.contains(&"fast-fb-openai-gpt-4o-mini"));
+
+        // Primary still uses the resolved litellm_name.
+        let primary = cfg.model_list.iter()
+            .find(|e| e.model_name == "fast").expect("primary entry");
+        assert_eq!(primary.litellm_params.model, "ollama/llama3.1:8b");
     }
 
     #[test] fn yaml_round_trips_through_serde_yaml() {
@@ -435,6 +555,122 @@ mod tests {
         };
         let env = generate_env_example(&resolved);
         assert!(env.contains("(no provider credentials needed for this resolution)"));
+    }
+
+    // ----------------------------------------------------------------
+    // Thursday: fallback routing chains
+    // ----------------------------------------------------------------
+
+    #[test] fn demo_router_settings_has_fallback_chain() {
+        // The fallbacks map should contain one key "fast" pointing at
+        // the two alternates (haiku before gpt-4o-mini per prefer order).
+        let (resolved, catalog) = resolve_demo();
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        let router = cfg.router_settings.as_ref()
+            .expect("router_settings must be present for demo");
+        let fast_fb = router.fallbacks.get("fast")
+            .expect("fast key in fallbacks map");
+        // Order from source: prefer = [haiku, gpt-4o-mini], fallback = [llama_3_1_8b].
+        // Llama is primary (excluded). Remaining: haiku, gpt-4o-mini.
+        assert_eq!(fast_fb, &vec![
+            "fast-fb-anthropic-claude-haiku-4-5".to_string(),
+            "fast-fb-openai-gpt-4o-mini".to_string(),
+        ]);
+    }
+
+    #[test] fn primary_excluded_from_own_fallback_list() {
+        // The resolved primary's ModelId must NOT appear as an alias
+        // in the fallbacks list.
+        let (resolved, catalog) = resolve_demo();
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        let router = cfg.router_settings.as_ref().unwrap();
+        let fast_fb = router.fallbacks.get("fast").unwrap();
+        for alias in fast_fb {
+            assert!(!alias.contains("ollama"),
+                "primary (ollama) must not appear in own fallback list; \
+                 got alias `{alias}`");
+        }
+    }
+
+    #[test] fn fallback_alias_scheme_format() {
+        // Pin the format: `{primary_label}-fb-{provider}-{model-name}`
+        // with name-part underscores hyphenated. LiteLLM convention.
+        let cases = vec![
+            ("fast", "anthropic", "claude_haiku_4_5",
+                "fast-fb-anthropic-claude-haiku-4-5"),
+            ("fast", "openai",    "gpt_4o_mini",
+                "fast-fb-openai-gpt-4o-mini"),
+            ("fast", "ollama",    "llama_3_1_8b",
+                "fast-fb-ollama-llama-3-1-8b"),
+            ("smart", "google",   "gemini_2_0_pro",
+                "smart-fb-google-gemini-2-0-pro"),
+        ];
+        for (primary, provider, name, expected) in cases {
+            let mid = ModelId { provider: provider.into(), name: name.into() };
+            assert_eq!(super::fallback_alias(primary, &mid), expected);
+        }
+    }
+
+    #[test] fn dedupe_overlapping_prefer_and_fallback() {
+        // Same ModelId in prefer AND fallback → first occurrence wins.
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_haiku_4_5, openai.gpt_4o_mini]
+                fallback    = [openai.gpt_4o_mini, anthropic.claude_haiku_4_5]
+                pin         = anthropic.claude_haiku_4_5
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
+            .expect("resolve");
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        // Primary is anthropic (pinned). Alternates: gpt-4o-mini only —
+        // anthropic-claude-haiku is primary (excluded), and the
+        // duplicate gpt_4o_mini is deduped.
+        let router = cfg.router_settings.as_ref().unwrap();
+        let m_fb = router.fallbacks.get("m").unwrap();
+        assert_eq!(m_fb, &vec!["m-fb-openai-gpt-4o-mini".to_string()]);
+    }
+
+    #[test] fn pin_only_no_alternates_yields_no_router_settings() {
+        // Model block with only pin (no prefer/fallback alternates
+        // remaining after primary exclusion) → no fallback chain →
+        // router_settings is None.
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_haiku_4_5]
+                pin         = anthropic.claude_haiku_4_5
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
+            .expect("resolve");
+        let cfg = build_config(&resolved, &catalog).expect("build");
+
+        assert_eq!(cfg.model_list.len(), 1);
+        assert_eq!(cfg.model_list[0].model_name, "m");
+        assert!(cfg.router_settings.is_none(),
+            "expected router_settings = None when no alternates; got {:?}",
+            cfg.router_settings);
+    }
+
+    #[test] fn yaml_emits_router_settings_under_top_level() {
+        // String-form check that the YAML structure is right.
+        let (resolved, catalog) = resolve_demo();
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        assert!(yaml.contains("router_settings:"));
+        assert!(yaml.contains("fallbacks:"));
+        assert!(yaml.contains("fast:"));
+        assert!(yaml.contains("- fast-fb-anthropic-claude-haiku-4-5"));
+        assert!(yaml.contains("- fast-fb-openai-gpt-4o-mini"));
     }
 
     #[test] fn env_example_deduplicates_across_models() {
