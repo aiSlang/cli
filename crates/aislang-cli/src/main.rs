@@ -89,9 +89,30 @@ fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
     let source = std::fs::read_to_string(&file)?;
 
     match aislang_core::validate(&source) {
-        Ok(project) => {
+        Ok((project, mut warnings)) => {
+            // Catalog ID validation lives in the sibling `aislang-resolver`
+            // crate (architecture decision: avoids aislang-core ↔
+            // aislang-catalog dep cycle — see PLAN §Week-1 dep-graph note).
+            // CLI is the natural place to chain core's parse+typecheck
+            // with resolver's catalog-check, combining their warnings.
+            match aislang_resolver::check_against_bundled_catalog(&project) {
+                Ok(cat_warnings) => warnings.extend(cat_warnings),
+                Err(e) => return Err(anyhow::anyhow!("catalog error: {e}")),
+            }
+
             // Success line always goes to stdout (machine-readable surface).
             println!("OK: {} parsed and type-checked", file.display());
+
+            // Warnings come right after the OK line, on stderr, prefixed
+            // with `warnings:`. Exit code remains 0 — warnings inform but
+            // don't fail (see PLAN §Locked design decisions).
+            if !warnings.is_empty() {
+                eprintln!();
+                eprintln!("warnings:");
+                for w in &warnings {
+                    eprintln!("  - {}", w.message);
+                }
+            }
 
             // Verbose output goes to stderr so stdout stays clean for
             // callers that pipe `aislang validate` into other tools.

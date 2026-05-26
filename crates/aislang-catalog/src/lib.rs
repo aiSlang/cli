@@ -10,6 +10,7 @@
 //! binary build time (the `bundled_catalog_parses` test trips), not at
 //! runtime — see LANGUAGE-SPEC-v0.md §5.5 for the rationale.
 
+use aislang_core::ast::ModelId;
 use aislang_core::types::{
     Capability, Duration, Money, Percentage, Residency, Size,
 };
@@ -77,6 +78,20 @@ pub struct CatalogModel {
 pub fn bundled() -> Result<Catalog, CatalogError> {
     let cat: Catalog = serde_json::from_str(BUNDLED_CATALOG_JSON)?;
     Ok(cat)
+}
+
+impl Catalog {
+    /// Look up a catalog entry by `ModelId`. The catalog stores `id` as
+    /// the dotted `"provider.name"` string; this function reconstructs
+    /// that form from a parsed `ModelId` and does a linear scan.
+    ///
+    /// For v0.1's 10-entry catalog the linear scan is trivially fast
+    /// (~100 ns); a future index can be added behind this same API
+    /// without breaking callers if the catalog ever grows past O(100).
+    pub fn find(&self, id: &ModelId) -> Option<&CatalogModel> {
+        let dotted = format!("{}.{}", id.provider, id.name);
+        self.models.iter().find(|m| m.id == dotted)
+    }
 }
 
 // ---------------------------------------------------------------------- //

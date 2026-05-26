@@ -12,6 +12,8 @@ pub mod checker;
 pub mod parser;
 pub mod types;
 
+pub use checker::Warning;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,18 +28,21 @@ pub enum ValidateError {
 
 /// Parse + type-check the source string.
 ///
-/// Pipeline (week 3 day 1 — duplicate-label detection lives in the
-/// checker; ref resolution and catalog validation arrive Tue/Wed):
+/// Pipeline (week 3):
 ///   1. `parser::parse`  — chumsky grammar + per-resource converters
 ///   2. `checker::check` — duplicate-label detection (Mon),
 ///                         cross-resource ref resolution (Tue),
-///                         catalog ID validation (Wed)
+///                         catalog ID validation (Wed) — returns the
+///                         list of non-fatal warnings as the success
+///                         value
 ///
-/// Returns the validated [`ast::Project`] on success. Wednesday's
-/// warning infrastructure will change the return shape to
-/// `Result<(Project, Vec<Warning>), ValidateError>`.
-pub fn validate(source: &str) -> Result<ast::Project, ValidateError> {
-    let project = parser::parse(source).map_err(ValidateError::Parse)?;
-    checker::check(&project).map_err(ValidateError::Type)?;
-    Ok(project)
+/// Returns `(Project, Vec<Warning>)` on success. Warnings include
+/// references to catalog entries marked `deprecated: true` — those
+/// references are honoured (the compliance-audit-trail use case
+/// requires it; see PLAN §Locked design decisions) but surfaced to
+/// the user.
+pub fn validate(source: &str) -> Result<(ast::Project, Vec<Warning>), ValidateError> {
+    let project  = parser::parse(source).map_err(ValidateError::Parse)?;
+    let warnings = checker::check(&project).map_err(ValidateError::Type)?;
+    Ok((project, warnings))
 }

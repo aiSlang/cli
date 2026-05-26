@@ -15,20 +15,48 @@
 use crate::ast::*;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
+//
+// NOTE: aislang-catalog is *not* a dependency of aislang-core — that
+// would create a cycle (catalog already depends on core for the typed
+// shims). Catalog ID validation lives in the `aislang-resolver` crate
+// instead, which depends on both core and catalog. The CLI chains
+// `aislang_core::validate` and `aislang_resolver::check_catalog_ids`,
+// combining their `Vec<Warning>` outputs. See PLAN week-1 dep-graph
+// note + week-3 architecture comment.
 
 // ============================================================================
-// Public entry point
+// Warning type — see PLAN-90-days.md §Locked design decisions (deprecated
+// catalog entries surface as warnings, not errors, for compliance audit)
 // ============================================================================
 
-/// Run all available semantic checks on the project. Today: duplicate-
-/// label detection (Mon) + cross-resource reference resolution (Tue).
-/// The signature stays `Result<(), String>` until Wednesday — when
-/// warnings land, this becomes `Result<Vec<Warning>, String>`.
-pub fn check(project: &Project) -> Result<(), String> {
+/// A non-fatal semantic-check finding. CLI prints these under a
+/// `warnings:` heading after the OK line; exit code remains 0.
+///
+/// In v0.1 a warning carries only a human-readable message. A future
+/// version can extend with severity, source span, machine-readable
+/// code — additive change, no API break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub message: String,
+}
+
+// ============================================================================
+// Public entry points
+// ============================================================================
+
+/// Run all in-core semantic checks. Today: duplicate-label detection
+/// (Mon) + cross-resource reference resolution (Tue). Catalog ID
+/// validation lives in the sibling `aislang-resolver` crate (see
+/// module-level NOTE on the dependency-cycle constraint).
+///
+/// Returns a `Vec<Warning>` for forward-compatibility — today always
+/// empty, but the signature is stable so future in-core warnings
+/// (e.g. deprecated grammar form, unused resource) can be added
+/// additively without rippling through callers.
+pub fn check(project: &Project) -> Result<Vec<Warning>, String> {
     let graph = build_resource_graph(project)?;
     check_refs(project, &graph)?;
-    // Wednesday: validate ModelIds against the bundled catalog
-    Ok(())
+    Ok(Vec::new())
 }
 
 // ============================================================================
@@ -292,6 +320,13 @@ mod tests {
     }
 
     fn check_src(body: &str) -> Result<(), String> {
+        // Tests that don't care about warnings drop them on the floor.
+        // Tests that DO care use `check_src_with_warnings` (catalog
+        // tests use this for the deprecated path).
+        check_src_with_warnings(body).map(|_warnings| ())
+    }
+
+    fn check_src_with_warnings(body: &str) -> Result<Vec<Warning>, String> {
         let src = project_src(body);
         let project = parse(&src).expect("parse must succeed in checker tests");
         check(&project)
@@ -562,4 +597,8 @@ mod tests {
         assert_eq!(super::levenshtein("fast", "fas"), 1);    // del
         assert_eq!(super::levenshtein("kitten", "sitting"), 3);   // classic
     }
+
+    // Catalog ID validation tests live in `crates/aislang-resolver/`
+    // (separate crate to avoid the aislang-core ↔ aislang-catalog
+    // dependency cycle). See module-level NOTE.
 }

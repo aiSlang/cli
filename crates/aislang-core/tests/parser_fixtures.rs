@@ -256,7 +256,11 @@ fn parser_produces_expected_support_agent() {
 
 fn assert_parser_matches_expected(name: &str, expected: &Project) {
     let src = fs::read_to_string(source_path(name)).expect("source file");
-    let parsed = aislang_core::validate(&src)
+    // Week 3 Wed: validate() now returns (Project, Vec<Warning>) — the
+    // integration test cares about the Project shape, so warnings are
+    // discarded here. Warning-emission behavior has its own test
+    // coverage in checker.rs.
+    let (parsed, _warnings) = aislang_core::validate(&src)
         .unwrap_or_else(|e| panic!("validate({name}) failed: {e}"));
     assert_eq!(&parsed, expected,
         "parser output for `{name}` does not match expected AST");

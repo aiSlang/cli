@@ -4,6 +4,7 @@ members = [
     "crates/aislang-cli",
     "crates/aislang-core",
     "crates/aislang-catalog",
+    "crates/aislang-resolver",
     "crates/aislang-compose",
 ]
 
@@ -19,6 +20,7 @@ rust-version = "1.78"
 # Internal crates
 aislang-core     = { path = "crates/aislang-core",     version = "0.1.0-dev" }
 aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.1.0-dev" }
+aislang-resolver = { path = "crates/aislang-resolver", version = "0.1.0-dev" }
 aislang-compose  = { path = "crates/aislang-compose",  version = "0.1.0-dev" }
 
 # External
