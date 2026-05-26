@@ -90,9 +90,9 @@ fn expected_support_agent() -> Project {
     let mcp_docs = McpServer {
         label: "docs".into(),
         image: OciImage {
-            registry:   "ghcr.io".into(),
-            repository: "example/mcp_filesystem".into(),
-            tag:        Some("0.3.1".into()),
+            registry:   "docker.io".into(),
+            repository: "mcp/filesystem".into(),
+            tag:        Some("1.0.2".into()),
             digest:     None,
         },
         mount:   Some(PathBuf::from("./knowledge/")),

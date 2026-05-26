@@ -2,11 +2,8 @@
 //!
 //! Takes a [`ResolvedProject`] (post-validate, post-resolve, post-
 //! lockfile-reconciliation) and emits the matching `docker-compose.yml`
-//! content. v0.1 emits four service categories:
+//! content. v0.1 emits three long-running service categories:
 //!
-//!   - one service per `mcp_server` block (image = resolved OCI digest
-//!     when present, else `registry/repo:tag`; bind-mount the `mount`
-//!     dir if set; env carried through)
 //!   - `litellm` sidecar — central provider router; routing table
 //!     mounted from a generated `litellm_config.yaml` (week 5)
 //!   - `jaeger` sidecar — OTLP receiver + UI; placeholder for the
@@ -16,10 +13,19 @@
 //!
 //! **No `agent_runtime` service in v0.1.** Week 6 locks the in-CLI
 //! agent loop: `aislang chat <agent>` runs the loop in-process, dialing
-//! the Compose-managed LiteLLM and MCP servers. The week-4 placeholder
-//! service has been removed; the eventual containerized agent runtime
-//! (Open WebUI + per-agent service) is v0.2. See PLAN-90-days.md
-//! "Week 6 — Architectural decisions" for the rationale.
+//! Compose-managed LiteLLM and CLI-spawned MCP servers. The week-4
+//! placeholder service has been removed; the eventual containerized
+//! agent runtime (Open WebUI + per-agent service) is v0.2. See
+//! PLAN-90-days.md "Week 6 — Architectural decisions" (Decision 1).
+//!
+//! **No `mcp_<label>` services in v0.1 either.** Decision 5 (week 6 Mon
+//! afternoon): the 2026 MCP ecosystem is overwhelmingly stdio-first —
+//! the published `mcp/filesystem`, `mcp/git`, etc. images are designed
+//! to be spawned with `docker run -i --rm <image> <args>`, not run as
+//! long-lived network services. v0.1 surfaces them as informational
+//! header comments listing what `aislang chat` will spawn; v0.2's
+//! in-house `aislang-mcp-gateway` introduces them as proper SSE-fronted
+//! services for the containerized agent path.
 //!
 //! `deploy.expose` ports are emitted as an informational comment at
 //! the top of the YAML (no service binds them in v0.1) so the user
@@ -38,7 +44,6 @@
 pub mod litellm;
 
 use aislang_catalog::Catalog;
-use aislang_core::ast::McpServer;
 use aislang_core::types::OciImage;
 use aislang_resolver::ResolvedProject;
 use serde::Serialize;
@@ -111,7 +116,10 @@ pub fn emit(
 /// Top-of-file comment block prepended to the emitted compose YAML.
 /// Documents the v0.1 agent-in-CLI choice + lists declared
 /// `deploy.expose` ports (informational — no service binds them in
-/// v0.1; the v0.2 containerized agent runtime will).
+/// v0.1; the v0.2 containerized agent runtime will) + lists declared
+/// `mcp_server` blocks (informational — `aislang chat` spawns each
+/// as a stdio child, not a Compose service; v0.2's `aislang-mcp-gateway`
+/// changes this).
 fn build_yaml_header(resolved: &ResolvedProject) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -122,8 +130,24 @@ fn build_yaml_header(resolved: &ResolvedProject) -> String {
     let _ = writeln!(out, "# v0.2 will add a per-agent container service plus an Open WebUI");
     let _ = writeln!(out, "# presentation layer; the .ais source already describes that surface.");
 
-    // Collect declared expose ports for the comment. Stable order via
-    // per-deploy iteration; ports inside a deploy use BTreeMap order.
+    // (1) Declared mcp_server blocks — stdio children spawned by
+    // `aislang chat`, NOT Compose services. Surface them here so the
+    // user has one overview of the full runtime surface.
+    if !resolved.project.mcp_servers.is_empty() {
+        let _ = writeln!(out, "#");
+        let _ = writeln!(out, "# MCP servers (stdio children spawned by `aislang chat`, not Compose services):");
+        for mcp in &resolved.project.mcp_servers {
+            let image = format_image(&mcp.image);
+            let mount = mcp.mount.as_ref()
+                .map(|p| format!(" mount={}", p.display()))
+                .unwrap_or_default();
+            let _ = writeln!(out, "#   mcp_server \"{}\": image={image}{mount}",
+                mcp.label);
+        }
+        let _ = writeln!(out, "# (v0.2 wraps each in aislang-mcp-gateway for SSE access; v0.1 = stdio.)");
+    }
+
+    // (2) Declared deploy.expose ports — also stable iteration order.
     let mut declared: Vec<(String, u16)> = Vec::new();
     for d in &resolved.project.deploys {
         if let Some(expose) = &d.expose {
@@ -202,10 +226,12 @@ struct Volume {}
 fn build_compose(resolved: &ResolvedProject, output_dir: &Path) -> Result<ComposeFile, EmitError> {
     let mut services: BTreeMap<String, Service> = BTreeMap::new();
 
-    // (a) one service per mcp_server block.
-    for mcp in &resolved.project.mcp_servers {
-        services.insert(format!("mcp_{}", mcp.label), build_mcp_service(mcp));
-    }
+    // (a) MCP servers — NOT emitted as Compose services in v0.1 (Decision 5).
+    // Published MCP images are stdio-only; aislang chat spawns each with
+    // `docker run -i --rm` and connects rmcp's child-process transport to
+    // its stdin/stdout. The header-comment block in `build_yaml_header`
+    // surfaces what'll be spawned so the user has a single overview of
+    // the runtime surface.
 
     // (b) LiteLLM sidecar — central provider router. Reads its routing
     // table from `output_dir/litellm_config.yaml`, mounted in.
@@ -235,31 +261,14 @@ fn build_compose(resolved: &ResolvedProject, output_dir: &Path) -> Result<Compos
 // Per-service builders
 // ============================================================================
 
-fn build_mcp_service(mcp: &McpServer) -> Service {
-    let environment = mcp.env.as_ref().and_then(|pairs| {
-        if pairs.is_empty() { return None; }
-        let map: BTreeMap<String, String> = pairs.iter().cloned().collect();
-        Some(env_list(map))
-    });
-
-    let volumes: Option<Vec<String>> = mcp.mount.as_ref().map(|p| {
-        // Bind-mount the host directory into /data inside the container.
-        // The mcp_server image is expected to read from /data; v0.1
-        // doesn't introspect MCP server image config to find their
-        // expected mount path. v0.2 may allow override per spec.
-        vec![format!("{}:/data:ro", p.display())]
-    });
-
-    Service {
-        image:       format_image(&mcp.image),
-        environment,
-        volumes,
-        ports:       None,
-        depends_on:  None,
-        command:     None,
-        labels:      Some(aislang_labels("mcp_server")),
-    }
-}
+// `build_mcp_service` removed in week 6 Mon (Decision 5). v0.1 does not
+// emit Compose services for `mcp_server` blocks; the CLI spawns them
+// as stdio children at chat-session start. The block's `image`, `env`,
+// `mount`, and `secrets` fields surface in the YAML header comment
+// (see `build_yaml_header`) and are consumed by `aislang chat` at
+// runtime via the lockfile + ResolvedProject. v0.2's `aislang-mcp-gateway`
+// (Decision 5 forward direction) reintroduces a per-MCP-server Compose
+// service for the containerized-agent path.
 
 fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
     -> Result<Service, EmitError>
@@ -410,11 +419,40 @@ mod tests {
             .expect("emitted YAML must parse back via serde_yaml");
     }
 
-    #[test] fn emits_one_service_per_mcp_server() {
+    #[test] fn mcp_servers_not_emitted_as_compose_services_in_v01() {
+        // Decision 5 (week 6 Mon): MCP servers are stdio children
+        // spawned by `aislang chat`, NOT long-lived Compose services.
+        // The published mcp/* images are stdio-only — wiring them as
+        // services would yield containers that exit immediately on
+        // startup (the rationale that surfaced in the user's first
+        // `docker compose up` of the demo).
+        //
+        // The demo declares mcp_server "docs"; we must NOT find a
+        // `mcp_docs:` service in the YAML body.
         let yaml = emit_demo_yaml();
-        // demo has mcp_server "docs"
-        assert!(yaml.contains("mcp_docs:"),
-            "expected `mcp_docs:` service in output; got:\n{yaml}");
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let services = value["services"].as_mapping().expect("services map");
+        for (name, _) in services {
+            let n = name.as_str().unwrap_or("");
+            assert!(!n.starts_with("mcp_"),
+                "v0.1 must not emit mcp_<label> services (CLI-spawned); \
+                 found `{n}`");
+        }
+    }
+
+    #[test] fn mcp_servers_listed_in_yaml_header_comment() {
+        // The header comment surfaces what'll be spawned so the user
+        // has one overview of the full runtime surface even though
+        // MCP servers aren't in the services map.
+        let yaml = emit_demo_yaml();
+        assert!(yaml.contains("MCP servers (stdio children spawned by `aislang chat`"),
+            "header must announce MCP-as-stdio section:\n{yaml}");
+        assert!(yaml.contains("mcp_server \"docs\":"),
+            "header must list the declared mcp_server label:\n{yaml}");
+        assert!(yaml.contains("docker.io/mcp/filesystem:1.0.2"),
+            "header must carry the resolved image:\n{yaml}");
+        assert!(yaml.contains("aislang-mcp-gateway"),
+            "header must point at the v0.2 successor:\n{yaml}");
     }
 
     #[test] fn emits_litellm_with_mounted_config() {
