@@ -88,7 +88,7 @@ aiSlang is a *compile-then-deploy* tool, not an interpreter. A single `.ais` sou
 |---|---|---|---|
 | 1. **Parse + type-check** | `aislang validate` | Lex source, build AST per LANGUAGE-SPEC §8 grammar, validate types and resource-shape semantics from §8.1 | `aislang-core::parser`, `aislang-core::ast` |
 | 2. **Resolve** | `aislang plan` | For each `model` block: walk constraints (`requires`, `cost_max`, `latency_p95`, `residency`, `prefer`, `fallback`) against the bundled model catalog; pick the best satisfying entry. Hash prompt files. Pin image tags to digests. Reconcile with `aislang.lock`. Output the resolved IR | `aislang-core::resolver` (week 4) + `aislang-catalog` |
-| 3. **Emit** | `aislang plan` / `aislang apply` | Translate the resolved IR to standard target artifacts. v0.1 emits a single `docker-compose.yml` with the agent runtime, LiteLLM as a sidecar, MCP servers, Jaeger for OTel-GenAI traces, and a budget-enforcement sidecar | `aislang-compose` (v0.1); later: `aislang-k8s`, `aislang-helm`, `aislang-databricks`, etc. |
+| 3. **Emit** | `aislang plan` / `aislang apply` | Translate the resolved IR to standard target artifacts. v0.1 emits a single `docker-compose.yml` with the agent runtime, LiteLLM as a sidecar, MCP servers, Jaeger for OTel-GenAI traces, and a budget-enforcement sidecar, plus a `.env.example` (the union of provider-derived credentials + env vars referenced by `secret` blocks — see [Secrets handling](#secrets-handling) below) | `aislang-compose` (v0.1); later: `aislang-k8s`, `aislang-helm`, `aislang-databricks`, etc. |
 | 4. **Apply / operate** | `aislang apply` / `chat` / `eval` / `cost` / `destroy` | Hand artifacts to Docker / K8s / target platform. The running stack honours the declared budgets, exposes the declared port surface, runs declared evals on demand, and emits OTel traces | shells out to platform CLIs (`docker compose`, `kubectl apply`, etc.) |
 
 ### What's in the v0.1 scope vs. phased
@@ -98,6 +98,15 @@ aiSlang is a *compile-then-deploy* tool, not an interpreter. A single `.ais` sou
 - **Phase 2** — Managed cloud (`aislang.cloud`), compliance pack (EU AI Act / ISO 42001 evidence export), ArgoCD / Flux GitOps wrappers, Databricks / MS Fabric / Spark targets, dynamic prompt composition (decorators / guardrails) if user demand pulls for it.
 
 All Phase 1+ items are additive — they don't change the v0.1 grammar or AST. See [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) §7 for the forward-compatibility invariants that make this possible.
+
+### Secrets handling
+
+aiSlang never reads a real `.env` itself — secrets are the user's responsibility, handed to `docker compose` at runtime. `aislang plan` only emits a `.env.example` template (safe to commit), populated from **two sources merged into one alphabetized list**:
+
+1. **Provider-derived credentials.** For each resolved primary model, a per-provider mapping contributes the env vars LiteLLM expects (e.g. `ANTHROPIC_API_KEY` for an anthropic primary, `OLLAMA_API_BASE` for an ollama primary).
+2. **User-declared `secret` blocks.** Each `secret "<label>" { source = "env://VAR" … }` block contributes `VAR` to the same list. Non-`env://` sources (`file://`, future `vault://`) appear in an informational footer comment — `aislang` doesn't load them, but they're documented in one place. The `scope = [...]` field controls which containers receive each secret at compose time.
+
+The two sources are deduplicated: declaring `secret { source = "env://OLLAMA_API_BASE" }` for a project that already resolves to Ollama yields one line, not two. This dual flow is **a v0.1 compromise** — v0.2 unifies it by making `secret` blocks the canonical credential surface (see [LANGUAGE-SPEC-v0.md §5.6](LANGUAGE-SPEC-v0.md)). The forward-compat invariant is that any v0.1 source with no `secret` blocks continues to work in v0.2 against a provider-creds fallback.
 
 ## Build
 

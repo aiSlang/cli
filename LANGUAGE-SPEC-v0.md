@@ -284,6 +284,30 @@ The `catalog` and `catalog_model` keywords are reserved (§2) so a future migrat
 
 If none of these triggers fires by 6 months post-launch, the keywords can be unreserved.
 
+### 5.6 `secret` blocks as the canonical credential source (v0.2 direction)
+
+**v0.1 behavior — dual flow.** Today `aislang plan` populates `.env.example` from two independent sources:
+
+1. **Implicit (provider-derived).** For each *resolved primary* `ModelId`, a small hard-coded table in `aislang-compose::litellm::provider_creds()` maps `provider → {api_key_env_var, api_base_env_var}` (anthropic → `ANTHROPIC_API_KEY`, ollama → `OLLAMA_API_BASE`, …). These vars appear in `.env.example` without any source-level declaration.
+2. **Declared (user-authored).** Each `secret "<label>" { source = "env://VAR" … }` block contributes `VAR` to the same `.env.example` list. Non-`env://` sources (`file://`, future `vault://`) are surfaced in an informational footer comment block but not loaded as env vars.
+
+Both sources are merged into a single alphabetized, deduplicated env-var list. If a user declares `secret { source = "env://OLLAMA_API_BASE" }` and the same var is provider-derived, it appears exactly once.
+
+This dual flow is **deliberately temporary**. The implicit path makes the demo work without ceremony — a user writes one `model "fast"` block and `.env.example` is correct — but it also means provider credentials are invisible at the source-language level: there's no `.ais` syntax that says "this project depends on `ANTHROPIC_API_KEY`."
+
+**v0.2 direction — secret blocks as canonical.** In v0.2 the declared path becomes the source of truth:
+
+- The catalog gains a `provider_credentials` schema (per-provider list of required env vars + their roles: `api_key` / `api_base` / `region` / …).
+- `aislang plan` walks the resolved providers, looks up their declared credential requirements in the catalog, and *requires* a matching `secret` block in the source (or implicit auto-generation with a `--auto-secrets` flag for ergonomics).
+- The hard-coded `provider_creds()` table becomes a fallback only for projects that opted out of explicit declaration; the canonical answer to "what env vars does this project need?" is reading `project.secrets`.
+- `mcp_server.secrets = [secret.x, secret.y]` already scopes env vars to specific containers in v0.1 — that mechanism extends naturally to LiteLLM-scoped provider creds in v0.2.
+
+**Why not in v0.1.** Requiring `secret` blocks for every provider credential today would force the demo to grow three secret blocks (one per cloud provider in the prefer/fallback chain) for a project that resolves to a single primary. The catalog schema also needs the `provider_credentials` field, which is a multi-week change. v0.1 keeps both paths to ship the demo in 90 days; v0.2 unifies them once the catalog schema settles.
+
+**Forward-compatibility.** v0.2 is purely additive: an existing v0.1 source file with no `secret` blocks continues to work (the provider-creds table remains a fallback). Users who already declared `secret` blocks for their provider credentials get the v0.2 unified flow for free.
+
+The TODO marker lives at `crates/aislang-compose/src/litellm.rs::provider_creds` so the v0.2 migration point is visible from code search.
+
 ---
 
 ## 6. Model resolution algorithm
