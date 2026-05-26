@@ -209,6 +209,15 @@ struct Service {
     depends_on:  Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     command:     Option<Vec<String>>,
+    /// Static host-name entries injected into the container's
+    /// `/etc/hosts`. Used for the `host.docker.internal:host-gateway`
+    /// trick that gives the container a routable name for the host
+    /// machine on Linux (it already works on Mac/Windows via Docker
+    /// Desktop — the explicit line is harmless there). Wired into
+    /// LiteLLM so users running Ollama on the same host can point
+    /// `OLLAMA_API_BASE=http://host.docker.internal:11434`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_hosts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels:      Option<BTreeMap<String, String>>,
 }
@@ -304,6 +313,18 @@ fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
             "--port".to_string(),
             "4000".to_string(),
         ]),
+        // `host-gateway` is a Docker built-in keyword that resolves to
+        // the host's gateway IP at container-start time (Docker 20.10+).
+        // Gives LiteLLM a routable name for the host machine — needed
+        // on Linux for the common "Ollama running on the same host"
+        // pattern (OLLAMA_API_BASE=http://host.docker.internal:11434).
+        // On Mac/Windows the Docker Desktop runtime already wires
+        // host.docker.internal; the explicit line is redundant but
+        // harmless. One line of YAML, uniform UX across all three
+        // platforms.
+        extra_hosts: Some(vec![
+            "host.docker.internal:host-gateway".to_string(),
+        ]),
         labels:      Some(aislang_labels("litellm")),
     })
 }
@@ -322,6 +343,7 @@ fn build_jaeger_service() -> Service {
         ]),
         depends_on:  None,
         command:     None,
+        extra_hosts: None,
         labels:      Some(aislang_labels("jaeger")),
     }
 }
@@ -350,6 +372,7 @@ fn build_budget_counter_service(resolved: &ResolvedProject) -> Service {
              week 7. Cap env vars are set; an external counter could read \
              them now.' && sleep infinity".to_string(),
         ]),
+        extra_hosts: None,
         labels:      Some(aislang_labels("budget_counter")),
     }
 }
@@ -505,6 +528,49 @@ mod tests {
             "host path must be absolute; got `{host_side}` in `{mount}`");
         assert!(host_side.ends_with("/litellm_config.yaml"),
             "host path must point at litellm_config.yaml; got `{host_side}`");
+    }
+
+    #[test] fn litellm_carries_host_docker_internal_extra_host() {
+        // Pin the cross-platform "LiteLLM can reach services on the host"
+        // wire: `extra_hosts: ["host.docker.internal:host-gateway"]`.
+        //
+        // Why this matters: the common dev pattern is Ollama running
+        // on the same host (its own container or native binary) at
+        // localhost:11434. From inside LiteLLM's container, "localhost"
+        // means LiteLLM itself — useless. `host.docker.internal` is
+        // the canonical name for the host machine:
+        //   - Mac/Windows: Docker Desktop wires it automatically.
+        //   - Linux: needs the explicit extra_hosts line + the magic
+        //     `host-gateway` keyword (Docker 20.10+).
+        //
+        // With this line emitted, users can put
+        //   OLLAMA_API_BASE=http://host.docker.internal:11434
+        // in .env uniformly across all three platforms. Dropping this
+        // line silently breaks the Linux Ollama-on-host story.
+        let yaml = emit_demo_yaml();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let litellm = &value["services"]["litellm"];
+        let hosts = litellm["extra_hosts"].as_sequence()
+            .expect("litellm.extra_hosts must be a YAML sequence");
+        let strs: Vec<&str> = hosts.iter()
+            .filter_map(|v| v.as_str()).collect();
+        assert!(strs.contains(&"host.docker.internal:host-gateway"),
+            "litellm must declare host.docker.internal:host-gateway; \
+             got {strs:?}");
+    }
+
+    #[test] fn jaeger_and_budget_counter_omit_extra_hosts() {
+        // Only LiteLLM needs the host-gateway wire — Jaeger receives
+        // traces FROM containers (inbound), budget_counter is a
+        // placeholder. Keep the emitted YAML minimal for the other
+        // services so a reader sees `extra_hosts:` only where it's
+        // load-bearing.
+        let yaml = emit_demo_yaml();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        for svc in ["jaeger", "budget_counter"] {
+            assert!(value["services"][svc]["extra_hosts"].is_null(),
+                "{svc} must omit extra_hosts (only litellm needs the host-gateway wire)");
+        }
     }
 
     #[test] fn emits_jaeger_with_otlp_ports() {

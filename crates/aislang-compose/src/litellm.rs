@@ -333,6 +333,23 @@ pub fn generate_env_example(resolved: &ResolvedProject) -> String {
             let _ = writeln!(out, "#   secret \"{label}\": {source}");
         }
     }
+    // Cross-platform Ollama-on-host hint, emitted AFTER the env var
+    // listings so it doesn't collide with substring searches over
+    // the variable-assignment block. The litellm service emits
+    // `extra_hosts: [host.docker.internal:host-gateway]` (see
+    // aislang-compose::build_litellm_service) so this URL works
+    // uniformly on Mac/Windows/Linux. Phrasing avoids the literal
+    // `OLLAMA_API_BASE=` substring so the hint text doesn't read
+    // as a variable assignment.
+    if vars.iter().any(|v| v == "OLLAMA_API_BASE") {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "# --- Ollama-on-host hint ---");
+        let _ = writeln!(out, "# If you run Ollama as a container (or native binary) on this");
+        let _ = writeln!(out, "# same machine with port 11434 published, set the value above to");
+        let _ = writeln!(out, "#   http://host.docker.internal:11434");
+        let _ = writeln!(out, "# The compose stack wires `host.docker.internal` to the host");
+        let _ = writeln!(out, "# gateway so this URL resolves uniformly on Mac, Windows, and Linux.");
+    }
     out
 }
 
@@ -580,6 +597,55 @@ mod tests {
         let oai = env.find("OPENAI_API_KEY=").unwrap();
         assert!(ant < oll && oll < oai,
             "expected alphabetical ordering; got A@{ant}, OL@{oll}, OP@{oai}");
+    }
+
+    #[test] fn env_example_includes_ollama_host_hint_when_ollama_resolved() {
+        // When the resolved primary is Ollama, the .env.example
+        // surfaces the host.docker.internal:11434 recipe so users
+        // running Ollama on the same machine know exactly what to
+        // set. Pairs with the extra_hosts wire in build_litellm_service.
+        let (resolved, _) = resolve_demo();   // demo resolves to ollama
+        let env = generate_env_example(&resolved);
+        assert!(env.contains("Ollama-on-host hint"),
+            "footer must announce the Ollama hint when OLLAMA_API_BASE present:\n{env}");
+        assert!(env.contains("http://host.docker.internal:11434"),
+            "footer must spell out the working URL:\n{env}");
+        // Must follow the env-var listings — placed in the footer
+        // intentionally so substring searches over the var lines
+        // don't conflate the hint URL with an actual assignment.
+        let var_line = env.find("OLLAMA_API_BASE=").unwrap();
+        let hint     = env.find("Ollama-on-host hint").unwrap();
+        assert!(var_line < hint,
+            "Ollama hint must come AFTER the env-var listings; \
+             got var@{var_line}, hint@{hint}");
+        // Hint must NOT contain the literal `OLLAMA_API_BASE=` (which
+        // would re-introduce the substring-collision bug it was
+        // restructured to avoid).
+        let hint_block = &env[hint..];
+        assert!(!hint_block.contains("OLLAMA_API_BASE="),
+            "hint block must not contain `OLLAMA_API_BASE=` literal — \
+             that collides with substring searches over the var block. \
+             Got hint block:\n{hint_block}");
+    }
+
+    #[test] fn env_example_omits_ollama_hint_when_no_ollama_resolved() {
+        // Anthropic-only project → no OLLAMA_API_BASE → no Ollama
+        // hint clutter in the header. Keeps generated files terse.
+        use aislang_core::ast::Project;
+        let mut bindings = BTreeMap::new();
+        bindings.insert("smart".to_string(),
+            ModelId { provider: "anthropic".into(),
+                      name: "claude_haiku_4_5".into() });
+        let resolved = ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  bindings,
+            prompt_hashes:   BTreeMap::new(),
+        };
+        let env = generate_env_example(&resolved);
+        assert!(!env.contains("Ollama-on-host hint"),
+            "Ollama hint must be omitted when no OLLAMA_API_BASE in vars:\n{env}");
+        assert!(!env.contains("host.docker.internal"));
     }
 
     #[test] fn env_example_has_helpful_header() {
