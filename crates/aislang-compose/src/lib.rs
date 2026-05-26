@@ -374,13 +374,21 @@ fn build_jaeger_service() -> Service {
 fn build_budget_counter_service(resolved: &ResolvedProject) -> Service {
     let mut env = BTreeMap::new();
     if let Some(b) = &resolved.project.budget {
+        // `Money::Unlimited` → emit the literal `unlimited` so a
+        // future budget-counter sidecar can distinguish "no cap"
+        // from "huge but finite cap". `Capped` → emit the integer
+        // micro-units (same shape as v0.1 Wed).
         env.insert(
             "AISLANG_HARD_CAP_PER_DAY_MICRO".to_string(),
-            b.hard_cap_per_day.micro_units.to_string(),
+            b.hard_cap_per_day.micro_units()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "unlimited".to_string()),
         );
         env.insert(
             "AISLANG_HARD_CAP_PER_RUN_MICRO".to_string(),
-            b.hard_cap_per_run.micro_units.to_string(),
+            b.hard_cap_per_run.micro_units()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "unlimited".to_string()),
         );
     }
     Service {

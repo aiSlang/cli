@@ -306,7 +306,11 @@ fn resolve_one_model(
 
     let chosen: &CatalogModel = match optimize_for {
         OptimizeFor::Cost => ordered.iter()
-            .min_by_key(|c| c.cost_input.micro_units)
+            // Use Money's Ord impl directly: Unlimited sorts as
+            // greater than any Capped, so an Unlimited-cost candidate
+            // never wins "cheapest". Capped(0) (e.g. local Ollama)
+            // wins ties against pricier candidates.
+            .min_by(|a, b| a.cost_input.cmp(&b.cost_input))
             .copied()
             .expect("ordered non-empty"),
         OptimizeFor::Latency => ordered.iter()
@@ -353,11 +357,18 @@ fn check_satisfies(block: &Model, cat: &CatalogModel) -> Result<(), String> {
     // future spec extension that allows per-1M-tokens denominators
     // will need denominator unit-checking here first.
     if let Some(rate) = &block.cost_max {
-        if cat.cost_input.micro_units > rate.numerator.micro_units {
+        // Money's Ord impl gives the right semantics:
+        //   Unlimited catalog cost > any Capped numerator → exclude.
+        //   Capped(X) > Capped(Y) → standard arithmetic comparison.
+        if cat.cost_input > rate.numerator {
+            let lhs = cat.cost_input.micro_units()
+                .map(|m| format!("{m} µ-USD"))
+                .unwrap_or_else(|| "unlimited".to_string());
+            let rhs = rate.numerator.micro_units()
+                .map(|m| format!("{m} µ-USD"))
+                .unwrap_or_else(|| "unlimited".to_string());
             return Err(format!(
-                "cost {} µ-USD/1k-tok > max allowed {} µ-USD/1k-tok",
-                cat.cost_input.micro_units, rate.numerator.micro_units,
-            ));
+                "cost {lhs}/1k-tok > max allowed {rhs}/1k-tok"));
         }
     }
 
@@ -449,8 +460,8 @@ mod tests {
                     litellm_name: "test/active".into(),
                     capabilities: vec![Capability::Chat],
                     context_max: Size { units: 100 * 1024 },
-                    cost_input:  Money { currency: Currency::Usd, micro_units: 1_000 },
-                    cost_output: Money { currency: Currency::Usd, micro_units: 5_000 },
+                    cost_input:  Money::Capped { currency: Currency::Usd, micro_units: 1_000 },
+                    cost_output: Money::Capped { currency: Currency::Usd, micro_units: 5_000 },
                     latency_p95: Duration { nanos: 1_000_000_000 },
                     residency:   vec![Residency::Us],
                     deprecated: false,
@@ -461,8 +472,8 @@ mod tests {
                     litellm_name: "test/legacy".into(),
                     capabilities: vec![Capability::Chat],
                     context_max: Size { units: 50 * 1024 },
-                    cost_input:  Money { currency: Currency::Usd, micro_units: 100 },
-                    cost_output: Money { currency: Currency::Usd, micro_units: 500 },
+                    cost_input:  Money::Capped { currency: Currency::Usd, micro_units: 100 },
+                    cost_output: Money::Capped { currency: Currency::Usd, micro_units: 500 },
                     latency_p95: Duration { nanos: 2_000_000_000 },
                     residency:   vec![Residency::Us],
                     deprecated: true,
@@ -652,8 +663,8 @@ mod tests {
                     litellm_name: "test/cheap_slow".into(),
                     capabilities: vec![Capability::Chat, Capability::ToolUse],
                     context_max: Size { units: 32 * 1024 },
-                    cost_input:  Money { currency: Currency::Usd, micro_units: 100 },     // cheaper
-                    cost_output: Money { currency: Currency::Usd, micro_units: 500 },
+                    cost_input:  Money::Capped { currency: Currency::Usd, micro_units: 100 },     // cheaper
+                    cost_output: Money::Capped { currency: Currency::Usd, micro_units: 500 },
                     latency_p95: Duration { nanos: 5_000_000_000 },                       // slower
                     residency:   vec![Residency::Us, Residency::Eu],
                     deprecated: false,
@@ -664,8 +675,8 @@ mod tests {
                     litellm_name: "test/fast_expensive".into(),
                     capabilities: vec![Capability::Chat, Capability::ToolUse],
                     context_max: Size { units: 32 * 1024 },
-                    cost_input:  Money { currency: Currency::Usd, micro_units: 10_000 },  // pricier
-                    cost_output: Money { currency: Currency::Usd, micro_units: 50_000 },
+                    cost_input:  Money::Capped { currency: Currency::Usd, micro_units: 10_000 },  // pricier
+                    cost_output: Money::Capped { currency: Currency::Usd, micro_units: 50_000 },
                     latency_p95: Duration { nanos: 500_000_000 },                          // faster
                     residency:   vec![Residency::Us],
                     deprecated: false,
@@ -676,8 +687,8 @@ mod tests {
                     litellm_name: "test/small".into(),
                     capabilities: vec![Capability::Chat],
                     context_max: Size { units: 8 * 1024 },                                 // too small
-                    cost_input:  Money { currency: Currency::Usd, micro_units: 50 },
-                    cost_output: Money { currency: Currency::Usd, micro_units: 250 },
+                    cost_input:  Money::Capped { currency: Currency::Usd, micro_units: 50 },
+                    cost_output: Money::Capped { currency: Currency::Usd, micro_units: 250 },
                     latency_p95: Duration { nanos: 200_000_000 },
                     residency:   vec![Residency::Us],
                     deprecated: false,

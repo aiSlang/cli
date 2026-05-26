@@ -28,8 +28,8 @@ Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks
 - **Comments.** Line comments: either `#` or `//` to end of line (both accepted, HCL convention). Block comments (`/* … */`) deferred to v0.2.
 - **Identifiers.** `[a-z][a-z0-9_]*` (snake_case). Resource labels follow the same rule.
 - **Whitespace** is insignificant except as a token separator.
-- **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`.
-- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`, `catalog`, `catalog_model`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2; possible `.ais`-native model catalog — see §5.5) so v0.1 files remain forward-compatible.
+- **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`, `unlimited`. The `unlimited` keyword is a `Money` literal (Decision 10, week 7 Mon) — used in `budget.hard_cap_per_*` to mean "no cap" (free local models, infinite budget). Treated as the absorbing top in cost comparisons.
+- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`, `catalog`, `catalog_model`, `secret_provider`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2; possible `.ais`-native model catalog — see §5.5; enterprise secret providers — see §5.7) so v0.1 files remain forward-compatible.
 - **Type literals** use suffixes (`32k`, `$50`, `2s`, `85%`) — see §3.
 
 ---
@@ -308,9 +308,47 @@ This dual flow is **deliberately temporary**. The implicit path makes the demo w
 
 The TODO marker lives at `crates/aislang-compose/src/litellm.rs::provider_creds` so the v0.2 migration point is visible from code search.
 
----
+### 5.7 Enterprise secret providers — v0.2 direction (Decision 11)
 
-## 6. Model resolution algorithm
+**v0.1 behavior — URI-based sources only.** Today `secret.source` accepts a URI string with one of two schemes:
+
+- `env://VAR` — read the value from process env at runtime.
+- `file://path` — read the file's contents (UTF-8 string) as the secret value.
+
+Other schemes are rejected at parse time with a diagnostic pointing to this section. Both schemes are zero-dep (`env::var` + `std::fs::read`); they cover the local-dev and single-file-secret cases that the v0.1 demo needs.
+
+**Why this isn't enough long-term.** Enterprise deployments fetch secrets from centralized stores — HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, Kubernetes Secrets, 1Password, etc. Talking to those stores requires more than a URI:
+
+- The store's *address* (`https://vault.example.com:8200`).
+- An *auth flow* (Kubernetes service account, AWS IAM role, JWT bearer token, Vault AppRole, …) — each with its own setup, refresh cadence, error semantics.
+- A *path or key reference* inside the store, possibly with a *field* selector (e.g. `secret/data/production/openai_key#value`).
+- Possibly TLS verification config (custom CA, mTLS).
+
+Cramming all that into a URI string is brittle and unreadable. The conventional IaC pattern (Terraform `provider` blocks, Pulumi `Provider`, Helm `secretsManager.*`) separates the *store configuration* from the *secret reference*.
+
+**v0.2 direction — `secret_provider` resource type.** A new resource block describes the store connection; existing `secret` blocks reference it:
+
+```hcl
+secret_provider "company_vault" {
+  type    = vault
+  address = "https://vault.example.com:8200"
+  auth    = kubernetes
+  role    = "aislang-agents"
+}
+
+secret "openai_key" {
+  provider = secret_provider.company_vault
+  path     = "secret/production/openai_key"
+  field    = "value"            # which field of the store payload is THE secret
+  scope    = [agent.support]
+}
+```
+
+Initial v0.2 provider types under design (final list determined by user demand): `vault`, `aws_sm`, `gcp_sm`, `azure_kv`, `kubernetes`, `onepassword`. Auth flows specific per provider.
+
+**Forward-compatibility — `secret_provider` is reserved in v0.1.** §2 reserves the `secret_provider` keyword today so a v0.1 source file that doesn't use it parses cleanly in v0.2 (no breaking change). When v0.2 lands, the `secret` block gains the optional `provider` / `path` / `field` fields in addition to the existing `source` field. Migration is opt-in per secret block; v0.1's `env://` and `file://` URIs continue to work as the "no provider" path.
+
+**Out of scope until v0.2.** Auth-token refresh loops, secret rotation hooks, audit trails (who-fetched-what-when), per-secret-provider rate limiting, multi-region failover for the store. Phase-1+ behind cargo feature flags.
 
 Run by `aislang plan`. Deterministic given source + catalog + lockfile.
 

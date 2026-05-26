@@ -254,16 +254,21 @@ fn string_lit_parser<'src>(
 
 fn money_parser<'src>(
 ) -> impl Parser<'src, &'src str, Money, extra::Err<Rich<'src, char>>> + Clone {
-    // All four currency symbols supported by Money::from_literal; €/£/¥
-    // are multi-byte UTF-8 but `one_of` matches at the char level so the
-    // distinction is transparent.
-    one_of("$€£¥")
+    // Two shapes:
+    //   - `<symbol><digits>[.<digits>]` for finite amounts (`$50`, `€100`, …).
+    //   - bare keyword `unlimited` for the no-cap variant (Decision 10).
+    // We bias the currency-symbol path first because it's the common case;
+    // the keyword path uses `text::keyword` so it doesn't match prefixes of
+    // longer identifiers (e.g. `unlimited_xyz`).
+    let capped = one_of("$€£¥")
         .then(text::int(10))
         .then(just('.').then(text::digits(10).to_slice()).or_not())
         .to_slice()
         .try_map(|s: &str, span| {
             Money::from_literal(s).map_err(|e| Rich::custom(span, e.reason))
-        })
+        });
+    let unlimited = text::keyword("unlimited").to(Money::Unlimited);
+    choice((capped, unlimited))
 }
 
 /// Duration units. Two-character variants must be tried before their
@@ -1420,9 +1425,18 @@ mod value_tests {
     #[test] fn enum_member()         { assert_eq!(parse_value("cost").unwrap(),  RawValue::EnumMember("cost".into())); }
 
     #[test] fn money_int()           { assert_eq!(parse_value("$50").unwrap(),
-        RawValue::Money(Money { currency: Currency::Usd, micro_units: 50_000_000 })); }
+        RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 50_000_000 })); }
     #[test] fn money_decimal()       { assert_eq!(parse_value("$0.001").unwrap(),
-        RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 })); }
+        RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 1_000 })); }
+    #[test] fn money_unlimited()     { assert_eq!(parse_value("unlimited").unwrap(),
+        RawValue::Money(Money::Unlimited)); }
+    #[test] fn unlimited_keyword_does_not_match_prefix() {
+        // `text::keyword` is word-boundary aware: `unlimited_x` must lex as
+        // an enum-member identifier, not as `Money::Unlimited` followed by
+        // trailing junk. Pins the boundary contract.
+        let v = parse_value("unlimited_x").unwrap();
+        assert_eq!(v, RawValue::EnumMember("unlimited_x".into()));
+    }
 
     #[test] fn duration_seconds()    { assert_eq!(parse_value("5s").unwrap(),
         RawValue::Duration(Duration { nanos: 5_000_000_000 })); }
@@ -1593,7 +1607,7 @@ mod value_tests {
         let parsed = parse_value("$0.001 per 1k_tokens").unwrap();
         let RawValue::Rate(r) = parsed else { panic!("expected Rate, got {parsed:?}") };
         assert_eq!(r.numerator,
-            RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 }));
+            RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 1_000 }));
         assert_eq!(r.denominator,
             RawValue::Size(Size { units: 1024 }));
     }
@@ -1626,7 +1640,7 @@ mod value_tests {
         // is what enables this.
         let parsed = parse_value("$50").unwrap();
         assert_eq!(parsed,
-            RawValue::Money(Money { currency: Currency::Usd, micro_units: 50_000_000 }));
+            RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 50_000_000 }));
     }
 
     #[test] fn int_alone_is_not_rate() {
@@ -1710,11 +1724,11 @@ mod snippet_tests {
     fn snippet_cases() -> Vec<(&'static str, RawValue)> {
         vec![
             ("money-50-usd.ais",
-                RawValue::Money(Money { currency: Currency::Usd, micro_units: 50_000_000 })),
+                RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 50_000_000 })),
             ("money-001-usd.ais",
-                RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 })),
+                RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 1_000 })),
             ("money-100-eur.ais",
-                RawValue::Money(Money { currency: Currency::Eur, micro_units: 100_000_000 })),
+                RawValue::Money(Money::Capped { currency: Currency::Eur, micro_units: 100_000_000 })),
             ("duration-2s.ais",
                 RawValue::Duration(Duration { nanos: 2_000_000_000 })),
             ("duration-500ms.ais",
@@ -1763,12 +1777,12 @@ mod snippet_tests {
             // Wednesday additions — Rate + unit_quantity
             ("rate-money-per-tokens.ais",
                 RawValue::Rate(Box::new(RawRate {
-                    numerator:   RawValue::Money(Money { currency: Currency::Usd, micro_units: 1_000 }),
+                    numerator:   RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 1_000 }),
                     denominator: RawValue::Size(Size { units: 1024 }),
                 }))),
             ("rate-money-per-duration.ais",
                 RawValue::Rate(Box::new(RawRate {
-                    numerator:   RawValue::Money(Money { currency: Currency::Usd, micro_units: 5_000_000 }),
+                    numerator:   RawValue::Money(Money::Capped { currency: Currency::Usd, micro_units: 5_000_000 }),
                     denominator: RawValue::Duration(Duration { nanos: 3_600_000_000_000 }),
                 }))),
         ]
@@ -1853,9 +1867,9 @@ mod project_tests {
         assert_eq!(p.name, "minimal");
         let b = p.budget.expect("budget present");
         assert_eq!(b.hard_cap_per_day,
-            Money { currency: Currency::Usd, micro_units: 10_000_000 });
+            Money::Capped { currency: Currency::Usd, micro_units: 10_000_000 });
         assert_eq!(b.hard_cap_per_run,
-            Money { currency: Currency::Usd, micro_units: 100_000 });
+            Money::Capped { currency: Currency::Usd, micro_units: 100_000 });
         assert_eq!(b.optimize_for, OptimizeFor::Cost);
     }
 
@@ -2182,7 +2196,7 @@ mod project_tests {
         assert_eq!(m.context_min, Size { units: 32 * 1024 });
         let cost = m.cost_max.as_ref().expect("cost_max set");
         assert_eq!(cost.numerator,
-            Money { currency: Currency::Usd, micro_units: 1_000 });
+            Money::Capped { currency: Currency::Usd, micro_units: 1_000 });
         assert_eq!(cost.denominator, Size { units: 1024 });
         assert_eq!(m.latency_p95, Some(Duration { nanos: 2_000_000_000 }));
         assert_eq!(m.residency, Some(vec![Residency::Eu, Residency::Us]));

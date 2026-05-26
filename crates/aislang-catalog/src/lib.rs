@@ -193,7 +193,7 @@ mod tests {
         // Money: "$0.0008" → 800 micro-USD
         assert_eq!(
             haiku.cost_input,
-            Money { currency: Currency::Usd, micro_units: 800 }
+            Money::Capped { currency: Currency::Usd, micro_units: 800 }
         );
 
         // Duration: "1500ms" → 1.5 billion nanos. The integer-only Duration
@@ -213,10 +213,15 @@ mod tests {
         // catalog entry.
         let cat = bundled().expect("bundled catalog must parse");
         for m in &cat.models {
-            assert!(m.cost_input.micro_units >= 0,
-                "cost_input must be non-negative for {}", m.id);
-            assert!(m.cost_output.micro_units >= 0,
-                "cost_output must be non-negative for {}", m.id);
+            // `Money::Unlimited` is technically valid for catalog costs
+            // ("unbounded/unknown cost") — skip the non-negativity check
+            // for it. `Capped` values must be ≥ 0.
+            if let Some(u) = m.cost_input.micro_units() {
+                assert!(u >= 0, "cost_input must be non-negative for {}", m.id);
+            }
+            if let Some(u) = m.cost_output.micro_units() {
+                assert!(u >= 0, "cost_output must be non-negative for {}", m.id);
+            }
         }
     }
 

@@ -40,30 +40,76 @@ pub enum Currency {
     Jpy,
 }
 
-/// Monetary amount stored as integer micro-units of the base currency.
-/// `$1` → `1_000_000` micro-USD. Six fractional decimal digits are
-/// representable exactly (sufficient for sub-cent LLM pricing like
-/// `$0.000075`); more is rejected at parse time.
+/// Monetary amount. v0.1 has two shapes (Decision 10):
+///
+///   - **`Capped { currency, micro_units }`** — a finite amount stored
+///     as integer micro-units of the base currency. `$1` →
+///     `Capped { currency: Usd, micro_units: 1_000_000 }`. Six
+///     fractional decimal digits representable exactly (sub-cent LLM
+///     pricing like `$0.000075`); more rejected at parse time.
+///   - **`Unlimited`** — the bare keyword `unlimited`. Used in
+///     `budget` block fields to mean "no cap" — common for local-only
+///     models (Ollama). Treated as the absorbing top in cost
+///     comparisons: `Unlimited > Capped(any)`, `Unlimited == Unlimited`.
+///
+/// `Unlimited` is conceptually valid for catalog `cost_input_*` /
+/// `cost_output_*` fields too ("model exists but cost is unbounded /
+/// unknown") — the resolver handles it by excluding such candidates
+/// from any `Capped` budget constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Money {
-    pub currency:    Currency,
-    pub micro_units: i64,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Money {
+    Capped { currency: Currency, micro_units: i64 },
+    Unlimited,
 }
 
 /// `10^6` — number of micro-units per one base currency unit.
 const MICRO_PER_BASE: i64 = 1_000_000;
 
 impl Money {
-    /// Parse a `Money` literal of the form `<symbol><integer>[.<fraction>]`,
-    /// where `<symbol>` is one of `$`, `€`, `£`, `¥`.
+    /// `true` iff this is the `Unlimited` variant.
+    pub fn is_unlimited(&self) -> bool {
+        matches!(self, Money::Unlimited)
+    }
+
+    /// Extract `micro_units` if `Capped`, `None` if `Unlimited`. Use
+    /// at sites where "Unlimited" doesn't make arithmetic sense (e.g.
+    /// emitting env vars).
+    pub fn micro_units(&self) -> Option<i64> {
+        match self {
+            Money::Capped { micro_units, .. } => Some(*micro_units),
+            Money::Unlimited                  => None,
+        }
+    }
+
+    /// Extract `currency` if `Capped`, `None` if `Unlimited`.
+    pub fn currency(&self) -> Option<Currency> {
+        match self {
+            Money::Capped { currency, .. } => Some(*currency),
+            Money::Unlimited               => None,
+        }
+    }
+
+    /// Build a USD-`Capped` Money — used by tests + helpers.
+    pub fn usd(micro_units: i64) -> Self {
+        Money::Capped { currency: Currency::Usd, micro_units }
+    }
+
+    /// Parse a `Money` literal: `<symbol><integer>[.<fraction>]` for
+    /// a finite amount, OR the bare keyword `unlimited` for the
+    /// `Unlimited` variant.
     ///
     /// Examples (valid):
-    ///   `$50`, `$0.001`, `$0.000075`, `€100`, `£0.50`, `¥1000`
+    ///   `$50`, `$0.001`, `$0.000075`, `€100`, `£0.50`, `¥1000`,
+    ///   `unlimited`
     ///
     /// Examples (rejected):
     ///   `"$50"` (a String, not a Money — kind error caught by the type-checker),
     ///   `50`, `$`, `$.50`, `$0.0000001` (>6 fractional digits)
     pub fn from_literal(s: &str) -> Result<Self, LiteralParseError> {
+        if s == "unlimited" {
+            return Ok(Money::Unlimited);
+        }
         let err = |reason: &str| LiteralParseError::new("Money", s, reason);
 
         let mut chars = s.chars();
@@ -73,7 +119,7 @@ impl Money {
             '€' => Currency::Eur,
             '£' => Currency::Gbp,
             '¥' => Currency::Jpy,
-            _ => return Err(err("must start with one of $, €, £, ¥")),
+            _ => return Err(err("must start with one of $, €, £, ¥, or be the bare keyword `unlimited`")),
         };
 
         let rest = chars.as_str();
@@ -120,7 +166,28 @@ impl Money {
             .checked_add(micro_from_frac)
             .ok_or_else(|| err("amount overflow"))?;
 
-        Ok(Money { currency, micro_units })
+        Ok(Money::Capped { currency, micro_units })
+    }
+}
+
+// Cost-comparison ordering. v0.1 ignores currency mismatches — all
+// catalog/budget values are USD in practice. Mixed-currency
+// comparisons (rare) compare micro_units directly, matching what
+// users likely expect.
+impl PartialOrd for Money {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Money {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        match (self, other) {
+            (Money::Unlimited,                 Money::Unlimited)                 => Equal,
+            (Money::Unlimited,                 Money::Capped { .. })             => Greater,
+            (Money::Capped { .. },             Money::Unlimited)                 => Less,
+            (Money::Capped { micro_units: a, ..}, Money::Capped { micro_units: b, ..}) => a.cmp(b),
+        }
     }
 }
 
@@ -483,7 +550,7 @@ mod money_tests {
     fn ok(input: &str, currency: Currency, micro: i64) {
         let parsed = Money::from_literal(input)
             .unwrap_or_else(|e| panic!("expected `{input}` to parse, got: {e}"));
-        assert_eq!(parsed, Money { currency, micro_units: micro });
+        assert_eq!(parsed, Money::Capped { currency, micro_units: micro });
     }
 
     fn rejected(input: &str, substring: &str) {
@@ -521,6 +588,88 @@ mod money_tests {
     #[test] fn seven_decimals_rejected()      { rejected("$0.0000001","fractional precision"); }
     #[test] fn non_digit_in_integer_rejected(){ rejected("$5a",       "integer part must be decimal digits"); }
     #[test] fn negative_rejected()            { rejected("$-5",       "integer part must be decimal digits"); }
+
+    // ---- Money::Unlimited (Decision 10, week 7 Mon) ----
+
+    #[test] fn unlimited_literal_parses() {
+        // The bare keyword `unlimited` produces `Money::Unlimited`.
+        let m = Money::from_literal("unlimited").expect("unlimited parses");
+        assert_eq!(m, Money::Unlimited);
+        assert!(m.is_unlimited());
+        assert_eq!(m.micro_units(), None);
+        assert_eq!(m.currency(),    None);
+    }
+
+    #[test] fn unlimited_is_case_sensitive() {
+        // We reserve only the lowercase form. `UNLIMITED`, `Unlimited`,
+        // etc. continue to fail the currency-symbol check.
+        rejected("UNLIMITED", "must start with one of");
+        rejected("Unlimited", "must start with one of");
+    }
+
+    #[test] fn capped_helpers_work() {
+        let m = Money::Capped { currency: Currency::Usd, micro_units: 42 };
+        assert!(!m.is_unlimited());
+        assert_eq!(m.micro_units(), Some(42));
+        assert_eq!(m.currency(),    Some(Currency::Usd));
+    }
+
+    #[test] fn usd_constructor_helper() {
+        assert_eq!(
+            Money::usd(1_000),
+            Money::Capped { currency: Currency::Usd, micro_units: 1_000 },
+        );
+    }
+
+    // ---- Money Ord: Unlimited as absorbing top ----
+
+    #[test] fn unlimited_is_greater_than_any_capped() {
+        assert!(Money::Unlimited > Money::usd(0));
+        assert!(Money::Unlimited > Money::usd(i64::MAX));
+    }
+
+    #[test] fn capped_compares_by_micro_units() {
+        assert!(Money::usd(1)   < Money::usd(2));
+        assert!(Money::usd(100) > Money::usd(50));
+        assert_eq!(Money::usd(7), Money::usd(7));
+    }
+
+    #[test] fn unlimited_equals_unlimited() {
+        assert_eq!(Money::Unlimited, Money::Unlimited);
+        // Ord: not less, not greater.
+        assert_eq!(Money::Unlimited.cmp(&Money::Unlimited),
+                   std::cmp::Ordering::Equal);
+    }
+
+    #[test] fn min_with_unlimited_picks_capped() {
+        // Pinned for the resolver's `min_by` cost-optimization path
+        // (week 4 Mon): Unlimited never wins "cheapest".
+        let candidates = vec![Money::Unlimited, Money::usd(50), Money::usd(10)];
+        let cheapest = candidates.iter().min().unwrap();
+        assert_eq!(*cheapest, Money::usd(10));
+    }
+
+    // ---- JSON round-trip for both variants ----
+
+    #[test] fn capped_json_round_trip() {
+        let m = Money::usd(42);
+        let s = serde_json::to_string(&m).unwrap();
+        // Tagged enum: kind=capped + currency + micro_units.
+        assert!(s.contains(r#""kind":"capped""#), "got: {s}");
+        assert!(s.contains(r#""currency":"USD""#), "got: {s}");
+        assert!(s.contains(r#""micro_units":42"#), "got: {s}");
+        let back: Money = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test] fn unlimited_json_round_trip() {
+        let m = Money::Unlimited;
+        let s = serde_json::to_string(&m).unwrap();
+        // The variant has no payload — just the tag.
+        assert_eq!(s, r#"{"kind":"unlimited"}"#);
+        let back: Money = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, Money::Unlimited);
+    }
 }
 
 #[cfg(test)]

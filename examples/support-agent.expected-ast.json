@@ -2,10 +2,12 @@
   "name": "support-agent",
   "budget": {
     "hard_cap_per_day": {
+      "kind": "capped",
       "currency": "USD",
       "micro_units": 50000000
     },
     "hard_cap_per_run": {
+      "kind": "capped",
       "currency": "USD",
       "micro_units": 500000
     },
@@ -23,6 +25,7 @@
       },
       "cost_max": {
         "numerator": {
+          "kind": "capped",
           "currency": "USD",
           "micro_units": 1000
         },

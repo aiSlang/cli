@@ -52,8 +52,8 @@ fn expected_minimal() -> Project {
     Project {
         name:   "minimal".into(),
         budget: Some(Budget {
-            hard_cap_per_day: Money { currency: Currency::Usd, micro_units: 10_000_000 },
-            hard_cap_per_run: Money { currency: Currency::Usd, micro_units:    100_000 },
+            hard_cap_per_day: Money::Capped { currency: Currency::Usd, micro_units: 10_000_000 },
+            hard_cap_per_run: Money::Capped { currency: Currency::Usd, micro_units:    100_000 },
             optimize_for:     OptimizeFor::Cost,
         }),
         ..Project::default()
@@ -66,7 +66,7 @@ fn expected_support_agent() -> Project {
         requires:    vec![Capability::Chat, Capability::ToolUse],
         context_min: Size { units: 32 * 1024 },                  // 32k
         cost_max:    Some(Rate {
-            numerator:   Money { currency: Currency::Usd, micro_units: 1_000 }, // $0.001
+            numerator:   Money::Capped { currency: Currency::Usd, micro_units: 1_000 }, // $0.001
             denominator: Size  { units: 1024 },                                  // 1k tokens
         }),
         latency_p95: Some(Duration { nanos: 2_000_000_000 }),    // 2s
@@ -131,8 +131,8 @@ fn expected_support_agent() -> Project {
     Project {
         name:        "support-agent".into(),
         budget:      Some(Budget {
-            hard_cap_per_day: Money { currency: Currency::Usd, micro_units: 50_000_000 },
-            hard_cap_per_run: Money { currency: Currency::Usd, micro_units:    500_000 },
+            hard_cap_per_day: Money::Capped { currency: Currency::Usd, micro_units: 50_000_000 },
+            hard_cap_per_run: Money::Capped { currency: Currency::Usd, micro_units:    500_000 },
             optimize_for:     OptimizeFor::Cost,
         }),
         models:      vec![model_fast],

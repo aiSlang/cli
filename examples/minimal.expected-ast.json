@@ -2,10 +2,12 @@
   "name": "minimal",
   "budget": {
     "hard_cap_per_day": {
+      "kind": "capped",
       "currency": "USD",
       "micro_units": 10000000
     },
     "hard_cap_per_run": {
+      "kind": "capped",
       "currency": "USD",
       "micro_units": 100000
     },
