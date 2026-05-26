@@ -39,7 +39,9 @@ name = "aislang-compose"
 version = "0.1.0-dev"
 dependencies = [
  "aislang-core",
+ "aislang-resolver",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror",
 ]

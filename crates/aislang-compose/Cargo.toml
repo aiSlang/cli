@@ -9,7 +9,9 @@ authors.workspace      = true
 rust-version.workspace = true
 
 [dependencies]
-aislang-core = { workspace = true }
-serde        = { workspace = true }
-serde_yaml   = { workspace = true }
-thiserror    = { workspace = true }
+aislang-core     = { workspace = true }
+aislang-resolver = { workspace = true }   # consumes ResolvedProject
+serde            = { workspace = true }
+serde_json       = { workspace = true }   # model-bindings JSON for LiteLLM env
+serde_yaml       = { workspace = true }
+thiserror        = { workspace = true }
