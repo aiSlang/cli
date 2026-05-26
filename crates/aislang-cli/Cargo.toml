@@ -17,6 +17,8 @@ aislang-core     = { workspace = true }
 aislang-catalog  = { workspace = true }
 aislang-resolver = { workspace = true }   # catalog ID validation (week 3 Wed)
 aislang-compose  = { workspace = true }
+aislang-runtime  = { workspace = true }   # in-CLI agent runtime (week 6 Tue/Wed)
 clap             = { workspace = true }
 anyhow           = { workspace = true }
 serde_json       = { workspace = true }   # for -vvv JSON-IR rendering
+tokio            = { workspace = true }   # runtime for the chat subcommand (week 6 Wed)

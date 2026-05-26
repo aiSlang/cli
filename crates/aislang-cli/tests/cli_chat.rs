@@ -1,21 +1,26 @@
-//! Integration tests for `aislang chat <agent> <file>` — week 6 Mon stub.
+//! Integration tests for `aislang chat <agent> <file>` — week 6 Wed.
 //!
-//! These exercise the actual CLI binary against the bundled demo file
-//! and (intentionally) malformed inputs. They pin the v0.1 stub
-//! contract:
+//! Exercises the CLI binary against the bundled demo. Since Wed wires
+//! the live LiteLLM client, the tests use stdin EOF as the cleanest
+//! way to verify the banner + clean-shutdown path without standing up
+//! a real LiteLLM server. The wiremock-backed end-to-end test lives
+//! in `aislang-runtime::session::tests::session_turn_returns_*`.
 //!
-//!   1. `chat <known-agent> <demo>` → exit 0, prints the placeholder line.
-//!   2. `chat <unknown-agent> <demo>` → non-zero exit, error message
-//!      lists available labels and suggests close matches.
-//!   3. `chat <agent> <nonexistent-file>` → non-zero exit, clear file
-//!      error.
-//!
-//! All tests invoke the CARGO_BIN_EXE_aislang binary directly — no
-//! shell parsing, no rebuild between tests. Cargo builds the binary
-//! before this file's tests run.
+//! Contract pinned here:
+//!   1. `chat <known-agent> <demo>` with EOF stdin → exit 0; banner
+//!      on stderr ("agent `support`…connected to LiteLLM…") +
+//!      "(end of input)" on session close. Stdout stays clean
+//!      (no model output without a turn).
+//!   2. `chat <unknown-agent> <demo>` → non-zero exit + close-match
+//!      hint.
+//!   3. `chat <agent> <nonexistent-file>` → non-zero exit + clear
+//!      file error.
+//!   4. `chat <agent> <malformed-source>` → non-zero exit via the
+//!      source-aware validate pipeline.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Absolute path to the bundled support-agent demo file.
 fn demo_path() -> PathBuf {
@@ -30,39 +35,67 @@ fn bin() -> Command {
 }
 
 // ---------------------------------------------------------------------------
-// Happy path
+// Happy path — EOF stdin closes the session cleanly
 // ---------------------------------------------------------------------------
 
-#[test] fn chat_with_known_agent_in_demo_succeeds() {
-    let out = bin()
+#[test] fn chat_with_known_agent_opens_session_and_exits_on_eof() {
+    // No stdin → reader.next_line() returns Ok(None) immediately →
+    // session closes with "(end of input)" + exit 0. Validates the
+    // happy path through validate + agent lookup + prompt load +
+    // session.open WITHOUT requiring a live LiteLLM (no `turn()`
+    // is invoked — the very first action is the EOF check).
+    let mut child = bin()
         .args(["chat", "support"])
         .arg(demo_path())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn aislang");
+    // Close stdin immediately — child sees EOF.
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait");
+
     assert!(out.status.success(),
-        "expected exit 0; stderr was:\n{}",
+        "expected exit 0 on EOF; stderr was:\n{}",
         String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Banner contents (all on stderr — stdout stays pipe-clean).
+    assert!(stderr.contains("agent `support`"),
+        "stderr must name the agent; got:\n{stderr}");
+    assert!(stderr.contains("model alias `fast`"),
+        "stderr must name the model alias; got:\n{stderr}");
+    assert!(stderr.contains("LiteLLM"),
+        "stderr must mention LiteLLM connection; got:\n{stderr}");
+    assert!(stderr.contains("end of input"),
+        "stderr must mark clean EOF close; got:\n{stderr}");
+    // No turn was made → no assistant output on stdout.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("agent `support` resolved"),
-        "stdout should confirm agent resolution; got:\n{stdout}");
-    assert!(stdout.contains("chat loop arrives Wednesday"),
-        "stdout should carry the stub line; got:\n{stdout}");
+    assert!(stdout.is_empty(),
+        "no turns means no stdout; got: {stdout:?}");
 }
 
-#[test] fn chat_stub_lists_remaining_week6_schedule() {
-    // The stub line surfaces what's coming in the next four days —
-    // useful for anyone reading the output mid-week to know the
-    // current dev state.
-    let out = bin()
+#[test] fn chat_exit_command_ends_session_cleanly() {
+    // `/exit` typed at the prompt → "(/exit — session ended)" + exit 0.
+    // Same as EOF but via the explicit command keyword. Pin this so a
+    // future refactor doesn't accidentally break the documented escape.
+    let mut child = bin()
         .args(["chat", "support"])
         .arg(demo_path())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn aislang");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Tue: rmcp"));
-    assert!(stdout.contains("Wed: LiteLLM"));
-    assert!(stdout.contains("Thu: MCP tool-use"));
-    assert!(stdout.contains("Fri: end-to-end"));
+    {
+        let stdin = child.stdin.as_mut().expect("stdin handle");
+        stdin.write_all(b"/exit\n").expect("write /exit");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/exit — session ended"),
+        "stderr must mark /exit close; got:\n{stderr}");
 }
 
 // ---------------------------------------------------------------------------

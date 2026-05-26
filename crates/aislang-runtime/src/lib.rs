@@ -21,3 +21,8 @@
 //! exactly as they are.
 
 pub mod mcp;
+pub mod litellm;
+pub mod session;
+
+pub use session::{Session, SessionError, load_system_prompt, hex_sha256};
+pub use litellm::{LiteLlmClient, LiteLlmError, ChatRequest, ChatMessage, Role};

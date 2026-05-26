@@ -17,3 +17,12 @@ tokio       = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
+# week-6 Wed
+reqwest     = { workspace = true }
+sha2        = { workspace = true }
+
+[dev-dependencies]
+# wiremock — Rust port of WireMock; lets us spin up a fake HTTP server
+# in-process for testing LiteLlmClient end-to-end without a real LiteLLM.
+wiremock    = "0.6"
+tokio       = { workspace = true, features = ["test-util"] }

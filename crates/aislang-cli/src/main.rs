@@ -488,20 +488,35 @@ fn run_smoke_test(compose_yaml: &str) -> Result<()> {
 }
 
 // ============================================================================
-// `aislang chat` — Monday of week 6 (stub) → Wednesday onwards (live loop)
+// `aislang chat` — Monday of week 6 (stub) → Wednesday (live LiteLLM loop)
 // ============================================================================
 
-/// Validate the project parses, find the named agent, then print a
-/// placeholder line. Real chat loop lands week 6 Wednesday.
+/// Open an interactive chat session against a declared agent.
 ///
-/// v0.1 only checks: (1) source file readable; (2) parses cleanly;
-/// (3) agent label exists. The latter uses Levenshtein-style "did you
-/// mean…?" suggestions reusing the checker's `nearest_label` helper —
-/// same error UX as cross-resource ref lookups elsewhere.
+/// Flow:
+///   1. Read + validate the project source. Surface parse / type-check
+///      errors via the source-aware diagnostic pipeline so the UX
+///      matches `aislang validate`.
+///   2. Find the agent by label (with Levenshtein "did you mean…?"
+///      suggestions on misses — same UX as cross-resource refs).
+///   3. Resolve the agent's `model.label` reference and `prompt.label`
+///      reference into the concrete bindings the runtime needs.
+///   4. Load the system-prompt file's contents. If `aislang.lock` is
+///      present in the source directory and carries a hash for this
+///      prompt, verify it — otherwise read without verification (the
+///      user may have skipped lockfile creation via `--no-lock` at
+///      plan time).
+///   5. Open a `Session` against the compose-default LiteLLM URL.
+///   6. Loop: read one line from stdin, run a turn, print the
+///      assistant message. `/exit` or EOF cleanly closes.
+///
+/// The interactive loop is async (LiteLLM is HTTP-backed via reqwest).
+/// We spin up a single-thread tokio runtime on entry and `block_on`
+/// the whole session — keeps the rest of the CLI sync.
 fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
+    // ── 1. validate ──
     let source = std::fs::read_to_string(&file)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-
     let (project, _warnings) = match aislang_core::validate(&source) {
         Ok(v) => v,
         Err(err) => {
@@ -510,40 +525,130 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         }
     };
 
-    // Find the agent by label.
-    let exists = project.agents.iter().any(|a| a.label == agent_label);
-    if !exists {
-        let mut available: Vec<&str> = project.agents.iter()
-            .map(|a| a.label.as_str())
-            .collect();
-        available.sort();
-        let hint = nearest_agent_label(&agent_label, &available);
-        let hint_line = match hint {
-            Some(h) => format!(" — did you mean `{h}`?"),
-            None    => String::new(),
-        };
-        let avail_line = if available.is_empty() {
-            "  (no agents declared in this project)".to_string()
-        } else {
-            format!("  available: {}", available.join(", "))
-        };
-        return Err(anyhow::anyhow!(
-            "no agent named `{agent_label}` in {}{hint_line}\n{avail_line}",
-            file.display()
-        ));
-    }
+    // ── 2. find agent ──
+    let agent = match project.agents.iter().find(|a| a.label == agent_label) {
+        Some(a) => a,
+        None => {
+            let mut available: Vec<&str> = project.agents.iter()
+                .map(|a| a.label.as_str())
+                .collect();
+            available.sort();
+            let hint = nearest_agent_label(&agent_label, &available);
+            let hint_line = match hint {
+                Some(h) => format!(" — did you mean `{h}`?"),
+                None    => String::new(),
+            };
+            let avail_line = if available.is_empty() {
+                "  (no agents declared in this project)".to_string()
+            } else {
+                format!("  available: {}", available.join(", "))
+            };
+            return Err(anyhow::anyhow!(
+                "no agent named `{agent_label}` in {}{hint_line}\n{avail_line}",
+                file.display()
+            ));
+        }
+    };
 
-    // v0.1 Monday stub.
-    println!("aislang chat: agent `{agent_label}` resolved in {}.",
-             file.display());
-    println!("chat loop arrives Wednesday — see PLAN-90-days.md week 6.");
-    println!();
-    println!("scheduled days:");
-    println!("  Tue: rmcp client wiring (aislang-runtime crate)");
-    println!("  Wed: LiteLLM HTTP client + non-streaming chat loop");
-    println!("  Thu: MCP tool-use loop (8-iter cap)");
-    println!("  Fri: end-to-end demo + `aislang apply` promoted from stub");
-    Ok(())
+    // ── 3. resolve model + prompt refs ──
+    let model_label  = agent.model.label.clone();
+    let prompt_label = agent.system_prompt.label.clone();
+    let prompt_block = project.prompts.iter()
+        .find(|p| p.label == prompt_label)
+        .ok_or_else(|| anyhow::anyhow!(
+            "agent `{agent_label}` references prompt `{prompt_label}` \
+             which doesn't exist in {}", file.display()))?;
+
+    // Prompt file path is recorded relative to the source file's dir.
+    let source_dir   = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let prompt_path  = source_dir.join(&prompt_block.file);
+
+    // ── 4. load + verify prompt ──
+    // If aislang.lock exists in source_dir and carries a hash for
+    // this prompt label, verify it. Missing lockfile = no verification.
+    let lock_path = source_dir.join("aislang.lock");
+    let expected_hash: Option<String> =
+        match aislang_resolver::lockfile::read(&lock_path) {
+            Ok(Some(lock)) => lock.prompt_hashes.get(&prompt_label).cloned(),
+            _              => None,
+        };
+    let system_prompt = aislang_runtime::load_system_prompt(
+        &prompt_path,
+        expected_hash.as_deref(),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // ── 5+6. open session, run interactive loop ──
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+    rt.block_on(chat_interactive(
+        &agent_label,
+        &model_label,
+        system_prompt,
+    ))
+}
+
+/// The async interactive loop. Separate from `run_chat` to keep the
+/// sync arg-parsing + resolution phase out of the tokio runtime.
+async fn chat_interactive(
+    agent_label:   &str,
+    model_label:   &str,
+    system_prompt: String,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let session = aislang_runtime::Session::open(
+        model_label,
+        system_prompt,
+        None, // default http://localhost:4000
+    ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
+
+    // Banner — stderr so stdout stays pipe-clean for the model output.
+    eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`)");
+    eprintln!("connected to LiteLLM at {}", aislang_runtime::LiteLlmClient::DEFAULT_URL);
+    eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
+    eprintln!();
+
+    // Read one line at a time from stdin. tokio's stdin handle
+    // doesn't expose AsyncBufRead by default; wrap it.
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+
+    loop {
+        eprint!("> ");
+        // Flush eprint! before awaiting stdin — otherwise the prompt
+        // appears AFTER the user types, which is jarring.
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+
+        let line = match reader.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None)    => {
+                // EOF (Ctrl-D or piped input ran out).
+                eprintln!("(end of input)");
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("stdin read error: {e}")),
+        };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if line == "/exit" {
+            eprintln!("(/exit — session ended)");
+            return Ok(());
+        }
+
+        // One round-trip.
+        match session.turn(line).await {
+            Ok(reply) => println!("{reply}"),
+            Err(e)    => {
+                eprintln!("aislang chat: {e}");
+                // Don't abort the session on a single failed turn —
+                // user can retry. Network blips, rate limits, etc.
+                continue;
+            }
+        }
+    }
 }
 
 /// Levenshtein-style "closest match" heuristic. Threshold ≤2 edits;

@@ -38,7 +38,9 @@ semver      = { version = "1",   features = ["serde"] }
 sha2        = "0.10"
 # week-6 Tue: in-CLI agent runtime
 rmcp        = { version = "1.7", features = ["client", "transport-child-process"] }
-tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync"] }
+tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "time", "sync"] }
+# week-6 Wed: LiteLLM HTTP client + non-streaming chat loop
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]
 opt-level = 3
