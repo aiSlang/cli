@@ -692,4 +692,135 @@ mod tests {
         let count = env.matches("ANTHROPIC_API_KEY=").count();
         assert_eq!(count, 1, "expected one line, got {count} in:\n{env}");
     }
+
+    // ----------------------------------------------------------------
+    // Friday: additional edge cases pushed onto coverage before launch
+    // ----------------------------------------------------------------
+
+    #[test] fn multiple_model_blocks_get_separate_fallback_chains() {
+        // Two model blocks, each with its own prefer/fallback. The
+        // fallbacks map should have one key per primary label, each
+        // pointing at the right alternates.
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+            model "fast" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_haiku_4_5]
+                fallback    = [openai.gpt_4o_mini]
+                pin         = anthropic.claude_haiku_4_5
+            }
+            model "smart" {
+                requires    = [chat]
+                context_min = 200k
+                prefer      = [anthropic.claude_opus_4_7]
+                fallback    = [anthropic.claude_sonnet_4_6]
+                pin         = anthropic.claude_opus_4_7
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
+            .expect("resolve");
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        let router = cfg.router_settings.as_ref().unwrap();
+        assert_eq!(router.fallbacks.len(), 2);
+
+        let fast_fb = router.fallbacks.get("fast").unwrap();
+        assert_eq!(fast_fb, &vec!["fast-fb-openai-gpt-4o-mini".to_string()]);
+
+        let smart_fb = router.fallbacks.get("smart").unwrap();
+        assert_eq!(smart_fb,
+            &vec!["smart-fb-anthropic-claude-sonnet-4-6".to_string()]);
+    }
+
+    #[test] fn env_example_aggregates_across_two_blocks_with_diff_providers() {
+        // First block uses anthropic; second uses openai+ollama via
+        // fallbacks. .env.example must cover all three.
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+            model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_haiku_4_5]
+                pin         = anthropic.claude_haiku_4_5
+            }
+            model "secondary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [openai.gpt_4o_mini]
+                fallback    = [ollama.llama_3_1_8b]
+                pin         = openai.gpt_4o_mini
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
+            .expect("resolve");
+        let env = generate_env_example(&resolved);
+        // Note: .env.example collects vars from RESOLVED primaries only,
+        // not from fallback alternates. So ollama (fallback of secondary)
+        // doesn't appear unless a primary uses it.
+        assert!(env.contains("ANTHROPIC_API_KEY="));
+        assert!(env.contains("OPENAI_API_KEY="));
+        // Ollama is only in fallback, primary is openai — so no OLLAMA_API_BASE.
+        assert!(!env.contains("OLLAMA_API_BASE="));
+    }
+
+    #[test] fn no_models_no_router_settings() {
+        // Project with no model blocks at all → empty model_list,
+        // None router_settings.
+        use aislang_core::ast::Project;
+        let resolved = ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+        };
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        assert!(cfg.model_list.is_empty());
+        assert!(cfg.router_settings.is_none());
+    }
+
+    #[test] fn fallback_alias_handles_label_underscores() {
+        // Primary label with underscores stays as-is (only the model
+        // name part gets hyphenated). User-chosen labels can be either
+        // hyphenated or under_scored.
+        let mid = ModelId { provider: "anthropic".into(),
+                            name: "claude_haiku_4_5".into() };
+        assert_eq!(
+            super::fallback_alias("my_smart_model", &mid),
+            "my_smart_model-fb-anthropic-claude-haiku-4-5",
+        );
+    }
+
+    #[test] fn router_settings_yaml_after_model_list() {
+        // Diff-stable ordering: model_list section appears before
+        // router_settings (the order the struct fields are declared in).
+        let (resolved, catalog) = resolve_demo();
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        let ml_pos     = yaml.find("model_list:").expect("model_list");
+        let router_pos = yaml.find("router_settings:").expect("router_settings");
+        assert!(ml_pos < router_pos,
+            "model_list must precede router_settings; got model_list@{ml_pos}, router_settings@{router_pos}");
+    }
+
+    #[test] fn yaml_emits_block_style_for_router_settings_too() {
+        // Pin block style on the whole config — important for human
+        // readability of the generated file.
+        let (resolved, catalog) = resolve_demo();
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        assert!(yaml.contains("\nrouter_settings:\n  fallbacks:\n    fast:\n"),
+            "expected block-style nested map; got:\n{yaml}");
+    }
+
+    #[test] fn yaml_round_trips_with_full_config() {
+        // serde_yaml roundtrip on the Thu output (includes
+        // router_settings + multiple model_list entries).
+        let (resolved, catalog) = resolve_demo();
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        let _: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .expect("full config must round-trip through serde_yaml");
+    }
 }

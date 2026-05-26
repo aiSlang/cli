@@ -49,11 +49,18 @@ enum Command {
         #[arg(long)]
         no_lock: bool,
         /// Directory to write generated artifacts (litellm_config.yaml,
-        /// aislang.lock). Defaults to the source file's directory. The
-        /// emitted Compose YAML embeds absolute paths so the user can
-        /// `docker compose -f - up` from anywhere.
+        /// aislang.lock, .env.example). Defaults to the source file's
+        /// directory. The emitted Compose YAML embeds absolute paths
+        /// so the user can `docker compose -f - up` from anywhere.
         #[arg(short = 'o', long)]
         output_dir: Option<PathBuf>,
+        /// After emitting, pipe the generated Compose YAML through
+        /// `docker compose -f - config -q` to confirm Docker accepts
+        /// the structure. Gracefully degrades when the docker CLI
+        /// isn't on PATH (prints "skipped" — exit 0). v0.2 will
+        /// extend with `up -d` + health-poll + real LLM call.
+        #[arg(long)]
+        smoke_test: bool,
     },
     /// Apply the plan — deploy the stack via Docker Compose
     Apply {
@@ -99,8 +106,8 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate { file, verbose }            => run_validate(file, verbose),
-        Command::Plan { file, verbose, no_lock, output_dir } =>
-            run_plan(file, verbose, no_lock, output_dir),
+        Command::Plan { file, verbose, no_lock, output_dir, smoke_test } =>
+            run_plan(file, verbose, no_lock, output_dir, smoke_test),
         Command::Apply { file: _ }   => stub("apply",   6),
         Command::Destroy { file: _ } => stub("destroy", 10),
         Command::Eval { file: _ }    => stub("eval",    8),
@@ -230,6 +237,7 @@ fn run_plan(
     verbose:    u8,
     no_lock:    bool,
     output_dir: Option<PathBuf>,
+    smoke_test: bool,
 ) -> Result<()> {
     let source = std::fs::read_to_string(&file)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
@@ -391,6 +399,83 @@ fn run_plan(
             Err(e)   => eprintln!("(JSON serialization failed: {e})"),
         }
     }
+
+    if smoke_test {
+        eprintln!();
+        eprintln!("smoke test:");
+        run_smoke_test(&artifacts.docker_compose)?;
+    }
+
+    Ok(())
+}
+
+/// `--smoke-test`: hand the generated compose YAML to `docker compose
+/// config -q`, report whether Docker accepts the structure.
+///
+/// Tiered degradation:
+///   1. `docker` not on PATH        → skipped, exit 0
+///   2. `docker compose config -q`  → run; failure surfaces stderr
+///                                     to the user and propagates as
+///                                     an error
+///
+/// v0.2 extends with: `docker compose up -d` + health-poll + real
+/// `/v1/chat/completions` curl + `docker compose down`. The polling
+/// + cleanup machinery is non-trivial; v0.1 stops at the config-
+/// validation tier (which already catches every YAML-shape bug seen
+/// in week-5 — most recently the AISLANG_CATALOG_VERSION date-shape
+/// regression).
+fn run_smoke_test(compose_yaml: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Tier 1: docker CLI present?
+    let docker_present = Command::new("docker").arg("--version").output();
+    match docker_present {
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout);
+            eprintln!("  docker present:    {}", ver.trim());
+        }
+        _ => {
+            eprintln!("  docker not found on PATH — skipping all checks.");
+            eprintln!("  (install Docker Desktop or docker.io to enable smoke tests.)");
+            return Ok(());
+        }
+    }
+
+    // Tier 2: pipe the compose YAML to `docker compose config -q`.
+    let mut child = Command::new("docker")
+        .args(["compose", "-f", "-", "config", "-q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn docker compose: {e}"))?;
+
+    child.stdin.as_mut()
+        .ok_or_else(|| anyhow::anyhow!("docker compose stdin not available"))?
+        .write_all(compose_yaml.as_bytes())
+        .map_err(|e| anyhow::anyhow!("write to docker compose stdin: {e}"))?;
+
+    let output = child.wait_with_output()
+        .map_err(|e| anyhow::anyhow!("wait for docker compose: {e}"))?;
+
+    if output.status.success() {
+        eprintln!("  compose validate:  ✓ Docker accepts the YAML");
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("  compose validate:  ✗ Docker rejected the YAML:");
+        for line in stderr.lines() {
+            eprintln!("      {line}");
+        }
+        return Err(anyhow::anyhow!(
+            "docker compose config -q rejected the generated YAML \
+             (exit {:?}); see lines above",
+            output.status.code()
+        ));
+    }
+
+    // Tier 3 (`up -d` + health-poll + LLM call + `down`): v0.2.
+    eprintln!("  up/down + LLM call: deferred to v0.2");
 
     Ok(())
 }
