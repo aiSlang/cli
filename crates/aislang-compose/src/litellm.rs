@@ -36,15 +36,26 @@ pub struct LiteLlmConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouterSettings {
-    /// Map from a primary `model_name` (the alias users invoke) to
-    /// the ordered list of alternate `model_name` aliases LiteLLM
-    /// will try in turn if the primary errors. v0.1 only the
-    /// fallbacks knob is wired; v0.2+ may grow this struct.
+    /// LiteLLM router fallbacks — list of single-key dicts:
+    ///   ```yaml
+    ///   fallbacks:
+    ///     - fast:  ["fast-fb-anthropic-claude-haiku-4-5", "fast-fb-openai-gpt-4o-mini"]
+    ///     - smart: ["smart-fb-google-gemini-2-0-pro"]
+    ///   ```
     ///
-    /// Ordering of the inner `Vec` is significant — first alternate
-    /// is tried first. Outer `BTreeMap` sorts by key for diff-stable
-    /// YAML output.
-    pub fallbacks: BTreeMap<String, Vec<String>>,
+    /// Not a YAML map. LiteLLM iterates this field expecting each
+    /// element to be a `dict` and raises
+    ///   `ValueError: Item '<key>' is not a dictionary`
+    /// at startup if you emit it as a top-level mapping
+    /// (`fallbacks: { fast: [...] }`). That's why each entry is
+    /// itself a one-key `BTreeMap` — LiteLLM sees a `list[dict]`,
+    /// gets the `key` + `value` per element, and validates each as
+    /// a dict.
+    ///
+    /// Outer order is alphabetical by the single key (we sort at
+    /// build time) so the emitted YAML is diff-stable across plan
+    /// runs.
+    pub fallbacks: Vec<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,8 +131,10 @@ pub enum ConfigError {
 pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
     -> Result<LiteLlmConfig, ConfigError>
 {
-    let mut model_list:    Vec<ModelEntry>                  = Vec::new();
-    let mut fallbacks_map: BTreeMap<String, Vec<String>>    = BTreeMap::new();
+    let mut model_list: Vec<ModelEntry>                       = Vec::new();
+    // Collect (primary_label, fallback_aliases) pairs first; the
+    // list-of-single-key-dicts is built in alphabetical order below.
+    let mut fallback_pairs: BTreeMap<String, Vec<String>>     = BTreeMap::new();
 
     for (label, primary_id) in &resolved.model_bindings {
         // (a) primary entry — uses the label as model_name
@@ -159,14 +172,29 @@ pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
         }
 
         if !fallback_aliases.is_empty() {
-            fallbacks_map.insert(label.clone(), fallback_aliases);
+            fallback_pairs.insert(label.clone(), fallback_aliases);
         }
     }
 
-    let router_settings = if fallbacks_map.is_empty() {
+    let router_settings = if fallback_pairs.is_empty() {
         None
     } else {
-        Some(RouterSettings { fallbacks: fallbacks_map })
+        // Materialize as a list of single-key dicts. LiteLLM iterates
+        // this field expecting `dict` items; a top-level YAML mapping
+        // here crashes the proxy at startup with
+        //   ValueError: Item '<key>' is not a dictionary
+        // (litellm/router.py::validate_fallbacks). See RouterSettings
+        // docs above. BTreeMap iteration order → alphabetical outer
+        // ordering → diff-stable YAML.
+        let fallbacks: Vec<BTreeMap<String, Vec<String>>> = fallback_pairs
+            .into_iter()
+            .map(|(label, aliases)| {
+                let mut m = BTreeMap::new();
+                m.insert(label, aliases);
+                m
+            })
+            .collect();
+        Some(RouterSettings { fallbacks })
     };
 
     Ok(LiteLlmConfig { model_list, router_settings })
@@ -386,6 +414,15 @@ mod tests {
         let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
             .expect("resolve");
         (resolved, catalog)
+    }
+
+    /// Test helper: find the fallback list for a given primary label
+    /// inside `RouterSettings.fallbacks` (which is a list-of-single-
+    /// key-dicts, not a map — see `RouterSettings` docs).
+    fn find_fallbacks<'a>(router: &'a RouterSettings, label: &str)
+        -> Option<&'a Vec<String>>
+    {
+        router.fallbacks.iter().find_map(|m| m.get(label))
     }
 
     // ---------- happy path ----------
@@ -688,8 +725,8 @@ mod tests {
         let cfg = build_config(&resolved, &catalog).expect("build");
         let router = cfg.router_settings.as_ref()
             .expect("router_settings must be present for demo");
-        let fast_fb = router.fallbacks.get("fast")
-            .expect("fast key in fallbacks map");
+        let fast_fb = find_fallbacks(router, "fast")
+            .expect("fast key in fallbacks list");
         // Order from source: prefer = [haiku, gpt-4o-mini], fallback = [llama_3_1_8b].
         // Llama is primary (excluded). Remaining: haiku, gpt-4o-mini.
         assert_eq!(fast_fb, &vec![
@@ -704,7 +741,7 @@ mod tests {
         let (resolved, catalog) = resolve_demo();
         let cfg = build_config(&resolved, &catalog).expect("build");
         let router = cfg.router_settings.as_ref().unwrap();
-        let fast_fb = router.fallbacks.get("fast").unwrap();
+        let fast_fb = find_fallbacks(router, "fast").unwrap();
         for alias in fast_fb {
             assert!(!alias.contains("ollama"),
                 "primary (ollama) must not appear in own fallback list; \
@@ -752,7 +789,7 @@ mod tests {
         // anthropic-claude-haiku is primary (excluded), and the
         // duplicate gpt_4o_mini is deduped.
         let router = cfg.router_settings.as_ref().unwrap();
-        let m_fb = router.fallbacks.get("m").unwrap();
+        let m_fb = find_fallbacks(router, "m").unwrap();
         assert_eq!(m_fb, &vec!["m-fb-openai-gpt-4o-mini".to_string()]);
     }
 
@@ -784,11 +821,18 @@ mod tests {
 
     #[test] fn yaml_emits_router_settings_under_top_level() {
         // String-form check that the YAML structure is right.
+        // The fallbacks shape is a list-of-single-key-dicts (see
+        // RouterSettings docs for the LiteLLM bootstrap requirement)
+        // so we look for `- fast:` (list-item with the primary as a
+        // single dict key) rather than just `fast:` (which would be
+        // a top-level map, the v0.1-rejected shape).
         let (resolved, catalog) = resolve_demo();
         let yaml = generate_config(&resolved, &catalog).expect("generate");
         assert!(yaml.contains("router_settings:"));
         assert!(yaml.contains("fallbacks:"));
-        assert!(yaml.contains("fast:"));
+        assert!(yaml.contains("- fast:"),
+            "fallbacks entry must be a list-item single-key dict (`- fast:`); \
+             got:\n{yaml}");
         assert!(yaml.contains("- fast-fb-anthropic-claude-haiku-4-5"));
         assert!(yaml.contains("- fast-fb-openai-gpt-4o-mini"));
     }
@@ -846,10 +890,10 @@ mod tests {
         let router = cfg.router_settings.as_ref().unwrap();
         assert_eq!(router.fallbacks.len(), 2);
 
-        let fast_fb = router.fallbacks.get("fast").unwrap();
+        let fast_fb = find_fallbacks(router, "fast").unwrap();
         assert_eq!(fast_fb, &vec!["fast-fb-openai-gpt-4o-mini".to_string()]);
 
-        let smart_fb = router.fallbacks.get("smart").unwrap();
+        let smart_fb = find_fallbacks(router, "smart").unwrap();
         assert_eq!(smart_fb,
             &vec!["smart-fb-anthropic-claude-sonnet-4-6".to_string()]);
     }
@@ -926,13 +970,46 @@ mod tests {
             "model_list must precede router_settings; got model_list@{ml_pos}, router_settings@{router_pos}");
     }
 
+    #[test] fn yaml_fallbacks_is_a_sequence_of_dicts_not_a_map() {
+        // Regression test for the v0.1 boot-time crash documented on
+        // RouterSettings: emitting `fallbacks: {fast: [...]}` makes
+        // LiteLLM crash at startup with
+        //   ValueError: Item 'fast' is not a dictionary
+        // The correct shape is a list of single-key dicts.
+        //
+        // Parse the emitted YAML back through serde_yaml and assert
+        // structurally — we're checking the WIRE FORMAT, not text.
+        let (resolved, catalog) = resolve_demo();
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let fallbacks = &value["router_settings"]["fallbacks"];
+        assert!(fallbacks.is_sequence(),
+            "router_settings.fallbacks MUST be a YAML sequence (list); \
+             a mapping crashes LiteLLM at boot. Got: {fallbacks:?}");
+        // Each entry in the sequence must itself be a mapping (the
+        // single-key {primary_label: [aliases]} dict).
+        for (i, entry) in fallbacks.as_sequence().unwrap().iter().enumerate() {
+            assert!(entry.is_mapping(),
+                "fallbacks[{i}] must be a mapping; got {entry:?}");
+            let m = entry.as_mapping().unwrap();
+            assert_eq!(m.len(), 1,
+                "fallbacks[{i}] must be a single-key mapping; got {} keys",
+                m.len());
+        }
+    }
+
     #[test] fn yaml_emits_block_style_for_router_settings_too() {
         // Pin block style on the whole config — important for human
         // readability of the generated file.
+        //
+        // The fallbacks field is a list-of-single-key-dicts (required
+        // by LiteLLM at boot; see RouterSettings docs), so the nesting
+        // is `fallbacks:\n  - fast:\n      - alias…` rather than the
+        // older `fallbacks:\n  fast:\n    - alias…` map shape.
         let (resolved, catalog) = resolve_demo();
         let yaml = generate_config(&resolved, &catalog).expect("generate");
-        assert!(yaml.contains("\nrouter_settings:\n  fallbacks:\n    fast:\n"),
-            "expected block-style nested map; got:\n{yaml}");
+        assert!(yaml.contains("\nrouter_settings:\n  fallbacks:\n  - fast:\n"),
+            "expected block-style list-of-single-key-dicts; got:\n{yaml}");
     }
 
     #[test] fn yaml_round_trips_with_full_config() {
