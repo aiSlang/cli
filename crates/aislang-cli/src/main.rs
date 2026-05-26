@@ -95,24 +95,28 @@ fn run() -> Result<()> {
 fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
     let source = std::fs::read_to_string(&file)?;
 
-    match aislang_core::validate(&source) {
+    // ── Stage 1: parse + typecheck (in aislang-core::validate) ──
+    let t_start = std::time::Instant::now();
+    let validate_result = aislang_core::validate(&source);
+    let t_validate = t_start.elapsed();
+
+    match validate_result {
         Ok((project, mut warnings)) => {
-            // Catalog ID validation lives in the sibling `aislang-resolver`
-            // crate (architecture decision: avoids aislang-core ↔
-            // aislang-catalog dep cycle — see PLAN §Week-1 dep-graph note).
-            // CLI is the natural place to chain core's parse+typecheck
-            // with resolver's catalog-check, combining their warnings.
-            match aislang_resolver::check_against_bundled_catalog(&project) {
+            // ── Stage 2: catalog ID validation (in aislang-resolver,
+            // see PLAN §Week-1 dep-graph note for why it lives there). ──
+            let t_cat_start = std::time::Instant::now();
+            let cat_result  = aislang_resolver::check_against_bundled_catalog(&project);
+            let t_catalog   = t_cat_start.elapsed();
+            match cat_result {
                 Ok(cat_warnings) => warnings.extend(cat_warnings),
                 Err(e) => return Err(anyhow::anyhow!("catalog error: {e}")),
             }
+            let t_total = t_start.elapsed();
 
             // Success line always goes to stdout (machine-readable surface).
             println!("OK: {} parsed and type-checked", file.display());
 
-            // Warnings come right after the OK line, on stderr, prefixed
-            // with `warnings:`. Exit code remains 0 — warnings inform but
-            // don't fail (see PLAN §Locked design decisions).
+            // Warnings (stderr; exit code stays 0).
             if !warnings.is_empty() {
                 eprintln!();
                 eprintln!("warnings:");
@@ -125,16 +129,32 @@ fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
             // callers that pipe `aislang validate` into other tools.
             if verbose >= 1 {
                 print_summary(&project);
+                eprintln!();
+                eprintln!("checks: ✓ parse  ✓ typecheck  ✓ catalog");
+                eprintln!("elapsed: {:.2?}  (validate {:.2?} + catalog {:.2?})",
+                    t_total, t_validate, t_catalog);
             }
             if verbose >= 2 {
                 eprintln!();
                 eprintln!("AST (Debug):");
                 eprintln!("{project:#?}");
+
+                eprintln!();
+                eprintln!("Resource Graph (Debug):");
+                match aislang_core::checker::graph_summary(&project) {
+                    Ok(g)  => eprintln!("{g:#?}"),
+                    Err(e) => eprintln!("(graph build failed: {e})"),
+                }
             }
             if verbose >= 3 {
                 eprintln!();
-                eprintln!("AST (JSON IR):");
-                match serde_json::to_string_pretty(&project) {
+                eprintln!("AST + Resource Graph (JSON IR):");
+                let graph = aislang_core::checker::graph_summary(&project).ok();
+                let combined = serde_json::json!({
+                    "ast":   &project,
+                    "graph": graph,
+                });
+                match serde_json::to_string_pretty(&combined) {
                     Ok(json) => eprintln!("{json}"),
                     Err(e)   => eprintln!("(JSON serialization failed: {e})"),
                 }

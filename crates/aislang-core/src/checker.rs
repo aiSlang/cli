@@ -14,6 +14,7 @@
 
 use crate::ast::*;
 use petgraph::graph::{DiGraph, NodeIndex};
+use serde::Serialize;
 use std::collections::HashMap;
 //
 // NOTE: aislang-catalog is *not* a dependency of aislang-core — that
@@ -121,14 +122,23 @@ pub(crate) struct NodeData {
 }
 
 pub(crate) struct ResourceGraph {
-    #[allow(dead_code)]   // Edges + traversal land Tue; CLI display lands Fri
-    pub graph: DiGraph<NodeData, ()>,
-    #[allow(dead_code)]
+    pub graph: DiGraph<NodeData, EdgeData>,
     pub nodes: HashMap<NodeKey, NodeIndex>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeData {
+    /// Field name on the source block that produced this reference.
+    /// e.g. `"model"`, `"system_prompt"`, `"tools[0]"`, `"scope[1]"`.
+    pub field: String,
+}
+
 pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, String> {
-    let mut graph = DiGraph::new();
+    // Explicit type — needed because DiGraph::new() can't infer EdgeData
+    // from add_node calls alone (only add_edge would force it, and we
+    // don't add edges here — that's populate_edges' job, called by
+    // graph_summary later).
+    let mut graph: DiGraph<NodeData, EdgeData> = DiGraph::new();
     let mut nodes: HashMap<NodeKey, NodeIndex> = HashMap::new();
 
     for m in &project.models      { add_block(&mut graph, &mut nodes, BlockKind::Model,     &m.label)?; }
@@ -147,7 +157,7 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
 /// String error message; Thursday's source-aware rendering will attach
 /// span info pointing at both occurrences.
 fn add_block(
-    graph: &mut DiGraph<NodeData, ()>,
+    graph: &mut DiGraph<NodeData, EdgeData>,
     nodes: &mut HashMap<NodeKey, NodeIndex>,
     kind: BlockKind,
     label: &str,
@@ -298,6 +308,133 @@ fn levenshtein(a: &str, b: &str) -> usize {
         }
     }
     dp[n]
+}
+
+// ============================================================================
+// Public graph-summary API (week 3 Friday) — populates edges for every
+// Ref in the project and converts the petgraph DiGraph into a small
+// serializable shape suitable for CLI -vv (Debug) and -vvv (JSON IR)
+// display.
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphSummary {
+    pub nodes: Vec<NodeSummary>,
+    pub edges: Vec<EdgeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSummary {
+    pub kind:  String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EdgeSummary {
+    pub from:  NodeSummary,
+    pub to:    NodeSummary,
+    /// Source-side field on `from` that produced this reference.
+    pub field: String,
+}
+
+/// Build the resource graph (nodes + edges) and convert to a
+/// serializable summary. Must be called on a project that has already
+/// passed [`check`] — otherwise unresolved refs cause this to error.
+pub fn graph_summary(project: &Project) -> Result<GraphSummary, String> {
+    let mut graph = build_resource_graph(project)?;
+    populate_edges(project, &mut graph)?;
+    Ok(to_summary(&graph))
+}
+
+fn populate_edges(project: &Project, graph: &mut ResourceGraph) -> Result<(), String> {
+    for agent in &project.agents {
+        add_ref_edge(graph, BlockKind::Agent, &agent.label, "model",         &agent.model)?;
+        add_ref_edge(graph, BlockKind::Agent, &agent.label, "system_prompt", &agent.system_prompt)?;
+        for (i, tool) in agent.tools.iter().enumerate() {
+            add_ref_edge(graph, BlockKind::Agent, &agent.label,
+                &format!("tools[{i}]"), tool)?;
+        }
+    }
+    for secret in &project.secrets {
+        for (i, scope_ref) in secret.scope.iter().enumerate() {
+            add_ref_edge(graph, BlockKind::Secret, &secret.label,
+                &format!("scope[{i}]"), scope_ref)?;
+        }
+    }
+    for eval in &project.evals {
+        if let Some(agent_ref) = &eval.agent {
+            add_ref_edge(graph, BlockKind::Eval, &eval.label, "agent", agent_ref)?;
+        }
+    }
+    for mcp in &project.mcp_servers {
+        if let Some(secrets) = &mcp.secrets {
+            for (i, sec_ref) in secrets.iter().enumerate() {
+                add_ref_edge(graph, BlockKind::McpServer, &mcp.label,
+                    &format!("secrets[{i}]"), sec_ref)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_ref_edge(
+    graph:     &mut ResourceGraph,
+    src_kind:  BlockKind,
+    src_label: &str,
+    field:     &str,
+    r:         &Ref,
+) -> Result<(), String> {
+    let src_key: NodeKey = (src_kind, src_label.to_string());
+    let src_idx = *graph.nodes.get(&src_key).ok_or_else(|| {
+        format!("graph: source `{} {src_label}` not in node map (bug?)",
+            src_kind.as_str())
+    })?;
+
+    let tgt_kind = BlockKind::from_ref_kind(r.kind);
+    let tgt_key: NodeKey = (tgt_kind, r.label.clone());
+    let tgt_idx = *graph.nodes.get(&tgt_key).ok_or_else(|| {
+        format!("graph: target `{} {}` not in node map — graph_summary \
+                 called before check() succeeded?",
+            tgt_kind.as_str(), r.label)
+    })?;
+
+    graph.graph.add_edge(src_idx, tgt_idx, EdgeData { field: field.to_string() });
+    Ok(())
+}
+
+fn to_summary(graph: &ResourceGraph) -> GraphSummary {
+    let mut nodes: Vec<NodeSummary> = graph.graph.node_indices()
+        .map(|idx| {
+            let n = &graph.graph[idx];
+            NodeSummary { kind: n.kind.as_str().to_string(), label: n.label.clone() }
+        })
+        .collect();
+    // Deterministic order: sort by (kind, label). petgraph's
+    // node_indices() iterates in insertion order, which depends on
+    // project body ordering — that's also deterministic, but sorting
+    // gives a stable JSON shape regardless of source ordering.
+    nodes.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.label.cmp(&b.label)));
+
+    let mut edges: Vec<EdgeSummary> = graph.graph.edge_indices()
+        .map(|eidx| {
+            let (src_idx, tgt_idx) = graph.graph.edge_endpoints(eidx).unwrap();
+            let edge = &graph.graph[eidx];
+            let src = &graph.graph[src_idx];
+            let tgt = &graph.graph[tgt_idx];
+            EdgeSummary {
+                from:  NodeSummary { kind: src.kind.as_str().to_string(), label: src.label.clone() },
+                to:    NodeSummary { kind: tgt.kind.as_str().to_string(), label: tgt.label.clone() },
+                field: edge.field.clone(),
+            }
+        })
+        .collect();
+    edges.sort_by(|a, b| {
+        a.from.kind.cmp(&b.from.kind)
+            .then_with(|| a.from.label.cmp(&b.from.label))
+            .then_with(|| a.field.cmp(&b.field))
+    });
+
+    GraphSummary { nodes, edges }
 }
 
 // ============================================================================
@@ -601,4 +738,98 @@ mod tests {
     // Catalog ID validation tests live in `crates/aislang-resolver/`
     // (separate crate to avoid the aislang-core ↔ aislang-catalog
     // dependency cycle). See module-level NOTE.
+
+    // ----------------------------------------------------------------
+    // Graph summary — Friday
+    // ----------------------------------------------------------------
+
+    fn graph_for(body: &str) -> GraphSummary {
+        let src = project_src(body);
+        let project = parse(&src).expect("parse must succeed");
+        super::graph_summary(&project).expect("graph_summary must succeed")
+    }
+
+    #[test] fn graph_summary_empty_project_has_no_nodes_or_edges() {
+        let g = graph_for("");
+        assert!(g.nodes.is_empty());
+        assert!(g.edges.is_empty());
+    }
+
+    #[test] fn graph_summary_nodes_for_each_kind() {
+        let body = r#"
+            model "m"      { requires = [chat]  context_min = 32k }
+            prompt "p"     { file = "./x"  version = "1.0.0" }
+            mcp_server "s" { image = "ghcr.io/x/y:1.0" }
+            agent "a"      { model = model.m  system_prompt = prompt.p }
+            eval "e"       { dataset = "./q"  metric = exact_match  threshold = 85% }
+            deploy "d"     { target = compose }
+        "#;
+        let g = graph_for(body);
+        assert_eq!(g.nodes.len(), 6,
+            "expected one node per declared block; got {g:?}");
+        // Sorted by (kind, label) — first by kind alphabetically.
+        let kinds: Vec<&str> = g.nodes.iter().map(|n| n.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["agent", "deploy", "eval", "mcp_server", "model", "prompt"]);
+    }
+
+    #[test] fn graph_summary_edges_record_field_origin() {
+        let body = r#"
+            model "m"      { requires = [chat]  context_min = 32k }
+            prompt "p"     { file = "./x"  version = "1.0.0" }
+            mcp_server "s" { image = "ghcr.io/x/y:1.0" }
+            agent "a"      {
+                model         = model.m
+                system_prompt = prompt.p
+                tools         = [mcp_server.s]
+            }
+        "#;
+        let g = graph_for(body);
+        // agent.a should have 3 outgoing edges (model, system_prompt, tools[0]).
+        let from_a: Vec<&EdgeSummary> = g.edges.iter()
+            .filter(|e| e.from.kind == "agent" && e.from.label == "a")
+            .collect();
+        assert_eq!(from_a.len(), 3);
+        let fields: Vec<&str> = from_a.iter().map(|e| e.field.as_str()).collect();
+        // Sorted by field name (the to_summary sort).
+        assert_eq!(fields, vec!["model", "system_prompt", "tools[0]"]);
+    }
+
+    #[test] fn graph_summary_indexed_tools_become_separate_edges() {
+        let body = r#"
+            model "m"      { requires = [chat]  context_min = 32k }
+            prompt "p"     { file = "./x"  version = "1.0.0" }
+            mcp_server "s1" { image = "ghcr.io/x/y:1.0" }
+            mcp_server "s2" { image = "ghcr.io/x/z:1.0" }
+            agent "a"      {
+                model         = model.m
+                system_prompt = prompt.p
+                tools         = [mcp_server.s1, mcp_server.s2]
+            }
+        "#;
+        let g = graph_for(body);
+        let tools_edges: Vec<&EdgeSummary> = g.edges.iter()
+            .filter(|e| e.field.starts_with("tools["))
+            .collect();
+        assert_eq!(tools_edges.len(), 2);
+        let fields: Vec<&str> = tools_edges.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(fields, vec!["tools[0]", "tools[1]"]);
+    }
+
+    #[test] fn graph_summary_json_round_trips() {
+        // Sanity: the summary is structurally JSON-serializable and
+        // deserializes to the same nodes/edges (using serde_json::Value
+        // for round-trip — GraphSummary doesn't itself derive Deserialize
+        // because the type is a one-way IR-export shape).
+        let body = r#"
+            model "m" { requires = [chat]  context_min = 32k }
+            prompt "p" { file = "./x"  version = "1.0.0" }
+            agent "a" { model = model.m  system_prompt = prompt.p }
+        "#;
+        let g = graph_for(body);
+        let json = serde_json::to_string_pretty(&g).expect("serializes");
+        assert!(json.contains("\"nodes\""));
+        assert!(json.contains("\"edges\""));
+        assert!(json.contains("\"model\""));
+        assert!(json.contains("\"system_prompt\""));
+    }
 }
