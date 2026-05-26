@@ -57,10 +57,20 @@ enum Command {
         /// After emitting, pipe the generated Compose YAML through
         /// `docker compose -f - config -q` to confirm Docker accepts
         /// the structure. Gracefully degrades when the docker CLI
-        /// isn't on PATH (prints "skipped" — exit 0). v0.2 will
-        /// extend with `up -d` + health-poll + real LLM call.
+        /// isn't on PATH (prints "skipped" — exit 0).
         #[arg(long)]
         smoke_test: bool,
+        /// Live smoke test: actually brings the stack up with
+        /// `docker compose up -d`, polls LiteLLM's readiness on
+        /// port 4000, runs one real `/v1/chat/completions` against
+        /// the first resolved model alias, then `down -v` (always,
+        /// even on failure). Catches boot-time bugs that
+        /// `--smoke-test` (config-only) misses — see PLAN week 6
+        /// retrospective. Requires Docker on PATH + a populated
+        /// `.env` in the output dir (for provider creds the chat
+        /// call will use). Implies `--smoke-test`.
+        #[arg(long)]
+        smoke_test_live: bool,
     },
     /// Apply the plan — deploy the stack via Docker Compose
     Apply {
@@ -113,8 +123,8 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Validate { file, verbose }            => run_validate(file, verbose),
-        Command::Plan { file, verbose, no_lock, output_dir, smoke_test } =>
-            run_plan(file, verbose, no_lock, output_dir, smoke_test),
+        Command::Plan { file, verbose, no_lock, output_dir, smoke_test, smoke_test_live } =>
+            run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live),
         Command::Apply { file }      => run_apply(file),
         Command::Destroy { file }    => run_destroy(file),
         Command::Eval { file: _ }    => stub("eval",    8),
@@ -240,11 +250,12 @@ fn render_validate_error(source: &str, err: &aislang_core::ValidateError) {
 // ============================================================================
 
 fn run_plan(
-    file:       PathBuf,
-    verbose:    u8,
-    no_lock:    bool,
-    output_dir: Option<PathBuf>,
-    smoke_test: bool,
+    file:            PathBuf,
+    verbose:         u8,
+    no_lock:         bool,
+    output_dir:      Option<PathBuf>,
+    smoke_test:      bool,
+    smoke_test_live: bool,
 ) -> Result<()> {
     let source = std::fs::read_to_string(&file)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
@@ -407,36 +418,49 @@ fn run_plan(
         }
     }
 
-    if smoke_test {
+    if smoke_test || smoke_test_live {
         eprintln!();
-        eprintln!("smoke test:");
-        run_smoke_test(&artifacts.docker_compose)?;
+        eprintln!("smoke test{}:",
+            if smoke_test_live { " (live tier)" } else { "" });
+        run_smoke_test(
+            &artifacts.docker_compose,
+            &output_dir,
+            &resolved,
+            smoke_test_live,
+        )?;
     }
 
     Ok(())
 }
 
-/// `--smoke-test`: hand the generated compose YAML to `docker compose
-/// config -q`, report whether Docker accepts the structure.
+/// Tiered smoke test. Tiers 1–2 run for `--smoke-test`; tiers 3–5
+/// additionally run for `--smoke-test-live`.
 ///
-/// Tiered degradation:
-///   1. `docker` not on PATH        → skipped, exit 0
-///   2. `docker compose config -q`  → run; failure surfaces stderr
-///                                     to the user and propagates as
-///                                     an error
+///   1. `docker` not on PATH         → skip everything, exit 0.
+///   2. `docker compose config -q`   → reject bad YAML; clean error
+///                                     on non-zero exit.
+///   3. `docker compose up -d`       → bring the stack up (live tier).
+///   4. Readiness + chat completion  → poll TCP :4000, then `curl`
+///                                     a real `/v1/chat/completions`
+///                                     against the first resolved
+///                                     model alias.
+///   5. `docker compose down -v`     → ALWAYS, even on failure. The
+///                                     cleanup wrapper makes sure
+///                                     the host is left clean.
 ///
-/// v0.2 extends with: `docker compose up -d` + health-poll + real
-/// `/v1/chat/completions` curl + `docker compose down`. The polling
-/// + cleanup machinery is non-trivial; v0.1 stops at the config-
-/// validation tier (which already catches every YAML-shape bug seen
-/// in week-5 — most recently the AISLANG_CATALOG_VERSION date-shape
-/// regression).
-fn run_smoke_test(compose_yaml: &str) -> Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    // Tier 1: docker CLI present?
-    let docker_present = Command::new("docker").arg("--version").output();
+/// Tiers 3–5 catch boot-time bugs the config-only check misses —
+/// week 6 alone exposed three (router_settings.fallbacks shape,
+/// env-var forwarding into the litellm container, fake demo image).
+/// PLAN week-6 retrospective elaborates.
+fn run_smoke_test(
+    compose_yaml: &str,
+    output_dir:   &Path,
+    resolved:     &aislang_resolver::ResolvedProject,
+    live:         bool,
+) -> Result<()> {
+    // --- Tier 1: docker CLI present? ---
+    let docker_present = std::process::Command::new("docker")
+        .arg("--version").output();
     match docker_present {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout);
@@ -449,7 +473,23 @@ fn run_smoke_test(compose_yaml: &str) -> Result<()> {
         }
     }
 
-    // Tier 2: pipe the compose YAML to `docker compose config -q`.
+    // --- Tier 2: docker compose config -q over the emitted YAML ---
+    smoke_test_tier2_config(compose_yaml)?;
+    if !live {
+        eprintln!("  up/down + LLM call: skipped (pass --smoke-test-live to run).");
+        return Ok(());
+    }
+
+    // --- Tiers 3–5: live up/probe/chat/down ---
+    smoke_test_live_tier(compose_yaml, output_dir, resolved)
+}
+
+/// Tier 2 — pipe `compose_yaml` to `docker compose -f - config -q`.
+/// Errors out loudly with stderr captured if Docker rejects the YAML
+/// (catches Compose-schema bugs but NOT LiteLLM-semantic ones).
+fn smoke_test_tier2_config(compose_yaml: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
     let mut child = Command::new("docker")
         .args(["compose", "-f", "-", "config", "-q"])
         .stdin(Stdio::piped())
@@ -457,33 +497,215 @@ fn run_smoke_test(compose_yaml: &str) -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn docker compose: {e}"))?;
-
     child.stdin.as_mut()
         .ok_or_else(|| anyhow::anyhow!("docker compose stdin not available"))?
         .write_all(compose_yaml.as_bytes())
         .map_err(|e| anyhow::anyhow!("write to docker compose stdin: {e}"))?;
-
     let output = child.wait_with_output()
         .map_err(|e| anyhow::anyhow!("wait for docker compose: {e}"))?;
-
     if output.status.success() {
         eprintln!("  compose validate:  ✓ Docker accepts the YAML");
+        Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("  compose validate:  ✗ Docker rejected the YAML:");
         for line in stderr.lines() {
             eprintln!("      {line}");
         }
-        return Err(anyhow::anyhow!(
+        Err(anyhow::anyhow!(
             "docker compose config -q rejected the generated YAML \
              (exit {:?}); see lines above",
-            output.status.code()
-        ));
+            output.status.code()))
     }
+}
 
-    // Tier 3 (`up -d` + health-poll + LLM call + `down`): v0.2.
-    eprintln!("  up/down + LLM call: deferred to v0.2");
+/// Project name used for the smoke-test stack. Distinct from the
+/// user's typical `aislang-demo` so a parallel-running user stack
+/// doesn't clash with the smoke test's containers (ports still
+/// will — see the docs string on `smoke_test_live_tier`).
+const SMOKE_TEST_PROJECT: &str = "aislang-smoketest";
 
+/// Tiers 3–5: write the YAML to a temp file, `up -d`, poll for
+/// readiness, fire one real chat completion against the first
+/// resolved model alias, then `down -v` (always, regardless of
+/// whether the inner phases succeeded).
+///
+/// Port clash caveat: if the user already has the demo stack
+/// running on ports 4000/16686/4317/4318, `up -d` will fail with
+/// "port already allocated" — surfaced as a normal smoke-test
+/// error. Take down the existing stack (`docker compose down`)
+/// before running `--smoke-test-live`. v0.2 may add ephemeral
+/// port mappings for the smoke-test stack to avoid this.
+fn smoke_test_live_tier(
+    compose_yaml: &str,
+    output_dir:   &Path,
+    resolved:     &aislang_resolver::ResolvedProject,
+) -> Result<()> {
+    use std::process::Command;
+
+    // Need the YAML on disk — `compose up -d` doesn't accept stdin
+    // like `config -q` does. Place it under output_dir so any
+    // referenced paths in the YAML (volume mounts, env_file) still
+    // resolve.
+    let stack_path = output_dir.join(".stack-smoketest.yml");
+    std::fs::write(&stack_path, compose_yaml)
+        .map_err(|e| anyhow::anyhow!(
+            "write {}: {e}", stack_path.display()))?;
+
+    // Look for an .env next to the stack for compose's variable
+    // interpolation. Without it, OLLAMA_API_BASE etc. expand to
+    // empty strings (compose warns, doesn't fail).
+    let env_path  = output_dir.join(".env");
+    let has_env   = env_path.exists();
+    let env_arg: Option<String> = has_env
+        .then(|| env_path.to_string_lossy().into_owned());
+
+    // Cleanup wrapper — `down -v` MUST run even if a tier 4 phase
+    // panics. We split into an inner async-style function and call
+    // it, then unconditionally run cleanup at the end.
+    let inner = || -> Result<()> {
+        // Tier 3: up -d
+        let mut up = Command::new("docker");
+        up.args(["compose", "--project-name", SMOKE_TEST_PROJECT,
+                 "-f", stack_path.to_string_lossy().as_ref()]);
+        if let Some(ef) = env_arg.as_deref() {
+            up.args(["--env-file", ef]);
+        }
+        up.args(["up", "-d"]);
+        let out = up.output()
+            .map_err(|e| anyhow::anyhow!("spawn `docker compose up`: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("  up:                ✗ docker compose up failed:");
+            for line in stderr.lines() {
+                eprintln!("      {line}");
+            }
+            return Err(anyhow::anyhow!(
+                "docker compose up exited {:?}",
+                out.status.code()));
+        }
+        eprintln!("  up:                ✓ stack started");
+
+        // Tier 4a: wait for LiteLLM to bind :4000.
+        wait_for_port("127.0.0.1", 4000, std::time::Duration::from_secs(30))
+            .map_err(|e| anyhow::anyhow!(
+                "litellm did not become ready on :4000 within 30s: {e}\n\
+                 (run `docker compose --project-name {} -f {} logs litellm` \
+                 for boot diagnostics)",
+                SMOKE_TEST_PROJECT, stack_path.display()))?;
+        eprintln!("  litellm ready:     ✓ tcp 127.0.0.1:4000 reachable");
+
+        // Tier 4b: fire one real chat completion.
+        let first_model = resolved.model_bindings.keys().next()
+            .ok_or_else(|| anyhow::anyhow!(
+                "no resolved models — nothing to call /v1/chat/completions against"))?;
+        try_chat_completion(first_model)
+            .map_err(|e| anyhow::anyhow!(
+                "chat completion against `{first_model}` failed: {e}\n\
+                 (run `docker compose --project-name {} -f {} logs litellm` \
+                 for diagnostics)",
+                SMOKE_TEST_PROJECT, stack_path.display()))?;
+        eprintln!("  chat completion:   ✓ /v1/chat/completions returned a reply");
+        Ok(())
+    };
+
+    let result = inner();
+
+    // Tier 5: down -v ALWAYS, regardless of inner result.
+    let mut down = Command::new("docker");
+    down.args(["compose", "--project-name", SMOKE_TEST_PROJECT,
+               "-f", stack_path.to_string_lossy().as_ref()]);
+    if let Some(ef) = env_arg.as_deref() {
+        down.args(["--env-file", ef]);
+    }
+    down.args(["down", "-v"]);
+    let down_out = down.output();
+    match down_out {
+        Ok(out) if out.status.success() => {
+            eprintln!("  down -v:           ✓ stack torn down");
+        }
+        Ok(out) => {
+            eprintln!("  down -v:           ⚠ docker compose down exited {:?}",
+                out.status.code());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            for line in stderr.lines() {
+                eprintln!("      {line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("  down -v:           ⚠ spawn failed: {e}");
+        }
+    }
+    let _ = std::fs::remove_file(&stack_path);
+
+    result
+}
+
+/// Poll `127.0.0.1:port` (or whatever) until TCP connect succeeds,
+/// or `timeout` elapses. Used to wait for LiteLLM's port to bind
+/// during boot. Each attempt has a 1s connect-timeout so we don't
+/// hang on a slow probe.
+fn wait_for_port(host: &str, port: u16, timeout: std::time::Duration) -> Result<()> {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::time::Instant;
+    let deadline = Instant::now() + timeout;
+    let addr: SocketAddr = (host, port).to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addrs for {host}:{port}"))?;
+    let probe_timeout = std::time::Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, probe_timeout).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(anyhow::anyhow!("timed out polling tcp {host}:{port}"))
+}
+
+/// Fire one minimal `/v1/chat/completions` request via `curl`. We
+/// use the shell `curl` instead of dragging reqwest into the CLI
+/// crate — it's installed on every dev / CI Linux/Mac/WSL machine
+/// and keeps the CLI's dep graph small. Times out after 60s
+/// (cold-start Ollama loading a fresh model can be slow on first
+/// hit).
+fn try_chat_completion(model_alias: &str) -> Result<()> {
+    use std::process::Command;
+    let body = serde_json::json!({
+        "model": model_alias,
+        "messages": [{"role": "user", "content": "say 1 in one short sentence"}],
+    });
+    let body_str = serde_json::to_string(&body)?;
+    let out = Command::new("curl")
+        .args([
+            "--silent", "--show-error", "--fail-with-body",
+            "--max-time", "60",
+            "-H", "Content-Type: application/json",
+            "-X", "POST",
+            "-d", &body_str,
+            "http://localhost:4000/v1/chat/completions",
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn curl: {e}"))?;
+    if !out.status.success() {
+        let body = String::from_utf8_lossy(&out.stdout);
+        let err  = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!(
+            "curl exit {:?}; stderr: {}; body: {}",
+            out.status.code(), err.trim(), body.trim()));
+    }
+    // Parse the body — expect choices[0].message.content non-empty.
+    let body = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("response body not JSON: {e}; got: {body}"))?;
+    let content = parsed.pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!(
+            "response missing choices[0].message.content; body: {body}"))?;
+    if content.is_empty() {
+        return Err(anyhow::anyhow!(
+            "model returned empty content; body: {body}"));
+    }
     Ok(())
 }
 
@@ -1118,6 +1340,42 @@ mod tests {
     #[test] fn nearest_returns_none_for_empty_candidates() {
         let cands: [&str; 0] = [];
         assert_eq!(nearest_agent_label("support", &cands), None);
+    }
+
+    // ---- wait_for_port ----
+
+    #[test] fn wait_for_port_returns_quickly_on_immediate_connect() {
+        // Bind an actual listener on an OS-assigned port, then probe
+        // that exact port. Should connect on the first try — wall
+        // time well under the 5s timeout we pass.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port     = listener.local_addr().unwrap().port();
+        let started  = std::time::Instant::now();
+        wait_for_port("127.0.0.1", port, std::time::Duration::from_secs(5))
+            .expect("immediate connect");
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2),
+            "expected <2s; took {elapsed:?}");
+        drop(listener);
+    }
+
+    #[test] fn wait_for_port_times_out_when_nothing_listens() {
+        // Probe a port that nothing's bound to. Use a port number
+        // unlikely to clash (49152+ is IANA's ephemeral range). The
+        // timeout we pass is intentionally short so the test finishes
+        // fast — we just need the timeout path to actually trip.
+        let started = std::time::Instant::now();
+        let err = wait_for_port("127.0.0.1", 65534,
+            std::time::Duration::from_millis(800))
+            .err().expect("must time out");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"),
+            "expected timeout message; got: {msg}");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(700),
+            "must have actually waited; only {elapsed:?} elapsed");
+        assert!(elapsed < std::time::Duration::from_secs(5),
+            "should not overshoot timeout by 4x+; got {elapsed:?}");
     }
 
     #[test] fn nearest_picks_minimum_distance_when_multiple_match() {
