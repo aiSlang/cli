@@ -1,0 +1,19 @@
+[package]
+name = "aislang-runtime"
+description = "In-CLI agent runtime — MCP stdio client + LiteLLM chat loop (v0.1)"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+# rmcp gives us the official MCP client + child-process transport.
+# Decision 5 (PLAN week 6): v0.1 spawns MCP servers as `docker run -i`
+# stdio children; rmcp's TokioChildProcess is the wire integration.
+rmcp        = { workspace = true }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }

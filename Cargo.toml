@@ -6,6 +6,7 @@ members = [
     "crates/aislang-catalog",
     "crates/aislang-resolver",
     "crates/aislang-compose",
+    "crates/aislang-runtime",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ aislang-core     = { path = "crates/aislang-core",     version = "0.1.0-dev" }
 aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.1.0-dev" }
 aislang-resolver = { path = "crates/aislang-resolver", version = "0.1.0-dev" }
 aislang-compose  = { path = "crates/aislang-compose",  version = "0.1.0-dev" }
+aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.1.0-dev" }
 
 # External
 clap        = { version = "4.5", features = ["derive"] }
@@ -34,6 +36,9 @@ thiserror   = "1"
 anyhow      = "1"
 semver      = { version = "1",   features = ["serde"] }
 sha2        = "0.10"
+# week-6 Tue: in-CLI agent runtime
+rmcp        = { version = "1.7", features = ["client", "transport-child-process"] }
+tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync"] }
 
 [profile.release]
 opt-level = 3
