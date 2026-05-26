@@ -577,7 +577,43 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         expected_hash.as_deref(),
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // ── 5+6. open session, run interactive loop ──
+    // ── 5. collect MCP server specs the CLI must spawn for this agent ──
+    // For each ref in `agent.tools[]`, find the matching mcp_server
+    // block and capture its image + mount. Resolution failures here
+    // surface BEFORE we spin up the tokio runtime so the error path
+    // is sync (and the diagnostic line lines up with `aislang validate`).
+    use aislang_runtime::SpawnConfig;
+    let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
+    for tool_ref in &agent.tools {
+        // v0.1 only supports `mcp_server.X` tools (per spec §4.6).
+        if tool_ref.kind != aislang_core::ast::RefKind::McpServer {
+            return Err(anyhow::anyhow!(
+                "agent `{agent_label}.tools` ref `{}` has kind `{:?}` — \
+                 v0.1 only supports `mcp_server` tool refs",
+                tool_ref.label, tool_ref.kind));
+        }
+        let mcp = project.mcp_servers.iter()
+            .find(|m| m.label == tool_ref.label)
+            .ok_or_else(|| anyhow::anyhow!(
+                "agent `{agent_label}` references mcp_server `{}` \
+                 which doesn't exist in {}",
+                tool_ref.label, file.display()))?;
+        // Canonicalise the mount path (StdioChild's docker -v needs absolute).
+        let mount = mcp.mount.as_ref().map(|p| {
+            // Resolve relative to the source file's directory, matching
+            // how aislang plan handles paths.
+            let resolved = source_dir.join(p);
+            std::fs::canonicalize(&resolved).unwrap_or(resolved)
+        });
+        mcp_specs.push((mcp.label.clone(), SpawnConfig {
+            image: format_image(&mcp.image),
+            args:  Vec::new(),
+            mount,
+            env:   Vec::new(),
+        }));
+    }
+
+    // ── 6. open session, run interactive loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -586,7 +622,23 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         &agent_label,
         &model_label,
         system_prompt,
+        mcp_specs,
     ))
+}
+
+/// Render an `OciImage` into the docker-friendly form. Mirrors
+/// `aislang_compose::format_image` (private there) — duplicated here
+/// rather than re-exported so the CLI and emitter can diverge later
+/// (the emitter writes a YAML scalar; the CLI hands it to
+/// `docker run`).
+fn format_image(img: &aislang_core::types::OciImage) -> String {
+    let base = format!("{}/{}", img.registry, img.repository);
+    match (&img.tag, &img.digest) {
+        (Some(t), Some(d)) => format!("{base}:{t}@{d}"),
+        (Some(t), None)    => format!("{base}:{t}"),
+        (None,    Some(d)) => format!("{base}@{d}"),
+        (None,    None)    => base,
+    }
 }
 
 /// The async interactive loop. Separate from `run_chat` to keep the
@@ -595,60 +647,84 @@ async fn chat_interactive(
     agent_label:   &str,
     model_label:   &str,
     system_prompt: String,
+    mcp_specs:     Vec<(String, aislang_runtime::SpawnConfig)>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let session = aislang_runtime::Session::open(
+    // ── Spawn MCP children + list their tools to populate the registry ──
+    let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
+    let mut server_tools: Vec<(String, Vec<aislang_runtime::ToolSpec>)> = Vec::new();
+    for (label, cfg) in &mcp_specs {
+        let child = aislang_runtime::StdioChild::spawn(cfg).await
+            .map_err(|e| anyhow::anyhow!(
+                "spawn MCP server `{label}` ({}): {e}", cfg.image))?;
+        let tools = child.list_tools().await
+            .map_err(|e| anyhow::anyhow!(
+                "list tools from MCP server `{label}`: {e}"))?;
+        eprintln!("  mcp server `{label}` connected ({} tool{})",
+            tools.len(), if tools.len() == 1 { "" } else { "s" });
+        server_tools.push((label.clone(), tools));
+        mcp_clients.push(child);
+    }
+
+    let tool_registry = aislang_runtime::ToolRegistry::from_servers(&server_tools);
+    let tool_count    = tool_registry.len();
+
+    let session = aislang_runtime::Session::open_with_tools(
         model_label,
         system_prompt,
         None, // default http://localhost:4000
+        mcp_clients,
+        tool_registry,
     ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
 
     // Banner — stderr so stdout stays pipe-clean for the model output.
     eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`)");
     eprintln!("connected to LiteLLM at {}", aislang_runtime::LiteLlmClient::DEFAULT_URL);
+    if tool_count > 0 {
+        eprintln!("tools: {tool_count} available across {} MCP server{}",
+            mcp_specs.len(), if mcp_specs.len() == 1 { "" } else { "s" });
+    }
     eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
     eprintln!();
 
-    // Read one line at a time from stdin. tokio's stdin handle
-    // doesn't expose AsyncBufRead by default; wrap it.
+    // Read one line at a time from stdin.
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
 
-    loop {
+    let exit_reason = loop {
         eprint!("> ");
-        // Flush eprint! before awaiting stdin — otherwise the prompt
-        // appears AFTER the user types, which is jarring.
         use std::io::Write;
         let _ = std::io::stderr().flush();
 
         let line = match reader.next_line().await {
             Ok(Some(l)) => l,
-            Ok(None)    => {
-                // EOF (Ctrl-D or piped input ran out).
-                eprintln!("(end of input)");
-                return Ok(());
+            Ok(None)    => break "(end of input)",
+            Err(e)      => {
+                // Print AFTER shutting down MCP children to leave a
+                // clean host state.
+                session.shutdown().await.ok();
+                return Err(anyhow::anyhow!("stdin read error: {e}"));
             }
-            Err(e) => return Err(anyhow::anyhow!("stdin read error: {e}")),
         };
         let line = line.trim();
         if line.is_empty() { continue; }
-        if line == "/exit" {
-            eprintln!("(/exit — session ended)");
-            return Ok(());
-        }
+        if line == "/exit" { break "(/exit — session ended)"; }
 
-        // One round-trip.
         match session.turn(line).await {
             Ok(reply) => println!("{reply}"),
             Err(e)    => {
                 eprintln!("aislang chat: {e}");
-                // Don't abort the session on a single failed turn —
-                // user can retry. Network blips, rate limits, etc.
                 continue;
             }
         }
-    }
+    };
+
+    // Clean shutdown — kill MCP children.
+    eprintln!("{exit_reason}");
+    session.shutdown().await
+        .map_err(|e| anyhow::anyhow!("shutdown MCP children: {e}"))?;
+    Ok(())
 }
 
 /// Levenshtein-style "closest match" heuristic. Threshold ≤2 edits;

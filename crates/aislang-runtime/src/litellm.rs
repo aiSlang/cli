@@ -23,8 +23,7 @@ use thiserror::Error;
 // Wire types — OpenAI-compatible Chat Completions API
 // ============================================================================
 
-/// Top-level chat-completion request body. v0.1 Wed only populates
-/// `model` and `messages`; `tools` / `tool_choice` land Thursday.
+/// Top-level chat-completion request body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
     /// Model alias from the `.ais` `model` block (e.g. `"fast"`).
@@ -35,19 +34,117 @@ pub struct ChatRequest {
     /// field is sent explicitly to be unambiguous about it (some
     /// proxies default to streaming).
     pub stream:   bool,
-    /// Per-request timeout hint surfaced to LiteLLM. The actual
-    /// transport timeout is enforced client-side via reqwest's
-    /// builder; this is informational for the proxy's router.
-    /// Optional in the wire format — only set when the user pins
-    /// it via the .ais `model.latency_p95` (v0.2).
+    /// Tool catalog (week-6 Thu). When `None`, LiteLLM gets a plain
+    /// chat request — same wire shape as Wed. When `Some(non-empty)`,
+    /// the model is told what tools it can call; on its turn it can
+    /// emit `tool_calls` on the assistant message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools:    Option<Vec<Tool>>,
+    /// Per-request timeout hint surfaced to LiteLLM. Optional in the
+    /// wire format — only set when the user pins it via the .ais
+    /// `model.latency_p95` (v0.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout:  Option<u64>,
 }
 
+/// One message in a chat exchange.
+///
+/// `content` and `tool_calls` and `tool_call_id` are all optional —
+/// which combination is valid depends on the `role`:
+///   - **system**, **user**: require `content` (string).
+///   - **assistant**: requires `content` OR `tool_calls` (or both).
+///     When the model wants to invoke tools, it emits `tool_calls`
+///     with no `content`; when it's giving a final answer, it emits
+///     `content` with no `tool_calls`.
+///   - **tool**: requires `content` (the tool's textual output) AND
+///     `tool_call_id` (matching the assistant's `tool_calls[i].id`
+///     so LiteLLM can pair them).
+///
+/// v0.1's chat loop manages the invariants. The struct itself is
+/// permissive — invalid combinations are rejected by LiteLLM, not
+/// here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role:    Role,
-    pub content: String,
+    pub role: Role,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Tool invocations emitted by the assistant when it wants the
+    /// runtime to dispatch one or more MCP calls. Populated on
+    /// assistant messages only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Pairing key on `role=tool` messages — must match a
+    /// `tool_calls[i].id` from the preceding assistant message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Helper: build a plain `{role, content}` message (system/user/
+    /// tool-without-id). Most v0.1 call sites use this shape.
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Helper: build a tool-response message that pairs with a
+    /// specific assistant `tool_calls[i].id`.
+    pub fn tool_response(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+        }
+    }
+}
+
+// -- Tool wire types (OpenAI-compatible) ---------------------------------- //
+
+/// One tool exposed to the model in the request's `tools` array.
+/// `type` is always `"function"` for v0.1 (OpenAI also has
+/// `code_interpreter` / `file_search` etc., but those don't apply
+/// to MCP-routed tools).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema describing the tool's input. Passed verbatim from
+    /// the MCP server's `tools/list` response.
+    pub parameters: serde_json::Value,
+}
+
+/// One tool invocation in an assistant message's `tool_calls` array.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Server-generated ID used to pair this call with its
+    /// `role=tool` response message.
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+/// Quirk of the OpenAI spec: `function.arguments` is a JSON-encoded
+/// **string** containing a JSON object, NOT a JSON object directly.
+/// Callers must `serde_json::from_str(&call.function.arguments)` to
+/// get the parsed argument map. Documented here so callers don't
+/// have to re-discover it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,12 +250,22 @@ impl LiteLlmClient {
 
     /// POST a non-streaming chat completion. Returns the first
     /// choice's assistant message content as a plain `String`.
-    /// For v0.1 Wed this is all the chat loop consumes.
     ///
-    /// Thursday's tool-use loop will need access to `tool_calls` on
-    /// the assistant message; we'll add `send_chat_full` returning
-    /// `ChatResponse` then. For Wed simplicity wins.
+    /// For requests with no `tools` array (Wed-style simple turns),
+    /// this is the most ergonomic API. For tool-use turns the loop
+    /// needs access to `tool_calls`; use [`send_chat_full`] instead.
     pub async fn send_chat(&self, req: &ChatRequest) -> Result<String, LiteLlmError> {
+        let response = self.send_chat_full(req).await?;
+        let first = response.choices.into_iter().next()
+            .ok_or(LiteLlmError::EmptyChoices)?;
+        Ok(first.message.content.unwrap_or_default())
+    }
+
+    /// POST a non-streaming chat completion and return the full
+    /// parsed `ChatResponse`. Required by the tool-use loop (Thu)
+    /// because it needs `choices[0].message.tool_calls`, not just
+    /// the textual content.
+    pub async fn send_chat_full(&self, req: &ChatRequest) -> Result<ChatResponse, LiteLlmError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self.http.post(&url)
             .json(req)
@@ -182,9 +289,7 @@ impl LiteLlmClient {
                 cause: e.to_string(),
                 body:  body.clone(),
             })?;
-        let first = parsed.choices.into_iter().next()
-            .ok_or(LiteLlmError::EmptyChoices)?;
-        Ok(first.message.content)
+        Ok(parsed)
     }
 }
 
@@ -193,16 +298,19 @@ impl LiteLlmClient {
 // the session module and tests that pin the wire shape.
 // ============================================================================
 
-/// Build a request with one system message + one user message.
-/// Stream is hard-set to `false` per Decision 3.
+/// Build a request with one system message + one user message + no
+/// tools. Stream is hard-set to `false` per Decision 3. Used by
+/// callers that aren't running a tool-use loop (e.g. the prompt
+/// hashing harness, tests).
 pub fn one_turn_request(model: &str, system: &str, user: &str) -> ChatRequest {
     ChatRequest {
         model:    model.to_string(),
         messages: vec![
-            ChatMessage { role: Role::System, content: system.to_string() },
-            ChatMessage { role: Role::User,   content: user.to_string() },
+            ChatMessage::text(Role::System, system),
+            ChatMessage::text(Role::User,   user),
         ],
         stream:   false,
+        tools:    None,
         timeout:  None,
     }
 }
@@ -254,7 +362,7 @@ mod tests {
         let parsed: ChatResponse = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.choices.len(), 1);
         assert_eq!(parsed.choices[0].message.role, Role::Assistant);
-        assert_eq!(parsed.choices[0].message.content, "hello!");
+        assert_eq!(parsed.choices[0].message.content.as_deref(), Some("hello!"));
         assert_eq!(parsed.usage.as_ref().unwrap().total_tokens, 7);
     }
 
@@ -263,20 +371,21 @@ mod tests {
         // Some upstream providers don't fill in usage / finish_reason.
         let body = r#"{"choices": [{"message": {"role": "assistant", "content": "ok"}}]}"#;
         let parsed: ChatResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.choices[0].message.content, "ok");
+        assert_eq!(parsed.choices[0].message.content.as_deref(), Some("ok"));
         assert!(parsed.usage.is_none());
         assert!(parsed.choices[0].finish_reason.is_none());
     }
 
     #[test] fn role_tool_round_trips() {
-        // Thursday's tool-use loop will emit Role::Tool messages.
-        // Pin the wire format now so a Wed→Thu change can't quietly
-        // break it.
-        let m = ChatMessage { role: Role::Tool, content: "tool output".into() };
+        let m = ChatMessage::tool_response("call_abc", "tool output");
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"role\":\"tool\""), "got: {s}");
+        assert!(s.contains("\"tool_call_id\":\"call_abc\""),
+            "tool messages must carry tool_call_id; got: {s}");
         let back: ChatMessage = serde_json::from_str(&s).unwrap();
         assert_eq!(back.role, Role::Tool);
+        assert_eq!(back.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(back.content.as_deref(), Some("tool output"));
     }
 
     // ---- LiteLlmClient construction ----
@@ -378,5 +487,166 @@ mod tests {
         let err    = client.send_chat(&req).await.err().expect("must error");
         assert!(matches!(err, LiteLlmError::Transport { .. }),
             "expected Transport; got {err:?}");
+    }
+
+    // ----------------------------------------------------------------
+    // Thursday: tool wire types + send_chat_full + tool_calls round-trip
+    // ----------------------------------------------------------------
+
+    #[test] fn tool_kind_is_function_for_v01() {
+        let t = Tool {
+            kind: "function".into(),
+            function: ToolFunction {
+                name: "list_dir".into(),
+                description: "List directory contents".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }),
+            },
+        };
+        let s = serde_json::to_string(&t).unwrap();
+        // OpenAI wire shape: `type` is the discriminator (renamed via
+        // serde, not the Rust field name).
+        assert!(s.contains("\"type\":\"function\""), "got: {s}");
+        assert!(s.contains("\"name\":\"list_dir\""));
+        assert!(s.contains("\"required\":[\"path\"]"));
+    }
+
+    #[test] fn tool_call_round_trips_with_string_arguments() {
+        // OpenAI quirk: function.arguments is a JSON-encoded STRING,
+        // not a JSON object. Round-trip pins this so a future
+        // "helpful" refactor to JsonValue would break the wire shape
+        // loudly.
+        let call = ToolCall {
+            id: "call_abc".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "list_dir".into(),
+                arguments: r#"{"path":"/data"}"#.into(),
+            },
+        };
+        let s = serde_json::to_string(&call).unwrap();
+        // Argument string must be JSON-escaped, NOT inlined as an obj.
+        assert!(s.contains(r#""arguments":"{\"path\":\"/data\"}""#),
+            "arguments must be a string in the wire format; got: {s}");
+        let back: ToolCall = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.function.arguments, r#"{"path":"/data"}"#);
+    }
+
+    #[test] fn assistant_message_with_tool_calls_omits_content() {
+        // The wire shape for a "model wants to invoke tools" message:
+        // role=assistant, no content, tool_calls populated.
+        let m = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "list_dir".into(),
+                    arguments: r#"{"path":"/"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"role\":\"assistant\""));
+        assert!(!s.contains("\"content\""),
+            "content field must be omitted when None; got: {s}");
+        assert!(s.contains("\"tool_calls\":"),
+            "tool_calls must appear; got: {s}");
+    }
+
+    #[test] fn chat_response_parses_assistant_with_tool_calls() {
+        // What LiteLLM returns when the model decides to invoke tools.
+        let body = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_xyz",
+                        "type": "function",
+                        "function": {
+                            "name": "list_dir",
+                            "arguments": "{\"path\":\"/data\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(body).unwrap();
+        let msg = &parsed.choices[0].message;
+        assert_eq!(msg.role, Role::Assistant);
+        assert!(msg.content.is_none(),
+            "assistant invoking tools has no textual content; got {:?}",
+            msg.content);
+        let calls = msg.tool_calls.as_ref().expect("tool_calls present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_xyz");
+        assert_eq!(calls[0].function.name, "list_dir");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/data"}"#);
+    }
+
+    #[test] fn chat_request_with_tools_serializes_tools_array() {
+        let mut req = one_turn_request("fast", "sys", "user");
+        req.tools = Some(vec![Tool {
+            kind: "function".into(),
+            function: ToolFunction {
+                name: "list_dir".into(),
+                description: "List files".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }]);
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"tools\":["),
+            "tools array must appear; got: {s}");
+        assert!(s.contains("\"name\":\"list_dir\""));
+    }
+
+    #[test] fn chat_request_omits_tools_when_none() {
+        let req = one_turn_request("fast", "sys", "user");
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(!s.contains("\"tools\""),
+            "tools must be omitted on plain requests; got: {s}");
+    }
+
+    #[tokio::test]
+    async fn send_chat_full_returns_tool_calls() {
+        // Wiremock returns a response with tool_calls; send_chat_full
+        // must propagate them through to the caller (the tool-use
+        // loop in session.rs will react to them).
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_xyz",
+                        "type": "function",
+                        "function": {
+                            "name": "docs__list_dir",
+                            "arguments": "{\"path\":\"/data\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server).await;
+
+        let client = LiteLlmClient::new(server.uri()).unwrap();
+        let req    = one_turn_request("fast", "sys", "use a tool please");
+        let resp   = client.send_chat_full(&req).await.expect("send_chat_full ok");
+        let msg    = &resp.choices[0].message;
+        let calls  = msg.tool_calls.as_ref().expect("tool_calls present");
+        assert_eq!(calls[0].function.name, "docs__list_dir");
     }
 }

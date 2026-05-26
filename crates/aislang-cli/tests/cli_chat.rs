@@ -1,32 +1,67 @@
-//! Integration tests for `aislang chat <agent> <file>` — week 6 Wed.
+//! Integration tests for `aislang chat <agent> <file>` — week 6 Thu.
 //!
-//! Exercises the CLI binary against the bundled demo. Since Wed wires
-//! the live LiteLLM client, the tests use stdin EOF as the cleanest
-//! way to verify the banner + clean-shutdown path without standing up
-//! a real LiteLLM server. The wiremock-backed end-to-end test lives
-//! in `aislang-runtime::session::tests::session_turn_returns_*`.
+//! Two test categories:
 //!
-//! Contract pinned here:
-//!   1. `chat <known-agent> <demo>` with EOF stdin → exit 0; banner
-//!      on stderr ("agent `support`…connected to LiteLLM…") +
-//!      "(end of input)" on session close. Stdout stays clean
-//!      (no model output without a turn).
-//!   2. `chat <unknown-agent> <demo>` → non-zero exit + close-match
-//!      hint.
-//!   3. `chat <agent> <nonexistent-file>` → non-zero exit + clear
-//!      file error.
-//!   4. `chat <agent> <malformed-source>` → non-zero exit via the
-//!      source-aware validate pipeline.
+//!   1. **Tool-less agent** (`toolless_path()`): an inline .ais that
+//!      declares an agent with `tools = []`. EOF + `/exit` happy-path
+//!      tests run against this file — no Docker required, no MCP
+//!      spawn happens, so they pass in any CI environment.
+//!
+//!   2. **Demo agent** (`demo_path()`, has `tools = [mcp_server.docs]`):
+//!      used only for the agent-name-error tests, where we exit BEFORE
+//!      the MCP spawn step. Argument-validation paths thread through
+//!      validate → agent lookup before any Docker call.
+//!
+//! Real-MCP integration (the tool-use loop end-to-end against a live
+//! `mcp/filesystem:1.0.2`) is tested via `--ignored` runtime crate
+//! tests, not here.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Absolute path to the bundled support-agent demo file.
+/// Absolute path to the bundled support-agent demo file (has MCP
+/// servers; use for agent-name-error tests that exit before spawn).
 fn demo_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..").join("..")
         .join("examples").join("support-agent.ais")
+}
+
+/// Write a tool-less .ais source to a tempfile + the matching prompt
+/// file. Caller is responsible for removing them. Returns the .ais
+/// path.
+fn toolless_path() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("aislang-chat-toolless-{}",
+        std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let prompt_path = dir.join("system.md");
+    std::fs::write(&prompt_path, "you are helpful").expect("write prompt");
+    let ais_path = dir.join("toolless.ais");
+    let src = r#"project "toolless" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  model "fast" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+  }
+  prompt "system" {
+    file    = "./system.md"
+    version = "1.0.0"
+  }
+  agent "support" {
+    model         = model.fast
+    system_prompt = prompt.system
+    tools         = []
+  }
+}
+"#;
+    std::fs::write(&ais_path, src).expect("write toolless.ais");
+    ais_path
 }
 
 /// Path to the compiled `aislang` binary cargo built for these tests.
@@ -38,29 +73,27 @@ fn bin() -> Command {
 // Happy path — EOF stdin closes the session cleanly
 // ---------------------------------------------------------------------------
 
-#[test] fn chat_with_known_agent_opens_session_and_exits_on_eof() {
-    // No stdin → reader.next_line() returns Ok(None) immediately →
-    // session closes with "(end of input)" + exit 0. Validates the
+#[test] fn chat_with_toolless_agent_opens_session_and_exits_on_eof() {
+    // No tools → no MCP spawn → no Docker required. Validates the
     // happy path through validate + agent lookup + prompt load +
-    // session.open WITHOUT requiring a live LiteLLM (no `turn()`
-    // is invoked — the very first action is the EOF check).
+    // session.open + EOF clean-close WITHOUT requiring Docker.
+    let path = toolless_path();
     let mut child = bin()
         .args(["chat", "support"])
-        .arg(demo_path())
+        .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn aislang");
-    // Close stdin immediately — child sees EOF.
     drop(child.stdin.take());
     let out = child.wait_with_output().expect("wait");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 
     assert!(out.status.success(),
         "expected exit 0 on EOF; stderr was:\n{}",
         String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Banner contents (all on stderr — stdout stays pipe-clean).
     assert!(stderr.contains("agent `support`"),
         "stderr must name the agent; got:\n{stderr}");
     assert!(stderr.contains("model alias `fast`"),
@@ -69,7 +102,9 @@ fn bin() -> Command {
         "stderr must mention LiteLLM connection; got:\n{stderr}");
     assert!(stderr.contains("end of input"),
         "stderr must mark clean EOF close; got:\n{stderr}");
-    // No turn was made → no assistant output on stdout.
+    // Tool-less agent → no "tools: N available" banner line.
+    assert!(!stderr.contains("tools:"),
+        "tool-less session must NOT advertise a tool count; got:\n{stderr}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.is_empty(),
         "no turns means no stdout; got: {stdout:?}");
@@ -77,11 +112,11 @@ fn bin() -> Command {
 
 #[test] fn chat_exit_command_ends_session_cleanly() {
     // `/exit` typed at the prompt → "(/exit — session ended)" + exit 0.
-    // Same as EOF but via the explicit command keyword. Pin this so a
-    // future refactor doesn't accidentally break the documented escape.
+    // Tool-less for the same Docker-free reasons.
+    let path = toolless_path();
     let mut child = bin()
         .args(["chat", "support"])
-        .arg(demo_path())
+        .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,7 +127,10 @@ fn bin() -> Command {
         stdin.write_all(b"/exit\n").expect("write /exit");
     }
     let out = child.wait_with_output().expect("wait");
-    assert!(out.status.success());
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    assert!(out.status.success(),
+        "expected exit 0 on /exit; stderr was:\n{}",
+        String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("/exit — session ended"),
         "stderr must mark /exit close; got:\n{stderr}");

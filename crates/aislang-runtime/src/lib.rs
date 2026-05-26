@@ -24,5 +24,12 @@ pub mod mcp;
 pub mod litellm;
 pub mod session;
 
-pub use session::{Session, SessionError, load_system_prompt, hex_sha256};
-pub use litellm::{LiteLlmClient, LiteLlmError, ChatRequest, ChatMessage, Role};
+pub use session::{
+    Session, SessionError, ToolRegistry, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
+    load_system_prompt, hex_sha256,
+};
+pub use litellm::{
+    LiteLlmClient, LiteLlmError, ChatRequest, ChatMessage, Role,
+    Tool, ToolCall, ToolFunction, FunctionCall,
+};
+pub use mcp::{StdioChild, SpawnConfig, ToolSpec, ToolContent, McpError};
