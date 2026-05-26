@@ -1,0 +1,24 @@
+# examples/errors/missing-list-comma.ais
+#
+# Intentionally-malformed fixture: the requires-capability list below
+# is missing a comma between its two elements. The chumsky grammar
+# should reject at the start of the second element with an "expected
+# comma or closing bracket" error; the source-aware renderer should
+# emit a caret pointing at the second capability.
+#
+# Pinned by `error_fixtures::missing_list_comma_renders_source_snippet`.
+# Run `aislang validate examples/errors/missing-list-comma.ais` to see
+# the human-facing rendering.
+#
+# NOTE: this comment intentionally avoids quoting the malformed token
+# literally — the test scans the file body for that token to compute
+# the expected line dynamically, and a literal in the comment would
+# fool the scan.
+
+project "demo" {
+  budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+  model "fast" {
+    requires = [chat tool_use]
+    context_min = 32k
+  }
+}
