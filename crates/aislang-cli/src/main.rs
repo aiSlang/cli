@@ -3,7 +3,7 @@
 //! v0.1 subcommand surface (most are stubs until their scheduled week).
 //! See PLAN-90-days.md for the implementation schedule.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -115,8 +115,8 @@ fn run() -> Result<()> {
         Command::Validate { file, verbose }            => run_validate(file, verbose),
         Command::Plan { file, verbose, no_lock, output_dir, smoke_test } =>
             run_plan(file, verbose, no_lock, output_dir, smoke_test),
-        Command::Apply { file: _ }   => stub("apply",   6),
-        Command::Destroy { file: _ } => stub("destroy", 10),
+        Command::Apply { file }      => run_apply(file),
+        Command::Destroy { file }    => run_destroy(file),
         Command::Eval { file: _ }    => stub("eval",    8),
         Command::Cost { file: _ }    => stub("cost",    7),
         Command::Chat { agent, file } => run_chat(agent, file),
@@ -485,6 +485,232 @@ fn run_smoke_test(compose_yaml: &str) -> Result<()> {
     eprintln!("  up/down + LLM call: deferred to v0.2");
 
     Ok(())
+}
+
+// ============================================================================
+// `aislang apply` + `aislang destroy` — Friday of week 6
+// ============================================================================
+//
+// `apply` runs the same plan pipeline as `aislang plan` but writes
+// the Compose YAML to disk (`stack.yml`) instead of stdout, then
+// invokes `docker compose up -d` on it. `destroy` finds the same
+// `stack.yml` and runs `docker compose down -v`.
+//
+// Both commands gracefully degrade when Docker is missing: apply
+// prints the path to the written stack.yml and exits 0 with a hint
+// that the user can run docker compose themselves; destroy fails
+// fast with a clear "docker not on PATH" message (nothing to do
+// without docker — better to surface than silently no-op).
+
+/// Bundle of artifacts produced by the plan pipeline. Shared by
+/// `aislang plan` (which streams the YAML to stdout) and `aislang
+/// apply` (which writes it to disk + hands it to docker compose).
+struct PreparedStack {
+    artifacts:           aislang_compose::ComposeArtifacts,
+    output_dir:          PathBuf,
+    litellm_config_path: PathBuf,
+    env_example_path:    PathBuf,
+    /// `Some` when a lockfile was written; `None` when `--no-lock`.
+    /// Apply doesn't expose `--no-lock` in v0.1 — it always reconciles.
+    lock_path:           Option<PathBuf>,
+}
+
+/// Run the plan pipeline up to (and including) the `aislang-compose`
+/// emit step. Writes litellm_config.yaml + .env.example + (optionally)
+/// aislang.lock to `output_dir`. Returns the artifacts so callers can
+/// route the compose YAML to stdout (plan) or to a stack.yml file
+/// (apply).
+///
+/// This is the shared core of `run_plan` and `run_apply`. Errors
+/// surface via the same source-aware path as `aislang validate`.
+fn prepare_stack(
+    file:       &Path,
+    output_dir: Option<&Path>,
+    no_lock:    bool,
+    verbose:    u8,
+) -> Result<PreparedStack> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+
+    let output_dir_buf: PathBuf = match output_dir {
+        Some(p) => p.to_path_buf(),
+        None    => source_dir.to_path_buf(),
+    };
+    let output_dir = std::fs::canonicalize(&output_dir_buf).map_err(|e| {
+        anyhow::anyhow!("output dir `{}` doesn't exist or unreadable: {e}",
+            output_dir_buf.display())
+    })?;
+
+    // Stage 1: validate.
+    let (project, mut warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    // Stage 2: catalog ID validation.
+    match aislang_resolver::check_against_bundled_catalog(&project) {
+        Ok(cat_warnings) => warnings.extend(cat_warnings),
+        Err(e) => return Err(anyhow::anyhow!("catalog error: {e}")),
+    }
+    // Stage 3: resolve.
+    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
+        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+    // Stage 4: lockfile.
+    let lock_path = output_dir.join("aislang.lock");
+    let lock_path_out: Option<PathBuf> = if no_lock {
+        None
+    } else {
+        let existing = aislang_resolver::lockfile::read(&lock_path)
+            .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
+        let diff = aislang_resolver::lockfile::reconcile(
+            &source, existing.as_ref(), &resolved.catalog_version,
+        );
+        match diff {
+            aislang_resolver::LockfileDiff::Match => {}
+            aislang_resolver::LockfileDiff::Fresh
+            | aislang_resolver::LockfileDiff::Stale { .. } => {
+                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                aislang_resolver::lockfile::write(&lock_path, &new_lock)
+                    .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
+            }
+        }
+        Some(lock_path)
+    };
+    // Stage 5: emit + write supporting files.
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
+    let artifacts = aislang_compose::emit(&resolved, &catalog, &output_dir)
+        .map_err(|e| anyhow::anyhow!("compose emit error: {e}"))?;
+    let litellm_config_path = output_dir.join(aislang_compose::LITELLM_CONFIG_FILENAME);
+    std::fs::write(&litellm_config_path, &artifacts.litellm_config)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", litellm_config_path.display()))?;
+    let env_example_path = output_dir.join(aislang_compose::ENV_EXAMPLE_FILENAME);
+    std::fs::write(&env_example_path, &artifacts.env_example)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", env_example_path.display()))?;
+
+    if verbose >= 1 && !warnings.is_empty() {
+        eprintln!("warnings:");
+        for w in &warnings {
+            eprintln!("  - {}", w.message);
+        }
+    }
+
+    Ok(PreparedStack {
+        artifacts,
+        output_dir,
+        litellm_config_path,
+        env_example_path,
+        lock_path: lock_path_out,
+    })
+}
+
+/// `aislang apply <file>` — plan, then `docker compose up -d`.
+fn run_apply(file: PathBuf) -> Result<()> {
+    let prep = prepare_stack(&file, None, false, 0)?;
+
+    // Write stack.yml so `docker compose -f stack.yml` (and the
+    // companion `aislang destroy`) can find it.
+    let stack_path = prep.output_dir.join(aislang_compose::STACK_YAML_FILENAME);
+    std::fs::write(&stack_path, &prep.artifacts.docker_compose)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", stack_path.display()))?;
+
+    eprintln!("generated:");
+    eprintln!("  stack:            {}", stack_path.display());
+    eprintln!("  litellm config:   {}", prep.litellm_config_path.display());
+    eprintln!("  env example:      {}", prep.env_example_path.display());
+    if let Some(p) = &prep.lock_path {
+        eprintln!("  lockfile:         {}", p.display());
+    }
+    eprintln!();
+
+    // Now bring the stack up.
+    if !docker_on_path() {
+        eprintln!("docker not on PATH — wrote artifacts but didn't bring stack up.");
+        eprintln!("install Docker and run:");
+        eprintln!("  docker compose -f {} up -d", stack_path.display());
+        return Ok(());
+    }
+    eprintln!("bringing stack up: docker compose -f {} up -d", stack_path.display());
+    let status = std::process::Command::new("docker")
+        .args(["compose", "-f"])
+        .arg(&stack_path)
+        .args(["up", "-d"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoke docker compose: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "docker compose up -d exited {:?}", status.code()));
+    }
+    eprintln!();
+    eprintln!("stack is up. next steps:");
+    if let Some(agent) = first_agent_label_in_file(&file) {
+        eprintln!("  chat:      aislang chat {agent} {}", file.display());
+    }
+    eprintln!("  teardown:  aislang destroy {}", file.display());
+    Ok(())
+}
+
+/// `aislang destroy <file>` — locate the stack.yml emitted by apply
+/// and run `docker compose down -v`.
+fn run_destroy(file: PathBuf) -> Result<()> {
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
+        anyhow::anyhow!("source directory `{}` not readable: {e}",
+            source_dir.display())
+    })?;
+    let stack_path = output_dir.join(aislang_compose::STACK_YAML_FILENAME);
+    if !stack_path.exists() {
+        return Err(anyhow::anyhow!(
+            "no stack.yml at `{}` — run `aislang apply {}` first \
+             (or the stack was already destroyed)",
+            stack_path.display(), file.display()));
+    }
+    if !docker_on_path() {
+        return Err(anyhow::anyhow!(
+            "docker not on PATH; cannot tear down stack at `{}`",
+            stack_path.display()));
+    }
+    eprintln!("tearing down stack: docker compose -f {} down -v", stack_path.display());
+    let status = std::process::Command::new("docker")
+        .args(["compose", "-f"])
+        .arg(&stack_path)
+        .args(["down", "-v"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoke docker compose: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "docker compose down -v exited {:?}", status.code()));
+    }
+    eprintln!();
+    eprintln!("stack torn down — containers, networks, and volumes removed.");
+    eprintln!("the stack.yml file is preserved; remove it manually if desired:");
+    eprintln!("  rm {}", stack_path.display());
+    Ok(())
+}
+
+/// Check whether `docker` is callable. Used by apply (graceful
+/// degrade — write artifacts then tell the user how to bring them
+/// up manually) and destroy (hard fail — there's nothing useful to
+/// do without docker).
+fn docker_on_path() -> bool {
+    std::process::Command::new("docker")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Diagnostic helper for the apply success line. Re-parses the
+/// source just to find the first agent label so we can suggest a
+/// concrete chat command. Failure is silent — the suggestion is
+/// nice-to-have, not load-bearing.
+fn first_agent_label_in_file(file: &Path) -> Option<String> {
+    let source = std::fs::read_to_string(file).ok()?;
+    let (project, _) = aislang_core::validate(&source).ok()?;
+    project.agents.first().map(|a| a.label.clone())
 }
 
 // ============================================================================

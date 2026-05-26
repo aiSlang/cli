@@ -68,6 +68,10 @@ pub struct ComposeArtifacts {
 /// YAML's volume mount so the two stay in sync.
 pub const LITELLM_CONFIG_FILENAME: &str = "litellm_config.yaml";
 pub const ENV_EXAMPLE_FILENAME:    &str = ".env.example";
+/// Compose YAML on disk. `aislang plan` streams it to stdout for
+/// pipe usage (`aislang plan | docker compose -f - up`); `aislang
+/// apply` writes it here so `aislang destroy` can find it later.
+pub const STACK_YAML_FILENAME:     &str = "stack.yml";
 
 // ============================================================================
 // Public entry point

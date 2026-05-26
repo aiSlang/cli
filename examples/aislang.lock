@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "6328497fc91f10581959c0fd93edcd0efd77dc8aa3345f2d476cc29fc25bff8f",
+  "source_hash": "cbea368afd0d93b2ba76d9eed4e8a70c2bd2a67469fd9780b9156afc76debff3",
   "model_bindings": {
     "fast": {
       "provider": "ollama",

@@ -34,6 +34,20 @@ project "support-agent" {
 
 See [examples/support-agent.ais](examples/support-agent.ais) for the full reference example.
 
+```sh
+# Stand up the stack (LiteLLM + Jaeger + budget counter) in Docker.
+aislang apply examples/support-agent.ais
+
+# Chat with the agent — `aislang chat` runs the loop in-CLI:
+# the agent talks to the Compose-managed LiteLLM and spawns the
+# declared MCP servers (e.g. `mcp/filesystem:1.0.2`) as stdio
+# children for the duration of the session.
+aislang chat support examples/support-agent.ais
+
+# When you're done, tear it all down (containers + volumes).
+aislang destroy examples/support-agent.ais
+```
+
 ## How it works — the pipeline
 
 aiSlang is a *compile-then-deploy* tool, not an interpreter. A single `.ais` source file describes the whole AI infrastructure — models, agents, prompts, MCP servers, evals, budgets, deploy target. The CLI compiles it through four stages, then hands the resulting standard-format artifacts to your platform of choice.
@@ -88,7 +102,7 @@ aiSlang is a *compile-then-deploy* tool, not an interpreter. A single `.ais` sou
 |---|---|---|---|
 | 1. **Parse + type-check** | `aislang validate` | Lex source, build AST per LANGUAGE-SPEC §8 grammar, validate types and resource-shape semantics from §8.1 | `aislang-core::parser`, `aislang-core::ast` |
 | 2. **Resolve** | `aislang plan` | For each `model` block: walk constraints (`requires`, `cost_max`, `latency_p95`, `residency`, `prefer`, `fallback`) against the bundled model catalog; pick the best satisfying entry. Hash prompt files. Pin image tags to digests. Reconcile with `aislang.lock`. Output the resolved IR | `aislang-core::resolver` (week 4) + `aislang-catalog` |
-| 3. **Emit** | `aislang plan` / `aislang apply` | Translate the resolved IR to standard target artifacts. v0.1 emits a single `docker-compose.yml` with the agent runtime, LiteLLM as a sidecar, MCP servers, Jaeger for OTel-GenAI traces, and a budget-enforcement sidecar, plus a `.env.example` (the union of provider-derived credentials + env vars referenced by `secret` blocks — see [Secrets handling](#secrets-handling) below) | `aislang-compose` (v0.1); later: `aislang-k8s`, `aislang-helm`, `aislang-databricks`, etc. |
+| 3. **Emit** | `aislang plan` / `aislang apply` | Translate the resolved IR to standard target artifacts. v0.1 emits a `stack.yml` (Compose) with LiteLLM as the central router, Jaeger for OTel-GenAI traces, and a budget-enforcement sidecar, plus a `litellm_config.yaml` (mounted into the LiteLLM container) and a `.env.example` (union of provider-derived credentials + env vars referenced by `secret` blocks — see [Secrets handling](#secrets-handling) below). MCP servers are declared in the `.ais` but **spawned as `docker run -i` stdio children by `aislang chat`**, not as long-running Compose services (the published MCP images are stdio-only — see PLAN-90-days.md Decision 5; v0.2 changes this) | `aislang-compose` (v0.1); later: `aislang-k8s`, `aislang-helm`, `aislang-databricks`, etc. |
 | 4. **Apply / operate** | `aislang apply` / `chat` / `eval` / `cost` / `destroy` | Hand artifacts to Docker / K8s / target platform. The running stack honours the declared budgets, exposes the declared port surface, runs declared evals on demand, and emits OTel traces | shells out to platform CLIs (`docker compose`, `kubectl apply`, etc.) |
 
 ### What's in the v0.1 scope vs. phased
