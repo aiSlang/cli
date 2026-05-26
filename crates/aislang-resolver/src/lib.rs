@@ -21,7 +21,9 @@ use aislang_core::ast::{Model, ModelId, Project};
 use aislang_core::types::OptimizeFor;
 use aislang_core::Warning;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // ============================================================================
@@ -99,9 +101,9 @@ fn check_one_model_id(
 // ============================================================================
 
 /// The output of resolution: the original project plus the per-`model`-
-/// block catalog-entry choices. Week 4 Tue/Wed add prompt_hashes and
-/// oci_digests fields; week 4 Thu's Compose emitter consumes the whole
-/// struct.
+/// block catalog-entry choices plus per-`prompt`-block content hashes
+/// (Tuesday). Week 4 Wed adds oci_digests; week 4 Thu's Compose emitter
+/// consumes the whole struct.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedProject {
     pub project:         Project,
@@ -109,7 +111,11 @@ pub struct ResolvedProject {
     /// Map from `model.label` → catalog model ID chosen by the resolver.
     /// `BTreeMap` for deterministic JSON ordering (lockfile reproducibility).
     pub model_bindings:  BTreeMap<String, ModelId>,
-    // Tue: pub prompt_hashes: BTreeMap<String, String>,
+    /// Map from `prompt.label` → SHA-256 hex digest of the file content
+    /// at resolution time. Used by the lockfile (Wed) to detect prompt-
+    /// file edits between runs and by the Compose emitter (Thu) to
+    /// embed the hash as a config value for downstream cache-busting.
+    pub prompt_hashes:   BTreeMap<String, String>,
     // Wed: pub oci_digests:   BTreeMap<String, String>,
 }
 
@@ -121,13 +127,29 @@ pub enum ResolveError {
     #[error("model `{label}`: pin `{}.{}` violates constraints — {reason}",
             pin.provider, pin.name)]
     PinViolates { label: String, pin: ModelId, reason: String },
+
+    #[error("prompt `{label}`: cannot read file `{}` (resolved from source dir): {source}",
+            path.display())]
+    PromptFileMissing {
+        label:  String,
+        path:   PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
-/// Resolve every `model` block in the project against the catalog.
+/// Resolve every `model` and `prompt` block in the project against the
+/// catalog and source-directory tree.
+///
+/// `source_dir` is the directory containing the `.ais` file — used to
+/// resolve relative `prompt.file` paths. If a prompt's file path is
+/// absolute, source_dir is ignored for that prompt.
+///
 /// Algorithm per LANGUAGE-SPEC-v0.md §6.
-pub fn resolve(project: &Project, catalog: &Catalog)
+pub fn resolve(project: &Project, catalog: &Catalog, source_dir: &Path)
     -> Result<ResolvedProject, ResolveError>
 {
+    // ── models ───────────────────────────────────────────────────────
     let optimize_for = project.budget.as_ref()
         .map(|b| b.optimize_for)
         .unwrap_or(OptimizeFor::Cost);
@@ -138,15 +160,28 @@ pub fn resolve(project: &Project, catalog: &Catalog)
         model_bindings.insert(model.label.clone(), chosen);
     }
 
+    // ── prompts (Tuesday) ────────────────────────────────────────────
+    let mut prompt_hashes = BTreeMap::new();
+    for prompt in &project.prompts {
+        let abs_path = resolve_prompt_path(&prompt.file, source_dir);
+        let hash = hash_file(&abs_path).map_err(|e| ResolveError::PromptFileMissing {
+            label:  prompt.label.clone(),
+            path:   abs_path,
+            source: e,
+        })?;
+        prompt_hashes.insert(prompt.label.clone(), hash);
+    }
+
     Ok(ResolvedProject {
         project:         project.clone(),
         catalog_version: catalog.version.clone(),
         model_bindings,
+        prompt_hashes,
     })
 }
 
 /// Convenience: resolve against the bundled catalog.
-pub fn resolve_against_bundled_catalog(project: &Project)
+pub fn resolve_against_bundled_catalog(project: &Project, source_dir: &Path)
     -> Result<ResolvedProject, ResolveError>
 {
     let catalog = aislang_catalog::bundled()
@@ -154,7 +189,33 @@ pub fn resolve_against_bundled_catalog(project: &Project)
             label: "<bundled-catalog-load>".to_string(),
             detail: format!("failed to load bundled catalog: {e}"),
         })?;
-    resolve(project, &catalog)
+    resolve(project, &catalog, source_dir)
+}
+
+// ============================================================================
+// Prompt-file hashing — week 4 Tuesday
+// ============================================================================
+
+/// Resolve a prompt's `file` field into an absolute filesystem path.
+/// Absolute paths are returned as-is; relative paths are joined onto
+/// `source_dir` (the directory containing the `.ais` file).
+fn resolve_prompt_path(file: &Path, source_dir: &Path) -> PathBuf {
+    if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        source_dir.join(file)
+    }
+}
+
+/// SHA-256 hex digest of the byte content at `path`. Returns
+/// `std::io::Error` on file-not-found / permission / read failure;
+/// the caller wraps it in a `ResolveError::PromptFileMissing` with
+/// the prompt label for context.
+fn hash_file(path: &Path) -> Result<String, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn resolve_one_model(
@@ -553,6 +614,10 @@ mod tests {
     /// Build a project from a body fragment, then resolve against a
     /// supplied catalog. Returns the resolved binding for the named
     /// `model` block (or the first one if name is empty).
+    ///
+    /// Uses a tempfile-less dummy source dir — tests that pass bodies
+    /// with no `prompt` blocks don't touch the filesystem. Tests
+    /// involving prompt hashing use their own source-dir setup below.
     fn resolve_model(body: &str, catalog: &Catalog, model_label: &str)
         -> Result<ModelId, ResolveError>
     {
@@ -564,7 +629,7 @@ mod tests {
         );
         let (project, _warns) = aislang_core::validate(&src)
             .unwrap_or_else(|e| panic!("validate failed: {e}"));
-        let resolved = resolve(&project, catalog)?;
+        let resolved = resolve(&project, catalog, std::path::Path::new("."))?;
         let label = if model_label.is_empty() { "m" } else { model_label };
         Ok(resolved.model_bindings.get(label)
             .unwrap_or_else(|| panic!("no binding for `{label}`"))
@@ -645,7 +710,11 @@ mod tests {
         let (project, _) = aislang_core::validate(&src)
             .expect("demo must validate");
         let cat = aislang_catalog::bundled().expect("bundled catalog");
-        let resolved = resolve(&project, &cat).expect("must resolve");
+        // The demo references `./prompts/system.md` — resolve relative
+        // to examples/ so prompt hashing finds it.
+        let examples_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("examples");
+        let resolved = resolve(&project, &cat, &examples_dir).expect("must resolve");
         let fast = resolved.model_bindings.get("fast")
             .expect("model `fast` binding");
         assert_eq!(fast,
@@ -682,7 +751,7 @@ mod tests {
             }
         }"#;
         let (project, _) = aislang_core::validate(src).expect("validate");
-        let resolved = resolve(&project, &variety_catalog()).expect("resolve");
+        let resolved = resolve(&project, &variety_catalog(), std::path::Path::new(".")).expect("resolve");
         assert_eq!(resolved.model_bindings.get("m").unwrap().name, "fast_expensive");
     }
 
@@ -699,7 +768,7 @@ mod tests {
             }
         }"#;
         let (project, _) = aislang_core::validate(src).expect("validate");
-        let resolved = resolve(&project, &variety_catalog()).expect("resolve");
+        let resolved = resolve(&project, &variety_catalog(), std::path::Path::new(".")).expect("resolve");
         // First in prefer wins under `quality` — regardless of cost/latency.
         assert_eq!(resolved.model_bindings.get("m").unwrap().name, "fast_expensive");
     }
@@ -844,7 +913,114 @@ mod tests {
             }
         }"#;
         let (project, _) = aislang_core::validate(src).expect("validate");
-        let resolved = resolve(&project, &variety_catalog()).expect("resolve");
+        let resolved = resolve(&project, &variety_catalog(), std::path::Path::new(".")).expect("resolve");
         assert_eq!(resolved.catalog_version, "test-variety");
+    }
+
+    // ----------------------------------------------------------------
+    // Prompt-file hashing — week 4 Tuesday
+    // ----------------------------------------------------------------
+
+    use std::path::{Path, PathBuf};
+
+    fn examples_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("examples")
+    }
+
+    /// Build a project with a `prompt` block whose file path is the
+    /// supplied relative path; resolve against the supplied source dir.
+    fn resolve_with_prompt(file_path: &str, source_dir: &Path)
+        -> Result<ResolvedProject, ResolveError>
+    {
+        let src = format!(
+            r#"project "p" {{
+                budget {{ hard_cap_per_day = $1   hard_cap_per_run = $0.01 }}
+                prompt "system" {{ file = "{file_path}"  version = "1.0.0" }}
+            }}"#
+        );
+        let (project, _) = aislang_core::validate(&src).expect("validate");
+        resolve(&project, &variety_catalog(), source_dir)
+    }
+
+    #[test] fn prompt_file_produces_64hex_hash() {
+        // examples/prompts/system.md exists in the repo; hash it.
+        let resolved = resolve_with_prompt("./prompts/system.md", &examples_dir())
+            .expect("must resolve");
+        let hash = resolved.prompt_hashes.get("system")
+            .expect("system prompt hashed");
+        assert_eq!(hash.len(), 64, "SHA-256 hex digest should be 64 chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected lowercase hex; got `{hash}`");
+    }
+
+    #[test] fn prompt_hash_is_deterministic() {
+        // Two resolutions of the same file produce identical hashes —
+        // crucial for lockfile-bit-for-bit reproducibility (Wed).
+        let r1 = resolve_with_prompt("./prompts/system.md", &examples_dir())
+            .expect("first resolve");
+        let r2 = resolve_with_prompt("./prompts/system.md", &examples_dir())
+            .expect("second resolve");
+        assert_eq!(r1.prompt_hashes, r2.prompt_hashes);
+    }
+
+    #[test] fn missing_prompt_file_errors_with_label_and_path() {
+        let err = resolve_with_prompt("./does-not-exist.md", &examples_dir())
+            .err().expect("must error");
+        let s = format!("{err}");
+        assert!(s.contains("prompt `system`"));
+        assert!(s.contains("does-not-exist.md"));
+        // The std::io::Error display is appended via #[source].
+        assert!(s.contains("cannot read file"));
+    }
+
+    #[test] fn absolute_prompt_path_bypasses_source_dir() {
+        // Construct an absolute path to the existing demo file; pass an
+        // unrelated source_dir. Absolute file should win.
+        let abs = examples_dir().join("prompts").join("system.md");
+        let abs_str = abs.to_string_lossy().to_string();
+        let unrelated_dir = std::env::temp_dir();
+        let src = format!(
+            r#"project "p" {{
+                budget {{ hard_cap_per_day = $1   hard_cap_per_run = $0.01 }}
+                prompt "system" {{ file = "{abs_str}"  version = "1.0.0" }}
+            }}"#
+        );
+        let (project, _) = aislang_core::validate(&src).expect("validate");
+        let resolved = resolve(&project, &variety_catalog(), &unrelated_dir)
+            .expect("absolute path must resolve regardless of source_dir");
+        assert_eq!(resolved.prompt_hashes.get("system").unwrap().len(), 64);
+    }
+
+    #[test] fn different_content_produces_different_hash() {
+        // Use std::env::temp_dir + std::fs to create two same-named
+        // prompts under different dirs with different bytes — assert
+        // resulting hashes differ. This pins the "hash is
+        // content-sensitive" property of SHA-256, separate from any
+        // particular file the demo references.
+        let tmp_a = std::env::temp_dir().join("aislang-test-prompts-a");
+        let tmp_b = std::env::temp_dir().join("aislang-test-prompts-b");
+        std::fs::create_dir_all(&tmp_a).expect("mkdir a");
+        std::fs::create_dir_all(&tmp_b).expect("mkdir b");
+        std::fs::write(tmp_a.join("p.md"), b"alpha").expect("write a");
+        std::fs::write(tmp_b.join("p.md"), b"beta -- different bytes").expect("write b");
+
+        let r_a = resolve_with_prompt("./p.md", &tmp_a).expect("a");
+        let r_b = resolve_with_prompt("./p.md", &tmp_b).expect("b");
+        assert_ne!(r_a.prompt_hashes.get("system"),
+                   r_b.prompt_hashes.get("system"),
+            "different content must produce different SHA-256 digests");
+
+        // Cleanup; ignore errors.
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    #[test] fn resolved_project_json_includes_prompt_hashes() {
+        let resolved = resolve_with_prompt("./prompts/system.md", &examples_dir())
+            .expect("must resolve");
+        let json = serde_json::to_string_pretty(&resolved).expect("serialize");
+        assert!(json.contains("\"prompt_hashes\""));
+        assert!(json.contains("\"system\""));
     }
 }

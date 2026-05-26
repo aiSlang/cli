@@ -13,3 +13,7 @@ aislang-core    = { workspace = true }
 aislang-catalog = { workspace = true }
 serde           = { workspace = true }   # ResolvedProject Serialize for IR display
 thiserror       = { workspace = true }   # structured ResolveError variants
+sha2            = { workspace = true }   # SHA-256 prompt-file content hashing
+
+[dev-dependencies]
+serde_json      = { workspace = true }   # for JSON-shape assertions in tests
