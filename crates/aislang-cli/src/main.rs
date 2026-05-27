@@ -1107,9 +1107,10 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
 
     // ── 5. collect MCP server specs the CLI must spawn for this agent ──
     // For each ref in `agent.tools[]`, find the matching mcp_server
-    // block and capture its image + mount. Resolution failures here
-    // surface BEFORE we spin up the tokio runtime so the error path
-    // is sync (and the diagnostic line lines up with `aislang validate`).
+    // block, capture its image + mount, AND resolve its declared
+    // secrets into env pairs (week 7 Fri, Decisions 8/9). Resolution
+    // failures here surface BEFORE we spin up the tokio runtime so
+    // the error path is sync.
     use aislang_runtime::SpawnConfig;
     let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
     for tool_ref in &agent.tools {
@@ -1133,11 +1134,19 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
             let resolved = source_dir.join(p);
             std::fs::canonicalize(&resolved).unwrap_or(resolved)
         });
+        // Resolve mcp.secrets[] into env pairs (Decision 9: by
+        // construction — only secrets the user EXPLICITLY listed in
+        // this server's `secrets = [...]` field reach this child's
+        // env. No global env leakage; no other secret blocks visible).
+        let env = resolve_mcp_secrets(&project, mcp, source_dir)
+            .map_err(|e| anyhow::anyhow!(
+                "secret resolution failed for mcp_server `{}`: {e}",
+                mcp.label))?;
         mcp_specs.push((mcp.label.clone(), SpawnConfig {
             image: format_image(&mcp.image),
             args:  Vec::new(),
             mount,
-            env:   Vec::new(),
+            env,
         }));
     }
 
@@ -1214,6 +1223,53 @@ fn format_image(img: &aislang_core::types::OciImage) -> String {
         (None,    Some(d)) => format!("{base}@{d}"),
         (None,    None)    => base,
     }
+}
+
+/// Walk one `mcp_server`'s `secrets = [secret.X, secret.Y]` field,
+/// look up each ref in `project.secrets`, resolve its `source` URI
+/// via `aislang_runtime::resolve_secret`, and assemble the
+/// `(env_var_name, value)` pairs that'll be passed to the spawned
+/// child's environment.
+///
+/// Naming convention (v0.1): **the secret's label IS the env-var
+/// name inside the container**, used verbatim (case-preserved).
+/// Users should follow the standard `UPPER_SNAKE_CASE` convention
+/// for secret labels intended for env-var consumption.
+///
+/// Scoping (Decision 9): this function only ever reads the
+/// specific `secrets` list on the GIVEN mcp_server. Other secret
+/// blocks in `project.secrets` that don't appear here are simply
+/// not read. There's no "deny list" — by construction, only what
+/// was declared reaches the child.
+///
+/// Returns an empty `Vec` when `mcp.secrets` is `None` or empty.
+fn resolve_mcp_secrets(
+    project:    &aislang_core::ast::Project,
+    mcp:        &aislang_core::ast::McpServer,
+    source_dir: &std::path::Path,
+) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let refs = match &mcp.secrets {
+        Some(refs) if !refs.is_empty() => refs,
+        _ => return Ok(Vec::new()),
+    };
+    let mut env = Vec::with_capacity(refs.len());
+    for s_ref in refs {
+        // Lookup the secret block by label. The checker (week 3)
+        // already validated that all such refs resolve, but we
+        // double-check here so a programmer error in tests can't
+        // panic — surfaces as a clean error instead.
+        let secret = project.secrets.iter()
+            .find(|s| s.label == s_ref.label)
+            .ok_or_else(|| anyhow::anyhow!(
+                "mcp_server `{}` references secret `{}` which doesn't \
+                 exist in this project",
+                mcp.label, s_ref.label))?;
+        let value = aislang_runtime::resolve_secret(
+            &secret.label, &secret.source, source_dir,
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        env.push((secret.label.clone(), value));
+    }
+    Ok(env)
 }
 
 /// The async interactive loop. Separate from `run_chat` to keep the
@@ -1529,5 +1585,145 @@ mod tests {
         let pick = nearest_agent_label("suporrt", &cands);
         assert!(pick == Some("support") || pick == Some("supports"),
             "expected close-match; got {pick:?}");
+    }
+
+    // ---- resolve_mcp_secrets — scoping by construction (Decision 9) ----
+
+    /// Build a synthetic `Project` with two mcp_servers and two
+    /// secrets:
+    ///
+    ///   - `mcp_server.alpha`: declares `secrets = [a_only]`.
+    ///   - `mcp_server.beta`:  declares `secrets = [b_only]`.
+    ///   - `secret "a_only"`: scoped to `alpha` per source (informational
+    ///     here — runtime relies on mcp.secrets, not secret.scope).
+    ///   - `secret "b_only"`: scoped to `beta`.
+    ///
+    /// Both secrets resolve from `env://TEST_SCOPE_*` env vars
+    /// set by the test.
+    fn synthetic_two_mcp_two_secret() -> aislang_core::ast::Project {
+        use aislang_core::ast::*;
+        use aislang_core::types::OciImage;
+        let mk_mcp = |label: &str, secret_label: &str| McpServer {
+            label: label.to_string(),
+            image: OciImage {
+                registry:   "docker.io".into(),
+                repository: "mcp/x".into(),
+                tag:        Some("0".into()),
+                digest:     None,
+            },
+            mount:   None,
+            env:     None,
+            secrets: Some(vec![Ref {
+                kind:  RefKind::Secret,
+                label: secret_label.to_string(),
+            }]),
+        };
+        Project {
+            name: "x".into(),
+            mcp_servers: vec![
+                mk_mcp("alpha", "a_only"),
+                mk_mcp("beta",  "b_only"),
+            ],
+            secrets: vec![
+                Secret {
+                    label:  "a_only".into(),
+                    source: "env://TEST_SCOPE_A_ONLY".into(),
+                    scope:  vec![Ref { kind: RefKind::McpServer, label: "alpha".into() }],
+                },
+                Secret {
+                    label:  "b_only".into(),
+                    source: "env://TEST_SCOPE_B_ONLY".into(),
+                    scope:  vec![Ref { kind: RefKind::McpServer, label: "beta".into()  }],
+                },
+            ],
+            ..Project::default()
+        }
+    }
+
+    #[test] fn scoping_alpha_secret_not_in_beta_env() {
+        // Decision 9: by construction, only secrets declared in
+        // `mcp_server.secrets = [...]` reach that container's env.
+        // Pin: alpha's secret never appears in beta's resolved env,
+        // and vice versa.
+        std::env::set_var("TEST_SCOPE_A_ONLY", "alpha-val");
+        std::env::set_var("TEST_SCOPE_B_ONLY", "beta-val");
+        let project = synthetic_two_mcp_two_secret();
+        let alpha = &project.mcp_servers[0];
+        let beta  = &project.mcp_servers[1];
+
+        let alpha_env = resolve_mcp_secrets(&project, alpha, Path::new("/tmp")).unwrap();
+        let beta_env  = resolve_mcp_secrets(&project, beta,  Path::new("/tmp")).unwrap();
+
+        // Alpha sees exactly its declared secret. Beta's name doesn't appear.
+        let alpha_keys: Vec<&str> = alpha_env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(alpha_keys, vec!["a_only"],
+            "alpha must see ONLY its declared secret; got: {alpha_keys:?}");
+        assert!(alpha_env.iter().any(|(k, v)| k == "a_only" && v == "alpha-val"));
+
+        // Beta sees exactly its declared secret.
+        let beta_keys: Vec<&str> = beta_env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(beta_keys, vec!["b_only"],
+            "beta must see ONLY its declared secret; got: {beta_keys:?}");
+
+        // CROSS-CHECK: alpha's env has no b_only; beta's has no a_only.
+        assert!(!alpha_env.iter().any(|(k, _)| k == "b_only"),
+            "alpha must NOT see beta's secret; got: {alpha_env:?}");
+        assert!(!beta_env .iter().any(|(k, _)| k == "a_only"),
+            "beta must NOT see alpha's secret; got: {beta_env:?}");
+
+        std::env::remove_var("TEST_SCOPE_A_ONLY");
+        std::env::remove_var("TEST_SCOPE_B_ONLY");
+    }
+
+    #[test] fn mcp_with_no_secrets_field_yields_empty_env() {
+        // No secrets declared → empty env (not an error).
+        use aislang_core::ast::*;
+        use aislang_core::types::OciImage;
+        let project = Project {
+            name: "x".into(),
+            mcp_servers: vec![McpServer {
+                label: "free".into(),
+                image: OciImage {
+                    registry: "x".into(), repository: "y".into(),
+                    tag: None, digest: None,
+                },
+                mount: None, env: None,
+                secrets: None,   // explicitly absent
+            }],
+            ..Project::default()
+        };
+        let env = resolve_mcp_secrets(&project, &project.mcp_servers[0],
+                                       Path::new("/tmp")).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test] fn mcp_referencing_unknown_secret_errors_cleanly() {
+        // Defense in depth: if a `mcp_server.secrets` ref points
+        // at a non-existent secret block (which the checker should
+        // already reject), we surface a clean error rather than
+        // panic.
+        use aislang_core::ast::*;
+        use aislang_core::types::OciImage;
+        let project = Project {
+            name: "x".into(),
+            mcp_servers: vec![McpServer {
+                label: "borked".into(),
+                image: OciImage {
+                    registry: "x".into(), repository: "y".into(),
+                    tag: None, digest: None,
+                },
+                mount: None, env: None,
+                secrets: Some(vec![Ref {
+                    kind:  RefKind::Secret,
+                    label: "phantom".into(),
+                }]),
+            }],
+            secrets: vec![],   // phantom doesn't exist
+            ..Project::default()
+        };
+        let err = resolve_mcp_secrets(&project, &project.mcp_servers[0],
+                                       Path::new("/tmp")).err().unwrap();
+        assert!(err.to_string().contains("phantom"),
+            "error must name the missing secret; got: {err}");
     }
 }

@@ -853,13 +853,43 @@ fn to_secret(raw: RawBlock) -> Result<Secret, String> {
         }
     }
 
+    let source = source.ok_or_else(||
+        "secret missing required attribute `source`".to_string())?;
+
+    // v0.1 (Decision 8): accept only `env://` and `file://` URI
+    // schemes. Other schemes (`vault://`, `aws-sm://`, `gcp-secret://`,
+    // …) are reserved for v0.2's `secret_provider` resource type —
+    // see LANGUAGE-SPEC §5.7. Reject at parse time with a pointer
+    // there so users know it's a v0.2 promise, not a typo.
+    validate_secret_uri_scheme(&label, &source)?;
+
     Ok(Secret {
         label,
-        source: source.ok_or_else(||
-            "secret missing required attribute `source`".to_string())?,
+        source,
         scope:  scope.ok_or_else(||
             "secret missing required attribute `scope`".to_string())?,
     })
+}
+
+/// Reject any secret-source URI scheme that isn't `env://` or
+/// `file://`. v0.1 (Decision 8) restricts the surface to these two
+/// zero-dep schemes; enterprise vaults / cloud secret stores land
+/// in v0.2 via the `secret_provider` resource type (LANGUAGE-SPEC §5.7).
+fn validate_secret_uri_scheme(label: &str, source: &str) -> Result<(), String> {
+    const SUPPORTED: &[&str] = &["env://", "file://"];
+    if SUPPORTED.iter().any(|prefix| source.starts_with(prefix)) {
+        return Ok(());
+    }
+    // Extract just the scheme part for the error message (everything
+    // up to the first colon, then strip the `://` suffix).
+    let scheme = source.split(':').next().unwrap_or(source);
+    Err(format!(
+        "secret `{label}`: source URI scheme `{scheme}://` is not supported in \
+         v0.1. Supported v0.1 schemes: `env://VAR` (read from process env) and \
+         `file://path` (read file contents). Enterprise secret stores \
+         (vault, aws-sm, gcp-sm, azure-kv, k8s-secret) are reserved for v0.2 \
+         via the `secret_provider` resource type — see LANGUAGE-SPEC §5.7."
+    ))
 }
 
 fn to_agent(raw: RawBlock) -> Result<Agent, String> {
@@ -2107,6 +2137,44 @@ mod project_tests {
         let src = project_with(
             r#"secret "k" { source = "env://X"  scope = [model.fast] }"#);
         assert_parse_err_contains(&src, "agent` or `mcp_server");
+    }
+
+    // ---- URI scheme validation (week 7 Fri, Decision 8) ----
+
+    #[test] fn secret_file_uri_accepted() {
+        // `file://path` is the second v0.1 supported scheme — read
+        // file contents as the secret value.
+        let src = project_with(
+            r#"secret "db" { source = "file://./.secrets/db.token"  scope = [mcp_server.docs] }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.secrets[0].source, "file://./.secrets/db.token");
+    }
+
+    #[test] fn secret_vault_uri_rejected_with_spec_pointer() {
+        // `vault://` is reserved for v0.2's `secret_provider` work —
+        // see LANGUAGE-SPEC §5.7. v0.1 rejects at parse time so the
+        // user gets a clean diagnostic pointing at the spec section.
+        let src = project_with(
+            r#"secret "k" { source = "vault://secret/foo"  scope = [agent.support] }"#);
+        assert_parse_err_contains(&src, "LANGUAGE-SPEC §5.7");
+        assert_parse_err_contains(&src, "vault://");
+    }
+
+    #[test] fn secret_aws_sm_uri_rejected() {
+        // Every non-env / non-file scheme rejects the same way.
+        let src = project_with(
+            r#"secret "k" { source = "aws-sm://arn:..."  scope = [agent.support] }"#);
+        assert_parse_err_contains(&src, "is not supported in v0.1");
+        assert_parse_err_contains(&src, "secret_provider");
+    }
+
+    #[test] fn secret_bare_value_rejected() {
+        // `source = "MY_KEY_VALUE_HERE"` (no scheme prefix) is also
+        // wrong. v0.1 requires a URI form so the user is explicit
+        // about WHERE the secret comes from. Pin the rejection.
+        let src = project_with(
+            r#"secret "k" { source = "MY_KEY_VALUE"  scope = [agent.support] }"#);
+        assert_parse_err_contains(&src, "not supported in v0.1");
     }
 
     #[test] fn agent_block_parses() {
