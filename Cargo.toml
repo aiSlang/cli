@@ -43,9 +43,16 @@ tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "proce
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # week-9 Mon: OTel-GenAI tracing — official Rust SDK + OTLP HTTP exporter
 # (Decision 18). Targets the bundled Jaeger sidecar's :4318 HTTP port.
+#
+# Architecture choice (revised Mon late): simple span processor +
+# blocking reqwest. `rt-tokio` + batched async export panicked on
+# process exit (background thread outlived our tokio runtime). Our
+# spans-per-command count is tiny (≤ a few dozen), so the per-span
+# blocking HTTP cost is irrelevant and the lifecycle is rock-solid:
+# span ends → synchronous POST to OTLP receiver → no daemon threads.
 opentelemetry        = "0.32"
-opentelemetry_sdk    = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp   = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls"] }
+opentelemetry_sdk    = "0.32"
+opentelemetry-otlp   = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.32"
 
 [profile.release]

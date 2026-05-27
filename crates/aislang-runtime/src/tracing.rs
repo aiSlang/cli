@@ -40,7 +40,7 @@ use std::sync::OnceLock;
 use opentelemetry::{
     global,
     trace::{Span, SpanKind, TraceContextExt, TraceId, Tracer},
-    Context, ContextGuard, KeyValue,
+    Context, KeyValue,
 };
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
@@ -114,9 +114,11 @@ pub fn init_tracer(service_name: &str) -> Result<(), TracingError> {
 
     let endpoint = resolve_otlp_endpoint();
 
-    // HTTP/proto over reqwest-rustls (Decision 19). The feature flags
-    // in workspace Cargo.toml (`http-proto`, `reqwest-client`,
-    // `reqwest-rustls`) make this transport available.
+    // HTTP/proto over reqwest-rustls (Decision 19). Feature flags in
+    // workspace Cargo.toml: `http-proto` + `reqwest-blocking-client` +
+    // `reqwest-rustls`. The blocking client lets us pair the exporter
+    // with the SDK's *simple* processor below — no background thread,
+    // no runtime-lifecycle dance.
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
@@ -133,8 +135,13 @@ pub fn init_tracer(service_name: &str) -> Result<(), TracingError> {
         ])
         .build();
 
+    // *Simple* span processor (Decision 18, revised Mon late). For
+    // our scale — a few root + child spans per CLI invocation — sync
+    // export at span-end time has trivial overhead and avoids the
+    // background-thread / tokio-runtime-lifecycle pitfall a batch
+    // processor would create at process exit.
     let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(span_exporter)
+        .with_simple_exporter(span_exporter)
         .with_resource(resource)
         .build();
 
@@ -165,19 +172,30 @@ pub fn shutdown_tracer() {
 // RootSpan: parent-of-everything for one CLI command
 // ───────────────────────────────────────────────────────────────────
 
-/// One root span per CLI command. Holds the OTel `ContextGuard` so
-/// child spans (LiteLLM call, MCP tool call) automatically attach to
-/// this span by reading `Context::current()`.
+/// One root span per CLI command.
 ///
-/// `Drop` ends the span and prints the Jaeger trace URL to stderr.
-/// Per Decision 22 the URL goes to stderr so stdout (JSON eval
-/// reports, model output streams) stays pipe-clean for `jq`.
+/// Construct + drop `RootSpan` in **synchronous** code, *outside* any
+/// `tokio::runtime::Runtime::block_on` block. The simple-processor +
+/// blocking-reqwest exporter we use (see `init_tracer`) drives its
+/// HTTP POST through reqwest's internal blocking client, which sets
+/// up and tears down its own tiny tokio runtime per call. Dropping
+/// that runtime inside an outer tokio async context would panic, so
+/// the span's `.end()` (i.e. our `Drop`) must run in plain sync code.
+///
+/// The struct holds a cloneable `Context` rather than a thread-local
+/// `ContextGuard` so the parent context can travel into a tokio task:
+/// the async fn re-attaches it on its worker thread via
+/// `root.context().attach()`. Child spans inside the async block
+/// then read `Context::current()` and inherit this root as parent.
+///
+/// `Drop` ends the span (synchronously exporting via the simple
+/// processor) and prints the Jaeger trace URL to stderr — Decision
+/// 22's contract that stdout stays pipe-clean for JSON reports.
 pub struct RootSpan {
-    // Order matters: when `_guard` drops, the thread-local context is
-    // restored to its prior value. That releases the last Arc<Span>
-    // held by the attached context, which triggers the SDK to call
-    // `.end()` on the span. We then print the trace URL in Drop.
-    _guard:   Option<ContextGuard>,
+    // Owned via Option so Drop can take() and let the Context drop in
+    // sync ctx. The Context owns an Arc<Span> — when this is the last
+    // ref, the SDK ends the span and the simple processor exports it.
+    ctx:      Option<Context>,
     trace_id: TraceId,
     label:    String,
     kind:     RootKind,
@@ -220,19 +238,29 @@ impl RootSpan {
 
         let trace_id = span.span_context().trace_id();
 
-        // Attach the span to the current Context so any child span
-        // created via `tracer.start("…")` inherits it as parent. The
-        // span is moved into the Context; the SDK drops it (calling
-        // `.end()`) when the last Context Arc-ref goes out of scope —
-        // which happens at the moment the returned guard drops.
-        let guard = Context::current_with_span(span).attach();
+        // Move the span into a fresh Context. We do NOT attach it
+        // here — the caller is responsible for `.attach()` inside the
+        // tokio worker thread (Context is thread-local). The
+        // RootSpan struct holds the Context so it lives until Drop;
+        // when Drop runs (in sync ctx), the Arc<Span> reaches zero
+        // refs and the simple processor exports synchronously.
+        let ctx = Context::current_with_span(span);
 
         Self {
-            _guard:   Some(guard),
+            ctx:      Some(ctx),
             trace_id,
             label:    label.to_owned(),
             kind,
         }
+    }
+
+    /// A clone of the root context. Pass into the async tokio task
+    /// and call `.attach()` on the worker thread so child spans
+    /// inherit this root as parent via `Context::current()`. The
+    /// returned `ContextGuard` is held inside the async block — let
+    /// it drop at the end of the async fn.
+    pub fn context(&self) -> Context {
+        self.ctx.clone().unwrap_or_else(Context::current)
     }
 
     /// Raw OTel trace id. Useful when EvalReport needs to embed it
@@ -250,9 +278,12 @@ impl RootSpan {
 
 impl Drop for RootSpan {
     fn drop(&mut self) {
-        // 1. Drop the context guard → restores the parent (root)
-        //    context; ends the attached span via the SDK's drop path.
-        self._guard.take();
+        // 1. Take and drop the Context → drops the inner Arc<Span> →
+        //    SDK ends the span → simple processor exports it
+        //    synchronously via blocking reqwest. MUST run in a sync
+        //    (non-tokio-async) context — see the struct-level
+        //    rationale above.
+        let _ = self.ctx.take();
 
         // 2. Print the trace URL to stderr. Decision 22: this is the
         //    single user-visible breadcrumb that says "your trace is

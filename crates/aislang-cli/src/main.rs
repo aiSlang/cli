@@ -1205,23 +1205,41 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
     };
 
     // ── 8. open session, run interactive loop ──
+    //
+    // OTel-GenAI tracing (week 9 Mon, Decisions 18 + 21 + 22):
+    // the simple+blocking exporter requires sync ctx for both span
+    // export and provider shutdown. So init + RootSpan creation +
+    // RootSpan drop + shutdown all happen OUTSIDE rt.block_on; the
+    // async fn just re-attaches the root context on the tokio
+    // worker thread so any child spans (Tue/Wed) inherit.
+    if let Err(e) = aislang_runtime::init_tracer("aislang") {
+        eprintln!("tracing disabled: {e}");
+    }
+    let root_span = aislang_runtime::RootSpan::for_chat(&agent_label);
+    let root_ctx  = root_span.context();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-    let result = rt.block_on(chat_interactive(
-        &agent_label,
-        &model_label,
-        system_prompt,
-        mcp_specs,
-        budget_cfg,
-        tracker,
-    ));
-    // Flush any pending OTLP spans queued by the batch processor
-    // (week 9 Mon). Done inside the tokio context so the rt-tokio
-    // background tasks can drain cleanly. No-op if init_tracer
-    // never succeeded.
-    rt.block_on(async { aislang_runtime::shutdown_tracer(); });
+    let result = rt.block_on(async move {
+        let _g = root_ctx.attach();
+        chat_interactive(
+            &agent_label,
+            &model_label,
+            system_prompt,
+            mcp_specs,
+            budget_cfg,
+            tracker,
+        ).await
+    });
+    // Drop the tokio runtime in sync ctx — clean teardown.
+    drop(rt);
+    // Drop the root span in sync ctx → simple processor exports via
+    // blocking reqwest. Stderr breadcrumb prints here.
+    drop(root_span);
+    // Flush+shutdown the provider in sync ctx.
+    aislang_runtime::shutdown_tracer();
     result
 }
 
@@ -1299,17 +1317,11 @@ async fn chat_interactive(
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // ── OTel-GenAI tracing init (week 9 Mon, Decision 18) ──
-    // Idempotent + fail-soft (Decision 21): a failure here means
-    // tracing is off for this run, never fatal to the chat itself.
-    if let Err(e) = aislang_runtime::init_tracer("aislang") {
-        eprintln!("tracing disabled: {e}");
-    }
-    // Root span lives on the stack for the whole chat session; its
-    // Drop attaches/detaches the Context and prints the Jaeger URL.
-    // Held until function return so every LiteLLM/MCP child span
-    // (wired in Tue/Wed) reads `Context::current()` and inherits.
-    let _root = aislang_runtime::RootSpan::for_chat(agent_label);
+    // (OTel tracing init + RootSpan are owned by the sync wrapper
+    // `run_chat` — they MUST drop in sync ctx because the blocking
+    // OTLP exporter would otherwise panic dropping its internal
+    // tokio runtime inside ours. The root context is already
+    // attached on this worker thread by `run_chat`'s `_g` guard.)
 
     // ── Spawn MCP children + list their tools to populate the registry ──
     let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
@@ -1575,9 +1587,24 @@ fn run_eval(eval_label_opt: Option<String>, file: PathBuf) -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
 
+    // OTel tracing init (week 9 Mon, fail-soft). Same sync-only
+    // boundary rules as `run_chat` — see the comment block there.
+    if let Err(e) = aislang_runtime::init_tracer("aislang") {
+        eprintln!("tracing disabled: {e}");
+    }
+
     let mut all_passed = true;
     for eval in evals {
-        let report = rt.block_on(run_eval_inner(&project, eval, source_dir))?;
+        // One RootSpan per eval invocation — N+1 spans (root +
+        // per-case) per Mon DoD. Created in sync ctx; the inner
+        // async block re-attaches the cloned context so any child
+        // turn spans (Tue/Wed) inherit this root.
+        let root_span = aislang_runtime::RootSpan::for_eval(&eval.label);
+        let root_ctx  = root_span.context();
+        let report = rt.block_on(async {
+            let _g = root_ctx.attach();
+            run_eval_inner(&project, eval, source_dir).await
+        })?;
         // Stdout: machine-readable JSON.
         let json = serde_json::to_string_pretty(&report)
             .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
@@ -1596,10 +1623,15 @@ fn run_eval(eval_label_opt: Option<String>, file: PathBuf) -> Result<()> {
         eprintln!("  cases:       {}", report.cases.len());
         eprintln!("  dataset:     {}", report.dataset_path);
         if !report.pass { all_passed = false; }
+        // Drop the root span in sync ctx between iterations →
+        // simple processor exports synchronously, stderr breadcrumb
+        // for THIS eval prints here.
+        drop(root_span);
     }
 
-    // Flush OTLP batch processor inside the tokio context (week 9 Mon).
-    rt.block_on(async { aislang_runtime::shutdown_tracer(); });
+    // Drop the tokio runtime in sync ctx, then flush the provider.
+    drop(rt);
+    aislang_runtime::shutdown_tracer();
 
     if all_passed { Ok(()) } else {
         Err(anyhow::anyhow!(
@@ -1617,17 +1649,9 @@ async fn run_eval_inner(
 ) -> Result<aislang_runtime::EvalReport> {
     use aislang_runtime::SpawnConfig;
 
-    // ── OTel-GenAI tracing init (week 9 Mon, Decision 18) ──
-    // Idempotent across multiple evals in the same `aislang eval` run.
-    // Fail-soft (Decision 21): tracing failures never break an eval.
-    if let Err(e) = aislang_runtime::init_tracer("aislang") {
-        eprintln!("tracing disabled: {e}");
-    }
-    // One root span per eval invocation — N+1 spans per eval (root +
-    // per-case turn). The root is held until function return so the
-    // per-case Session::turn child spans (wired Tue/Wed) inherit it
-    // via Context::current().
-    let _root = aislang_runtime::RootSpan::for_eval(&eval.label);
+    // (OTel tracing init + RootSpan are owned by `run_eval` — they
+    // MUST drop in sync ctx. The root context is already attached
+    // on this worker thread by the calling block's `_g` guard.)
 
     // ── 1. resolve which agent this eval runs against (Decision 13) ──
     let agent: &aislang_core::ast::Agent = match &eval.agent {
