@@ -100,9 +100,9 @@
     {
       "label": "factual_accuracy",
       "dataset": "./evals/qa.jsonl",
-      "metric": "exact_match",
+      "metric": "f1",
       "threshold": {
-        "ratio": 0.85
+        "ratio": 0.5
       },
       "aggregator": "mean"
     }

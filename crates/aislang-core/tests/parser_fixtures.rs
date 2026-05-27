@@ -110,8 +110,8 @@ fn expected_support_agent() -> Project {
     let eval_accuracy = Eval {
         label:      "factual_accuracy".into(),
         dataset:    PathBuf::from("./evals/qa.jsonl"),
-        metric:     EvalMetric::ExactMatch,
-        threshold:  Percentage { ratio: 0.85 },
+        metric:     EvalMetric::F1,
+        threshold:  Percentage { ratio: 0.50 },
         aggregator: EvalAggregator::Mean,
         agent:      None,
     };

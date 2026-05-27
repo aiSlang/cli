@@ -1,5 +1,16 @@
-{"input": "What is the return policy?", "expected": "30 days from purchase, original packaging required."}
-{"input": "How do I reset my password?", "expected": "Visit the account settings page and click 'Reset password'."}
-{"input": "What payment methods do you accept?", "expected": "Visa, Mastercard, American Express, PayPal."}
-{"input": "Where are you headquartered?", "expected": "Berlin, Germany."}
-{"input": "How can I contact support?", "expected": "Email support@example.com or open a ticket from the help page."}
+# Eval dataset for the support-agent demo.
+#
+# Each case is one (input, expected) pair. The expected string is
+# the *gold-standard short answer* — the demo uses metric=f1
+# (bag-of-tokens) so paraphrases score well as long as the key
+# tokens overlap. exact_match would be too strict for free-form
+# LLM output.
+#
+# Update the matching `examples/knowledge/company-info.md` when
+# adding cases so the agent has documents to retrieve from.
+
+{"id": "returns_window",    "input": "What is the return policy?",         "expected": "30 days from purchase original packaging"}
+{"id": "password_reset",    "input": "How do I reset my password?",         "expected": "account settings page click reset password"}
+{"id": "payment_methods",   "input": "What payment methods do you accept?", "expected": "Visa Mastercard American Express PayPal"}
+{"id": "headquarters",      "input": "Where are you headquartered?",        "expected": "Berlin Germany"}
+{"id": "contact_support",   "input": "How can I contact support?",          "expected": "support@example.com or open a ticket help page"}
