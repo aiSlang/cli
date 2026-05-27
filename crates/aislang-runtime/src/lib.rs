@@ -30,6 +30,10 @@ pub mod cost;
 pub mod spend;
 pub mod secrets;
 pub mod eval;
+// week-9 Mon: OTel-GenAI tracing — SDK init + RootSpan lifecycle.
+// Decision 18 (official Rust SDK) + Decision 22 (Jaeger UI URL to
+// stderr). Child-span instrumentation in litellm/session lands Tue/Wed.
+pub mod tracing;
 
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
@@ -48,3 +52,6 @@ pub use eval::{
     EvalReport, CaseResult, aggregate as eval_aggregate,
 };
 pub use eval::metric::{score as metric_score, MetricError};
+pub use tracing::{
+    init_tracer, shutdown_tracer, jaeger_url, RootSpan, TracingError,
+};

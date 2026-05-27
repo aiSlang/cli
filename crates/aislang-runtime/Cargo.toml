@@ -23,6 +23,16 @@ sha2         = { workspace = true }
 # week-7 Tue: cost arithmetic needs Money + Currency from core's types.
 # Decision 6: budget enforcement lives in this crate, not LiteLLM config.
 aislang-core = { workspace = true }
+# week-9 Mon: OTel-GenAI tracing (Decision 18). Official Rust SDK +
+# OTLP HTTP/proto exporter; reqwest is reused for the OTLP transport
+# (see workspace dep features: http-proto + reqwest-client +
+# reqwest-rustls). Resource + semantic-convention attribute keys come
+# from opentelemetry-semantic-conventions so the strings match the
+# OTel-GenAI spec exactly (no typo'd `gen_ai.usage.input_tokens`).
+opentelemetry                      = { workspace = true }
+opentelemetry_sdk                  = { workspace = true }
+opentelemetry-otlp                 = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
 
 [dev-dependencies]
 # wiremock — Rust port of WireMock; lets us spin up a fake HTTP server

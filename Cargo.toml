@@ -41,6 +41,12 @@ rmcp        = { version = "1.7", features = ["client", "transport-child-process"
 tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "time", "sync"] }
 # week-6 Wed: LiteLLM HTTP client + non-streaming chat loop
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# week-9 Mon: OTel-GenAI tracing — official Rust SDK + OTLP HTTP exporter
+# (Decision 18). Targets the bundled Jaeger sidecar's :4318 HTTP port.
+opentelemetry        = "0.32"
+opentelemetry_sdk    = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp   = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls"] }
+opentelemetry-semantic-conventions = "0.32"
 
 [profile.release]
 opt-level = 3

@@ -1209,14 +1209,20 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-    rt.block_on(chat_interactive(
+    let result = rt.block_on(chat_interactive(
         &agent_label,
         &model_label,
         system_prompt,
         mcp_specs,
         budget_cfg,
         tracker,
-    ))
+    ));
+    // Flush any pending OTLP spans queued by the batch processor
+    // (week 9 Mon). Done inside the tokio context so the rt-tokio
+    // background tasks can drain cleanly. No-op if init_tracer
+    // never succeeded.
+    rt.block_on(async { aislang_runtime::shutdown_tracer(); });
+    result
 }
 
 /// Render an `OciImage` into the docker-friendly form. Mirrors
@@ -1292,6 +1298,18 @@ async fn chat_interactive(
     tracker:       Option<aislang_runtime::SpendTracker>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // ── OTel-GenAI tracing init (week 9 Mon, Decision 18) ──
+    // Idempotent + fail-soft (Decision 21): a failure here means
+    // tracing is off for this run, never fatal to the chat itself.
+    if let Err(e) = aislang_runtime::init_tracer("aislang") {
+        eprintln!("tracing disabled: {e}");
+    }
+    // Root span lives on the stack for the whole chat session; its
+    // Drop attaches/detaches the Context and prints the Jaeger URL.
+    // Held until function return so every LiteLLM/MCP child span
+    // (wired in Tue/Wed) reads `Context::current()` and inherits.
+    let _root = aislang_runtime::RootSpan::for_chat(agent_label);
 
     // ── Spawn MCP children + list their tools to populate the registry ──
     let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
@@ -1580,6 +1598,9 @@ fn run_eval(eval_label_opt: Option<String>, file: PathBuf) -> Result<()> {
         if !report.pass { all_passed = false; }
     }
 
+    // Flush OTLP batch processor inside the tokio context (week 9 Mon).
+    rt.block_on(async { aislang_runtime::shutdown_tracer(); });
+
     if all_passed { Ok(()) } else {
         Err(anyhow::anyhow!(
             "one or more evals failed their threshold (see reports above)"))
@@ -1595,6 +1616,18 @@ async fn run_eval_inner(
     source_dir: &Path,
 ) -> Result<aislang_runtime::EvalReport> {
     use aislang_runtime::SpawnConfig;
+
+    // ── OTel-GenAI tracing init (week 9 Mon, Decision 18) ──
+    // Idempotent across multiple evals in the same `aislang eval` run.
+    // Fail-soft (Decision 21): tracing failures never break an eval.
+    if let Err(e) = aislang_runtime::init_tracer("aislang") {
+        eprintln!("tracing disabled: {e}");
+    }
+    // One root span per eval invocation — N+1 spans per eval (root +
+    // per-case turn). The root is held until function return so the
+    // per-case Session::turn child spans (wired Tue/Wed) inherit it
+    // via Context::current().
+    let _root = aislang_runtime::RootSpan::for_eval(&eval.label);
 
     // ── 1. resolve which agent this eval runs against (Decision 13) ──
     let agent: &aislang_core::ast::Agent = match &eval.agent {
