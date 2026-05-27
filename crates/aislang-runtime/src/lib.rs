@@ -44,3 +44,4 @@ pub use cost::{cost_of_usage, sum as money_sum, format_money};
 pub use spend::{SpendTracker, SpendError};
 pub use secrets::{resolve as resolve_secret, SecretError};
 pub use eval::{load_dataset, parse_dataset, EvalCase, DatasetError};
+pub use eval::metric::{score as metric_score, MetricError};

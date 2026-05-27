@@ -28,6 +28,8 @@
 //! (counting empty + comment lines too, so the user can `sed -n
 //! '<N>p' dataset.jsonl` to see exactly the offending line).
 
+pub mod metric;
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
