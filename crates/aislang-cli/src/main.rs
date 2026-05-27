@@ -316,6 +316,7 @@ fn run_plan(
             &source,
             existing.as_ref(),
             &resolved.catalog_version,
+            &resolved.prompt_hashes,
         );
         match diff {
             aislang_resolver::LockfileDiff::Match => {
@@ -867,6 +868,7 @@ fn prepare_stack(
             .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
         let diff = aislang_resolver::lockfile::reconcile(
             &source, existing.as_ref(), &resolved.catalog_version,
+            &resolved.prompt_hashes,
         );
         match diff {
             aislang_resolver::LockfileDiff::Match => {}

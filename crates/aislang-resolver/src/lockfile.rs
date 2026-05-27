@@ -140,13 +140,24 @@ pub fn write(path: &Path, lockfile: &Lockfile) -> Result<(), LockfileError> {
 // ============================================================================
 
 /// Compare a (possibly-absent) on-disk lockfile against the current
-/// source bytes + catalog version. The result tells the caller whether
-/// to reuse cached bindings or re-resolve, and (if stale) lists the
-/// specific reasons for the user.
+/// source bytes + catalog version + freshly-resolved prompt hashes.
+/// The result tells the caller whether to reuse cached bindings or
+/// re-resolve, and (if stale) lists the specific reasons.
+///
+/// `current_prompt_hashes` comes from the just-completed
+/// `resolve()` run — it's the on-disk content hashes for every
+/// `prompt.label`. We compare them against the lockfile's stored
+/// hashes to detect "user edited a prompt file but didn't touch the
+/// .ais source" — without this, the .ais-source-only check returns
+/// `Match` and the lockfile keeps the stale hash forever, which then
+/// trips the chat-time prompt-hash verification with a confusing
+/// "Re-run aislang plan to refresh the lockfile" error (when the
+/// user just DID).
 pub fn reconcile(
     source:                  &str,
     existing:                Option<&Lockfile>,
     current_catalog_version: &str,
+    current_prompt_hashes:   &BTreeMap<String, String>,
 ) -> LockfileDiff {
     let lock = match existing {
         None    => return LockfileDiff::Fresh,
@@ -177,6 +188,36 @@ pub fn reconcile(
             "catalog version changed: lockfile {}, current {}",
             lock.catalog_version, current_catalog_version,
         ));
+    }
+
+    // Prompt-file content changes (week-7 hotfix). Two failure modes:
+    //   1. Same prompt label, different content: hash diff → stale.
+    //   2. Prompt added / removed: key-set diff → stale.
+    // We check both directions: every current entry must match
+    // the lockfile, AND the lockfile must not carry stale entries
+    // for prompts the user removed from the source.
+    for (label, current_hash) in current_prompt_hashes {
+        match lock.prompt_hashes.get(label) {
+            Some(lock_hash) if lock_hash == current_hash => {}
+            Some(lock_hash) => {
+                reasons.push(format!(
+                    "prompt `{label}` content changed (lockfile hash \
+                     starts {}, current starts {})",
+                    short(lock_hash),
+                    short(current_hash),
+                ));
+            }
+            None => {
+                reasons.push(format!(
+                    "prompt `{label}` added in source (not in lockfile)"));
+            }
+        }
+    }
+    for label in lock.prompt_hashes.keys() {
+        if !current_prompt_hashes.contains_key(label) {
+            reasons.push(format!(
+                "prompt `{label}` removed from source (present in lockfile)"));
+        }
     }
 
     if reasons.is_empty() {
@@ -278,8 +319,12 @@ mod tests {
 
     // ---------- reconcile() ----------
 
+    /// Convenience: an empty current prompt-hashes map. Most pre-week-7
+    /// reconcile tests don't exercise prompts.
+    fn no_prompts() -> BTreeMap<String, String> { BTreeMap::new() }
+
     #[test] fn reconcile_no_existing_returns_fresh() {
-        let diff = reconcile("source", None, "any-version");
+        let diff = reconcile("source", None, "any-version", &no_prompts());
         assert_eq!(diff, LockfileDiff::Fresh);
     }
 
@@ -287,14 +332,18 @@ mod tests {
         let source = "the source bytes";
         let mut lock = synthetic_lockfile();
         lock.source_hash = sha256_hex(source.as_bytes());
-        let diff = reconcile(source, Some(&lock), &lock.catalog_version);
+        // Ensure lockfile + current have identical prompt hash sets
+        // (`synthetic_lockfile` populates two prompts).
+        let diff = reconcile(source, Some(&lock), &lock.catalog_version,
+                             &lock.prompt_hashes);
         assert_eq!(diff, LockfileDiff::Match);
     }
 
     #[test] fn reconcile_stale_when_source_changed() {
         let mut lock = synthetic_lockfile();
         lock.source_hash = sha256_hex(b"the old source");
-        let diff = reconcile("the NEW source bytes", Some(&lock), &lock.catalog_version);
+        let diff = reconcile("the NEW source bytes", Some(&lock),
+                             &lock.catalog_version, &lock.prompt_hashes);
         match diff {
             LockfileDiff::Stale { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("source file changed")),
@@ -309,7 +358,8 @@ mod tests {
         let mut lock = synthetic_lockfile();
         lock.source_hash = sha256_hex(source.as_bytes());
         lock.catalog_version = "old-catalog".into();
-        let diff = reconcile(source, Some(&lock), "new-catalog");
+        let diff = reconcile(source, Some(&lock), "new-catalog",
+                             &lock.prompt_hashes);
         match diff {
             LockfileDiff::Stale { reasons } => {
                 assert!(reasons.iter().any(|r|
@@ -327,7 +377,8 @@ mod tests {
         let mut lock = synthetic_lockfile();
         lock.source_hash = sha256_hex(b"old source");
         lock.catalog_version = "old".into();
-        let diff = reconcile("new source", Some(&lock), "new-cat");
+        let diff = reconcile("new source", Some(&lock), "new-cat",
+                             &lock.prompt_hashes);
         match diff {
             LockfileDiff::Stale { reasons } => {
                 assert_eq!(reasons.len(), 2,
@@ -341,13 +392,93 @@ mod tests {
         let mut lock = synthetic_lockfile();
         lock.schema_version = 999;
         lock.source_hash = sha256_hex(b"src");
-        let diff = reconcile("src", Some(&lock), &lock.catalog_version);
+        let diff = reconcile("src", Some(&lock), &lock.catalog_version,
+                             &lock.prompt_hashes);
         match diff {
             LockfileDiff::Stale { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("schema version 999")));
             }
             other => panic!("expected Stale, got {other:?}"),
         }
+    }
+
+    // ---------- Prompt-hash reconciliation (week-7 hotfix) ----------
+    //
+    // Regression tests for the bug observed week 7 Thu:
+    // user edited a prompt file (system.md) without touching the .ais
+    // source, ran `aislang plan`, and the lockfile didn't refresh —
+    // then `aislang chat` complained about a hash mismatch and told
+    // them to re-run plan. The fix: reconcile() now compares
+    // prompt_hashes too.
+
+    #[test] fn reconcile_stale_when_prompt_content_changed() {
+        let source = "src";
+        let mut lock = synthetic_lockfile();
+        lock.source_hash = sha256_hex(source.as_bytes());
+        lock.prompt_hashes.insert("system".to_string(),
+            "old_hash_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        // Same label, different content hash.
+        let mut current = BTreeMap::new();
+        current.insert("system".to_string(),
+            "new_hash_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        let diff = reconcile(source, Some(&lock), &lock.catalog_version, &current);
+        match diff {
+            LockfileDiff::Stale { reasons } => {
+                assert!(reasons.iter().any(|r|
+                    r.contains("prompt `system` content changed")),
+                    "expected `prompt content changed` reason; got: {reasons:?}");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test] fn reconcile_stale_when_prompt_added_in_source() {
+        let source = "src";
+        let mut lock = synthetic_lockfile();
+        lock.source_hash = sha256_hex(source.as_bytes());
+        lock.prompt_hashes.clear();  // lockfile knows of no prompts
+        let mut current = BTreeMap::new();
+        current.insert("system".into(), "h".repeat(64));
+        let diff = reconcile(source, Some(&lock), &lock.catalog_version, &current);
+        match diff {
+            LockfileDiff::Stale { reasons } => {
+                assert!(reasons.iter().any(|r|
+                    r.contains("prompt `system` added in source")),
+                    "expected `prompt added` reason; got: {reasons:?}");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test] fn reconcile_stale_when_prompt_removed_from_source() {
+        let source = "src";
+        let mut lock = synthetic_lockfile();
+        lock.source_hash = sha256_hex(source.as_bytes());
+        lock.prompt_hashes.insert("orphan".into(), "h".repeat(64));
+        // Current has none.
+        let diff = reconcile(source, Some(&lock), &lock.catalog_version,
+                             &BTreeMap::new());
+        match diff {
+            LockfileDiff::Stale { reasons } => {
+                assert!(reasons.iter().any(|r|
+                    r.contains("prompt `orphan` removed from source")),
+                    "expected `prompt removed` reason; got: {reasons:?}");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test] fn reconcile_match_when_prompts_identical_across_runs() {
+        // No drift on either side → Match. Pins that the prompt
+        // check doesn't become a noisy false-positive.
+        let source = "src";
+        let mut lock = synthetic_lockfile();
+        lock.source_hash = sha256_hex(source.as_bytes());
+        lock.prompt_hashes.insert("system".into(), "h".repeat(64));
+        let mut current = BTreeMap::new();
+        current.insert("system".into(), "h".repeat(64));
+        let diff = reconcile(source, Some(&lock), &lock.catalog_version, &current);
+        assert_eq!(diff, LockfileDiff::Match);
     }
 
     // ---------- Lockfile::build ----------

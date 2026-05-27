@@ -13,6 +13,6 @@ model_list:
     api_key: os.environ/OPENAI_API_KEY
 router_settings:
   fallbacks:
-    fast:
+  - fast:
     - fast-fb-anthropic-claude-haiku-4-5
     - fast-fb-openai-gpt-4o-mini
