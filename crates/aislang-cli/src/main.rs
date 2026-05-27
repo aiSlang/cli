@@ -610,7 +610,7 @@ fn smoke_test_live_tier(
         // events complete — i.e. after the proxy is ready to route
         // chat completions. Poll until it's 200, then proceed.
         wait_for_litellm_ready(
-            "http://localhost:4000",
+            "http://127.0.0.1:4000",
             std::time::Duration::from_secs(30),
         ).map_err(|e| anyhow::anyhow!(
             "litellm /health/liveness did not return 200 within 30s: {e}\n\
@@ -762,7 +762,7 @@ fn try_chat_completion(model_alias: &str) -> Result<()> {
             "-H", "Content-Type: application/json",
             "-X", "POST",
             "-d", &body_str,
-            "http://localhost:4000/v1/chat/completions",
+            "http://127.0.0.1:4000/v1/chat/completions",
         ])
         .output()
         .map_err(|e| anyhow::anyhow!("spawn curl: {e}"))?;
@@ -1251,7 +1251,7 @@ async fn chat_interactive(
         let s = aislang_runtime::Session::open_with_tools(
             model_label,
             system_prompt,
-            None, // default http://localhost:4000
+            None, // default http://127.0.0.1:4000
             mcp_clients,
             tool_registry,
         ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;

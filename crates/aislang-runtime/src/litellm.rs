@@ -221,7 +221,20 @@ pub struct LiteLlmClient {
 impl LiteLlmClient {
     /// Default LiteLLM port exposed by the compose stack (matches
     /// `litellm` service port mapping in `aislang-compose`).
-    pub const DEFAULT_URL: &'static str = "http://localhost:4000";
+    /// Default LiteLLM URL. Uses **`127.0.0.1`** explicitly (not
+    /// `localhost`) to dodge a real-world bite: on Linux hosts where
+    /// `/etc/hosts` maps `localhost` to both `127.0.0.1` and `::1`,
+    /// reqwest's name resolution may try IPv6 first and hit Docker's
+    /// flaky `[::]:4000->4000/tcp` mapping (it's listed but TCP
+    /// connect frequently RSTs depending on kernel/userspace-proxy
+    /// config). `127.0.0.1` is unambiguous IPv4 → straight to the
+    /// `0.0.0.0:4000` published port → works everywhere.
+    ///
+    /// Observed week-7 Thu: with `localhost`, `curl http://localhost:4000/health/liveness`
+    /// works (curl tries v4 after v6 fails) but reqwest's request
+    /// surfaces "error sending request for url" because it commits
+    /// to the first-resolved address. Pinning v4 sidesteps it.
+    pub const DEFAULT_URL: &'static str = "http://127.0.0.1:4000";
 
     /// 30 seconds — the same default the v0.2 OTel spans will use.
     /// Long enough for slow models (Opus, GPT-4o), short enough that
@@ -398,7 +411,9 @@ mod tests {
     #[test] fn client_default_local_uses_known_port() {
         let c = LiteLlmClient::default_local().expect("build");
         assert_eq!(c.base_url, LiteLlmClient::DEFAULT_URL);
-        assert_eq!(c.base_url, "http://localhost:4000");
+        // Pinned to 127.0.0.1 (not `localhost`) to dodge the IPv6
+        // dual-stack flake — see DEFAULT_URL docs.
+        assert_eq!(c.base_url, "http://127.0.0.1:4000");
     }
 
     // ---- send_chat against a fake HTTP server ----
