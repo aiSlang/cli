@@ -81,7 +81,16 @@ enum Command {
         file: PathBuf,
     },
     /// Run declared evals against the deployed agent(s)
+    ///
+    /// `aislang eval [<eval-label>] <file>`. Label optional: without
+    /// it, every `eval` block in the project runs. With it, only the
+    /// named one. Overall exit code = 0 only when every eval passes
+    /// its threshold (per Decision 16).
     Eval {
+        /// Optional eval label to run. When omitted, all evals run.
+        #[arg(long = "eval", short = 'e')]
+        eval_label: Option<String>,
+        /// Path to the .ais project file.
         file: PathBuf,
     },
     /// Show projected and actual cost for the project
@@ -127,7 +136,7 @@ fn run() -> Result<()> {
             run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live),
         Command::Apply { file }      => run_apply(file),
         Command::Destroy { file }    => run_destroy(file),
-        Command::Eval { file: _ }    => stub("eval",    8),
+        Command::Eval { eval_label, file } => run_eval(eval_label, file),
         Command::Cost { file: _ }    => stub("cost",    7),
         Command::Chat { agent, file } => run_chat(agent, file),
     }
@@ -1480,6 +1489,289 @@ fn print_summary(project: &aislang_core::ast::Project) {
 fn stub(cmd: &str, week: u8) -> Result<()> {
     println!("aislang {cmd}: not implemented yet (scheduled for week {week} — see PLAN-90-days.md)");
     Ok(())
+}
+
+// ============================================================================
+// `aislang eval` — week 8 runner
+// ============================================================================
+//
+// Walks `project.evals`, filters to the named one (or runs all),
+// resolves the agent per Decision 13, opens a `Session` (reusing
+// week-7's Budget + Tracker plumbing — caps apply per case), and
+// iterates the dataset. JSON `EvalReport` per eval on stdout; human
+// summary on stderr.
+//
+// Exit codes (Decision 16):
+//   0 — every eval passed its threshold.
+//   1 — at least one eval below threshold (CI-fail trigger).
+//   2 — configuration error (file missing, unknown agent, malformed
+//       dataset, unimplemented metric). Returned via `anyhow::Error`
+//       so the existing `main()` exit-code handling fires
+//       ExitCode::FAILURE = 1 — for now we collapse 1 and 2 into
+//       "non-zero". Friday's polish may split them by routing
+//       config errors via a distinct sentinel.
+
+fn run_eval(eval_label_opt: Option<String>, file: PathBuf) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    // Filter to the requested eval(s).
+    let evals: Vec<&aislang_core::ast::Eval> = match &eval_label_opt {
+        Some(name) => {
+            let found = project.evals.iter().find(|e| &e.label == name);
+            match found {
+                Some(e) => vec![e],
+                None => {
+                    let available: Vec<&str> = project.evals.iter()
+                        .map(|e| e.label.as_str()).collect();
+                    return Err(anyhow::anyhow!(
+                        "no eval named `{name}` in {}.\n  available: {}",
+                        file.display(),
+                        if available.is_empty() { "(none declared)".to_string() }
+                        else { available.join(", ") },
+                    ));
+                }
+            }
+        }
+        None => project.evals.iter().collect(),
+    };
+
+    if evals.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no `eval` blocks declared in {}", file.display()));
+    }
+
+    // Spin up tokio once for the whole batch — each eval gets its
+    // own Session within.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    let mut all_passed = true;
+    for eval in evals {
+        let report = rt.block_on(run_eval_inner(&project, eval, source_dir))?;
+        // Stdout: machine-readable JSON.
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
+        println!("{json}");
+        // Stderr: human summary.
+        eprintln!();
+        eprintln!("eval `{}`: {} ({:.4} {} {})",
+            report.eval_label,
+            if report.pass { "PASS" } else { "FAIL" },
+            report.aggregate_score,
+            if report.pass { "≥" } else { "<" },
+            report.threshold,
+        );
+        eprintln!("  metric:      {}", report.metric);
+        eprintln!("  aggregator:  {}", report.aggregator);
+        eprintln!("  cases:       {}", report.cases.len());
+        eprintln!("  dataset:     {}", report.dataset_path);
+        if !report.pass { all_passed = false; }
+    }
+
+    if all_passed { Ok(()) } else {
+        Err(anyhow::anyhow!(
+            "one or more evals failed their threshold (see reports above)"))
+    }
+}
+
+/// Async: open a Session for one eval, run the dataset, build the
+/// EvalReport. Mirrors `chat_interactive`'s session-construction
+/// path so the agent runs exactly as it would for `aislang chat`.
+async fn run_eval_inner(
+    project:    &aislang_core::ast::Project,
+    eval:       &aislang_core::ast::Eval,
+    source_dir: &Path,
+) -> Result<aislang_runtime::EvalReport> {
+    use aislang_runtime::SpawnConfig;
+
+    // ── 1. resolve which agent this eval runs against (Decision 13) ──
+    let agent: &aislang_core::ast::Agent = match &eval.agent {
+        Some(a_ref) => project.agents.iter().find(|a| a.label == a_ref.label)
+            .ok_or_else(|| anyhow::anyhow!(
+                "eval `{}` references agent `{}` which doesn't exist",
+                eval.label, a_ref.label))?,
+        None => match project.agents.len() {
+            1 => &project.agents[0],
+            0 => return Err(anyhow::anyhow!(
+                "eval `{}` has no `agent = …` field and the project declares zero \
+                 agents — nothing to evaluate", eval.label)),
+            n => return Err(anyhow::anyhow!(
+                "eval `{}` has no `agent = …` field but the project declares {n} \
+                 agents — add an explicit `agent = agent.<label>` to disambiguate",
+                eval.label)),
+        },
+    };
+
+    let model_label = agent.model.label.clone();
+
+    // ── 2. resolve prompt + load + verify hash ──
+    let prompt_block = project.prompts.iter()
+        .find(|p| p.label == agent.system_prompt.label)
+        .ok_or_else(|| anyhow::anyhow!(
+            "agent `{}` references prompt `{}` which doesn't exist",
+            agent.label, agent.system_prompt.label))?;
+    let prompt_path = source_dir.join(&prompt_block.file);
+    let lock_path = source_dir.join("aislang.lock");
+    let expected_hash: Option<String> =
+        match aislang_resolver::lockfile::read(&lock_path) {
+            Ok(Some(lock)) => lock.prompt_hashes.get(&prompt_block.label).cloned(),
+            _              => None,
+        };
+    let system_prompt = aislang_runtime::load_system_prompt(
+        &prompt_path, expected_hash.as_deref(),
+    ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // ── 3. resolve model bindings + build budget (mirrors run_chat) ──
+    use aislang_runtime::BudgetConfig;
+    let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
+        Some(b) => {
+            let resolved = aislang_resolver::resolve_against_bundled_catalog(
+                project, source_dir,
+            ).map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+            let model_id = resolved.model_bindings.get(&model_label)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "model `{model_label}` has no resolved binding"))?;
+            let catalog = aislang_catalog::bundled()
+                .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
+            let entry = catalog.find(model_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "catalog entry `{}.{}` (resolved primary for `{model_label}`) \
+                     not found in bundled catalog",
+                    model_id.provider, model_id.name))?;
+            Some(BudgetConfig {
+                per_run_cap:        b.hard_cap_per_run,
+                per_day_cap:        b.hard_cap_per_day,
+                cost_input_per_1k:  entry.cost_input,
+                cost_output_per_1k: entry.cost_output,
+            })
+        }
+        None => None,
+    };
+    let tracker = match budget_cfg.as_ref() {
+        Some(_) => Some(aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?),
+        None => None,
+    };
+
+    // ── 4. collect MCP specs for the resolved agent (same as chat) ──
+    let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
+    for tool_ref in &agent.tools {
+        if tool_ref.kind != aislang_core::ast::RefKind::McpServer {
+            return Err(anyhow::anyhow!(
+                "agent `{}.tools` ref `{}` has kind `{:?}` — \
+                 v0.1 only supports `mcp_server` tool refs",
+                agent.label, tool_ref.label, tool_ref.kind));
+        }
+        let mcp = project.mcp_servers.iter()
+            .find(|m| m.label == tool_ref.label)
+            .ok_or_else(|| anyhow::anyhow!(
+                "agent `{}` references mcp_server `{}` which doesn't exist",
+                agent.label, tool_ref.label))?;
+        let mount = mcp.mount.as_ref().map(|p| {
+            let resolved = source_dir.join(p);
+            std::fs::canonicalize(&resolved).unwrap_or(resolved)
+        });
+        let env = resolve_mcp_secrets(project, mcp, source_dir)
+            .map_err(|e| anyhow::anyhow!(
+                "secret resolution failed for mcp_server `{}`: {e}", mcp.label))?;
+        mcp_specs.push((mcp.label.clone(), SpawnConfig {
+            image: format_image(&mcp.image),
+            args:  Vec::new(),
+            mount,
+            env,
+        }));
+    }
+
+    // ── 5. spawn MCP children + build registry ──
+    let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
+    let mut server_tools: Vec<(String, Vec<aislang_runtime::ToolSpec>)> = Vec::new();
+    for (label, cfg) in &mcp_specs {
+        let child = aislang_runtime::StdioChild::spawn(cfg).await
+            .map_err(|e| anyhow::anyhow!(
+                "spawn MCP server `{label}` ({}): {e}", cfg.image))?;
+        let tools = child.list_tools().await
+            .map_err(|e| anyhow::anyhow!(
+                "list tools from MCP server `{label}`: {e}"))?;
+        server_tools.push((label.clone(), tools));
+        mcp_clients.push(child);
+    }
+    let tool_registry = aislang_runtime::ToolRegistry::from_servers(&server_tools);
+
+    // ── 6. open Session (reuses week-7 budget + tracker plumbing) ──
+    let session = {
+        let s = aislang_runtime::Session::open_with_tools(
+            &model_label, system_prompt, None,
+            mcp_clients, tool_registry,
+        ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
+        let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };
+        match tracker { Some(t) => s.with_tracker(t), None => s }
+    };
+
+    // ── 7. load dataset + iterate cases ──
+    let dataset_path = source_dir.join(&eval.dataset);
+    let dataset = aislang_runtime::load_dataset(&dataset_path)
+        .map_err(|e| anyhow::anyhow!("load dataset: {e}"))?;
+
+    eprintln!("eval `{}`: running {} cases against agent `{}`...",
+        eval.label, dataset.len(), agent.label);
+
+    let mut case_results: Vec<aislang_runtime::CaseResult> =
+        Vec::with_capacity(dataset.len());
+    for case in &dataset {
+        let t0 = std::time::Instant::now();
+        let turn_result = session.turn(&case.input).await;
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let actual = match turn_result {
+            Ok(s) => s,
+            // A per-case turn failure (network, MCP, budget abort)
+            // is recorded as an empty actual + score 0. The eval
+            // continues so the user sees the FULL run, not just
+            // the first failure.
+            Err(e) => format!("(turn errored: {e})"),
+        };
+        let score = aislang_runtime::metric_score(eval.metric, &case.expected, &actual)
+            .map_err(|e| anyhow::anyhow!("metric scoring failed: {e}"))?;
+        case_results.push(aislang_runtime::CaseResult {
+            id:       case.id.clone(),
+            input:    case.input.clone(),
+            expected: case.expected.clone(),
+            actual,
+            score,
+            latency_ms,
+        });
+    }
+
+    // ── 8. aggregate + threshold compare ──
+    let scores: Vec<f64> = case_results.iter().map(|c| c.score).collect();
+    let aggregate_score = aislang_runtime::eval_aggregate(eval.aggregator, &scores);
+    let pass = aggregate_score >= eval.threshold.ratio;
+
+    // ── 9. clean shutdown of MCP children ──
+    session.shutdown().await
+        .map_err(|e| anyhow::anyhow!("shutdown MCP children: {e}"))?;
+
+    Ok(aislang_runtime::EvalReport {
+        eval_label:      eval.label.clone(),
+        dataset_path:    dataset_path.display().to_string(),
+        metric:          format!("{:?}", eval.metric).to_lowercase(),
+        aggregator:      format!("{:?}", eval.aggregator).to_lowercase(),
+        threshold:       eval.threshold.ratio,
+        aggregate_score,
+        pass,
+        cases:           case_results,
+    })
 }
 
 // ============================================================================

@@ -43,5 +43,8 @@ pub use mcp::{StdioChild, SpawnConfig, ToolSpec, ToolContent, McpError};
 pub use cost::{cost_of_usage, sum as money_sum, format_money};
 pub use spend::{SpendTracker, SpendError};
 pub use secrets::{resolve as resolve_secret, SecretError};
-pub use eval::{load_dataset, parse_dataset, EvalCase, DatasetError};
+pub use eval::{
+    load_dataset, parse_dataset, EvalCase, DatasetError,
+    EvalReport, CaseResult, aggregate as eval_aggregate,
+};
 pub use eval::metric::{score as metric_score, MetricError};

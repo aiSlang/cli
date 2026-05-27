@@ -35,6 +35,95 @@ use std::path::Path;
 use thiserror::Error;
 
 // ============================================================================
+// Result types (the JSON wire format `aislang eval` writes to stdout)
+// ============================================================================
+
+/// One case's outcome after running the agent against `case.input`.
+/// Persists every field needed for governance / audit-trail review:
+/// the model's actual output, the score against the expected gold,
+/// per-case latency. v0.2 may add `model_binding_used` (when
+/// fallbacks fire mid-case) and `tokens_in / tokens_out`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaseResult {
+    pub id:         String,
+    pub input:      String,
+    pub expected:   String,
+    pub actual:     String,
+    pub score:      f64,
+    pub latency_ms: u64,
+}
+
+/// Top-level eval report. Stdout-emitted JSON shape for one eval
+/// run. Both per-case + aggregate evidence in one JSON object.
+///
+/// v0.1 fields are the audit-trail floor — see PLAN week-8 §"Governance
+/// / certification angle" for the v0.2 additions (catalog version,
+/// lockfile source-hash, per-case model binding, UTC timestamps).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalReport {
+    pub eval_label:      String,
+    pub dataset_path:    String,
+    pub metric:          String,         // EvalMetric serialized form
+    pub aggregator:      String,         // EvalAggregator serialized form
+    pub threshold:       f64,
+    pub aggregate_score: f64,
+    pub pass:            bool,
+    pub cases:           Vec<CaseResult>,
+}
+
+// ============================================================================
+// Aggregation
+// ============================================================================
+//
+// v0.1 ships `mean` only (the default per the parser). Min / max /
+// p95 land Wed. Future-proofed: the public `aggregate()` function
+// already dispatches on `EvalAggregator`, so adding variants
+// changes the dispatcher only, not callers.
+
+/// Combine per-case scores into a single aggregate. Empty input
+/// returns NaN — caller surfaces "dataset had zero cases" rather
+/// than a misleading 0.0. (NaN propagates through pass/fail
+/// comparisons sensibly: any `NaN >= threshold` is `false`.)
+pub fn aggregate(agg: aislang_core::types::EvalAggregator, scores: &[f64]) -> f64 {
+    use aislang_core::types::EvalAggregator::*;
+    match agg {
+        Mean          => mean(scores),
+        Min           => min(scores),
+        Max           => max(scores),
+        PercentileP95 => p95(scores),
+    }
+}
+
+fn mean(scores: &[f64]) -> f64 {
+    if scores.is_empty() { return f64::NAN; }
+    scores.iter().sum::<f64>() / scores.len() as f64
+}
+
+fn min(scores: &[f64]) -> f64 {
+    scores.iter().copied().fold(f64::NAN, |acc, v| {
+        if acc.is_nan() { v } else { acc.min(v) }
+    })
+}
+
+fn max(scores: &[f64]) -> f64 {
+    scores.iter().copied().fold(f64::NAN, |acc, v| {
+        if acc.is_nan() { v } else { acc.max(v) }
+    })
+}
+
+/// 95th percentile via `sorted[ceil(0.95 * n) - 1]`. The "look up
+/// the 95th-percentile index" convention matches what most BI tools
+/// use; for n=1 returns the single score; for n=2 returns the max.
+fn p95(scores: &[f64]) -> f64 {
+    if scores.is_empty() { return f64::NAN; }
+    let mut sorted: Vec<f64> = scores.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len() as f64;
+    let idx = (0.95 * n).ceil() as usize;
+    sorted[idx.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -330,5 +419,61 @@ mod tests {
         let s = serde_json::to_string(&c).unwrap();
         let back: EvalCase = serde_json::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    // ---- aggregators (Wed work, brought forward for Thu's runner) ----
+
+    use aislang_core::types::EvalAggregator;
+
+    #[test] fn mean_of_typical_scores() {
+        let s = aggregate(EvalAggregator::Mean, &[0.0, 0.5, 1.0]);
+        assert!((s - 0.5).abs() < 1e-9);
+    }
+
+    #[test] fn mean_empty_is_nan() {
+        assert!(aggregate(EvalAggregator::Mean, &[]).is_nan());
+    }
+
+    #[test] fn min_max_typical() {
+        let xs = [0.4, 0.9, 0.6];
+        assert!((aggregate(EvalAggregator::Min, &xs) - 0.4).abs() < 1e-9);
+        assert!((aggregate(EvalAggregator::Max, &xs) - 0.9).abs() < 1e-9);
+    }
+
+    #[test] fn p95_of_20_returns_19th_sorted() {
+        // 20 scores from 0.0 to 0.95 in 0.05 steps. ceil(0.95 * 20) =
+        // 19; index 18 → 0.90. Pin so the percentile-index
+        // convention doesn't drift.
+        let xs: Vec<f64> = (0..20).map(|i| i as f64 * 0.05).collect();
+        let p = aggregate(EvalAggregator::PercentileP95, &xs);
+        assert!((p - 0.90).abs() < 1e-9, "expected 0.90, got {p}");
+    }
+
+    #[test] fn p95_single_score() {
+        let p = aggregate(EvalAggregator::PercentileP95, &[0.7]);
+        assert!((p - 0.7).abs() < 1e-9);
+    }
+
+    #[test] fn eval_report_json_round_trips() {
+        let r = EvalReport {
+            eval_label:      "factual_accuracy".into(),
+            dataset_path:    "examples/evals/qa.jsonl".into(),
+            metric:          "exact_match".into(),
+            aggregator:      "mean".into(),
+            threshold:       0.85,
+            aggregate_score: 0.92,
+            pass:            true,
+            cases: vec![CaseResult {
+                id:         "q1".into(),
+                input:      "hi".into(),
+                expected:   "hello".into(),
+                actual:     "hello".into(),
+                score:      1.0,
+                latency_ms: 312,
+            }],
+        };
+        let s    = serde_json::to_string(&r).unwrap();
+        let back: EvalReport = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
     }
 }
