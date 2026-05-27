@@ -1724,25 +1724,48 @@ async fn run_eval_inner(
     let dataset = aislang_runtime::load_dataset(&dataset_path)
         .map_err(|e| anyhow::anyhow!("load dataset: {e}"))?;
 
-    eprintln!("eval `{}`: running {} cases against agent `{}`...",
-        eval.label, dataset.len(), agent.label);
+    let total = dataset.len();
+    eprintln!("eval `{}`: running {total} cases against agent `{}`...",
+        eval.label, agent.label);
 
+    // Per-case progress feedback — local-LLM eval runs can take
+    // minutes, especially when individual turns hit the tool-use
+    // loop's iteration cap. Print one line per case BEFORE the
+    // turn (so the user sees what's running) and one line AFTER
+    // (score + latency). Stderr only, so the JSON stdout stays
+    // clean for downstream pipes / jq.
+    use std::io::Write as _;
     let mut case_results: Vec<aislang_runtime::CaseResult> =
         Vec::with_capacity(dataset.len());
-    for case in &dataset {
+    for (idx, case) in dataset.iter().enumerate() {
+        let n = idx + 1;   // 1-indexed for human display
+        // Pre-turn line — flush immediately so the user sees the
+        // "running" state during the long wait, not just after.
+        eprint!("  [{n}/{total}] {} … ", case.id);
+        let _ = std::io::stderr().flush();
+
         let t0 = std::time::Instant::now();
         let turn_result = session.turn(&case.input).await;
         let latency_ms = t0.elapsed().as_millis() as u64;
-        let actual = match turn_result {
-            Ok(s) => s,
-            // A per-case turn failure (network, MCP, budget abort)
-            // is recorded as an empty actual + score 0. The eval
-            // continues so the user sees the FULL run, not just
-            // the first failure.
-            Err(e) => format!("(turn errored: {e})"),
+        let (actual, ok) = match turn_result {
+            Ok(s)  => (s, true),
+            // Per-case turn failures (network, MCP, budget abort)
+            // become empty-actual + score 0. The eval continues so
+            // the user sees the full run, not just the first
+            // failure.
+            Err(e) => (format!("(turn errored: {e})"), false),
         };
         let score = aislang_runtime::metric_score(eval.metric, &case.expected, &actual)
             .map_err(|e| anyhow::anyhow!("metric scoring failed: {e}"))?;
+
+        // Post-turn line — overwrite the trailing `…` placeholder
+        // with the score + latency. Newline ends the case line.
+        let mark = if !ok { "✗ err" }
+                   else if score >= 0.999 { "✓ 1.00" }
+                   else if score >= eval.threshold.ratio { "✓" }
+                   else                                  { "✗" };
+        eprintln!("{mark} score={score:.3} ({latency_ms}ms)");
+
         case_results.push(aislang_runtime::CaseResult {
             id:       case.id.clone(),
             input:    case.input.clone(),

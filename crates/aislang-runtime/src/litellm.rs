@@ -236,10 +236,25 @@ impl LiteLlmClient {
     /// to the first-resolved address. Pinning v4 sidesteps it.
     pub const DEFAULT_URL: &'static str = "http://127.0.0.1:4000";
 
-    /// 30 seconds — the same default the v0.2 OTel spans will use.
-    /// Long enough for slow models (Opus, GPT-4o), short enough that
-    /// a broken proxy doesn't hang the chat loop forever.
-    pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+    /// 180 seconds (3 minutes). Sized for CPU-bound local inference
+    /// (Ollama on a developer laptop generating a 4k-token response
+    /// can comfortably take 60-120s; eval datasets exercise the
+    /// long tail of those generations).
+    ///
+    /// History: shipped at 30s originally. User report from week 8
+    /// e2e eval testing surfaced 30s firing on cases that asked for
+    /// long-form answers against Llama 3.1 8B on CPU. 3 minutes is
+    /// generous for local models AND still bounds a wedged proxy
+    /// from blocking the chat loop indefinitely. Fast cloud models
+    /// (Haiku, gpt-4o-mini, Sonnet) complete well under 30s, so
+    /// the longer ceiling doesn't hurt their UX.
+    ///
+    /// v0.2: make this configurable per-eval / per-session via the
+    /// `.ais` source's `model.latency_p95` field (currently used
+    /// only as a resolver constraint), with a fallback to this
+    /// constant. Catalog entry's `latency_p95 * 4` is a reasonable
+    /// per-call timeout derivation.
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
     /// Build a client pointing at the given LiteLLM base URL.
     /// `base_url` must NOT include the `/v1/...` path — that's
