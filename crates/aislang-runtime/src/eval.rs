@@ -454,6 +454,26 @@ mod tests {
         assert!((p - 0.7).abs() < 1e-9);
     }
 
+    #[test] fn enum_metric_serializes_to_snake_case() {
+        // Pin the wire form so the CLI's `enum_str(&eval.metric)`
+        // produces `exact_match` (not `exactmatch` or `ExactMatch`).
+        // Regression: the Debug-lowercase form silently dropped the
+        // underscore — caught by user e2e testing.
+        use aislang_core::types::EvalMetric;
+        let s = serde_json::to_value(EvalMetric::ExactMatch).unwrap();
+        assert_eq!(s.as_str(), Some("exact_match"));
+        let s = serde_json::to_value(EvalMetric::RougeL).unwrap();
+        assert_eq!(s.as_str(), Some("rouge_l"));
+        let s = serde_json::to_value(EvalMetric::LlmJudge).unwrap();
+        assert_eq!(s.as_str(), Some("llm_judge"));
+    }
+
+    #[test] fn enum_aggregator_serializes_to_snake_case() {
+        use aislang_core::types::EvalAggregator;
+        let s = serde_json::to_value(EvalAggregator::PercentileP95).unwrap();
+        assert_eq!(s.as_str(), Some("percentile_p95"));
+    }
+
     #[test] fn eval_report_json_round_trips() {
         let r = EvalReport {
             eval_label:      "factual_accuracy".into(),

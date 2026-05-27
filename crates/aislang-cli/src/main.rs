@@ -1762,11 +1762,22 @@ async fn run_eval_inner(
     session.shutdown().await
         .map_err(|e| anyhow::anyhow!("shutdown MCP children: {e}"))?;
 
+    // Serialize metric + aggregator through Serde so we get the
+    // `#[serde(rename_all = "snake_case")]` form (e.g. `exact_match`,
+    // not the Debug-lowercased `exactmatch`). The values are simple
+    // enum variants → serde_json::to_value yields a JSON string.
+    let metric_str = serde_json::to_value(&eval.metric).ok()
+        .and_then(|j| j.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "(unserializable)".to_string());
+    let aggregator_str = serde_json::to_value(&eval.aggregator).ok()
+        .and_then(|j| j.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "(unserializable)".to_string());
+
     Ok(aislang_runtime::EvalReport {
         eval_label:      eval.label.clone(),
         dataset_path:    dataset_path.display().to_string(),
-        metric:          format!("{:?}", eval.metric).to_lowercase(),
-        aggregator:      format!("{:?}", eval.aggregator).to_lowercase(),
+        metric:          metric_str,
+        aggregator:      aggregator_str,
         threshold:       eval.threshold.ratio,
         aggregate_score,
         pass,

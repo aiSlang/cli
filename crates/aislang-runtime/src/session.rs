@@ -150,9 +150,34 @@ impl ToolRegistry {
     }
 
     /// Resolve a LiteLLM tool-call name → (server_idx, mcp_name).
+    ///
+    /// Two-step lookup (Llama-tolerance):
+    ///   1. Exact match against the visible name we advertised
+    ///      (`{server_label}{SEP}{mcp_name}`) — this is what
+    ///      well-behaved models echo back.
+    ///   2. **Fallback:** if the visible name doesn't match, look
+    ///      for an entry whose bare `mcp_name` matches. Smaller
+    ///      models (Llama 3.1 8B in particular) frequently drop
+    ///      the `{label}{SEP}` prefix when emitting tool_calls.
+    ///      The fallback returns a match ONLY when EXACTLY ONE
+    ///      entry has that mcp_name — ambiguous matches (same
+    ///      bare name on two MCP servers) still return None so
+    ///      the user has to address the collision explicitly.
     fn route(&self, visible_name: &str) -> Option<(usize, &str)> {
-        self.entries.get(visible_name)
-            .map(|e| (e.server_idx, e.mcp_name.as_str()))
+        // (1) exact-match path
+        if let Some(e) = self.entries.get(visible_name) {
+            return Some((e.server_idx, e.mcp_name.as_str()));
+        }
+        // (2) bare-name fallback — model probably dropped the
+        // `{label}__` prefix. Accept iff unambiguous.
+        let candidates: Vec<&ToolEntry> = self.entries.values()
+            .filter(|e| e.mcp_name == visible_name)
+            .collect();
+        if candidates.len() == 1 {
+            let e = candidates[0];
+            return Some((e.server_idx, e.mcp_name.as_str()));
+        }
+        None
     }
 
     /// Comma-separated visible names — used in error messages so
@@ -769,6 +794,72 @@ mod tests {
         let (idx2, _) = reg.route("git__commit").unwrap();
         assert_eq!(idx2, 1);
         assert!(reg.route("nonexistent").is_none());
+    }
+
+    // ---- Bare-name routing fallback (week-8 hotfix) ----
+    //
+    // Smaller models (Llama 3.1 8B in particular) frequently drop
+    // the `{label}__` prefix when emitting tool_calls. The route()
+    // fallback path accepts the bare name when it's unambiguous so
+    // these models can still drive tools end-to-end.
+
+    #[test] fn registry_routes_bare_name_when_unambiguous() {
+        // Single server → no collision possible. Llama emits
+        // `list_dir` instead of `docs__list_dir` → route() should
+        // still find it.
+        let reg = ToolRegistry::from_servers(&[
+            ("docs".into(), vec![fake_tool("list_dir", "list")]),
+        ]);
+        let (idx, mcp_name) = reg.route("list_dir")
+            .expect("bare name should route when unambiguous");
+        assert_eq!(idx, 0);
+        assert_eq!(mcp_name, "list_dir");
+    }
+
+    #[test] fn registry_bare_name_lookup_handles_multi_server_unambiguous() {
+        // Two servers, different tool names → bare-name lookup
+        // for `commit` still has exactly one candidate (git's) →
+        // accepted.
+        let reg = ToolRegistry::from_servers(&[
+            ("docs".into(), vec![fake_tool("list_dir", "list")]),
+            ("git".into(),  vec![fake_tool("commit",   "commit")]),
+        ]);
+        let (idx, mcp_name) = reg.route("commit").expect("found");
+        assert_eq!(idx, 1);
+        assert_eq!(mcp_name, "commit");
+    }
+
+    #[test] fn registry_rejects_bare_name_when_ambiguous() {
+        // BOTH servers expose a `read` tool — bare `read` is
+        // ambiguous → route() returns None so the caller (Session)
+        // surfaces UnknownTool. The user must address the collision
+        // (use the prefixed name explicitly, or rename one of the
+        // server's tools).
+        let reg = ToolRegistry::from_servers(&[
+            ("docs".into(), vec![fake_tool("read", "read file")]),
+            ("git".into(),  vec![fake_tool("read", "read commit")]),
+        ]);
+        assert!(reg.route("read").is_none(),
+            "ambiguous bare-name lookup must return None");
+        // But the FULL forms still resolve.
+        assert!(reg.route("docs__read").is_some());
+        assert!(reg.route("git__read").is_some());
+    }
+
+    #[test] fn registry_exact_match_wins_over_bare_fallback() {
+        // Edge case: a server label happens to be a single
+        // underscore away from a tool's bare name. Exact-match
+        // path must take precedence.
+        let reg = ToolRegistry::from_servers(&[
+            ("a".into(), vec![fake_tool("read", "a's read")]),
+            ("b".into(), vec![fake_tool("a__read", "b's literal-named tool")]),
+        ]);
+        // `a__read` is in the table as both:
+        //   - server "a"'s `read`, visible name = `a__read`
+        //   - server "b"'s `a__read`, visible name = `b__a__read`
+        // route("a__read") must resolve to the FIRST (exact match).
+        let (idx, _) = reg.route("a__read").expect("exact match wins");
+        assert_eq!(idx, 0, "exact match against a's read must win");
     }
 
     #[test] fn registry_litellm_tools_are_alphabetically_ordered() {
