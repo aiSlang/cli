@@ -1,0 +1,74 @@
+// examples/support-agent-paid.ais — the v0.1 paid-tier demo variant.
+//
+// Companion to support-agent.ais (free-local Llama). This file
+// pins the model to Anthropic Claude Haiku for clean tool-use
+// behavior, faster responses, and demo-gif-quality answers.
+// Llama 3.1 8B on CPU works for free-local dev but its tool-use
+// adherence is shaky (see week 8 retrospective in PLAN-90-days.md);
+// this file is what you want for end-of-week-12 launch demos.
+//
+// Run:
+//   export ANTHROPIC_API_KEY=sk-ant-...
+//   aislang apply examples/support-agent-paid.ais
+//   aislang eval examples/support-agent-paid.ais
+//   aislang chat support examples/support-agent-paid.ais
+//
+// Cost: Haiku is currently ~$0.0008 in / $0.004 out per 1k tokens.
+// A 100-case eval should run for well under $1 total. The per-day
+// $50 cap below leaves plenty of headroom.
+
+project "support-agent" {
+  budget {
+    hard_cap_per_day = $50
+    hard_cap_per_run = $0.50
+    // optimize_for = quality keeps Haiku as primary even if a
+    // cheaper Capped(0) Ollama happens to be in the prefer list
+    // — the demo wants Haiku's clean tool-use behavior, not the
+    // cheapest path.
+    optimize_for     = quality
+  }
+
+  model "fast" {
+    requires    = [chat, tool_use]
+    context_min = 32k
+    cost_max    = $0.005 per 1k_tokens   // Haiku fits; Sonnet/Opus don't
+    latency_p95 = 5s
+    residency   = [eu, us]
+
+    // Pin to Haiku exactly — no resolver-time choice; predictable
+    // for demo runs + audit trails.
+    prefer   = [anthropic.claude_haiku_4_5]
+    fallback = [openai.gpt_4o_mini]
+    pin      = anthropic.claude_haiku_4_5
+  }
+
+  prompt "system" {
+    file    = "./prompts/system.md"
+    version = "1.0.0"
+  }
+
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "./knowledge/"
+  }
+
+  agent "support" {
+    model         = model.fast
+    system_prompt = prompt.system
+    tools         = [mcp_server.docs]
+  }
+
+  eval "factual_accuracy" {
+    dataset   = "./evals/qa.jsonl"
+    // Same metric as the free-local variant but with a tighter
+    // threshold — Haiku should comfortably clear 75% F1 on this
+    // dataset where Llama 3.1 8B scored ~2%.
+    metric    = f1
+    threshold = 75%
+  }
+
+  deploy "local" {
+    target = compose
+    expose = { port = 8080 }
+  }
+}

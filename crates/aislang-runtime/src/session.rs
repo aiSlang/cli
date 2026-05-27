@@ -38,6 +38,23 @@ use thiserror::Error;
 /// session — user can type again).
 pub const MAX_TOOL_ITERS: usize = 8;
 
+/// Wall-clock ceiling for a single user turn (week 8 Fri hotfix).
+/// Bounds the tool-use loop on TIME in addition to ITERATIONS — 8
+/// fast iterations × `LiteLlmClient::DEFAULT_TIMEOUT_SECS` could
+/// otherwise exceed any reasonable per-turn budget (a user
+/// scenario where 5×~60s calls churn for 5 minutes per turn).
+///
+/// v0.1 hardcodes this at `2 × DEFAULT_TIMEOUT_SECS = 360s` (6 min)
+/// — generous enough for CPU local inference doing one or two
+/// long completions, tight enough that an unresponsive model
+/// path doesn't wedge the CLI for double-digit minutes.
+///
+/// v0.2 will lift this to a per-eval / per-session config field
+/// (likely derived from the catalog entry's `latency_p95 * 4 *
+/// MAX_TOOL_ITERS` as a more model-aware ceiling).
+pub const PER_TURN_TIMEOUT_SECS: u64 =
+    crate::litellm::LiteLlmClient::DEFAULT_TIMEOUT_SECS * 2;
+
 /// Separator between the MCP server label and the MCP tool name in
 /// the LiteLLM-visible function name (e.g. `docs__list_dir`).
 /// Two underscores avoid collisions with MCP tool names that
@@ -362,6 +379,15 @@ impl Session {
         // `cost_of_usage`'s "Currency handling" doc.
         let mut running_cost = Money::usd(0);
 
+        // Per-turn wall-clock deadline (week 8 Fri). Bounds the loop
+        // on TIME in addition to ITERATIONS, so 8 long calls can't
+        // exceed PER_TURN_TIMEOUT_SECS combined. Post-call check —
+        // we let any in-flight LiteLLM call finish (the client has
+        // its own per-call timeout), then refuse to start the next
+        // iteration if we'd be past the deadline.
+        let turn_start = std::time::Instant::now();
+        let per_turn_timeout = std::time::Duration::from_secs(PER_TURN_TIMEOUT_SECS);
+
         for _iter in 0..MAX_TOOL_ITERS {
             let req = ChatRequest {
                 model:    self.model_label.clone(),
@@ -441,6 +467,20 @@ impl Session {
                     return Ok(assistant.content.unwrap_or_default());
                 }
             };
+
+            // Wall-clock deadline check (week 8 Fri). If we've
+            // already burned the per-turn budget, refuse the next
+            // iteration rather than risking a multi-minute runaway.
+            // Post-call placement: the in-flight LiteLLM call
+            // completed (its own timeout bounded it); we abort
+            // BEFORE dispatching tools / making the next LLM call.
+            let elapsed = turn_start.elapsed();
+            if elapsed > per_turn_timeout {
+                return Ok(format!(
+                    "turn timeout exceeded ({}s of {}s budget; \
+                     {} iterations completed)",
+                    elapsed.as_secs(), per_turn_timeout.as_secs(), _iter + 1));
+            }
 
             // Record the assistant's tool-call request in history.
             messages.push(assistant);
