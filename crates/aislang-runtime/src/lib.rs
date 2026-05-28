@@ -30,6 +30,10 @@ pub mod cost;
 pub mod spend;
 pub mod secrets;
 pub mod eval;
+// week-10 Mon: applied-stack state file. `aislang apply` writes
+// `.aislang/state.json`; `aislang destroy` reads + marks-torn-down;
+// `aislang status` reads to render the stack/project summary.
+pub mod state;
 // week-9 Mon: OTel-GenAI tracing — SDK init + RootSpan lifecycle.
 // Decision 18 (official Rust SDK) + Decision 22 (Jaeger UI URL to
 // stderr). Child-span instrumentation in litellm/session lands Tue/Wed.
@@ -46,6 +50,12 @@ pub use litellm::{
 pub use mcp::{StdioChild, SpawnConfig, ToolSpec, ToolContent, McpError};
 pub use cost::{cost_of_usage, sum as money_sum, format_money};
 pub use spend::{SpendTracker, SpendError};
+pub use state::{
+    StateFile, StateError,
+    read as read_state, write_atomic as write_state_atomic,
+    mark_torn_down as mark_state_torn_down,
+    state_path_in, new_applied as new_applied_state,
+};
 pub use secrets::{resolve as resolve_secret, SecretError};
 pub use eval::{
     load_dataset, parse_dataset, EvalCase, DatasetError,

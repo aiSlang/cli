@@ -49,10 +49,32 @@ pub struct SpendFile {
     pub projects: BTreeMap<String, BTreeMap<String, DayEntry>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DayEntry {
-    /// µ-USD. v0.1 USD-only (see module docs).
+    /// µ-USD. v0.1 USD-only (see module docs). This is the
+    /// AUTHORITATIVE today-total — the per-day cap check
+    /// (`Session::turn`) reads this field.
     pub micro_units: i64,
+    /// Per-model breakdown of today's spend (week 10 Tue). Keys are
+    /// `"{provider}.{name}"` strings — the canonical
+    /// `ModelId::to_string()` form so they match catalog ids verbatim.
+    /// `#[serde(default)]` means v1.0 spend files (where this field
+    /// didn't exist) load cleanly with an empty map; we never bump
+    /// `schema_version` for this purely-additive field.
+    ///
+    /// Sums of `by_model` values are expected to equal `micro_units`
+    /// for new writes; older v1.0 files have an empty map and a
+    /// non-zero `micro_units` (no per-model attribution available).
+    /// `aislang status --model-spend` (week 10 Thu) reads from
+    /// `by_model`; `aislang status --spend` reads from `micro_units`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_model: BTreeMap<String, i64>,
+}
+
+impl Default for DayEntry {
+    fn default() -> Self {
+        Self { micro_units: 0, by_model: BTreeMap::new() }
+    }
 }
 
 impl Default for SpendFile {
@@ -151,7 +173,7 @@ impl SpendTracker {
         {
             let mut f = self.file.lock().expect("spend file mutex");
             let by_day = f.projects.entry(self.project_name.clone()).or_default();
-            let entry  = by_day.entry(day).or_insert(DayEntry { micro_units: 0 });
+            let entry  = by_day.entry(day).or_insert_with(DayEntry::default);
             entry.micro_units = entry.micro_units.saturating_add(mu);
         }
         self.write_atomic()
@@ -248,6 +270,31 @@ pub fn utc_date_from_epoch_secs(epoch_secs: i64) -> String {
     let days = epoch_secs.div_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Current UTC instant as an RFC3339 / ISO-8601 string with a `Z`
+/// suffix. Used by week-10 state-file's `applied_at` field. No
+/// sub-second precision (we don't need it) and no offset variants —
+/// always UTC, always `Z`. Pure-w.r.t.-clock companion lives at
+/// `utc_rfc3339_from_epoch_secs`.
+pub fn utc_rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    utc_rfc3339_from_epoch_secs(secs)
+}
+
+/// Pure: format a UNIX epoch timestamp as `YYYY-MM-DDTHH:MM:SSZ`.
+/// Tested against known timestamps without touching the system clock.
+pub fn utc_rfc3339_from_epoch_secs(epoch_secs: i64) -> String {
+    let days = epoch_secs.div_euclid(86_400);
+    let secs_of_day = epoch_secs.rem_euclid(86_400);
+    let (y, mo, d) = civil_from_days(days);
+    let hh = (secs_of_day / 3_600) as u32;
+    let mm = ((secs_of_day % 3_600) / 60) as u32;
+    let ss = (secs_of_day % 60) as u32;
+    format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 /// Howard Hinnant's `civil_from_days` algorithm. Pure, branch-light,
@@ -512,5 +559,104 @@ mod tests {
             other => panic!("expected Decode error; got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- week 10 Mon: by_model field + RFC3339 helper ----
+
+    #[test] fn day_entry_default_is_zero_total_and_empty_by_model() {
+        let d = DayEntry::default();
+        assert_eq!(d.micro_units, 0);
+        assert!(d.by_model.is_empty());
+    }
+
+    #[test] fn day_entry_v1_file_without_by_model_loads_cleanly() {
+        // Older spend.json files (before week 10 Mon) wrote only
+        // `micro_units`. They MUST keep loading after the schema
+        // extension — the `#[serde(default)]` on `by_model` is what
+        // makes this safe. This is the load-bearing back-compat pin.
+        let dir = tempdir();
+        let path = dir.join("spend.json");
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "projects": {
+                "support-agent": {
+                    "2026-05-20": { "micro_units": 12345 }
+                }
+            }
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let tracker = SpendTracker::at("support-agent", path.clone()).unwrap();
+        // `today_spend` for 2026-05-20 reads from the loaded file
+        // structure regardless of what "today" is. We can't easily
+        // set today; instead probe the in-memory file directly.
+        let f = tracker.file.lock().unwrap();
+        let entry = f.projects.get("support-agent").unwrap().get("2026-05-20").unwrap();
+        assert_eq!(entry.micro_units, 12345);
+        assert!(entry.by_model.is_empty(),
+            "v1 file with no by_model field must load with empty map");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn day_entry_with_by_model_round_trips() {
+        // A spend.json that DID carry per-model data must serialise
+        // and parse back identically. Pin the JSON-key spelling
+        // (`by_model`) since `aislang status --model-spend` queries
+        // it.
+        let mut entry = DayEntry::default();
+        entry.micro_units = 5000;
+        entry.by_model.insert("anthropic.claude_haiku_4_5".into(), 3000);
+        entry.by_model.insert("openai.gpt_4o_mini".into(), 2000);
+        let s = serde_json::to_string(&entry).unwrap();
+        // Spelling pin — JSON key MUST be `by_model` (snake_case, no
+        // hyphens, no `byModel`).
+        assert!(s.contains("\"by_model\""),
+            "field must serialise as `by_model`: {s}");
+        let back: DayEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test] fn empty_by_model_omitted_from_json() {
+        // PII / size hygiene: an empty by_model map MUST NOT serialise
+        // as `"by_model":{}` — that'd inflate every entry forever once
+        // we ship the schema. `#[serde(skip_serializing_if = "BTreeMap::is_empty")]`
+        // is what makes this work; the test pins the policy.
+        let entry = DayEntry { micro_units: 12, by_model: BTreeMap::new() };
+        let s = serde_json::to_string(&entry).unwrap();
+        assert!(!s.contains("by_model"),
+            "empty by_model must be omitted from JSON; got: {s}");
+        assert!(s.contains("\"micro_units\":12"),
+            "micro_units must still serialise normally: {s}");
+    }
+
+    // ---- utc_rfc3339_from_epoch_secs (pure, system-clock-free) ----
+
+    #[test] fn rfc3339_epoch_zero_is_1970_01_01t00_00_00z() {
+        assert_eq!(utc_rfc3339_from_epoch_secs(0),
+                   "1970-01-01T00:00:00Z");
+    }
+
+    #[test] fn rfc3339_known_timestamps_match_iso_8601() {
+        // 2026-05-20 00:00:00 UTC = 1779235200 (cross-checked with
+        // `date -u -d '2026-05-20T00:00:00' +%s`). Adding 1h2m3s.
+        let base = 1_779_235_200i64;
+        assert_eq!(utc_rfc3339_from_epoch_secs(base),
+                   "2026-05-20T00:00:00Z");
+        assert_eq!(utc_rfc3339_from_epoch_secs(base + 3_723),
+                   "2026-05-20T01:02:03Z");
+        // End-of-day rollover: one second past 23:59:59 → next-day 00:00:00.
+        assert_eq!(utc_rfc3339_from_epoch_secs(base + 86_400),
+                   "2026-05-21T00:00:00Z");
+    }
+
+    #[test] fn rfc3339_now_has_z_suffix_and_t_separator() {
+        // Smoke-test the wall-clock variant. We can't predict the
+        // exact value but we CAN pin the shape — 20 chars exactly,
+        // `YYYY-MM-DDTHH:MM:SSZ`.
+        let now = utc_rfc3339_now();
+        assert_eq!(now.len(), 20, "RFC3339 minute-precision form is 20 chars; got `{now}`");
+        assert_eq!(now.chars().nth(10), Some('T'),
+            "char 11 must be `T` (date/time separator); got `{now}`");
+        assert_eq!(now.chars().last(), Some('Z'),
+            "final char must be `Z` (UTC zone); got `{now}`");
     }
 }
