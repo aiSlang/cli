@@ -1,0 +1,99 @@
+# aiSlang CI — PLAN-90-days.md §Week 11 Mon, Decision 35.
+#
+# Test on the two platforms v0.1 supports (Linux + macOS, both
+# x86_64+aarch64 via the github-hosted runner pools). Stable Rust
+# only. Clippy runs informationally (no -D warnings) so the
+# codebase's existing pedantic-lint drift doesn't gate PRs — see
+# Mon's deliverable note for why we deferred -D warnings to v0.2.
+#
+# No fmt --check job: the codebase has a deliberate aligned style
+# (e.g. `let foo: T   = ...; let bar: U = ...;`) that default
+# rustfmt mass-rewrites. v0.2 may revisit with a custom
+# `rustfmt.toml` or a vendored style guide.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # Cache key suffix — bump when CI shape changes to invalidate.
+  CACHE_VERSION: v1
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Primary gate: full workspace test suite on both platforms.
+  # ──────────────────────────────────────────────────────────────
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.CACHE_VERSION }}-test-${{ matrix.os }}
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  # ──────────────────────────────────────────────────────────────
+  # Compile-only check: catches type errors in code paths that
+  # don't have tests (#[cfg(test)] paths only run in `cargo test`).
+  # Cheaper than running tests; finishes ~30s typically.
+  # ──────────────────────────────────────────────────────────────
+  build:
+    name: build all targets (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.CACHE_VERSION }}-build
+
+      - name: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
+
+  # ──────────────────────────────────────────────────────────────
+  # Informational clippy run. NOT gated (no -D warnings) — exists
+  # to surface lint drift in PR logs. Treat clippy output as a
+  # discussion prompt, not a blocker. Promote to gated in v0.2
+  # once the pedantic backlog is addressed.
+  # ──────────────────────────────────────────────────────────────
+  clippy:
+    name: clippy (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.CACHE_VERSION }}-clippy
+
+      # `|| true` — informational only; never fails the workflow.
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked || true
