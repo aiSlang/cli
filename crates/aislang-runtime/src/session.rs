@@ -390,11 +390,12 @@ impl Session {
 
         for _iter in 0..MAX_TOOL_ITERS {
             let req = ChatRequest {
-                model:    self.model_label.clone(),
-                messages: messages.clone(),
-                stream:   false,
-                tools:    self.tools.as_litellm_tools(),
-                timeout:  None,
+                model:      self.model_label.clone(),
+                messages:   messages.clone(),
+                stream:     false,
+                tools:      self.tools.as_litellm_tools(),
+                timeout:    None,
+                max_tokens: None,
             };
             let response = self.litellm.send_chat_full(&req).await?;
 

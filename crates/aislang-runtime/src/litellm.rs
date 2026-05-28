@@ -19,6 +19,18 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
+// week-9 Tue: OTel-GenAI semantic-convention instrumentation of
+// `send_chat_full`. Spans are children of whatever `Context::current()`
+// resolves to at call time — the CLI attaches the per-command root
+// context (week 9 Mon) before invoking `chat_interactive` /
+// `run_eval_inner`, so each LiteLLM call appears as a child of the
+// root span in the trace tree.
+use opentelemetry::{
+    global,
+    trace::{Span, SpanKind, Tracer},
+    Array, KeyValue, StringValue, Value,
+};
+
 // ============================================================================
 // Wire types — OpenAI-compatible Chat Completions API
 // ============================================================================
@@ -45,6 +57,13 @@ pub struct ChatRequest {
     /// `model.latency_p95` (v0.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout:  Option<u64>,
+    /// Upper bound on generated tokens. Optional — when `None`, the
+    /// provider's default applies. v0.1 leaves this `None` everywhere
+    /// (no `.ais` source field wires it through yet); the field
+    /// exists so week-9 Tue can emit `gen_ai.request.max_tokens` on
+    /// the OTel-GenAI span when v0.2 plumbs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 /// One message in a chat exchange.
@@ -206,6 +225,88 @@ pub enum LiteLlmError {
 }
 
 // ============================================================================
+// OTel-GenAI attribute helpers (week 9 Tue, Decision 18)
+//
+// The pure functions below build the attribute lists that go on the
+// `chat <model>` span emitted by `send_chat_full`. Kept separate so
+// they're testable without standing up the OTel SDK; the span-wiring
+// code just calls these and pushes the KVs.
+//
+// Spec: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+// Naming convention: `gen_ai.<facet>.<field>`, all snake_case, units
+// in the field name when ambiguous (e.g. `*_tokens`).
+// ============================================================================
+
+/// OTel-GenAI attribute keys we set on the LiteLLM child span. String
+/// literals (no `opentelemetry-semantic-conventions::trace::*`
+/// constant uses) for two reasons: the gen_ai namespace is still
+/// moving in the spec, and keeping these inline makes the wire
+/// contract greppable from one place.
+pub(crate) mod gen_ai {
+    /// Pin our wire contract: the values we emit MUST stay matched
+    /// to the OTel-GenAI spec. Change-detector tests in `mod tests`
+    /// below assert each constant value verbatim.
+    pub const KEY_SYSTEM:           &str = "gen_ai.system";
+    pub const KEY_REQUEST_MODEL:    &str = "gen_ai.request.model";
+    pub const KEY_REQUEST_MAX_TOK:  &str = "gen_ai.request.max_tokens";
+    pub const KEY_USAGE_INPUT:      &str = "gen_ai.usage.input_tokens";
+    pub const KEY_USAGE_OUTPUT:     &str = "gen_ai.usage.output_tokens";
+    pub const KEY_FINISH_REASONS:   &str = "gen_ai.response.finish_reasons";
+
+    /// `gen_ai.system` value identifies the upstream provider as a
+    /// short string. We send "litellm" because our HTTP wire endpoint
+    /// IS LiteLLM — the concrete provider behind it (anthropic, openai,
+    /// ollama …) is what LiteLLM resolves via its routing config.
+    pub const SYSTEM_VALUE: &str = "litellm";
+}
+
+/// OTel-GenAI convention for span names: `<operation> <model>` (e.g.
+/// `chat fast`). The operation for our wire is `chat` (chat-completion).
+pub(crate) fn gen_ai_span_name(model_alias: &str) -> String {
+    format!("chat {model_alias}")
+}
+
+/// Attributes known before the HTTP call — system identifier, request
+/// model alias, and `max_tokens` (omitted when not set, per OTel
+/// convention that optional fields are skipped rather than zeroed).
+pub(crate) fn gen_ai_request_attrs(req: &ChatRequest) -> Vec<KeyValue> {
+    let mut attrs = Vec::with_capacity(3);
+    attrs.push(KeyValue::new(gen_ai::KEY_SYSTEM,
+        gen_ai::SYSTEM_VALUE.to_string()));
+    attrs.push(KeyValue::new(gen_ai::KEY_REQUEST_MODEL,
+        req.model.clone()));
+    if let Some(mt) = req.max_tokens {
+        // i64 because OTel `Value::I64` is the only integer variant;
+        // u32 fits losslessly.
+        attrs.push(KeyValue::new(gen_ai::KEY_REQUEST_MAX_TOK, mt as i64));
+    }
+    attrs
+}
+
+/// Attributes derived from the response — token usage and finish
+/// reasons. Both are conditional: some providers (Ollama in
+/// particular) don't populate usage; degenerate responses may have
+/// zero choices or choices without a finish_reason.
+pub(crate) fn gen_ai_response_attrs(resp: &ChatResponse) -> Vec<KeyValue> {
+    let mut attrs = Vec::with_capacity(3);
+    if let Some(u) = &resp.usage {
+        attrs.push(KeyValue::new(gen_ai::KEY_USAGE_INPUT,  u.prompt_tokens as i64));
+        attrs.push(KeyValue::new(gen_ai::KEY_USAGE_OUTPUT, u.completion_tokens as i64));
+    }
+    let reasons: Vec<StringValue> = resp.choices.iter()
+        .filter_map(|c| c.finish_reason.clone())
+        .map(StringValue::from)
+        .collect();
+    if !reasons.is_empty() {
+        attrs.push(KeyValue::new(
+            gen_ai::KEY_FINISH_REASONS,
+            Value::Array(Array::String(reasons)),
+        ));
+    }
+    attrs
+}
+
+// ============================================================================
 // `LiteLlmClient`
 // ============================================================================
 
@@ -293,14 +394,40 @@ impl LiteLlmClient {
     /// parsed `ChatResponse`. Required by the tool-use loop (Thu)
     /// because it needs `choices[0].message.tool_calls`, not just
     /// the textual content.
+    ///
+    /// **OTel-GenAI instrumentation** (week 9 Tue, Decision 18):
+    /// each call opens a `chat <model>` Client-kind span as a child
+    /// of `Context::current()` (the per-command root attached by the
+    /// CLI's sync wrapper). Pre-call attributes are set from `req`;
+    /// post-call attributes (`gen_ai.usage.*`, `gen_ai.response.finish_reasons`)
+    /// are set from the parsed `ChatResponse`. Latency = span
+    /// duration, computed automatically by the SDK.
     pub async fn send_chat_full(&self, req: &ChatRequest) -> Result<ChatResponse, LiteLlmError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
+
+        // Open the span BEFORE the HTTP call so its duration captures
+        // request serialization + network round-trip + body parsing.
+        let tracer = global::tracer("aislang");
+        let mut span = tracer.span_builder(gen_ai_span_name(&req.model))
+            .with_kind(SpanKind::Client)
+            .with_attributes(gen_ai_request_attrs(req))
+            .start(&tracer);
+
         let response = self.http.post(&url)
             .json(req)
             .send().await
-            .map_err(|e| LiteLlmError::Transport {
-                url:   url.clone(),
-                cause: e.to_string(),
+            .map_err(|e| {
+                // Span ends on Drop with whatever attrs are set;
+                // status defaults to "Unset" — that's fine for v0.1.
+                // Tue/Wed don't need `span.set_status(Error)` yet;
+                // Thu can add error semantics if useful for the
+                // demo. (Decision 21: telemetry is observational —
+                // never adds caller-visible behaviour.)
+                let _ = &span; // explicit no-op to silence "moved" lints
+                LiteLlmError::Transport {
+                    url:   url.clone(),
+                    cause: e.to_string(),
+                }
             })?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -317,6 +444,12 @@ impl LiteLlmClient {
                 cause: e.to_string(),
                 body:  body.clone(),
             })?;
+
+        // Response-derived attrs go on the span before it ends.
+        for kv in gen_ai_response_attrs(&parsed) {
+            span.set_attribute(kv);
+        }
+        span.end();
         Ok(parsed)
     }
 }
@@ -332,14 +465,15 @@ impl LiteLlmClient {
 /// hashing harness, tests).
 pub fn one_turn_request(model: &str, system: &str, user: &str) -> ChatRequest {
     ChatRequest {
-        model:    model.to_string(),
+        model:      model.to_string(),
         messages: vec![
             ChatMessage::text(Role::System, system),
             ChatMessage::text(Role::User,   user),
         ],
-        stream:   false,
-        tools:    None,
-        timeout:  None,
+        stream:     false,
+        tools:      None,
+        timeout:    None,
+        max_tokens: None,
     }
 }
 
@@ -429,6 +563,162 @@ mod tests {
         // Pinned to 127.0.0.1 (not `localhost`) to dodge the IPv6
         // dual-stack flake — see DEFAULT_URL docs.
         assert_eq!(c.base_url, "http://127.0.0.1:4000");
+    }
+
+    // ---- gen_ai semantic-convention attribute builders (week 9 Tue) ----
+    //
+    // These guard the wire contract of our LiteLLM child span:
+    //  - the OTel-GenAI key strings stay exactly as the spec writes them,
+    //  - the request side always emits `system` + `model`, conditionally
+    //    `max_tokens`,
+    //  - the response side maps `prompt_tokens`/`completion_tokens` to
+    //    the GenAI `input_tokens`/`output_tokens` (NB: the wire types
+    //    use the OpenAI vocabulary; the span attributes use the OTel-
+    //    GenAI vocabulary — this translation is the contract under test).
+
+    fn find_attr<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a KeyValue> {
+        attrs.iter().find(|kv| kv.key.as_str() == key)
+    }
+
+    #[test] fn gen_ai_key_constants_match_otel_spec() {
+        // Change-detector: any rename in `mod gen_ai` (typo'd
+        // `gen_ai.usage.input_token` would silently produce broken
+        // telemetry, the panicky kind upstream Jaeger / Splunk /
+        // GCP-Cloud-Trace processors silently drop). Pin the strings.
+        assert_eq!(gen_ai::KEY_SYSTEM,          "gen_ai.system");
+        assert_eq!(gen_ai::KEY_REQUEST_MODEL,   "gen_ai.request.model");
+        assert_eq!(gen_ai::KEY_REQUEST_MAX_TOK, "gen_ai.request.max_tokens");
+        assert_eq!(gen_ai::KEY_USAGE_INPUT,     "gen_ai.usage.input_tokens");
+        assert_eq!(gen_ai::KEY_USAGE_OUTPUT,    "gen_ai.usage.output_tokens");
+        assert_eq!(gen_ai::KEY_FINISH_REASONS,  "gen_ai.response.finish_reasons");
+        assert_eq!(gen_ai::SYSTEM_VALUE,        "litellm");
+    }
+
+    #[test] fn gen_ai_span_name_follows_chat_model_convention() {
+        // OTel-GenAI convention: `<operation> <model>`, e.g. `chat fast`.
+        // Pinning this string keeps Jaeger search ergonomics consistent
+        // — users will grep `chat ` to find their LLM calls.
+        assert_eq!(gen_ai_span_name("fast"),                 "chat fast");
+        assert_eq!(gen_ai_span_name("claude_haiku_4_5"),     "chat claude_haiku_4_5");
+        assert_eq!(gen_ai_span_name(""),                     "chat ");
+    }
+
+    #[test] fn gen_ai_request_attrs_always_emits_system_and_model() {
+        let req = one_turn_request("fast", "sys", "user");
+        let attrs = gen_ai_request_attrs(&req);
+
+        let sys = find_attr(&attrs, gen_ai::KEY_SYSTEM)
+            .expect("gen_ai.system must always be present");
+        assert_eq!(sys.value.as_str(), "litellm");
+
+        let model = find_attr(&attrs, gen_ai::KEY_REQUEST_MODEL)
+            .expect("gen_ai.request.model must always be present");
+        assert_eq!(model.value.as_str(), "fast");
+
+        // max_tokens omitted when None — the OTel convention is to
+        // not emit absent values rather than zero-fill.
+        assert!(find_attr(&attrs, gen_ai::KEY_REQUEST_MAX_TOK).is_none(),
+            "gen_ai.request.max_tokens must be absent when req.max_tokens is None");
+    }
+
+    #[test] fn gen_ai_request_attrs_emits_max_tokens_when_set() {
+        let mut req = one_turn_request("fast", "sys", "user");
+        req.max_tokens = Some(512);
+        let attrs = gen_ai_request_attrs(&req);
+
+        let mt = find_attr(&attrs, gen_ai::KEY_REQUEST_MAX_TOK)
+            .expect("gen_ai.request.max_tokens must be present when req.max_tokens is Some");
+        // Stored as i64 in OTel Value land; 512 must round-trip cleanly.
+        assert_eq!(mt.value.as_str(), "512",
+            "max_tokens must serialise as the i64 it was set to (got {:?})", mt.value);
+    }
+
+    #[test] fn gen_ai_response_attrs_maps_openai_token_names_to_gen_ai_names() {
+        // Pin the rename: OpenAI uses `prompt_tokens`/`completion_tokens`
+        // on the wire; the OTel-GenAI semantic convention uses
+        // `input_tokens`/`output_tokens` on the span. The mapping must
+        // not flip.
+        let resp = ChatResponse {
+            id:      Some("chatcmpl-x".into()),
+            model:   Some("fast".into()),
+            usage:   Some(UsageStats {
+                prompt_tokens:     42,
+                completion_tokens: 17,
+                total_tokens:      59,
+            }),
+            choices: vec![ChatChoice {
+                index:         0,
+                message:       ChatMessage::text(Role::Assistant, "ok"),
+                finish_reason: Some("stop".into()),
+            }],
+        };
+        let attrs = gen_ai_response_attrs(&resp);
+
+        let inp = find_attr(&attrs, gen_ai::KEY_USAGE_INPUT)
+            .expect("gen_ai.usage.input_tokens must be present when usage is Some");
+        assert_eq!(inp.value.as_str(), "42",
+            "input_tokens MUST come from prompt_tokens (42), not completion_tokens");
+
+        let out = find_attr(&attrs, gen_ai::KEY_USAGE_OUTPUT)
+            .expect("gen_ai.usage.output_tokens must be present when usage is Some");
+        assert_eq!(out.value.as_str(), "17",
+            "output_tokens MUST come from completion_tokens (17), not prompt_tokens");
+    }
+
+    #[test] fn gen_ai_response_attrs_finish_reasons_is_string_array() {
+        // OTel-GenAI spec: `gen_ai.response.finish_reasons` is an
+        // ARRAY (one entry per choice) — not a scalar. Pin the type.
+        let resp = ChatResponse {
+            id:      None,
+            model:   None,
+            usage:   None,
+            choices: vec![
+                ChatChoice {
+                    index:         0,
+                    message:       ChatMessage::text(Role::Assistant, "a"),
+                    finish_reason: Some("stop".into()),
+                },
+                ChatChoice {
+                    index:         1,
+                    message:       ChatMessage::text(Role::Assistant, "b"),
+                    finish_reason: Some("length".into()),
+                },
+            ],
+        };
+        let attrs = gen_ai_response_attrs(&resp);
+
+        let fr = find_attr(&attrs, gen_ai::KEY_FINISH_REASONS)
+            .expect("gen_ai.response.finish_reasons must be present");
+        // OTel `Value::Array(Array::String(...))` Display joins with `,`.
+        // We just want to confirm both reasons are in there in order.
+        let rendered = fr.value.as_str();
+        assert!(rendered.contains("stop"),   "must contain `stop`: {rendered}");
+        assert!(rendered.contains("length"), "must contain `length`: {rendered}");
+    }
+
+    #[test] fn gen_ai_response_attrs_omitted_when_provider_skips_usage() {
+        // Ollama-style: no `usage` block, single choice without
+        // finish_reason. We must NOT emit `gen_ai.usage.*` keys with
+        // zero values (would skew dashboards) and we must NOT emit
+        // an empty finish_reasons array (semantic noise).
+        let resp = ChatResponse {
+            id:      Some("chatcmpl-ollama".into()),
+            model:   Some("fast".into()),
+            usage:   None,
+            choices: vec![ChatChoice {
+                index:         0,
+                message:       ChatMessage::text(Role::Assistant, "ok"),
+                finish_reason: None,
+            }],
+        };
+        let attrs = gen_ai_response_attrs(&resp);
+
+        assert!(find_attr(&attrs, gen_ai::KEY_USAGE_INPUT).is_none(),
+            "input_tokens must be absent when usage is None");
+        assert!(find_attr(&attrs, gen_ai::KEY_USAGE_OUTPUT).is_none(),
+            "output_tokens must be absent when usage is None");
+        assert!(find_attr(&attrs, gen_ai::KEY_FINISH_REASONS).is_none(),
+            "finish_reasons must be absent when no choice carries one");
     }
 
     // ---- send_chat against a fake HTTP server ----
