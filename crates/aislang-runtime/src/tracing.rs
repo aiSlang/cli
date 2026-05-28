@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 
 use opentelemetry::{
     global,
-    trace::{Span, SpanKind, TraceContextExt, TraceId, Tracer},
+    trace::{Span, SpanId, SpanKind, TraceContextExt, TraceId, Tracer},
     Context, KeyValue,
 };
 use opentelemetry_otlp::{Protocol, WithExportConfig};
@@ -86,11 +86,27 @@ fn resolve_otlp_endpoint() -> String {
 /// Format a Jaeger UI URL for the given trace id. Lower-case 32-hex
 /// is the Jaeger convention; `TraceId`'s `Display` already lowercases.
 pub fn jaeger_url(trace_id: TraceId) -> String {
-    let base = std::env::var("AISLANG_JAEGER_UI")
+    let base = jaeger_ui_base();
+    format!("{base}/trace/{trace_id}")
+}
+
+/// Format a Jaeger UI URL deep-linked to a specific span within the
+/// trace. Used by the eval runner (week 9 Thu) to put per-case URLs
+/// in the JSON report: clicking such a URL opens the eval's trace and
+/// highlights / scrolls to the specific `aislang.case` span via
+/// Jaeger's `uiFind` query parameter (16-hex span id is enough — the
+/// UI matches by prefix).
+pub fn jaeger_url_with_span(trace_id: TraceId, span_id: SpanId) -> String {
+    let base = jaeger_ui_base();
+    format!("{base}/trace/{trace_id}?uiFind={span_id}")
+}
+
+/// Shared base-URL resolver, honouring `AISLANG_JAEGER_UI` env override.
+fn jaeger_ui_base() -> String {
+    std::env::var("AISLANG_JAEGER_UI")
         .ok()
         .map(|s| s.trim_end_matches('/').to_owned())
-        .unwrap_or_else(|| DEFAULT_JAEGER_UI_BASE.to_owned());
-    format!("{base}/trace/{trace_id}")
+        .unwrap_or_else(|| DEFAULT_JAEGER_UI_BASE.to_owned())
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -274,6 +290,20 @@ impl RootSpan {
     /// The Jaeger UI URL pointing at this trace. Honors
     /// `AISLANG_JAEGER_UI` env override.
     pub fn jaeger_url(&self) -> String { jaeger_url(self.trace_id) }
+
+    /// `Some(url)` when this span has a real trace id; `None` when
+    /// tracing wasn't initialised (trace_id is the all-zeros
+    /// `TraceId::INVALID`). This is the right thing to stamp onto
+    /// `EvalReport.trace_url` — callers who'd otherwise get a
+    /// useless `…/trace/00000000000000000000000000000000` URL just
+    /// see the field omitted from JSON instead.
+    pub fn trace_url(&self) -> Option<String> {
+        if self.trace_id == TraceId::INVALID {
+            None
+        } else {
+            Some(jaeger_url(self.trace_id))
+        }
+    }
 }
 
 impl Drop for RootSpan {
@@ -358,6 +388,74 @@ mod tests {
             jaeger_url(id),
             "http://localhost:16686/trace/0123456789abcdeffedcba9876543210",
         );
+    }
+
+    /// Deep-link URL format pin (week 9 Thu, Decision 24). The eval
+    /// JSON report's `case.trace_url` MUST follow this exact shape:
+    /// `<base>/trace/<32-hex-trace>?uiFind=<16-hex-span>` — that's
+    /// what Jaeger v1's UI accepts to scroll-to-and-highlight a
+    /// specific span within a trace.
+    #[test]
+    fn jaeger_url_with_span_format_pin() {
+        let _g = EnvGuard::clear(&["AISLANG_JAEGER_UI"]);
+        let trace = TraceId::from_bytes([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ]);
+        let span = SpanId::from_bytes([
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
+        ]);
+        assert_eq!(
+            jaeger_url_with_span(trace, span),
+            "http://localhost:16686/trace/0123456789abcdeffedcba9876543210\
+             ?uiFind=a1b2c3d4e5f60718",
+        );
+    }
+
+    /// The deep-link helper must honor `AISLANG_JAEGER_UI` the same
+    /// way the trace-only helper does (Decision 22 carryover).
+    #[test]
+    fn jaeger_url_with_span_honors_env_override() {
+        let _g = EnvGuard::set(&[
+            ("AISLANG_JAEGER_UI", Some("https://traces.corp.example/")),
+        ]);
+        let trace = TraceId::from_bytes([0xAA; 16]);
+        let span  = SpanId::from_bytes([0xBB; 8]);
+        let url = jaeger_url_with_span(trace, span);
+        assert!(url.starts_with("https://traces.corp.example/trace/"),
+            "must use overridden base, not localhost; got {url}");
+        assert!(url.contains("?uiFind=bbbbbbbbbbbbbbbb"),
+            "uiFind must carry the 16-hex span_id; got {url}");
+        // No double-slash from a trailing slash on the env base.
+        assert!(!url.contains("com//"),
+            "trailing slash on base must be normalised; got {url}");
+    }
+
+    /// `RootSpan::trace_url()` returns `None` when tracing wasn't
+    /// initialised (trace_id is the all-zeros `INVALID`). The CLI's
+    /// `run_eval` relies on this to omit the `trace_url` field from
+    /// the eval JSON when running without Jaeger.
+    #[test]
+    fn rootspan_trace_url_is_none_when_tracing_off() {
+        // NOTE: do NOT call init_tracer here. The OnceLock may already
+        // be set by an earlier test in the same process — in that case
+        // the global tracer is real and the span DOES get a valid
+        // trace_id, so this test would flake. Guard against that by
+        // asserting the conditional contract instead of unconditional
+        // None: when trace_id IS invalid, url IS none; otherwise both
+        // are populated and consistent.
+        let root = RootSpan::for_eval("smoke");
+        match root.trace_id() {
+            id if id == TraceId::INVALID => {
+                assert!(root.trace_url().is_none(),
+                    "trace_url MUST be None when trace_id is INVALID");
+            }
+            id => {
+                let url = root.trace_url().expect("valid trace_id ⇒ Some(url)");
+                assert!(url.contains(&format!("{id}")),
+                    "url should carry the trace_id; url={url} id={id}");
+            }
+        }
     }
 
     /// `AISLANG_JAEGER_UI` overrides the default base URL; trailing

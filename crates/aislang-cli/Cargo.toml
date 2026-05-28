@@ -22,3 +22,9 @@ clap             = { workspace = true }
 anyhow           = { workspace = true }
 serde_json       = { workspace = true }   # for -vvv JSON-IR rendering
 tokio            = { workspace = true }   # runtime for the chat subcommand (week 6 Wed)
+# week-9 Thu: per-case `aislang.case` span opened in the eval loop so
+# each CaseResult can carry a Jaeger deep-link URL. Direct dep instead
+# of routing through aislang-runtime helpers keeps the call site
+# transparent — the CLI is where the case loop lives, so the span
+# lifecycle belongs here.
+opentelemetry    = { workspace = true }

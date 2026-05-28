@@ -53,5 +53,6 @@ pub use eval::{
 };
 pub use eval::metric::{score as metric_score, MetricError};
 pub use tracing::{
-    init_tracer, shutdown_tracer, jaeger_url, RootSpan, TracingError,
+    init_tracer, shutdown_tracer, jaeger_url, jaeger_url_with_span,
+    RootSpan, TracingError,
 };

@@ -51,6 +51,18 @@ pub struct CaseResult {
     pub actual:     String,
     pub score:      f64,
     pub latency_ms: u64,
+    /// Deep-link to this case's `aislang.case` span in the Jaeger UI
+    /// (week 9 Thu, Decision 24). `None` when tracing is disabled or
+    /// the case ran before init_tracer succeeded. Skipped from JSON
+    /// output when absent so CI artifacts stay tight.
+    ///
+    /// URL shape: `<jaeger-ui-base>/trace/<trace_id>?uiFind=<span_id>`
+    /// — the same trace_id as the parent `EvalReport.trace_url`,
+    /// pinned to this case's specific turn via uiFind. Clicking the
+    /// link opens the eval's full trace and scrolls to / highlights
+    /// the case's span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_url:  Option<String>,
 }
 
 /// Top-level eval report. Stdout-emitted JSON shape for one eval
@@ -68,6 +80,12 @@ pub struct EvalReport {
     pub threshold:       f64,
     pub aggregate_score: f64,
     pub pass:            bool,
+    /// Link to the eval's root span (`aislang.eval`) in the Jaeger UI
+    /// (week 9 Thu, Decision 24). Opens a view of the entire eval run
+    /// — all N cases, all per-iteration spans, all LLM + MCP calls
+    /// nested under one root. `None` when tracing is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_url:       Option<String>,
     pub cases:           Vec<CaseResult>,
 }
 
@@ -483,6 +501,7 @@ mod tests {
             threshold:       0.85,
             aggregate_score: 0.92,
             pass:            true,
+            trace_url:       None,
             cases: vec![CaseResult {
                 id:         "q1".into(),
                 input:      "hi".into(),
@@ -490,10 +509,63 @@ mod tests {
                 actual:     "hello".into(),
                 score:      1.0,
                 latency_ms: 312,
+                trace_url:  None,
             }],
         };
         let s    = serde_json::to_string(&r).unwrap();
         let back: EvalReport = serde_json::from_str(&s).unwrap();
         assert_eq!(r, back);
+    }
+
+    // ---- week 9 Thu: trace_url field on EvalReport + CaseResult ----
+
+    #[test] fn eval_report_omits_trace_url_when_none() {
+        // The OTel-disabled common-case (CI without Jaeger): the
+        // `trace_url` keys MUST be absent from the JSON, not present
+        // with `null`. Keeps eval artifacts compact + diff-friendly.
+        let r = EvalReport {
+            eval_label:      "ea".into(),
+            dataset_path:    "d.jsonl".into(),
+            metric:          "f1".into(),
+            aggregator:      "mean".into(),
+            threshold:       0.5,
+            aggregate_score: 0.6,
+            pass:            true,
+            trace_url:       None,
+            cases: vec![CaseResult {
+                id: "c1".into(), input: "i".into(), expected: "e".into(),
+                actual: "a".into(), score: 0.6, latency_ms: 100,
+                trace_url: None,
+            }],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(!s.contains("trace_url"),
+            "trace_url must be omitted when None; got {s}");
+    }
+
+    #[test] fn eval_report_includes_trace_url_when_some() {
+        // Tracing enabled: both top-level AND per-case URLs are
+        // present and pin the contract (`jq -r '.cases[].trace_url'`
+        // must yield a clickable URL per case).
+        let r = EvalReport {
+            eval_label:      "ea".into(),
+            dataset_path:    "d.jsonl".into(),
+            metric:          "f1".into(),
+            aggregator:      "mean".into(),
+            threshold:       0.5,
+            aggregate_score: 0.6,
+            pass:            true,
+            trace_url:       Some("http://localhost:16686/trace/abc123".into()),
+            cases: vec![CaseResult {
+                id: "c1".into(), input: "i".into(), expected: "e".into(),
+                actual: "a".into(), score: 0.6, latency_ms: 100,
+                trace_url: Some("http://localhost:16686/trace/abc123?uiFind=def".into()),
+            }],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"trace_url\":\"http://localhost:16686/trace/abc123\""),
+            "top-level trace_url must be present: {s}");
+        assert!(s.contains("uiFind=def"),
+            "per-case trace_url must include uiFind=<span_id>: {s}");
     }
 }

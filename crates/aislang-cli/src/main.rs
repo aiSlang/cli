@@ -1601,9 +1601,15 @@ fn run_eval(eval_label_opt: Option<String>, file: PathBuf) -> Result<()> {
         // turn spans (Tue/Wed) inherit this root.
         let root_span = aislang_runtime::RootSpan::for_eval(&eval.label);
         let root_ctx  = root_span.context();
+        // Capture the eval-root URL BEFORE handing the span into the
+        // async block — `run_eval_inner` stamps it on EvalReport.trace_url
+        // (week 9 Thu, Decision 24). Returns `None` when tracing is
+        // disabled so the JSON omits the field rather than emitting
+        // a useless …/trace/00000…0 link.
+        let eval_trace_url = root_span.trace_url();
         let report = rt.block_on(async {
             let _g = root_ctx.attach();
-            run_eval_inner(&project, eval, source_dir).await
+            run_eval_inner(&project, eval, source_dir, eval_trace_url).await
         })?;
         // Stdout: machine-readable JSON.
         let json = serde_json::to_string_pretty(&report)
@@ -1643,15 +1649,20 @@ fn run_eval(eval_label_opt: Option<String>, file: PathBuf) -> Result<()> {
 /// EvalReport. Mirrors `chat_interactive`'s session-construction
 /// path so the agent runs exactly as it would for `aislang chat`.
 async fn run_eval_inner(
-    project:    &aislang_core::ast::Project,
-    eval:       &aislang_core::ast::Eval,
-    source_dir: &Path,
+    project:        &aislang_core::ast::Project,
+    eval:           &aislang_core::ast::Eval,
+    source_dir:     &Path,
+    eval_trace_url: Option<String>,
 ) -> Result<aislang_runtime::EvalReport> {
     use aislang_runtime::SpawnConfig;
 
     // (OTel tracing init + RootSpan are owned by `run_eval` — they
     // MUST drop in sync ctx. The root context is already attached
-    // on this worker thread by the calling block's `_g` guard.)
+    // on this worker thread by the calling block's `_g` guard.
+    // `eval_trace_url` was captured from the RootSpan before this
+    // function ran; we stamp it on the produced EvalReport at the
+    // bottom. Per-case URLs are computed inline as we open each
+    // `aislang.case` span below.)
 
     // ── 1. resolve which agent this eval runs against (Decision 13) ──
     let agent: &aislang_core::ast::Agent = match &eval.agent {
@@ -1792,14 +1803,43 @@ async fn run_eval_inner(
     // (score + latency). Stderr only, so the JSON stdout stays
     // clean for downstream pipes / jq.
     use std::io::Write as _;
+    use opentelemetry::{
+        global, KeyValue,
+        trace::{Span, SpanKind, TraceContextExt, Tracer},
+        Context,
+    };
     let mut case_results: Vec<aislang_runtime::CaseResult> =
         Vec::with_capacity(dataset.len());
+    let tracer = global::tracer("aislang");
     for (idx, case) in dataset.iter().enumerate() {
         let n = idx + 1;   // 1-indexed for human display
         // Pre-turn line — flush immediately so the user sees the
         // "running" state during the long wait, not just after.
         eprint!("  [{n}/{total}] {} … ", case.id);
         let _ = std::io::stderr().flush();
+
+        // ── Per-case OTel span (week 9 Thu, Decision 24) ──
+        // Opened here, BEFORE session.turn, so `aislang.turn` nests
+        // under `aislang.case` (Context::current() = case_ctx during
+        // the turn). Span_id is what we deep-link to in the
+        // EvalReport via `uiFind=<span_id>`.
+        let case_span = tracer.span_builder("aislang.case")
+            .with_kind(SpanKind::Internal)
+            .with_attributes([
+                KeyValue::new("aislang.case",       case.id.clone()),
+                KeyValue::new("aislang.case.index", idx as i64),
+            ])
+            .start(&tracer);
+        let case_trace_id = case_span.span_context().trace_id();
+        let case_span_id  = case_span.span_context().span_id();
+        let case_url = if eval_trace_url.is_some() {
+            Some(aislang_runtime::jaeger_url_with_span(
+                case_trace_id, case_span_id))
+        } else {
+            None
+        };
+        let case_ctx = Context::current_with_span(case_span);
+        let _case_guard = case_ctx.attach();
 
         let t0 = std::time::Instant::now();
         let turn_result = session.turn(&case.input).await;
@@ -1830,7 +1870,9 @@ async fn run_eval_inner(
             actual,
             score,
             latency_ms,
+            trace_url: case_url,
         });
+        // _case_guard drops here → case span ends.
     }
 
     // ── 8. aggregate + threshold compare ──
@@ -1861,6 +1903,7 @@ async fn run_eval_inner(
         threshold:       eval.threshold.ratio,
         aggregate_score,
         pass,
+        trace_url:       eval_trace_url,
         cases:           case_results,
     })
 }

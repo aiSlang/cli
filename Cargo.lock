@@ -32,6 +32,7 @@ dependencies = [
  "aislang-runtime",
  "anyhow",
  "clap",
+ "opentelemetry",
  "serde_json",
  "tokio",
 ]
