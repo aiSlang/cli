@@ -20,12 +20,49 @@ use crate::litellm::{
     ChatMessage, ChatRequest, ChatResponse, LiteLlmClient,
     LiteLlmError, Role, Tool, ToolCall, ToolFunction,
 };
-use crate::mcp::{McpError, StdioChild, ToolContent, ToolSpec};
+use crate::mcp::{
+    McpError, StdioChild, ToolContent, ToolSpec,
+    mcp_call_tool_attrs, mcp_call_tool_span_name,
+};
 use aislang_core::types::Money;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
+
+// week-9 Wed: turn-level + per-iteration + per-MCP-call spans. Span
+// nesting is controlled by `Context::current()` at the moment each
+// span is opened — we attach turn ctx at the top of `turn()`, then
+// iter ctx at the top of each loop body, so `chat <model>` and
+// `mcp <server>.<tool>` spans automatically nest under the right
+// `tool_use_iteration[N]`.
+use opentelemetry::{
+    global,
+    trace::{SpanKind, TraceContextExt, Tracer},
+    Context, KeyValue,
+};
+
+// ============================================================================
+// OTel span-name helpers for the turn + iteration spans (week 9 Wed)
+//
+// Pure functions — same separation-of-concerns pattern as the
+// `gen_ai_*` helpers in `litellm.rs` and `mcp_call_tool_*` helpers
+// in `mcp.rs`. Lets the tests pin the wire names without standing
+// up an OTel runtime.
+// ============================================================================
+
+/// Span name for the whole `Session::turn` call. One per user input.
+/// `"aislang.turn"` mirrors the root-span naming convention (`aislang.chat`,
+/// `aislang.eval`) so the operation hierarchy in Jaeger reads cleanly.
+pub(crate) fn turn_span_name() -> &'static str { "aislang.turn" }
+
+/// Span name for one iteration of the tool-use loop. `N` is the
+/// 0-indexed iteration counter; `tool_use_iteration[0]` is the
+/// first LLM call. Bracket notation matches OTel-GenAI convention
+/// for indexed sub-operations.
+pub(crate) fn iteration_span_name(iter: usize) -> String {
+    format!("tool_use_iteration[{iter}]")
+}
 
 // ============================================================================
 // Public constants
@@ -122,6 +159,12 @@ pub struct ToolRegistry {
     /// `tools[]` array we emit is alphabetically stable (helps the
     /// model pick deterministically + makes test assertions easier).
     entries: BTreeMap<String, ToolEntry>,
+    /// Parallel to `Session.mcp_clients`. `server_labels[i]` is the
+    /// human-meaningful label for `mcp_clients[i]` (the `.ais` source's
+    /// `mcp_server "<label>" { … }` block). Stored so the week-9 Wed
+    /// OTel MCP span can tag `mcp.server.label` without forcing the
+    /// caller to plumb a label through every call site.
+    server_labels: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -132,7 +175,9 @@ impl ToolRegistry {
     /// LiteLLM-visible names (`docs__read`, `git__read`).
     pub fn from_servers(servers: &[(String, Vec<ToolSpec>)]) -> Self {
         let mut entries = BTreeMap::new();
+        let mut server_labels = Vec::with_capacity(servers.len());
         for (idx, (label, tools)) in servers.iter().enumerate() {
+            server_labels.push(label.clone());
             for t in tools {
                 let visible_name = format!("{label}{}{}", TOOL_NAME_SEPARATOR, t.name);
                 entries.insert(visible_name, ToolEntry {
@@ -143,12 +188,21 @@ impl ToolRegistry {
                 });
             }
         }
-        Self { entries }
+        Self { entries, server_labels }
     }
 
     /// Number of tools in the registry.
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+
+    /// Human-meaningful label for the MCP server at `server_idx`
+    /// (parallel to `Session.mcp_clients[server_idx]`). Returns
+    /// `"unknown"` if the index is out of range — this is a defensive
+    /// fallback for telemetry; real callers route through `route()`
+    /// which only returns valid indices.
+    pub fn server_label_of(&self, server_idx: usize) -> &str {
+        self.server_labels.get(server_idx).map(String::as_str).unwrap_or("unknown")
+    }
 
     /// Build the OpenAI-compatible `tools[]` array for inclusion in
     /// a chat request. Returns `None` when the registry is empty
@@ -373,6 +427,16 @@ impl Session {
             ChatMessage::text(Role::User,   user_input),
         ];
 
+        // ── OTel: open the turn-level span (week 9 Wed) ──
+        // Parent = `Context::current()` (per-command root attached
+        // by the CLI sync wrapper). Each iteration below opens its
+        // own `tool_use_iteration[N]` child under this turn span.
+        let tracer = global::tracer("aislang");
+        let turn_span = tracer.span_builder(turn_span_name())
+            .with_kind(SpanKind::Internal)
+            .start(&tracer);
+        let _turn_guard = Context::current_with_span(turn_span).attach();
+
         // Per-turn running cost (week 7 Wed). Initialized to $0; only
         // mutated when `self.budget` is Some. Currency follows the
         // catalog prices' currency (USD in the v0.1 catalog) — see
@@ -389,6 +453,21 @@ impl Session {
         let per_turn_timeout = std::time::Duration::from_secs(PER_TURN_TIMEOUT_SECS);
 
         for _iter in 0..MAX_TOOL_ITERS {
+            // Open the iteration span (week 9 Wed). Parent = turn span
+            // (because turn_ctx is still attached on this thread).
+            // `chat <model>` and `mcp <server>.<tool>` spans created
+            // by `send_chat_full` and `dispatch_tool_call` below
+            // automatically nest under THIS iteration via the same
+            // `Context::current()` mechanism.
+            let iter_span = tracer.span_builder(iteration_span_name(_iter))
+                .with_kind(SpanKind::Internal)
+                .with_attributes([
+                    KeyValue::new("aislang.iteration", _iter as i64),
+                ])
+                .start(&tracer);
+            let iter_ctx   = Context::current_with_span(iter_span);
+            let _iter_guard = iter_ctx.attach();
+
             let req = ChatRequest {
                 model:      self.model_label.clone(),
                 messages:   messages.clone(),
@@ -533,9 +612,39 @@ impl Session {
             }
         };
 
-        // 3. Invoke through the routed MCP client.
+        // 3. Open the MCP `call_tool` span — child of whatever
+        // `Context::current()` resolves to (the active
+        // `tool_use_iteration[N]` span, set by `turn()` above).
+        // PII safety (Decision 21): we tag the byte length of the
+        // serialised args, NOT the args themselves. See
+        // `mcp::mcp_call_tool_attrs` for rationale.
+        let server_label = self.tools.server_label_of(server_idx).to_owned();
+        let args_size_bytes = serde_json::to_string(&args_obj)
+            .map(|s| s.len()).unwrap_or(0);
+        let tracer = global::tracer("aislang");
+        let mut mcp_span = tracer.span_builder(
+                mcp_call_tool_span_name(&server_label, mcp_name)
+            )
+            .with_kind(SpanKind::Client)
+            .with_attributes(mcp_call_tool_attrs(
+                &server_label, mcp_name, args_size_bytes,
+            ))
+            .start(&tracer);
+
+        // 4. Invoke through the routed MCP client.
         let client = &self.mcp_clients[server_idx];
         let result = client.call_tool(mcp_name, args_obj).await?;
+
+        // 4b. Tag the result size + error status for searchability
+        // (still no PII — only counts + a boolean). These supplement
+        // the three core attrs Wed's DoD names; they're cheap to add
+        // and useful in Jaeger's grouping.
+        use opentelemetry::trace::Span;
+        mcp_span.set_attribute(KeyValue::new(
+            "mcp.tool.result_fragments_count", result.content.len() as i64));
+        mcp_span.set_attribute(KeyValue::new(
+            "mcp.tool.is_error", result.is_error));
+        mcp_span.end();
 
         // 4. Concatenate textual fragments. Non-text fragments get
         // a visible placeholder so the model can see they happened.
@@ -916,6 +1025,62 @@ mod tests {
         let tools = reg.as_litellm_tools().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
         assert_eq!(names, vec!["docs__alpha", "docs__middle", "docs__zeta"]);
+    }
+
+    // ---- ToolRegistry::server_label_of (week 9 Wed) ----
+
+    #[test] fn registry_server_label_of_returns_each_servers_label() {
+        // Built in `from_servers` order — index 0 = first arg, etc.
+        // The MCP span uses this lookup to tag `mcp.server.label`.
+        let reg = ToolRegistry::from_servers(&[
+            ("docs".into(), vec![fake_tool("list_dir", "list")]),
+            ("git".into(),  vec![fake_tool("commit",   "commit")]),
+        ]);
+        assert_eq!(reg.server_label_of(0), "docs");
+        assert_eq!(reg.server_label_of(1), "git");
+    }
+
+    #[test] fn registry_server_label_of_oob_falls_back_to_unknown() {
+        // Defensive: telemetry must never panic. Out-of-range indices
+        // (programmer bug — `route()` always returns valid ones)
+        // surface as the literal string `"unknown"` on the span.
+        let reg = ToolRegistry::from_servers(&[
+            ("docs".into(), vec![fake_tool("list_dir", "list")]),
+        ]);
+        assert_eq!(reg.server_label_of(0),   "docs");
+        assert_eq!(reg.server_label_of(7),   "unknown");
+        assert_eq!(reg.server_label_of(999), "unknown");
+    }
+
+    #[test] fn registry_empty_servers_has_no_labels() {
+        // No mcp_server blocks → no labels → out-of-range for every
+        // idx including 0. Useful pin: empty-server-list eval runs
+        // (no tools at all) must not panic when MCP span code looks
+        // up server_label_of(0).
+        let reg = ToolRegistry::from_servers(&[]);
+        assert_eq!(reg.server_label_of(0), "unknown");
+    }
+
+    // ---- turn/iteration span name helpers (week 9 Wed) ----
+
+    #[test] fn turn_span_name_is_aislang_turn() {
+        // Pinned literal — matches the root naming convention
+        // (`aislang.chat`, `aislang.eval`) so Jaeger's operation
+        // listing has all three at the same prefix depth.
+        assert_eq!(turn_span_name(), "aislang.turn");
+    }
+
+    #[test] fn iteration_span_name_uses_zero_indexed_bracket_form() {
+        // OTel-GenAI convention for indexed sub-ops:
+        // `<operation>[<n>]`. Pinned so a refactor that switches
+        // 0-indexed → 1-indexed (a common refactor mistake)
+        // would fail loudly.
+        assert_eq!(iteration_span_name(0), "tool_use_iteration[0]");
+        assert_eq!(iteration_span_name(1), "tool_use_iteration[1]");
+        assert_eq!(iteration_span_name(7), "tool_use_iteration[7]");
+        // MAX_TOOL_ITERS is 8 → max valid index is 7 (0..8).
+        assert_eq!(iteration_span_name(MAX_TOOL_ITERS - 1),
+                   "tool_use_iteration[7]");
     }
 
     // ---- iteration cap + tool-use loop ----

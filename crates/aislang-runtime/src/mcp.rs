@@ -28,6 +28,60 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
 
+// week-9 Wed: OTel-GenAI instrumentation of MCP tool dispatch. Spans
+// are opened in `Session::dispatch_tool_call` (the caller) — that's
+// where the server *label* is known (from the resolver). `StdioChild`
+// only knows the *image*, which is too low-level for a useful Jaeger
+// tag. Keeping the wrap at the caller side also means `StdioChild`'s
+// public API doesn't gain an OTel arg — direct programmatic uses
+// stay zero-cost.
+use opentelemetry::KeyValue;
+
+// ============================================================================
+// OTel-MCP attribute helpers (week 9 Wed)
+//
+// Convention: span name `"mcp <server>.<tool>"` (greppable in Jaeger
+// search by typing `mcp `). Attributes use the `mcp.*` namespace —
+// OTel-GenAI doesn't have a sanctioned MCP convention yet, so we pin
+// these keys ourselves; tests below assert each constant verbatim.
+//
+// PII safety (Decision 21): we record *sizes* not *contents* of the
+// argument map. Tool args can contain user-supplied secrets, paths,
+// search queries — none of which should land in observability storage.
+// `arguments_size_bytes` is enough to spot anomalies (a tool called
+// with a 200KB payload is suspicious) without leaking the payload.
+// ============================================================================
+
+/// Pinned attribute keys for the MCP `call_tool` span.
+pub(crate) mod mcp_otel {
+    pub const KEY_SERVER_LABEL:  &str = "mcp.server.label";
+    pub const KEY_TOOL_NAME:     &str = "mcp.tool.name";
+    pub const KEY_ARGS_SIZE:     &str = "mcp.tool.arguments_size_bytes";
+}
+
+/// OTel span name for one MCP `call_tool` invocation. `"mcp <server>.<tool>"`
+/// keeps the server-level grouping visible in Jaeger's search UI and
+/// at the trace-tree level it appears as `mcp docs.read_text_file` —
+/// distinct from the `chat <model>` LLM spans, easy to filter.
+pub(crate) fn mcp_call_tool_span_name(server_label: &str, tool_name: &str) -> String {
+    format!("mcp {server_label}.{tool_name}")
+}
+
+/// Build the three OTel attributes attached to an MCP call-tool span.
+/// `arguments_size_bytes` is the byte length of the JSON-serialised
+/// arg object, NOT the object's content — see PII rationale above.
+pub(crate) fn mcp_call_tool_attrs(
+    server_label: &str,
+    tool_name:    &str,
+    args_size_bytes: usize,
+) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new(mcp_otel::KEY_SERVER_LABEL, server_label.to_owned()),
+        KeyValue::new(mcp_otel::KEY_TOOL_NAME,    tool_name.to_owned()),
+        KeyValue::new(mcp_otel::KEY_ARGS_SIZE,    args_size_bytes as i64),
+    ]
+}
+
 // ============================================================================
 // Public types — aislang-owned newtypes (decoupled from rmcp internals)
 // ============================================================================
@@ -478,5 +532,83 @@ mod tests {
         assert!(cfg.env.is_empty());
         assert_eq!(cfg.args, vec!["a"]);
         assert_eq!(cfg.image, "img");
+    }
+
+    // ---- OTel MCP span helpers (week 9 Wed) ----
+
+    fn find_attr<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a KeyValue> {
+        attrs.iter().find(|kv| kv.key.as_str() == key)
+    }
+
+    #[test] fn mcp_otel_key_constants_match_documented_spec() {
+        // Pinned strings — anything that breaks one of these breaks
+        // downstream dashboards. PR diff that touches a key value
+        // must touch this test too.
+        assert_eq!(mcp_otel::KEY_SERVER_LABEL, "mcp.server.label");
+        assert_eq!(mcp_otel::KEY_TOOL_NAME,    "mcp.tool.name");
+        assert_eq!(mcp_otel::KEY_ARGS_SIZE,    "mcp.tool.arguments_size_bytes");
+    }
+
+    #[test] fn mcp_call_tool_span_name_follows_server_dot_tool_convention() {
+        // "mcp <server>.<tool>" — distinct from "chat <model>" so the
+        // Jaeger search panel can filter LLM vs MCP spans by prefix.
+        assert_eq!(mcp_call_tool_span_name("docs", "read_text_file"),
+                   "mcp docs.read_text_file");
+        assert_eq!(mcp_call_tool_span_name("git",  "commit"),
+                   "mcp git.commit");
+        // Even if labels carry punctuation, the format stays composable.
+        assert_eq!(mcp_call_tool_span_name("a-b", "c_d"), "mcp a-b.c_d");
+    }
+
+    #[test] fn mcp_call_tool_attrs_emits_all_three_keys() {
+        let attrs = mcp_call_tool_attrs("docs", "read_text_file", 42);
+        assert_eq!(attrs.len(), 3, "exactly three attrs (no more, no less)");
+        let srv = find_attr(&attrs, mcp_otel::KEY_SERVER_LABEL)
+            .expect("server.label must be present");
+        assert_eq!(srv.value.as_str(), "docs");
+        let tool = find_attr(&attrs, mcp_otel::KEY_TOOL_NAME)
+            .expect("tool.name must be present");
+        assert_eq!(tool.value.as_str(), "read_text_file");
+        let size = find_attr(&attrs, mcp_otel::KEY_ARGS_SIZE)
+            .expect("arguments_size_bytes must be present");
+        assert_eq!(size.value.as_str(), "42");
+    }
+
+    #[test] fn mcp_call_tool_attrs_records_size_not_content() {
+        // PII safety pin (Decision 21): a "sensitive" argument payload
+        // — `{"password":"hunter2"}` — must NOT appear in attrs. Only
+        // its byte length.
+        let secret_args = serde_json::json!({"password": "hunter2"});
+        let s = serde_json::to_string(&secret_args).unwrap();
+        let len = s.len();
+
+        let attrs = mcp_call_tool_attrs("docs", "auth_check", len);
+
+        // None of the three attributes should contain the secret.
+        for kv in &attrs {
+            let rendered = kv.value.as_str();
+            assert!(!rendered.contains("hunter2"),
+                "attribute value {:?} leaked content (`hunter2`)", kv.key);
+            assert!(!rendered.contains("password"),
+                "attribute value {:?} leaked content (`password`)", kv.key);
+        }
+
+        // …but the byte-length must be present so anomalies are
+        // still observable.
+        let size = find_attr(&attrs, mcp_otel::KEY_ARGS_SIZE).unwrap();
+        assert_eq!(size.value.as_str(), len.to_string());
+    }
+
+    #[test] fn mcp_call_tool_attrs_handles_empty_args() {
+        // `{}` serializes to "{}" → 2 bytes. We should NOT skip the
+        // attribute (zero would be misleading: it'd look like the
+        // attribute is absent). Pin: empty args → exactly 2 bytes.
+        let empty = serde_json::Value::Object(serde_json::Map::new());
+        let s = serde_json::to_string(&empty).unwrap();
+        assert_eq!(s, "{}");
+        let attrs = mcp_call_tool_attrs("docs", "list_dir", s.len());
+        let size = find_attr(&attrs, mcp_otel::KEY_ARGS_SIZE).unwrap();
+        assert_eq!(size.value.as_str(), "2",
+            "empty-arg-object should record 2 bytes (the `{{}}`), not 0");
     }
 }
