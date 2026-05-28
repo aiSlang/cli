@@ -357,14 +357,24 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    // Per-process atomic counter — guarantees uniqueness for
+    // parallel tests in the same binary regardless of system
+    // clock resolution. macOS's SystemTime::now() resolves only
+    // to microseconds, so two `tempdir()` calls scheduled within
+    // the same µs would otherwise collide on the path and step
+    // on each other's spend.json (caught in CI on macos-latest;
+    // Linux nanos resolution masked the bug).
     fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "aislang-spend-{}-{}",
+            "aislang-spend-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir

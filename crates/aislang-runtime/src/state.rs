@@ -194,14 +194,21 @@ pub fn new_applied(
 mod tests {
     use super::*;
 
+    // Per-process atomic counter — guarantees uniqueness for
+    // parallel tests regardless of system clock resolution.
+    // See spend.rs's `tempdir()` for the macOS-microsecond
+    // collision rationale.
     fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "aislang-state-{}-{}",
+            "aislang-state-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
