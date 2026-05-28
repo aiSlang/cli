@@ -84,7 +84,34 @@ detect_target() {
         *) die "unsupported macOS arch: $arch (supported: x86_64, arm64)" ;;
       esac ;;
     MINGW*|MSYS*|CYGWIN*|Windows*)
-      die "Windows is not supported in v0.1 — use WSL2 or wait for v0.2+." ;;
+      # Soft-bail with explicit WSL2 guidance — running aislang
+      # natively on Windows would require porting Docker shellouts,
+      # MCP stdio framing, and ~5-15 tests (see v0.2 plan §Track A.5
+      # for the eventual PowerShell wrapper). Since Docker Desktop on
+      # Windows runs through WSL2 anyway, the Linux build of aislang
+      # is what every Windows user actually needs — installed inside
+      # WSL where ELF binaries are first-class.
+      cat >&2 <<EOF
+
+==> Windows is not natively supported in v0.1.
+
+    aiSlang depends on Docker, which on Windows runs through WSL2
+    anyway — so the Linux build of aislang is what you want,
+    installed inside WSL.  One-time setup (PowerShell, as admin):
+
+        wsl --install
+
+    Then re-run this installer from inside a WSL shell:
+
+        wsl
+        curl -sSfL https://github.com/${REPO}/releases/latest/download/install.sh | sh
+
+    (A native PowerShell wrapper that does the WSL hop for you is
+    planned for v0.2 — see ROADMAP.)
+
+EOF
+      exit 1
+      ;;
     *)
       die "unsupported OS: $os (supported: Linux, macOS)" ;;
   esac
