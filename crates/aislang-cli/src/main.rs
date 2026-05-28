@@ -77,8 +77,22 @@ enum Command {
         file: PathBuf,
     },
     /// Tear down the deployed stack and free resources
+    ///
+    /// Idempotent: re-running destroy on an already-torn-down stack
+    /// exits 0 with a "nothing to destroy" message (week 10 Wed,
+    /// Decision 27). The state file at `.aislang/state.json` is the
+    /// source of truth — its `applied_at` field flips to null after
+    /// a successful tear-down. Re-applying recreates state.json with
+    /// a fresh timestamp.
     Destroy {
         file: PathBuf,
+        /// Run `docker compose down -v` against the stack.yml even when
+        /// the state file is absent or marked as torn down. Useful for
+        /// users who manually edited `.aislang/` away or who want to
+        /// re-run cleanup as a belt-and-suspenders measure on a
+        /// torn-down stack (Decision 29).
+        #[arg(long)]
+        force: bool,
     },
     /// Run declared evals against the deployed agent(s)
     ///
@@ -143,7 +157,7 @@ fn run() -> Result<()> {
         Command::Plan { file, verbose, no_lock, output_dir, smoke_test, smoke_test_live } =>
             run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live),
         Command::Apply { file }      => run_apply(file),
-        Command::Destroy { file }    => run_destroy(file),
+        Command::Destroy { file, force } => run_destroy(file, force),
         Command::Eval { eval_label, file } => run_eval(eval_label, file),
         Command::Cost { file }       => run_cost(file),
         Command::Chat { agent, file } => run_chat(agent, file),
@@ -1010,19 +1024,65 @@ fn run_apply(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// `aislang destroy <file>` — locate the stack.yml emitted by apply
-/// and run `docker compose down -v`.
-fn run_destroy(file: PathBuf) -> Result<()> {
+/// `aislang destroy <file> [--force]` — locate the stack.yml emitted
+/// by apply and run `docker compose down -v`. Idempotent per
+/// Decision 27 + 29 (week 10 Wed): re-running on an already-torn-down
+/// stack exits 0; absent stack.yml AND absent state file is also a
+/// clean exit 0. `--force` bypasses state-file existence checks and
+/// runs the compose down anyway (when stack.yml exists).
+fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
     let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
         anyhow::anyhow!("source directory `{}` not readable: {e}",
             source_dir.display())
     })?;
     let stack_path = output_dir.join(aislang_compose::STACK_YAML_FILENAME);
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+
+    // ── Idempotency check (Decision 27) ─────────────────────────
+    // The state file's `applied_at` is the source of truth for
+    // "is this stack currently considered up". --force skips this
+    // check entirely.
+    if !force {
+        match aislang_runtime::read_state(&state_path) {
+            Ok(Some(state)) if state.applied_at.is_none() => {
+                // Already torn down. Idempotent success — important
+                // for CI cleanup pipelines that re-run destroy without
+                // tracking whether they've already run it.
+                eprintln!("nothing to destroy: state file at `{}` shows the \
+                           stack was already torn down.", state_path.display());
+                eprintln!("(pass --force to run `docker compose down -v` \
+                           against `{}` anyway.)", stack_path.display());
+                return Ok(());
+            }
+            Ok(None) if !stack_path.exists() => {
+                // No state file AND no stack.yml — nothing was ever
+                // applied to this directory. Exit 0 with a hint.
+                eprintln!("nothing to destroy: neither `{}` nor `{}` exists.",
+                    state_path.display(), stack_path.display());
+                eprintln!("(if the stack IS up but state was lost, pass \
+                           --force to attempt cleanup via the stack.yml \
+                           — you'll need to recreate stack.yml first via \
+                           `aislang plan -o {}` or `aislang apply`.)",
+                    output_dir.display());
+                return Ok(());
+            }
+            Ok(_)  => {}   // applied_at = Some, OR state missing but stack.yml present — proceed.
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "read state file `{}`: {e}\n\
+                     (pass --force to ignore the state file and tear \
+                     down via stack.yml directly)",
+                    state_path.display()));
+            }
+        }
+    }
+
+    // ── Stack.yml is required for the actual docker compose down ──
     if !stack_path.exists() {
         return Err(anyhow::anyhow!(
-            "no stack.yml at `{}` — run `aislang apply {}` first \
-             (or the stack was already destroyed)",
+            "no stack.yml at `{}` — run `aislang apply {}` to recreate \
+             it, then re-run destroy",
             stack_path.display(), file.display()));
     }
     if !docker_on_path() {
@@ -1041,6 +1101,17 @@ fn run_destroy(file: PathBuf) -> Result<()> {
         return Err(anyhow::anyhow!(
             "docker compose down -v exited {:?}", status.code()));
     }
+
+    // ── Mark state torn down (Decision 27) ──────────────────────
+    // `applied_at` flips to None. No-op when state file is absent
+    // (user is using --force without ever having had a state file,
+    // e.g. they pre-date week 10). Failures here log-and-continue
+    // — the stack IS down; we just couldn't update the audit-trail.
+    if let Err(e) = aislang_runtime::mark_state_torn_down(&state_path) {
+        eprintln!("warning: stack torn down but failed to update state \
+                   file `{}`: {e}", state_path.display());
+    }
+
     eprintln!();
     eprintln!("stack torn down — containers, networks, and volumes removed.");
     eprintln!("the stack.yml file is preserved; remove it manually if desired:");
