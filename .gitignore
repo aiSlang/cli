@@ -7,9 +7,9 @@
 .aislang/
 
 # Local skill caches (each dev's own running deltas — see
-# .claude/skills/code-stat/SKILL.md). Committed skill files are
-# tracked; their state files are not.
-.claude/skills/*/cache.txt
+# .claude/skills/code-stat/SKILL.md + perf-stat/SKILL.md).
+# Committed skill files are tracked; their state files are not.
+.claude/skills/*/cache.*
 
 # `aislang apply` writes stack.yml into the source dir; it embeds
 # absolute host paths (litellm volume mount) so it's machine-specific
