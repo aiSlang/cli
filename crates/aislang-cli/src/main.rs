@@ -119,6 +119,35 @@ enum Command {
     Cost {
         file: PathBuf,
     },
+    /// Show stack status, spend, and/or per-model breakdown for the
+    /// deployed agent(s)
+    ///
+    /// Reads `.aislang/state.json` (project-local, written by apply)
+    /// and `~/.aislang/spend.json` (global, written during chat/eval).
+    /// With no flags: renders stack status (state file + docker compose
+    /// ps). With `--spend`: appends today's UTC total. With
+    /// `--model-spend [MODEL]`: appends today's by-model breakdown,
+    /// optionally filtered to one model id.
+    ///
+    /// Exit codes (Decision 28):
+    ///   0  stack matches state (or no flags + state present + applied_at Some)
+    ///   1  drift — state missing, applied_at is None, or compose ps disagrees
+    ///   2  docker unavailable when a stack check was attempted
+    Status {
+        file: PathBuf,
+        /// Append today's total spend (read from `~/.aislang/spend.json`).
+        #[arg(long)]
+        spend: bool,
+        /// Append today's by-model spend breakdown. Filter to one
+        /// model id via `--model-spend=anthropic.claude_haiku_4_5`
+        /// (note the `=` — required to disambiguate from the
+        /// positional FILE argument), or pass bare `--model-spend`
+        /// to show all models recorded today.
+        #[arg(long = "model-spend", value_name = "MODEL",
+              num_args = 0..=1, default_missing_value = "",
+              require_equals = true)]
+        model_spend: Option<String>,
+    },
     /// Open a CLI chat session against a deployed agent
     ///
     /// v0.1 (week 6 Mon): validates the agent exists in the source
@@ -135,7 +164,7 @@ enum Command {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             let msg = format!("{e:#}");
             // The sentinel "(see error above)" signals: subcommand
@@ -150,18 +179,27 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Validate { file, verbose }            => run_validate(file, verbose),
+    // Most subcommands return `Result<()>` and exit 0 on success;
+    // `status` returns `Result<ExitCode>` so it can surface
+    // Decision 28's 0/1/2 spectrum. `.map(|_| ExitCode::SUCCESS)`
+    // unifies the two shapes for the dispatch.
+    let code = match cli.command {
+        Command::Validate { file, verbose }            =>
+            run_validate(file, verbose).map(|_| ExitCode::SUCCESS)?,
         Command::Plan { file, verbose, no_lock, output_dir, smoke_test, smoke_test_live } =>
-            run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live),
-        Command::Apply { file }      => run_apply(file),
-        Command::Destroy { file, force } => run_destroy(file, force),
-        Command::Eval { eval_label, file } => run_eval(eval_label, file),
-        Command::Cost { file }       => run_cost(file),
-        Command::Chat { agent, file } => run_chat(agent, file),
-    }
+            run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live)
+                .map(|_| ExitCode::SUCCESS)?,
+        Command::Apply { file }      => run_apply(file).map(|_| ExitCode::SUCCESS)?,
+        Command::Destroy { file, force } => run_destroy(file, force).map(|_| ExitCode::SUCCESS)?,
+        Command::Eval { eval_label, file } => run_eval(eval_label, file).map(|_| ExitCode::SUCCESS)?,
+        Command::Cost { file }       => run_cost(file).map(|_| ExitCode::SUCCESS)?,
+        Command::Status { file, spend, model_spend } =>
+            run_status(file, spend, model_spend)?,
+        Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
+    };
+    Ok(code)
 }
 
 fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
@@ -1224,6 +1262,263 @@ fn run_cost(file: PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// `aislang status` — week 10 Thu (Decision 28 revised)
+// ============================================================================
+//
+// Three sections, gated by flags:
+//   default (no flag): stack status from state.json + `docker compose ps`
+//   --spend          : append today's UTC total from spend.json
+//   --model-spend [M]: append today's by-model breakdown (filter to M
+//                       when a value is given; show all otherwise)
+//
+// Flags compose: `--spend --model-spend` renders the stack section,
+// then the total, then the per-model breakdown.
+//
+// Exit codes (Decision 28):
+//   0  stack OK (state present + applied_at Some + compose ps clean
+//      OR no stack section requested but spend section rendered)
+//   1  drift — state file absent, applied_at == None, or compose ps
+//      shows services down
+//   2  docker unavailable when a stack check was attempted
+
+fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result<ExitCode> {
+    // Validate so the user sees the same diagnostics as `aislang validate`
+    // when the source is broken. Status is rare; the parse cost is
+    // immaterial.
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    // canonicalize() fails on a missing dir; degrade to the raw path
+    // so the diagnostic still mentions a useful location.
+    let output_dir = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.to_path_buf());
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+    let stack_path = output_dir.join(aislang_compose::STACK_YAML_FILENAME);
+
+    // Drift accumulator — any section that detects a problem flips
+    // this. We render ALL requested sections regardless, then exit
+    // with the appropriate non-zero code at the end so users see
+    // the full state in one shot.
+    let mut drift = false;
+    let mut docker_unavailable_for_stack = false;
+
+    // ── Section 1: stack status ────────────────────────────────
+    println!("project:  {}", project.name);
+    println!("source:   {}", file.display());
+    println!();
+    println!("stack:");
+    match aislang_runtime::read_state(&state_path) {
+        Ok(Some(state)) => {
+            match state.applied_at {
+                Some(ref ts) => {
+                    println!("  applied_at:      {ts}");
+                    println!("  catalog_version: {}", state.catalog_version);
+                    println!("  source_hash:     {}", short_hash(&state.source_hash));
+                    println!("  stack.yml:       {}", state.stack_yaml_path.display());
+
+                    if stack_path.exists() && docker_on_path() {
+                        match docker_compose_ps_json(&stack_path) {
+                            Ok(rows) => render_service_rows(&rows, &mut drift),
+                            Err(e) => {
+                                println!("  services: (failed to query docker: {e})");
+                                drift = true;
+                            }
+                        }
+                    } else if !docker_on_path() {
+                        println!("  services: (docker not on PATH — cannot query live status)");
+                        docker_unavailable_for_stack = true;
+                    } else {
+                        println!("  services: (stack.yml missing at `{}`)", stack_path.display());
+                        drift = true;
+                    }
+                }
+                None => {
+                    println!("  status:  torn down (applied_at: null)");
+                    println!("  catalog_version: {}", state.catalog_version);
+                    println!("  hint:    `aislang apply {}` to redeploy", file.display());
+                    drift = true;
+                }
+            }
+        }
+        Ok(None) => {
+            println!("  status:  not applied (no state file at `{}`)", state_path.display());
+            println!("  hint:    `aislang apply {}` to deploy the stack", file.display());
+            drift = true;
+        }
+        Err(e) => {
+            println!("  status:  ERROR reading state file: {e}");
+            drift = true;
+        }
+    }
+
+    // ── Section 2: --spend total ───────────────────────────────
+    if spend {
+        let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+        println!();
+        println!("spend ({} UTC):", aislang_runtime::spend::utc_today());
+        let total = tracker.today_spend();
+        println!("  total:   {}", aislang_runtime::format_money(&total));
+        // Show the % of per-day cap when budget present + cap is Capped.
+        if let Some(b) = project.budget.as_ref() {
+            if let (Some(cap_mu), Some(spent_mu)) =
+                (b.hard_cap_per_day.micro_units(), total.micro_units())
+            {
+                if cap_mu > 0 {
+                    let pct = (spent_mu as f64 / cap_mu as f64) * 100.0;
+                    println!("  cap:     {} ({pct:.1}% used)",
+                        aislang_runtime::format_money(&b.hard_cap_per_day));
+                }
+            }
+        }
+    }
+
+    // ── Section 3: --model-spend [MODEL] breakdown ─────────────
+    if let Some(filter) = model_spend {
+        let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+        let by_model = tracker.today_by_model();
+        println!();
+        if filter.is_empty() {
+            println!("spend by model ({} UTC):", aislang_runtime::spend::utc_today());
+        } else {
+            println!("spend for model `{}` ({} UTC):",
+                filter, aislang_runtime::spend::utc_today());
+        }
+        if by_model.is_empty() {
+            println!("  (no spend recorded today)");
+        } else if filter.is_empty() {
+            // All models. Sort by amount descending for readability.
+            let mut rows: Vec<_> = by_model.iter().collect();
+            rows.sort_by(|a, b| b.1.micro_units().cmp(&a.1.micro_units()));
+            let pad = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+            for (model, amount) in rows {
+                println!("  {model:<pad$}  {}",
+                    aislang_runtime::format_money(amount));
+            }
+        } else {
+            match by_model.get(&filter) {
+                Some(amount) => {
+                    println!("  {}", aislang_runtime::format_money(amount));
+                }
+                None => {
+                    println!("  (no spend recorded for `{filter}` today)");
+                    // NOT drift — absent model just means the agent
+                    // didn't use that one today. v0.2 might warn when
+                    // the requested model isn't in the project's
+                    // resolved model set at all.
+                }
+            }
+        }
+    }
+
+    // ── Exit code resolution ───────────────────────────────────
+    // Decision 28: 0/1/2. Docker-unavailable takes precedence over
+    // generic drift — the user needs to fix docker before drift
+    // diagnostics are meaningful.
+    Ok(if docker_unavailable_for_stack {
+        ExitCode::from(2)
+    } else if drift {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Display the first 12 hex chars of the source hash for the status
+/// summary. Full 64-char hash is in the state file for audit; the
+/// truncated form keeps the human-readable summary scannable.
+fn short_hash(full: &str) -> String {
+    if full.len() >= 12 {
+        format!("{}…", &full[..12])
+    } else {
+        full.to_owned()
+    }
+}
+
+/// Minimal compose-ps JSON line. Docker emits `--format json` as
+/// NDJSON in 24+; older versions emit a JSON array. We tolerate both.
+#[derive(serde::Deserialize)]
+struct ComposeService {
+    #[serde(rename = "Name", alias = "name", default)]
+    name:    String,
+    #[serde(rename = "Service", alias = "service", default)]
+    service: String,
+    #[serde(rename = "State",   alias = "state",   default)]
+    state:   String,
+    #[serde(rename = "Status",  alias = "status",  default)]
+    status:  String,
+}
+
+/// Query `docker compose -f <stack_path> ps --format json` and parse
+/// the result. Tolerates both NDJSON (Docker Compose v2.24+) and
+/// JSON-array (older) output shapes.
+fn docker_compose_ps_json(stack_path: &Path) -> anyhow::Result<Vec<ComposeService>> {
+    let out = std::process::Command::new("docker")
+        .args(["compose", "-f"])
+        .arg(stack_path)
+        .args(["ps", "--format", "json"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("invoke docker compose ps: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "docker compose ps exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let body = body.trim();
+    if body.is_empty() { return Ok(Vec::new()); }
+    // Try JSON-array first (older), then NDJSON (newer).
+    if body.starts_with('[') {
+        let v: Vec<ComposeService> = serde_json::from_str(body)
+            .map_err(|e| anyhow::anyhow!("parse compose ps json array: {e}"))?;
+        Ok(v)
+    } else {
+        let mut rows = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let row: ComposeService = serde_json::from_str(line)
+                .map_err(|e| anyhow::anyhow!("parse compose ps json line `{line}`: {e}"))?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+/// Render a `services:` sub-block for the stack section, flipping
+/// `drift` when any service isn't in a healthy state.
+fn render_service_rows(rows: &[ComposeService], drift: &mut bool) {
+    if rows.is_empty() {
+        println!("  services: (none running — compose ps returned empty)");
+        *drift = true;
+        return;
+    }
+    println!("  services:");
+    let pad = rows.iter()
+        .map(|r| if r.service.is_empty() { r.name.len() } else { r.service.len() })
+        .max().unwrap_or(0);
+    for r in rows {
+        let label = if r.service.is_empty() { &r.name } else { &r.service };
+        // `state` is the canonical lowercase form; `status` is the
+        // human-readable string ("Up 5 minutes"). Prefer state for
+        // the drift check, status for the display.
+        let is_up = matches!(r.state.as_str(), "running" | "Up" | "up");
+        let mark  = if is_up { "✓" } else { "✗" };
+        println!("    {mark} {label:<pad$}  {}", r.status);
+        if !is_up { *drift = true; }
+    }
 }
 
 // ============================================================================

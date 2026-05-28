@@ -20,6 +20,7 @@ aislang-compose  = { workspace = true }
 aislang-runtime  = { workspace = true }   # in-CLI agent runtime (week 6 Tue/Wed)
 clap             = { workspace = true }
 anyhow           = { workspace = true }
+serde            = { workspace = true }   # week 10 Thu: derive for docker compose ps json
 serde_json       = { workspace = true }   # for -vvv JSON-IR rendering
 tokio            = { workspace = true }   # runtime for the chat subcommand (week 6 Wed)
 # week-9 Thu: per-case `aislang.case` span opened in the eval loop so
