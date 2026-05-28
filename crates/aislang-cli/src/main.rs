@@ -93,7 +93,15 @@ enum Command {
         /// Path to the .ais project file.
         file: PathBuf,
     },
-    /// Show projected and actual cost for the project
+    /// Show today's spend (per-model + total) and the budget caps for
+    /// the declared agent(s)
+    ///
+    /// Reads `~/.aislang/spend.json` (the persistent per-day spend
+    /// tracker written during `aislang chat` / `aislang eval` runs)
+    /// and renders today's UTC total alongside the per-model breakdown
+    /// (week 10 Tue's `by_model` attribution). Compares against the
+    /// `budget { hard_cap_per_run, hard_cap_per_day }` from the
+    /// project's .ais source. No network calls — read-only.
     Cost {
         file: PathBuf,
     },
@@ -137,7 +145,7 @@ fn run() -> Result<()> {
         Command::Apply { file }      => run_apply(file),
         Command::Destroy { file }    => run_destroy(file),
         Command::Eval { eval_label, file } => run_eval(eval_label, file),
-        Command::Cost { file: _ }    => stub("cost",    7),
+        Command::Cost { file }       => run_cost(file),
         Command::Chat { agent, file } => run_chat(agent, file),
     }
 }
@@ -1063,6 +1071,91 @@ fn first_agent_label_in_file(file: &Path) -> Option<String> {
 }
 
 // ============================================================================
+// `aislang cost` — week 10 Tue extra (was stubbed since week 7)
+// ============================================================================
+//
+// Read-only command: surfaces today's UTC spend (total + per-model
+// breakdown) for the project, plus the static `budget {…}` caps from
+// the .ais source. Pairs the persistent `~/.aislang/spend.json`
+// tracker (week 7 Thu) with the new `by_model` attribution
+// (week 10 Tue, Decision 32). No network, no docker — fully offline.
+//
+// Output is plain text on stdout, dollar-formatted via the same
+// `cost::format_money` helper the rest of the CLI uses. Designed for
+// `aislang cost foo.ais | grep total` ergonomics; v0.2 may add
+// `--json` for CI pipelines.
+
+fn run_cost(file: PathBuf) -> Result<()> {
+    // Validate so the user sees the same diagnostics they'd see on
+    // `aislang validate` if the source is broken. Cheap; the cost
+    // command is rare so we don't optimize away the parse.
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    // Open the tracker read-only — `open_default` reads
+    // ~/.aislang/spend.json if present, else seeds an empty one in
+    // memory (doesn't write anything until add() is called, which
+    // we never do here).
+    let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+        .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+    let today_total    = tracker.today_spend();
+    let today_by_model = tracker.today_by_model();
+
+    use aislang_runtime::format_money;
+    println!("project:    {}", project.name);
+    println!("spend file: {}", tracker.path().display());
+    println!();
+    println!("today's spend ({}):", aislang_runtime::spend::utc_today());
+    println!("  total:   {}", format_money(&today_total));
+    if today_by_model.is_empty() {
+        println!("  by model: (no per-model attribution yet — \
+                   spend.json may predate week-10 Tue, or no chat/eval \
+                   run has recorded a cost today)");
+    } else {
+        println!("  by model:");
+        // Find the longest key for column alignment — keeps the
+        // output readable when model ids vary in length.
+        let pad = today_by_model.keys().map(|k| k.len()).max().unwrap_or(0);
+        for (model, amount) in &today_by_model {
+            println!("    {model:<pad$}  {}", format_money(amount));
+        }
+    }
+
+    println!();
+    println!("budget caps (from {}):", file.display());
+    match project.budget.as_ref() {
+        Some(b) => {
+            println!("  per-run cap:  {}", format_money(&b.hard_cap_per_run));
+            println!("  per-day cap:  {}", format_money(&b.hard_cap_per_day));
+            // Day-cap utilization, when both caps are Capped and
+            // non-zero. Round to whole percent — over-precision
+            // here implies a confidence in micro-USD accuracy that
+            // upstream providers don't actually give us.
+            if let (Some(cap_mu), Some(spent_mu)) =
+                (b.hard_cap_per_day.micro_units(), today_total.micro_units())
+            {
+                if cap_mu > 0 {
+                    let pct = (spent_mu as f64 / cap_mu as f64) * 100.0;
+                    println!("  used today:   {pct:.1}%");
+                }
+            }
+        }
+        None => {
+            println!("  (no `budget {{ … }}` block in source — caps not enforced)");
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // `aislang chat` — Monday of week 6 (stub) → Wednesday (live LiteLLM loop)
 // ============================================================================
 
@@ -1559,10 +1652,11 @@ fn print_summary(project: &aislang_core::ast::Project) {
     }
 }
 
-fn stub(cmd: &str, week: u8) -> Result<()> {
-    println!("aislang {cmd}: not implemented yet (scheduled for week {week} — see PLAN-90-days.md)");
-    Ok(())
-}
+// (`stub` helper removed week 10 Tue — every subcommand is now wired
+// to its real implementation. v0.2 commands that need placeholders
+// should declare them in `Command` then route to a fresh inline
+// helper, not bring this back; the type-checker should refuse to
+// build with an unimplemented subcommand.)
 
 // ============================================================================
 // `aislang eval` — week 8 runner
