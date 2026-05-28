@@ -44,9 +44,32 @@ aislang apply examples/support-agent.ais
 # children for the duration of the session.
 aislang chat support examples/support-agent.ais
 
+# Run the declared evals against the deployed agent and print a
+# JSON report (per-case scores + trace URLs that deep-link into
+# the bundled Jaeger UI at localhost:16686 for each case).
+aislang eval examples/support-agent.ais
+
 # When you're done, tear it all down (containers + volumes).
 aislang destroy examples/support-agent.ais
 ```
+
+### Observability
+
+Every `aislang chat` and `aislang eval` invocation emits OpenTelemetry traces over OTLP/HTTP to the bundled Jaeger sidecar (`localhost:16686`). The trace tree mirrors the chat loop's structure — each user turn becomes one `aislang.turn` span, the tool-use loop fans out into `tool_use_iteration[N]` spans, and each iteration carries one `chat <model>` LLM call + zero-or-more `mcp <server>.<tool>` dispatch spans. Attributes follow the [OTel-GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, …) plus our own `mcp.*` namespace for tool calls (sizes only, never argument content — PII-safe by construction).
+
+After each command, the trace URL prints to stderr — paste it into a browser to see the full call hierarchy:
+
+```
+trace (eval `factual_accuracy`): http://localhost:16686/trace/7ca996386817d4859e6921c26245e4e3
+```
+
+`aislang eval`'s JSON report carries the same URLs as machine-readable fields so CI artifacts can link straight into Jaeger:
+
+```sh
+aislang eval examples/support-agent.ais | jq -r '.trace_url, .cases[].trace_url'
+```
+
+Override the Jaeger UI URL with `AISLANG_JAEGER_UI` (e.g. for a shared collector) or the OTLP endpoint with the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. v0.1 uses 100 % head sampling — eval volumes are small enough that the debuggability win pays for itself.
 
 ## How it works — the pipeline
 
