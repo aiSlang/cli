@@ -155,10 +155,33 @@ impl SpendTracker {
         Money::Capped { currency: Currency::Usd, micro_units: mu }
     }
 
+    /// Per-model breakdown of today's spend for this tracker's
+    /// project. Empty map when no data has been recorded yet. Used
+    /// by `aislang status --model-spend` (week 10 Thu).
+    pub fn today_by_model(&self) -> BTreeMap<String, Money> {
+        let day = utc_today();
+        let f   = self.file.lock().expect("spend file mutex");
+        let Some(p) = f.projects.get(&self.project_name) else { return BTreeMap::new(); };
+        let Some(e) = p.get(&day)                        else { return BTreeMap::new(); };
+        e.by_model.iter()
+            .map(|(k, &mu)| (k.clone(), Money::Capped {
+                currency: Currency::Usd,
+                micro_units: mu,
+            }))
+            .collect()
+    }
+
     /// Record one call's cost against today's spend + flush to disk
     /// atomically. `Money::Unlimited` costs are silently skipped
     /// (can't add unbounded to a finite total).
-    pub fn add(&self, call_cost: &Money) -> Result<(), SpendError> {
+    ///
+    /// `model_id_str` is the canonical `"<provider>.<name>"` form of
+    /// the model the call hit (week 10 Tue). Pass `""` (empty string)
+    /// when the model is unknown — the call still contributes to
+    /// `micro_units` but is NOT attributed in `by_model`. This is the
+    /// graceful-degradation path for tests and any future callers
+    /// that don't know the resolved model.
+    pub fn add(&self, model_id_str: &str, call_cost: &Money) -> Result<(), SpendError> {
         let mu = match call_cost.micro_units() {
             Some(m) => m,
             None    => return Ok(()),   // Unlimited: skip
@@ -175,6 +198,14 @@ impl SpendTracker {
             let by_day = f.projects.entry(self.project_name.clone()).or_default();
             let entry  = by_day.entry(day).or_insert_with(DayEntry::default);
             entry.micro_units = entry.micro_units.saturating_add(mu);
+            // Per-model attribution (week 10 Tue). Empty model_id_str
+            // means "caller doesn't know which model" — total still
+            // moves but no by_model bucket is touched (avoids polluting
+            // the map with `"" -> N` keys).
+            if !model_id_str.is_empty() {
+                let m_entry = entry.by_model.entry(model_id_str.to_owned()).or_insert(0);
+                *m_entry = m_entry.saturating_add(mu);
+            }
         }
         self.write_atomic()
     }
@@ -431,8 +462,8 @@ mod tests {
         let path = dir.join("spend.json");
         {
             let t = SpendTracker::at("demo", path.clone()).unwrap();
-            t.add(&Money::usd(1_200)).unwrap();
-            t.add(&Money::usd(800)).unwrap();
+            t.add("", &Money::usd(1_200)).unwrap();
+            t.add("", &Money::usd(800)).unwrap();
         }
         // Re-open via a fresh tracker — should see 2000 µ-USD.
         let t2 = SpendTracker::at("demo", path).unwrap();
@@ -446,7 +477,7 @@ mod tests {
         let dir  = tempdir();
         let path = dir.join("spend.json");
         let t = SpendTracker::at("demo", path).unwrap();
-        t.add(&Money::Unlimited).unwrap();
+        t.add("", &Money::Unlimited).unwrap();
         assert_eq!(t.today_spend(), Money::usd(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -458,7 +489,7 @@ mod tests {
         let dir  = tempdir();
         let path = dir.join("spend.json");
         let t = SpendTracker::at("demo", path.clone()).unwrap();
-        t.add(&Money::usd(0)).unwrap();
+        t.add("", &Money::usd(0)).unwrap();
         assert_eq!(t.today_spend(), Money::usd(0));
         assert!(!path.exists(),
             "zero-cost add must not write the file; got file at {}",
@@ -472,7 +503,7 @@ mod tests {
         let dir  = tempdir();
         let path = dir.join("spend.json");
         let t_a = SpendTracker::at("project_a", path.clone()).unwrap();
-        t_a.add(&Money::usd(100)).unwrap();
+        t_a.add("", &Money::usd(100)).unwrap();
         // Open a DIFFERENT project against the SAME file.
         let t_b = SpendTracker::at("project_b", path).unwrap();
         // project_b's spend is independent.
@@ -504,7 +535,7 @@ mod tests {
         let dir  = tempdir();
         let path = dir.join("spend.json");
         let t = SpendTracker::at("demo", path.clone()).unwrap();
-        t.add(&Money::usd(100)).unwrap();
+        t.add("", &Money::usd(100)).unwrap();
         // The .tmp.<pid> sibling should be gone after rename success.
         let entries: Vec<_> = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok())
@@ -534,9 +565,9 @@ mod tests {
         let dir  = tempdir();
         let path = dir.join("spend.json");
         let t = SpendTracker::at("demo", path.clone()).unwrap();
-        t.add(&Money::usd(100)).unwrap();
+        t.add("", &Money::usd(100)).unwrap();
         let after_first = std::fs::read_to_string(&path).unwrap();
-        t.add(&Money::usd(200)).unwrap();
+        t.add("", &Money::usd(200)).unwrap();
         let after_second = std::fs::read_to_string(&path).unwrap();
         // Both writes succeeded; running total is 300.
         assert!(after_first.contains("100"));
@@ -646,6 +677,94 @@ mod tests {
         // End-of-day rollover: one second past 23:59:59 → next-day 00:00:00.
         assert_eq!(utc_rfc3339_from_epoch_secs(base + 86_400),
                    "2026-05-21T00:00:00Z");
+    }
+
+    // ---- week 10 Tue: add() populates by_model when model_id_str is set ----
+
+    #[test] fn add_with_model_id_str_populates_by_model() {
+        // Happy path: the empty by_model becomes a single-entry map
+        // keyed by the canonical "<provider>.<name>" string.
+        let dir  = tempdir();
+        let path = dir.join("spend.json");
+        let t = SpendTracker::at("demo", path.clone()).unwrap();
+        t.add("anthropic.claude_haiku_4_5", &Money::usd(1_200)).unwrap();
+        let by = t.today_by_model();
+        assert_eq!(by.len(), 1);
+        assert_eq!(by.get("anthropic.claude_haiku_4_5"),
+            Some(&Money::usd(1_200)),
+            "by_model entry must match the canonical model id and full cost");
+        // Total moves too.
+        assert_eq!(t.today_spend(), Money::usd(1_200));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn add_with_empty_model_id_str_skips_by_model() {
+        // Graceful-degradation sentinel: an empty model_id_str means
+        // "caller doesn't know the model". Total still moves; by_model
+        // stays empty so we don't pollute the breakdown with a `"" -> N`
+        // bucket.
+        let dir  = tempdir();
+        let path = dir.join("spend.json");
+        let t = SpendTracker::at("demo", path.clone()).unwrap();
+        t.add("", &Money::usd(500)).unwrap();
+        assert_eq!(t.today_spend(), Money::usd(500));
+        assert!(t.today_by_model().is_empty(),
+            "empty model_id_str must not create a by_model bucket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn add_accumulates_per_model_across_calls() {
+        // Two calls to the same model → its by_model bucket sums; total
+        // sums to the same. Two calls to different models → two
+        // by_model buckets; total sums all.
+        let dir  = tempdir();
+        let path = dir.join("spend.json");
+        let t = SpendTracker::at("demo", path.clone()).unwrap();
+        t.add("anthropic.claude_haiku_4_5", &Money::usd(1_000)).unwrap();
+        t.add("anthropic.claude_haiku_4_5", &Money::usd(500)).unwrap();
+        t.add("openai.gpt_4o_mini",         &Money::usd(200)).unwrap();
+        let by = t.today_by_model();
+        assert_eq!(by.get("anthropic.claude_haiku_4_5"), Some(&Money::usd(1_500)));
+        assert_eq!(by.get("openai.gpt_4o_mini"),         Some(&Money::usd(200)));
+        assert_eq!(t.today_spend(),                       Money::usd(1_700),
+            "total = sum of by_model buckets (1500+200)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn today_by_model_empty_when_no_data() {
+        // Fresh tracker, no add() calls → today_by_model is empty.
+        let dir  = tempdir();
+        let path = dir.join("spend.json");
+        let t = SpendTracker::at("demo", path).unwrap();
+        assert!(t.today_by_model().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn add_unlimited_does_not_populate_by_model() {
+        // Unlimited is skipped silently (already pinned by
+        // add_unlimited_is_a_noop). Verify the by_model map ALSO
+        // stays empty — no half-state where total skipped but model
+        // bucket got 0.
+        let dir  = tempdir();
+        let path = dir.join("spend.json");
+        let t = SpendTracker::at("demo", path).unwrap();
+        t.add("anthropic.claude_haiku_4_5", &Money::Unlimited).unwrap();
+        assert!(t.today_by_model().is_empty());
+        assert_eq!(t.today_spend(), Money::usd(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test] fn add_zero_cost_does_not_populate_by_model() {
+        // Zero-cost (Ollama free-tier) skips disk write AND
+        // by_model attribution. The local-model path stays a
+        // by_model-free zone — keeps dashboards clean of "5 calls
+        // costing nothing" noise.
+        let dir  = tempdir();
+        let path = dir.join("spend.json");
+        let t = SpendTracker::at("demo", path).unwrap();
+        t.add("ollama.llama_3_1_8b", &Money::usd(0)).unwrap();
+        assert!(t.today_by_model().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test] fn rfc3339_now_has_z_suffix_and_t_separator() {

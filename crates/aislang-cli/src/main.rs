@@ -823,6 +823,14 @@ struct PreparedStack {
     /// `Some` when a lockfile was written; `None` when `--no-lock`.
     /// Apply doesn't expose `--no-lock` in v0.1 — it always reconciles.
     lock_path:           Option<PathBuf>,
+    /// Week 10 Tue: `aislang apply` reads these to populate the
+    /// state file (`.aislang/state.json`). `source` is held verbatim
+    /// rather than hashed eagerly so apply can compute `source_hash`
+    /// with the same sha256 helper the runtime uses for prompt
+    /// hashing — keeps "source identity" one consistent thing.
+    source:              String,
+    project_name:        String,
+    catalog_version:     String,
 }
 
 /// Run the plan pipeline up to (and including) the `aislang-compose`
@@ -915,6 +923,9 @@ fn prepare_stack(
         litellm_config_path,
         env_example_path,
         lock_path: lock_path_out,
+        source,
+        project_name:    project.name.clone(),
+        catalog_version: resolved.catalog_version.clone(),
     })
 }
 
@@ -955,6 +966,33 @@ fn run_apply(file: PathBuf) -> Result<()> {
         return Err(anyhow::anyhow!(
             "docker compose up -d exited {:?}", status.code()));
     }
+
+    // ── Write `.aislang/state.json` (week 10 Tue, Decision 26) ──
+    // Recorded after the stack is confirmed up so a failed
+    // `docker compose up -d` doesn't leave behind a misleading
+    // "applied" state. Failures here surface as a warning rather
+    // than aborting the apply — the stack IS up; we just couldn't
+    // persist the audit-trail record. Users can re-run apply or
+    // file the missing state manually.
+    let state_path = aislang_runtime::state_path_in(&prep.output_dir);
+    let source_hash = aislang_runtime::hex_sha256(prep.source.as_bytes());
+    let state = aislang_runtime::new_applied_state(
+        &prep.project_name,
+        source_hash,
+        &prep.catalog_version,
+        stack_path.clone(),
+    );
+    match aislang_runtime::write_state_atomic(&state_path, &state) {
+        Ok(()) => {
+            eprintln!("  state:     {}", state_path.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: stack is up but failed to write {}: {e}",
+                state_path.display());
+        }
+    }
+
     eprintln!();
     eprintln!("stack is up. next steps:");
     if let Some(agent) = first_agent_label_in_file(&file) {
@@ -1187,6 +1225,11 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
                 per_day_cap:        b.hard_cap_per_day,
                 cost_input_per_1k:  entry.cost_input,
                 cost_output_per_1k: entry.cost_output,
+                // Canonical model id form — matches `aislang.lock`'s
+                // `model_bindings` values verbatim. Week 10 Tue stamps
+                // this on every `SpendTracker::add()` so today's
+                // `by_model` breakdown stays accurate per Decision 32.
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
             })
         }
         None => None,
@@ -1723,6 +1766,7 @@ async fn run_eval_inner(
                 per_day_cap:        b.hard_cap_per_day,
                 cost_input_per_1k:  entry.cost_input,
                 cost_output_per_1k: entry.cost_output,
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
             })
         }
         None => None,
