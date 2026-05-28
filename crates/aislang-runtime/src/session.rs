@@ -298,6 +298,14 @@ pub struct BudgetConfig {
     pub cost_input_per_1k:  Money,
     /// Resolved primary model's `cost_output_per_1k_tokens`.
     pub cost_output_per_1k: Money,
+    /// Canonical `"<provider>.<name>"` form of the resolved primary
+    /// model (week 10 Tue). Stamped on each `SpendTracker::add()`
+    /// call so today's per-model breakdown stays accurate. Empty
+    /// string is the graceful-degradation sentinel — callers that
+    /// don't know the resolved model (programmatic uses, tests) leave
+    /// it empty and the call still moves the daily total without
+    /// polluting `by_model`.
+    pub model_id_str: String,
 }
 
 // ============================================================================
@@ -509,9 +517,13 @@ impl Session {
                 );
 
                 // (2) Daily tracker: persist BEFORE cap checks so
-                // even an aborting turn's cost lands on disk.
+                // even an aborting turn's cost lands on disk. Pass
+                // the resolved model id (`"<provider>.<name>"`) so
+                // `by_model` attribution stays accurate; the empty
+                // string is the graceful-degradation sentinel for
+                // programmatic uses that didn't populate it.
                 if let Some(tracker) = self.tracker.as_ref() {
-                    tracker.add(&call_cost)?;
+                    tracker.add(&budget.model_id_str, &call_cost)?;
                 }
 
                 // (3) Per-run cap (Wed)
@@ -1299,6 +1311,7 @@ mod tests {
             per_day_cap:        Money::Unlimited,    // no daily cap by default
             cost_input_per_1k:  Money::usd(800),     // $0.0008/1k
             cost_output_per_1k: Money::usd(4_000),   // $0.004/1k
+            model_id_str:       "anthropic.claude_haiku_4_5".into(),
         }
     }
 
@@ -1440,6 +1453,7 @@ mod tests {
             per_day_cap:        Money::Unlimited,
             cost_input_per_1k:  Money::usd(0),
             cost_output_per_1k: Money::usd(0),
+            model_id_str:       "ollama.llama_3_1_8b".into(),
         };
         let s = Session::open("fast", "sys", Some(&server.uri())).unwrap()
             .with_budget(ollama_budget);
@@ -1487,6 +1501,7 @@ mod tests {
             per_day_cap:        per_day,
             cost_input_per_1k:  Money::usd(800),
             cost_output_per_1k: Money::usd(4_000),
+            model_id_str:       "anthropic.claude_haiku_4_5".into(),
         }
     }
 

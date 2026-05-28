@@ -77,8 +77,22 @@ enum Command {
         file: PathBuf,
     },
     /// Tear down the deployed stack and free resources
+    ///
+    /// Idempotent: re-running destroy on an already-torn-down stack
+    /// exits 0 with a "nothing to destroy" message (week 10 Wed,
+    /// Decision 27). The state file at `.aislang/state.json` is the
+    /// source of truth — its `applied_at` field flips to null after
+    /// a successful tear-down. Re-applying recreates state.json with
+    /// a fresh timestamp.
     Destroy {
         file: PathBuf,
+        /// Run `docker compose down -v` against the stack.yml even when
+        /// the state file is absent or marked as torn down. Useful for
+        /// users who manually edited `.aislang/` away or who want to
+        /// re-run cleanup as a belt-and-suspenders measure on a
+        /// torn-down stack (Decision 29).
+        #[arg(long)]
+        force: bool,
     },
     /// Run declared evals against the deployed agent(s)
     ///
@@ -93,9 +107,46 @@ enum Command {
         /// Path to the .ais project file.
         file: PathBuf,
     },
-    /// Show projected and actual cost for the project
+    /// Show today's spend (per-model + total) and the budget caps for
+    /// the declared agent(s)
+    ///
+    /// Reads `~/.aislang/spend.json` (the persistent per-day spend
+    /// tracker written during `aislang chat` / `aislang eval` runs)
+    /// and renders today's UTC total alongside the per-model breakdown
+    /// (week 10 Tue's `by_model` attribution). Compares against the
+    /// `budget { hard_cap_per_run, hard_cap_per_day }` from the
+    /// project's .ais source. No network calls — read-only.
     Cost {
         file: PathBuf,
+    },
+    /// Show stack status, spend, and/or per-model breakdown for the
+    /// deployed agent(s)
+    ///
+    /// Reads `.aislang/state.json` (project-local, written by apply)
+    /// and `~/.aislang/spend.json` (global, written during chat/eval).
+    /// With no flags: renders stack status (state file + docker compose
+    /// ps). With `--spend`: appends today's UTC total. With
+    /// `--model-spend [MODEL]`: appends today's by-model breakdown,
+    /// optionally filtered to one model id.
+    ///
+    /// Exit codes (Decision 28):
+    ///   0  stack matches state (or no flags + state present + applied_at Some)
+    ///   1  drift — state missing, applied_at is None, or compose ps disagrees
+    ///   2  docker unavailable when a stack check was attempted
+    Status {
+        file: PathBuf,
+        /// Append today's total spend (read from `~/.aislang/spend.json`).
+        #[arg(long)]
+        spend: bool,
+        /// Append today's by-model spend breakdown. Filter to one
+        /// model id via `--model-spend=anthropic.claude_haiku_4_5`
+        /// (note the `=` — required to disambiguate from the
+        /// positional FILE argument), or pass bare `--model-spend`
+        /// to show all models recorded today.
+        #[arg(long = "model-spend", value_name = "MODEL",
+              num_args = 0..=1, default_missing_value = "",
+              require_equals = true)]
+        model_spend: Option<String>,
     },
     /// Open a CLI chat session against a deployed agent
     ///
@@ -113,7 +164,7 @@ enum Command {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             let msg = format!("{e:#}");
             // The sentinel "(see error above)" signals: subcommand
@@ -128,18 +179,27 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Validate { file, verbose }            => run_validate(file, verbose),
+    // Most subcommands return `Result<()>` and exit 0 on success;
+    // `status` returns `Result<ExitCode>` so it can surface
+    // Decision 28's 0/1/2 spectrum. `.map(|_| ExitCode::SUCCESS)`
+    // unifies the two shapes for the dispatch.
+    let code = match cli.command {
+        Command::Validate { file, verbose }            =>
+            run_validate(file, verbose).map(|_| ExitCode::SUCCESS)?,
         Command::Plan { file, verbose, no_lock, output_dir, smoke_test, smoke_test_live } =>
-            run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live),
-        Command::Apply { file }      => run_apply(file),
-        Command::Destroy { file }    => run_destroy(file),
-        Command::Eval { eval_label, file } => run_eval(eval_label, file),
-        Command::Cost { file: _ }    => stub("cost",    7),
-        Command::Chat { agent, file } => run_chat(agent, file),
-    }
+            run_plan(file, verbose, no_lock, output_dir, smoke_test, smoke_test_live)
+                .map(|_| ExitCode::SUCCESS)?,
+        Command::Apply { file }      => run_apply(file).map(|_| ExitCode::SUCCESS)?,
+        Command::Destroy { file, force } => run_destroy(file, force).map(|_| ExitCode::SUCCESS)?,
+        Command::Eval { eval_label, file } => run_eval(eval_label, file).map(|_| ExitCode::SUCCESS)?,
+        Command::Cost { file }       => run_cost(file).map(|_| ExitCode::SUCCESS)?,
+        Command::Status { file, spend, model_spend } =>
+            run_status(file, spend, model_spend)?,
+        Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
+    };
+    Ok(code)
 }
 
 fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
@@ -823,6 +883,14 @@ struct PreparedStack {
     /// `Some` when a lockfile was written; `None` when `--no-lock`.
     /// Apply doesn't expose `--no-lock` in v0.1 — it always reconciles.
     lock_path:           Option<PathBuf>,
+    /// Week 10 Tue: `aislang apply` reads these to populate the
+    /// state file (`.aislang/state.json`). `source` is held verbatim
+    /// rather than hashed eagerly so apply can compute `source_hash`
+    /// with the same sha256 helper the runtime uses for prompt
+    /// hashing — keeps "source identity" one consistent thing.
+    source:              String,
+    project_name:        String,
+    catalog_version:     String,
 }
 
 /// Run the plan pipeline up to (and including) the `aislang-compose`
@@ -915,6 +983,9 @@ fn prepare_stack(
         litellm_config_path,
         env_example_path,
         lock_path: lock_path_out,
+        source,
+        project_name:    project.name.clone(),
+        catalog_version: resolved.catalog_version.clone(),
     })
 }
 
@@ -955,6 +1026,33 @@ fn run_apply(file: PathBuf) -> Result<()> {
         return Err(anyhow::anyhow!(
             "docker compose up -d exited {:?}", status.code()));
     }
+
+    // ── Write `.aislang/state.json` (week 10 Tue, Decision 26) ──
+    // Recorded after the stack is confirmed up so a failed
+    // `docker compose up -d` doesn't leave behind a misleading
+    // "applied" state. Failures here surface as a warning rather
+    // than aborting the apply — the stack IS up; we just couldn't
+    // persist the audit-trail record. Users can re-run apply or
+    // file the missing state manually.
+    let state_path = aislang_runtime::state_path_in(&prep.output_dir);
+    let source_hash = aislang_runtime::hex_sha256(prep.source.as_bytes());
+    let state = aislang_runtime::new_applied_state(
+        &prep.project_name,
+        source_hash,
+        &prep.catalog_version,
+        stack_path.clone(),
+    );
+    match aislang_runtime::write_state_atomic(&state_path, &state) {
+        Ok(()) => {
+            eprintln!("  state:     {}", state_path.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: stack is up but failed to write {}: {e}",
+                state_path.display());
+        }
+    }
+
     eprintln!();
     eprintln!("stack is up. next steps:");
     if let Some(agent) = first_agent_label_in_file(&file) {
@@ -964,19 +1062,65 @@ fn run_apply(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// `aislang destroy <file>` — locate the stack.yml emitted by apply
-/// and run `docker compose down -v`.
-fn run_destroy(file: PathBuf) -> Result<()> {
+/// `aislang destroy <file> [--force]` — locate the stack.yml emitted
+/// by apply and run `docker compose down -v`. Idempotent per
+/// Decision 27 + 29 (week 10 Wed): re-running on an already-torn-down
+/// stack exits 0; absent stack.yml AND absent state file is also a
+/// clean exit 0. `--force` bypasses state-file existence checks and
+/// runs the compose down anyway (when stack.yml exists).
+fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
     let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
         anyhow::anyhow!("source directory `{}` not readable: {e}",
             source_dir.display())
     })?;
     let stack_path = output_dir.join(aislang_compose::STACK_YAML_FILENAME);
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+
+    // ── Idempotency check (Decision 27) ─────────────────────────
+    // The state file's `applied_at` is the source of truth for
+    // "is this stack currently considered up". --force skips this
+    // check entirely.
+    if !force {
+        match aislang_runtime::read_state(&state_path) {
+            Ok(Some(state)) if state.applied_at.is_none() => {
+                // Already torn down. Idempotent success — important
+                // for CI cleanup pipelines that re-run destroy without
+                // tracking whether they've already run it.
+                eprintln!("nothing to destroy: state file at `{}` shows the \
+                           stack was already torn down.", state_path.display());
+                eprintln!("(pass --force to run `docker compose down -v` \
+                           against `{}` anyway.)", stack_path.display());
+                return Ok(());
+            }
+            Ok(None) if !stack_path.exists() => {
+                // No state file AND no stack.yml — nothing was ever
+                // applied to this directory. Exit 0 with a hint.
+                eprintln!("nothing to destroy: neither `{}` nor `{}` exists.",
+                    state_path.display(), stack_path.display());
+                eprintln!("(if the stack IS up but state was lost, pass \
+                           --force to attempt cleanup via the stack.yml \
+                           — you'll need to recreate stack.yml first via \
+                           `aislang plan -o {}` or `aislang apply`.)",
+                    output_dir.display());
+                return Ok(());
+            }
+            Ok(_)  => {}   // applied_at = Some, OR state missing but stack.yml present — proceed.
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "read state file `{}`: {e}\n\
+                     (pass --force to ignore the state file and tear \
+                     down via stack.yml directly)",
+                    state_path.display()));
+            }
+        }
+    }
+
+    // ── Stack.yml is required for the actual docker compose down ──
     if !stack_path.exists() {
         return Err(anyhow::anyhow!(
-            "no stack.yml at `{}` — run `aislang apply {}` first \
-             (or the stack was already destroyed)",
+            "no stack.yml at `{}` — run `aislang apply {}` to recreate \
+             it, then re-run destroy",
             stack_path.display(), file.display()));
     }
     if !docker_on_path() {
@@ -995,6 +1139,17 @@ fn run_destroy(file: PathBuf) -> Result<()> {
         return Err(anyhow::anyhow!(
             "docker compose down -v exited {:?}", status.code()));
     }
+
+    // ── Mark state torn down (Decision 27) ──────────────────────
+    // `applied_at` flips to None. No-op when state file is absent
+    // (user is using --force without ever having had a state file,
+    // e.g. they pre-date week 10). Failures here log-and-continue
+    // — the stack IS down; we just couldn't update the audit-trail.
+    if let Err(e) = aislang_runtime::mark_state_torn_down(&state_path) {
+        eprintln!("warning: stack torn down but failed to update state \
+                   file `{}`: {e}", state_path.display());
+    }
+
     eprintln!();
     eprintln!("stack torn down — containers, networks, and volumes removed.");
     eprintln!("the stack.yml file is preserved; remove it manually if desired:");
@@ -1022,6 +1177,348 @@ fn first_agent_label_in_file(file: &Path) -> Option<String> {
     let source = std::fs::read_to_string(file).ok()?;
     let (project, _) = aislang_core::validate(&source).ok()?;
     project.agents.first().map(|a| a.label.clone())
+}
+
+// ============================================================================
+// `aislang cost` — week 10 Tue extra (was stubbed since week 7)
+// ============================================================================
+//
+// Read-only command: surfaces today's UTC spend (total + per-model
+// breakdown) for the project, plus the static `budget {…}` caps from
+// the .ais source. Pairs the persistent `~/.aislang/spend.json`
+// tracker (week 7 Thu) with the new `by_model` attribution
+// (week 10 Tue, Decision 32). No network, no docker — fully offline.
+//
+// Output is plain text on stdout, dollar-formatted via the same
+// `cost::format_money` helper the rest of the CLI uses. Designed for
+// `aislang cost foo.ais | grep total` ergonomics; v0.2 may add
+// `--json` for CI pipelines.
+
+fn run_cost(file: PathBuf) -> Result<()> {
+    // Validate so the user sees the same diagnostics they'd see on
+    // `aislang validate` if the source is broken. Cheap; the cost
+    // command is rare so we don't optimize away the parse.
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    // Open the tracker read-only — `open_default` reads
+    // ~/.aislang/spend.json if present, else seeds an empty one in
+    // memory (doesn't write anything until add() is called, which
+    // we never do here).
+    let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+        .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+    let today_total    = tracker.today_spend();
+    let today_by_model = tracker.today_by_model();
+
+    use aislang_runtime::format_money;
+    println!("project:    {}", project.name);
+    println!("spend file: {}", tracker.path().display());
+    println!();
+    println!("today's spend ({}):", aislang_runtime::spend::utc_today());
+    println!("  total:   {}", format_money(&today_total));
+    if today_by_model.is_empty() {
+        println!("  by model: (no per-model attribution yet — \
+                   spend.json may predate week-10 Tue, or no chat/eval \
+                   run has recorded a cost today)");
+    } else {
+        println!("  by model:");
+        // Find the longest key for column alignment — keeps the
+        // output readable when model ids vary in length.
+        let pad = today_by_model.keys().map(|k| k.len()).max().unwrap_or(0);
+        for (model, amount) in &today_by_model {
+            println!("    {model:<pad$}  {}", format_money(amount));
+        }
+    }
+
+    println!();
+    println!("budget caps (from {}):", file.display());
+    match project.budget.as_ref() {
+        Some(b) => {
+            println!("  per-run cap:  {}", format_money(&b.hard_cap_per_run));
+            println!("  per-day cap:  {}", format_money(&b.hard_cap_per_day));
+            // Day-cap utilization, when both caps are Capped and
+            // non-zero. Round to whole percent — over-precision
+            // here implies a confidence in micro-USD accuracy that
+            // upstream providers don't actually give us.
+            if let (Some(cap_mu), Some(spent_mu)) =
+                (b.hard_cap_per_day.micro_units(), today_total.micro_units())
+            {
+                if cap_mu > 0 {
+                    let pct = (spent_mu as f64 / cap_mu as f64) * 100.0;
+                    println!("  used today:   {pct:.1}%");
+                }
+            }
+        }
+        None => {
+            println!("  (no `budget {{ … }}` block in source — caps not enforced)");
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// `aislang status` — week 10 Thu (Decision 28 revised)
+// ============================================================================
+//
+// Three sections, gated by flags:
+//   default (no flag): stack status from state.json + `docker compose ps`
+//   --spend          : append today's UTC total from spend.json
+//   --model-spend [M]: append today's by-model breakdown (filter to M
+//                       when a value is given; show all otherwise)
+//
+// Flags compose: `--spend --model-spend` renders the stack section,
+// then the total, then the per-model breakdown.
+//
+// Exit codes (Decision 28):
+//   0  stack OK (state present + applied_at Some + compose ps clean
+//      OR no stack section requested but spend section rendered)
+//   1  drift — state file absent, applied_at == None, or compose ps
+//      shows services down
+//   2  docker unavailable when a stack check was attempted
+
+fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result<ExitCode> {
+    // Validate so the user sees the same diagnostics as `aislang validate`
+    // when the source is broken. Status is rare; the parse cost is
+    // immaterial.
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    // canonicalize() fails on a missing dir; degrade to the raw path
+    // so the diagnostic still mentions a useful location.
+    let output_dir = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.to_path_buf());
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+    let stack_path = output_dir.join(aislang_compose::STACK_YAML_FILENAME);
+
+    // Drift accumulator — any section that detects a problem flips
+    // this. We render ALL requested sections regardless, then exit
+    // with the appropriate non-zero code at the end so users see
+    // the full state in one shot.
+    let mut drift = false;
+    let mut docker_unavailable_for_stack = false;
+
+    // ── Section 1: stack status ────────────────────────────────
+    println!("project:  {}", project.name);
+    println!("source:   {}", file.display());
+    println!();
+    println!("stack:");
+    match aislang_runtime::read_state(&state_path) {
+        Ok(Some(state)) => {
+            match state.applied_at {
+                Some(ref ts) => {
+                    println!("  applied_at:      {ts}");
+                    println!("  catalog_version: {}", state.catalog_version);
+                    println!("  source_hash:     {}", short_hash(&state.source_hash));
+                    println!("  stack.yml:       {}", state.stack_yaml_path.display());
+
+                    if stack_path.exists() && docker_on_path() {
+                        match docker_compose_ps_json(&stack_path) {
+                            Ok(rows) => render_service_rows(&rows, &mut drift),
+                            Err(e) => {
+                                println!("  services: (failed to query docker: {e})");
+                                drift = true;
+                            }
+                        }
+                    } else if !docker_on_path() {
+                        println!("  services: (docker not on PATH — cannot query live status)");
+                        docker_unavailable_for_stack = true;
+                    } else {
+                        println!("  services: (stack.yml missing at `{}`)", stack_path.display());
+                        drift = true;
+                    }
+                }
+                None => {
+                    println!("  status:  torn down (applied_at: null)");
+                    println!("  catalog_version: {}", state.catalog_version);
+                    println!("  hint:    `aislang apply {}` to redeploy", file.display());
+                    drift = true;
+                }
+            }
+        }
+        Ok(None) => {
+            println!("  status:  not applied (no state file at `{}`)", state_path.display());
+            println!("  hint:    `aislang apply {}` to deploy the stack", file.display());
+            drift = true;
+        }
+        Err(e) => {
+            println!("  status:  ERROR reading state file: {e}");
+            drift = true;
+        }
+    }
+
+    // ── Section 2: --spend total ───────────────────────────────
+    if spend {
+        let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+        println!();
+        println!("spend ({} UTC):", aislang_runtime::spend::utc_today());
+        let total = tracker.today_spend();
+        println!("  total:   {}", aislang_runtime::format_money(&total));
+        // Show the % of per-day cap when budget present + cap is Capped.
+        if let Some(b) = project.budget.as_ref() {
+            if let (Some(cap_mu), Some(spent_mu)) =
+                (b.hard_cap_per_day.micro_units(), total.micro_units())
+            {
+                if cap_mu > 0 {
+                    let pct = (spent_mu as f64 / cap_mu as f64) * 100.0;
+                    println!("  cap:     {} ({pct:.1}% used)",
+                        aislang_runtime::format_money(&b.hard_cap_per_day));
+                }
+            }
+        }
+    }
+
+    // ── Section 3: --model-spend [MODEL] breakdown ─────────────
+    if let Some(filter) = model_spend {
+        let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+        let by_model = tracker.today_by_model();
+        println!();
+        if filter.is_empty() {
+            println!("spend by model ({} UTC):", aislang_runtime::spend::utc_today());
+        } else {
+            println!("spend for model `{}` ({} UTC):",
+                filter, aislang_runtime::spend::utc_today());
+        }
+        if by_model.is_empty() {
+            println!("  (no spend recorded today)");
+        } else if filter.is_empty() {
+            // All models. Sort by amount descending for readability.
+            let mut rows: Vec<_> = by_model.iter().collect();
+            rows.sort_by(|a, b| b.1.micro_units().cmp(&a.1.micro_units()));
+            let pad = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+            for (model, amount) in rows {
+                println!("  {model:<pad$}  {}",
+                    aislang_runtime::format_money(amount));
+            }
+        } else {
+            match by_model.get(&filter) {
+                Some(amount) => {
+                    println!("  {}", aislang_runtime::format_money(amount));
+                }
+                None => {
+                    println!("  (no spend recorded for `{filter}` today)");
+                    // NOT drift — absent model just means the agent
+                    // didn't use that one today. v0.2 might warn when
+                    // the requested model isn't in the project's
+                    // resolved model set at all.
+                }
+            }
+        }
+    }
+
+    // ── Exit code resolution ───────────────────────────────────
+    // Decision 28: 0/1/2. Docker-unavailable takes precedence over
+    // generic drift — the user needs to fix docker before drift
+    // diagnostics are meaningful.
+    Ok(if docker_unavailable_for_stack {
+        ExitCode::from(2)
+    } else if drift {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Display the first 12 hex chars of the source hash for the status
+/// summary. Full 64-char hash is in the state file for audit; the
+/// truncated form keeps the human-readable summary scannable.
+fn short_hash(full: &str) -> String {
+    if full.len() >= 12 {
+        format!("{}…", &full[..12])
+    } else {
+        full.to_owned()
+    }
+}
+
+/// Minimal compose-ps JSON line. Docker emits `--format json` as
+/// NDJSON in 24+; older versions emit a JSON array. We tolerate both.
+#[derive(serde::Deserialize)]
+struct ComposeService {
+    #[serde(rename = "Name", alias = "name", default)]
+    name:    String,
+    #[serde(rename = "Service", alias = "service", default)]
+    service: String,
+    #[serde(rename = "State",   alias = "state",   default)]
+    state:   String,
+    #[serde(rename = "Status",  alias = "status",  default)]
+    status:  String,
+}
+
+/// Query `docker compose -f <stack_path> ps --format json` and parse
+/// the result. Tolerates both NDJSON (Docker Compose v2.24+) and
+/// JSON-array (older) output shapes.
+fn docker_compose_ps_json(stack_path: &Path) -> anyhow::Result<Vec<ComposeService>> {
+    let out = std::process::Command::new("docker")
+        .args(["compose", "-f"])
+        .arg(stack_path)
+        .args(["ps", "--format", "json"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("invoke docker compose ps: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "docker compose ps exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let body = body.trim();
+    if body.is_empty() { return Ok(Vec::new()); }
+    // Try JSON-array first (older), then NDJSON (newer).
+    if body.starts_with('[') {
+        let v: Vec<ComposeService> = serde_json::from_str(body)
+            .map_err(|e| anyhow::anyhow!("parse compose ps json array: {e}"))?;
+        Ok(v)
+    } else {
+        let mut rows = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let row: ComposeService = serde_json::from_str(line)
+                .map_err(|e| anyhow::anyhow!("parse compose ps json line `{line}`: {e}"))?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+/// Render a `services:` sub-block for the stack section, flipping
+/// `drift` when any service isn't in a healthy state.
+fn render_service_rows(rows: &[ComposeService], drift: &mut bool) {
+    if rows.is_empty() {
+        println!("  services: (none running — compose ps returned empty)");
+        *drift = true;
+        return;
+    }
+    println!("  services:");
+    let pad = rows.iter()
+        .map(|r| if r.service.is_empty() { r.name.len() } else { r.service.len() })
+        .max().unwrap_or(0);
+    for r in rows {
+        let label = if r.service.is_empty() { &r.name } else { &r.service };
+        // `state` is the canonical lowercase form; `status` is the
+        // human-readable string ("Up 5 minutes"). Prefer state for
+        // the drift check, status for the display.
+        let is_up = matches!(r.state.as_str(), "running" | "Up" | "up");
+        let mark  = if is_up { "✓" } else { "✗" };
+        println!("    {mark} {label:<pad$}  {}", r.status);
+        if !is_up { *drift = true; }
+    }
 }
 
 // ============================================================================
@@ -1187,6 +1684,11 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
                 per_day_cap:        b.hard_cap_per_day,
                 cost_input_per_1k:  entry.cost_input,
                 cost_output_per_1k: entry.cost_output,
+                // Canonical model id form — matches `aislang.lock`'s
+                // `model_bindings` values verbatim. Week 10 Tue stamps
+                // this on every `SpendTracker::add()` so today's
+                // `by_model` breakdown stays accurate per Decision 32.
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
             })
         }
         None => None,
@@ -1516,10 +2018,11 @@ fn print_summary(project: &aislang_core::ast::Project) {
     }
 }
 
-fn stub(cmd: &str, week: u8) -> Result<()> {
-    println!("aislang {cmd}: not implemented yet (scheduled for week {week} — see PLAN-90-days.md)");
-    Ok(())
-}
+// (`stub` helper removed week 10 Tue — every subcommand is now wired
+// to its real implementation. v0.2 commands that need placeholders
+// should declare them in `Command` then route to a fresh inline
+// helper, not bring this back; the type-checker should refuse to
+// build with an unimplemented subcommand.)
 
 // ============================================================================
 // `aislang eval` — week 8 runner
@@ -1723,6 +2226,7 @@ async fn run_eval_inner(
                 per_day_cap:        b.hard_cap_per_day,
                 cost_input_per_1k:  entry.cost_input,
                 cost_output_per_1k: entry.cost_output,
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
             })
         }
         None => None,

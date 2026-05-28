@@ -1,0 +1,223 @@
+# aiSlang release pipeline — PLAN-90-days.md §Week 11 Tue,
+# Decisions 36 + 38.
+#
+# On tag `v[0-9]+.[0-9]+.[0-9]+*`:
+#   1. Cross-compile `aislang` to four targets:
+#        - x86_64-unknown-linux-gnu   (native on ubuntu-latest)
+#        - aarch64-unknown-linux-gnu  (cross via `cross` on ubuntu-latest)
+#        - x86_64-apple-darwin        (rustup cross-target on macos-latest arm64)
+#        - aarch64-apple-darwin       (native on macos-latest arm64)
+#   2. Package each as `aislang-<version>-<target>.tar.gz`.
+#   3. Generate a `checksums.txt` (sha256 of every tarball).
+#   4. Attach all five files to a GitHub Release **draft** — we
+#      promote the draft to published manually after the cold-VM
+#      install rehearsal (Decision 38).
+#
+# Risk-1 mitigation: aarch64-darwin built natively on macos-latest
+# (which runs arm64 in the github-hosted runner pool); we never
+# cross-compile darwin from linux. See PLAN §Week 11 risks.
+#
+# Dry-run via `workflow_dispatch` with an arbitrary `tag` input —
+# useful for verifying matrix changes without burning a real tag.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and attach the release draft to (e.g. v0.1.0-rc1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write          # required for `gh release create`
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  BIN: aislang
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Per-target build job. Matrix fans out four ways.
+  # ──────────────────────────────────────────────────────────────
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os:    ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os:    ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os:    macos-latest
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os:    macos-latest
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # `cross` builds Linux aarch64 inside an x86_64 Docker image
+      # with the aarch64 toolchain — works reliably on github-hosted
+      # ubuntu-latest. We only install it where we need it.
+      - name: Install `cross` (Linux cross-targets only)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # Native or rustup-cross-target build (linux x86_64 + both darwins).
+      - name: cargo build --release
+        if: '!matrix.use_cross'
+        run: cargo build --release --locked --bin ${{ env.BIN }} --target ${{ matrix.target }}
+
+      # Docker-based cross build (linux aarch64).
+      - name: cross build --release
+        if: matrix.use_cross
+        run: cross build --release --locked --bin ${{ env.BIN }} --target ${{ matrix.target }}
+
+      # ─── Package ────────────────────────────────────────────────
+      # Resolve the version string. For tag pushes,
+      # GITHUB_REF_NAME is `v0.1.0` etc.; for workflow_dispatch the
+      # input is passed verbatim. Strip the leading `v` for the
+      # filename so it reads `aislang-0.1.0-<target>.tar.gz`.
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          STAGE="${BIN}-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${{ matrix.target }}/release/${BIN}" "dist/${STAGE}/"
+          # Include README + LICENSE when present. README is committed;
+          # LICENSE is currently a v0.1 gap (Cargo.toml declares
+          # Apache-2.0 but the text file isn't in the repo yet —
+          # tracked as a Week 11 follow-up). The `|| true` keeps
+          # the package step from breaking once LICENSE lands.
+          cp README.md "dist/${STAGE}/" || true
+          cp LICENSE   "dist/${STAGE}/" 2>/dev/null || true
+          tar -czf "dist/${STAGE}.tar.gz" -C dist "${STAGE}"
+          ls -la "dist/${STAGE}.tar.gz"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ env.BIN }}-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────
+  # Aggregate the four tarballs, generate checksums, create the
+  # release draft on GitHub. Runs once after all matrix builds.
+  # ──────────────────────────────────────────────────────────────
+  release:
+    name: publish release draft
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Generate checksums.txt
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz | sort -k 2 > checksums.txt
+          echo "── checksums.txt ──"
+          cat checksums.txt
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${{ steps.tag.outputs.version }}"
+
+          # Idempotent: if the draft already exists (e.g. a rerun of
+          # a workflow_dispatch dry-run), delete and recreate it so
+          # the tarball list always matches THIS build.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; deleting + recreating"
+            gh release delete "$TAG" --yes --cleanup-tag=false
+          fi
+
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<EOF
+          aiSlang $TAG — v0.1 internal milestone.
+
+          See \`PLAN-90-days.md\` §Week 11 for the close-out plan.
+          This is a tagged internal release, not a public launch
+          (which is gated on v0.2's commercial-moat features and
+          v0.3's docs site).
+
+          ## Install
+
+          \`\`\`sh
+          curl -sSfL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | sh
+          \`\`\`
+
+          Or download the matching tarball below, verify against
+          \`checksums.txt\`, untar, and place \`aislang\` on your PATH.
+
+          ## Artifacts
+
+          | Target | Notes |
+          |---|---|
+          | \`aislang-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\`  | Linux x86_64 |
+          | \`aislang-${VERSION}-aarch64-unknown-linux-gnu.tar.gz\` | Linux ARM64 |
+          | \`aislang-${VERSION}-x86_64-apple-darwin.tar.gz\`       | macOS Intel |
+          | \`aislang-${VERSION}-aarch64-apple-darwin.tar.gz\`      | macOS Apple Silicon |
+          | \`checksums.txt\`                                         | sha256 of every tarball |
+          EOF
+
+          gh release create "$TAG" \
+            --draft \
+            --title "aislang $TAG" \
+            --notes-file "$NOTES_FILE" \
+            dist/*.tar.gz dist/checksums.txt
+          rm -f "$NOTES_FILE"
+          echo
+          echo "Draft created at: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          echo "Promote to published after cold-VM install rehearsal (PLAN §Week 11 Decision 38)."

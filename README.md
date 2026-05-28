@@ -71,6 +71,151 @@ aislang eval examples/support-agent.ais | jq -r '.trace_url, .cases[].trace_url'
 
 Override the Jaeger UI URL with `AISLANG_JAEGER_UI` (e.g. for a shared collector) or the OTLP endpoint with the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. v0.1 uses 100 % head sampling — eval volumes are small enough that the debuggability win pays for itself.
 
+## Commands
+
+`aislang` exposes eight subcommands. Four are read-only / offline (`validate`, `plan`, `cost`, `status`); four shell out to `docker compose` and the running LiteLLM router (`apply`, `destroy`, `chat`, `eval`). Run `aislang <cmd> --help` for the full flag list — the table is a quick reference, the flowcharts below show each command's decision tree.
+
+| Command | Synopsis | What it does |
+|---|---|---|
+| `validate` | `aislang validate [-v…] <file>` | Parse, type-check, and catalog-id-check the .ais source. No network, no writes. |
+| `plan`     | `aislang plan [-v…] [--no-lock] [-o DIR] [--smoke-test] [--smoke-test-live] <file>` | Resolve models, reconcile `aislang.lock`, emit Compose YAML to stdout + `litellm_config.yaml` + `.env.example` to disk. Optional tiered smoke test. |
+| `apply`    | `aislang apply <file>` | Run `plan` internals, write `stack.yml`, then `docker compose up -d` and record `.aislang/state.json`. |
+| `destroy`  | `aislang destroy [--force] <file>` | `docker compose down -v` against the recorded stack. Idempotent — re-runs on a torn-down stack exit 0. |
+| `chat`     | `aislang chat <agent> <file>` | Open an interactive REPL against the deployed LiteLLM, spawning declared MCP servers as stdio children for the session. Tool-use loop hard-capped at 8 iterations. |
+| `eval`     | `aislang eval [-e <label>] <file>` | Run every `eval` block (or one named via `-e`) against the deployed agent. JSON `EvalReport` on stdout; per-case `trace_url`s deep-link into Jaeger. Exit 1 if any eval fails threshold. |
+| `cost`     | `aislang cost <file>` | Print today's UTC spend (total + per-model) from `~/.aislang/spend.json` against the budget caps in the source. Read-only. |
+| `status`   | `aislang status [--spend] [--model-spend[=MODEL]] <file>` | Render stack health (state file + `docker compose ps`), optionally with spend sections. Exit `0/1/2` for clean / drift / docker-unavailable. |
+
+### Flowcharts
+
+Per-command decision trees, in the tree style used elsewhere in the docs for `destroy`'s idempotency design.
+
+#### `validate`
+
+```
+read source
+└── aislang_core::validate                          (lex → parse → typecheck)
+    └── aislang_resolver::check_against_bundled_catalog   (verify catalog IDs)
+        ├── error  → render source-aware snippet → exit 1
+        └── ok     → "OK: <file> parsed and type-checked"   (exit 0)
+                     ├── -v    resource counts + stage timings (stderr)
+                     ├── -vv   AST Debug + resource-graph Debug
+                     └── -vvv  full AST + graph as JSON IR
+```
+
+#### `plan`
+
+```
+validate → catalog check → resolve → lockfile reconcile → emit
+                                       ├── Match  → reuse cached bindings
+                                       ├── Fresh  → write aislang.lock
+                                       └── Stale  → rewrite (-v shows reasons)
+                                                    (skipped under --no-lock)
+   stdout: docker-compose YAML
+   stderr: paths of <out>/litellm_config.yaml + .env.example + aislang.lock,
+           warnings, optional verbose tail (-v stage timings;
+           -vv ResolvedProject Debug; -vvv combined JSON IR)
+
+   --smoke-test       → pipe YAML through `docker compose -f - config -q`
+                        (docker missing → exit 0 "skipped")
+   --smoke-test-live  → docker compose up -d
+                        → poll :4000 readiness
+                        → real /v1/chat/completions vs. first resolved model
+                        → docker compose down -v   (ALWAYS, even on failure)
+```
+
+#### `apply`
+
+```
+plan internals  (validate → resolve → emit)
+   └── write <source_dir>/stack.yml
+       └── docker on PATH?
+           ├── no   → exit 0, print manual "docker compose -f stack.yml up -d" hint
+           └── yes  → docker compose -f stack.yml up -d
+                       └── write .aislang/state.json
+                              (applied_at = now, source_hash, catalog_version)
+                           └── print "stack is up" + next-step `chat` / `destroy` hints
+```
+
+#### `destroy`
+
+```
+read .aislang/state.json
+├── applied_at == None    → exit 0 "already torn down"      [no docker]
+├── absent + no stack.yml → exit 0 "nothing to destroy"     [no docker]
+├── absent + stack.yml present  (v0.0.x back-compat)  → proceed
+├── applied_at == Some    → proceed
+│       └── docker compose -f stack.yml down -v
+│           └── mark_torn_down() → applied_at = None
+└── --force               → skip everything above, just proceed
+```
+
+#### `chat`
+
+```
+validate → find agent  (Levenshtein "did you mean…?" on miss)
+   └── resolve model + system_prompt
+       └── verify prompt hash against aislang.lock  (when present)
+           └── spawn MCP stdio children — one per agent.tools[mcp_server.<X>]
+               └── list_tools per server → ToolRegistry
+                   └── open Session → LiteLLM @ localhost:4000
+                       └── stdin loop:
+                           read line → turn → assistant reply
+                                       └── tool-use loop, hard cap = 8 iters
+                                                          (Decision 4)
+                           /exit or EOF → shutdown MCP children, flush trace,
+                                          print Jaeger URL on stderr
+```
+
+#### `eval`
+
+```
+validate → filter to requested eval(s)
+              ├── -e <label>  → that one
+              └── (no flag)   → every `eval` block
+                  │
+                  ▼ per eval (RootSpan = aislang.eval):
+              resolve agent + prompt + budget + MCP servers
+                  └── open Session
+                      └── for each case in dataset (JSONL):
+                          open `aislang.case` span → run turn
+                              → score with metric (exact_match | f1)
+                          aggregate (mean) vs. threshold
+                              ├── ≥ → eval pass
+                              └── < → eval fail
+   stdout: EvalReport JSON  (cases[], trace_url, per-case trace_urls)
+   stderr: per-case progress + PASS/FAIL summary
+   exit:   0 iff every eval passed its threshold   (Decision 16)
+```
+
+#### `cost`
+
+```
+validate → open ~/.aislang/spend.json   (read-only)
+   └── today's UTC total + by_model breakdown
+       └── compare to source's `budget { hard_cap_per_run, hard_cap_per_day }`
+           └── stdout: spend report + day-cap utilization %
+                       (no network, no docker)
+```
+
+#### `status`
+
+```
+validate → read .aislang/state.json + check stack.yml
+   ├── state missing            → "not applied"   (drift, exit 1)
+   ├── applied_at == None       → "torn down"     (drift, exit 1)
+   └── applied_at == Some
+         └── docker on PATH?
+             ├── no  → "(cannot query live status)"   (exit 2)
+             └── yes → docker compose -f stack.yml ps --format json
+                       ├── any service ≠ running     (drift, exit 1)
+                       └── all running               (clean, exit 0)
+
+   --spend                → append today's total + cap utilization %
+   --model-spend[=MODEL]  → append today's by-model breakdown
+                            (=MODEL filters to one; bare flag shows all)
+```
+
 ## How it works — the pipeline
 
 aiSlang is a *compile-then-deploy* tool, not an interpreter. A single `.ais` source file describes the whole AI infrastructure — models, agents, prompts, MCP servers, evals, budgets, deploy target. The CLI compiles it through four stages, then hands the resulting standard-format artifacts to your platform of choice.

@@ -143,21 +143,21 @@ fn bin_no_docker() -> Command {
 // destroy — without prior apply, without docker, etc.
 // ---------------------------------------------------------------------------
 
-#[test] fn destroy_without_prior_apply_errors_with_clear_message() {
-    // No stack.yml in the source dir → clean error pointing at
-    // `aislang apply` as the fix.
+#[test] fn destroy_without_prior_apply_exits_zero_idempotently() {
+    // Week 10 Wed: no stack.yml AND no state file → exit 0 with a
+    // "nothing to destroy" message. CI cleanup pipelines re-run
+    // destroy without tracking state; that path must succeed.
     let ais = tempdir_with_project("destroy-no-prior-apply");
     let dir = ais.parent().unwrap().to_path_buf();
     let out = bin_no_docker().args(["destroy"]).arg(&ais).output()
         .expect("spawn");
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(!out.status.success(),
-        "destroy must fail when stack.yml is missing");
+    assert!(out.status.success(),
+        "destroy with nothing to tear down must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no stack.yml"),
-        "stderr must explain stack.yml is missing; got:\n{stderr}");
-    assert!(stderr.contains("aislang apply"),
-        "stderr must point at apply as the fix; got:\n{stderr}");
+    assert!(stderr.contains("nothing to destroy"),
+        "stderr must explain there's nothing to destroy; got:\n{stderr}");
 }
 
 #[test] fn destroy_without_docker_errors_with_clear_message() {
@@ -183,6 +183,153 @@ fn bin_no_docker() -> Command {
         .output().expect("spawn");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not readable") || stderr.contains("no stack.yml"),
+    assert!(stderr.contains("not readable")
+            || stderr.contains("nothing to destroy"),
         "stderr must explain the failure; got:\n{stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// destroy idempotency (week 10 Wed, Decisions 27 + 29)
+// ---------------------------------------------------------------------------
+
+/// Helper: seed a `.aislang/state.json` with the given `applied_at`
+/// (Some for "up", None for "torn down").
+fn write_state(dir: &std::path::Path, applied_at: Option<&str>) {
+    let aislang_dir = dir.join(".aislang");
+    std::fs::create_dir_all(&aislang_dir).expect("mkdir .aislang");
+    let applied = applied_at
+        .map(|s| format!("\"applied_at\":\"{s}\","))
+        .unwrap_or_default();
+    let json = format!(r#"{{
+        "schema_version": 1,
+        {applied}
+        "source_hash":     "deadbeef",
+        "catalog_version": "2026-05-25",
+        "stack_yaml_path": "{}",
+        "project_name":    "demo"
+    }}"#, dir.join("stack.yml").display());
+    std::fs::write(aislang_dir.join("state.json"), json).expect("write state");
+}
+
+#[test] fn destroy_with_torn_down_state_exits_zero_idempotently() {
+    // Decision 27: re-running destroy on an already-torn-down stack
+    // (state.json present with applied_at: null) MUST exit 0 with a
+    // "nothing to destroy" message. CI cleanup pipelines depend on
+    // this — they run destroy unconditionally on teardown.
+    let ais = tempdir_with_project("destroy-already-torn-down");
+    let dir = ais.parent().unwrap().to_path_buf();
+    // State says "torn down" + stack.yml still on disk (apply
+    // preserves it; destroy doesn't remove it). Real-world shape.
+    write_state(&dir, None);
+    std::fs::write(dir.join("stack.yml"), "# placeholder").expect("write stack");
+
+    let out = bin_no_docker().args(["destroy"]).arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(),
+        "destroy on torn-down state must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already torn down"),
+        "stderr must say `already torn down`; got:\n{stderr}");
+    // Crucially: docker compose was NEVER invoked (bin_no_docker
+    // would have surfaced a "docker not on PATH" error otherwise).
+    assert!(!stderr.contains("docker not on PATH"),
+        "destroy on torn-down state must NOT attempt docker; got:\n{stderr}");
+}
+
+#[test] fn destroy_force_proceeds_even_on_torn_down_state() {
+    // Decision 29: --force skips state-file checks entirely. With
+    // state torn down + stack.yml present + --force, destroy runs
+    // `docker compose down -v` anyway. Without docker on PATH it
+    // bails with the docker error — proving --force got past the
+    // state gate.
+    let ais = tempdir_with_project("destroy-force-on-torn-down");
+    let dir = ais.parent().unwrap().to_path_buf();
+    write_state(&dir, None);
+    std::fs::write(dir.join("stack.yml"), "# placeholder").expect("write stack");
+
+    let out = bin_no_docker().args(["destroy", "--force"]).arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success(),
+        "--force must attempt docker; without docker it should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("docker not on PATH"),
+        "--force must surface the docker-missing error; got:\n{stderr}");
+    assert!(!stderr.contains("already torn down"),
+        "--force must skip the torn-down check; got:\n{stderr}");
+}
+
+#[test] fn destroy_with_state_up_and_no_stack_yml_errors_clearly() {
+    // Inconsistent state: state file says "up" but stack.yml is
+    // gone (user manually deleted it). This is NOT idempotent
+    // territory — the state DOES think things are deployed; we
+    // can't `docker compose down` without the yml. Error with a
+    // clear fix path (re-apply to recreate stack.yml).
+    let ais = tempdir_with_project("destroy-state-up-no-yml");
+    let dir = ais.parent().unwrap().to_path_buf();
+    write_state(&dir, Some("2026-05-28T12:00:00Z"));
+    // intentionally NO stack.yml
+
+    let out = bin_no_docker().args(["destroy"]).arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success(),
+        "destroy with state-up + no stack.yml must error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no stack.yml"),
+        "stderr must explain stack.yml is missing; got:\n{stderr}");
+    assert!(stderr.contains("aislang apply"),
+        "stderr should point at apply as the fix; got:\n{stderr}");
+}
+
+#[test] fn destroy_back_compat_state_absent_stack_yml_present_proceeds() {
+    // Decision 27 back-compat: a v0.0.x user (no state file, stack.yml
+    // from before week-10) still has their destroy work. State
+    // absent + stack.yml present → proceed (will fail on no-docker
+    // here, but past the state gate).
+    let ais = tempdir_with_project("destroy-back-compat");
+    let dir = ais.parent().unwrap().to_path_buf();
+    // No .aislang/ at all.
+    std::fs::write(dir.join("stack.yml"), "# placeholder").expect("write stack");
+
+    let out = bin_no_docker().args(["destroy"]).arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    // No state but stack present: proceed → docker missing → fail.
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("docker not on PATH"),
+        "back-compat path must surface docker error, not state error; \
+         got:\n{stderr}");
+    assert!(!stderr.contains("nothing to destroy"),
+        "back-compat path must NOT short-circuit to 'nothing to destroy' \
+         when stack.yml exists; got:\n{stderr}");
+}
+
+#[test] fn destroy_then_destroy_again_both_succeed() {
+    // The full idempotency property: run destroy twice in a row,
+    // both must exit 0. First call processes the state→torn-down
+    // transition (no docker → error in practice, but if docker
+    // were here it'd succeed). We can't test the success path
+    // without docker; we CAN test that the SECOND call on a
+    // torn-down state exits 0 cleanly. Combined with the
+    // `destroy_with_torn_down_state_exits_zero_idempotently` test
+    // above, this property is fully pinned.
+    //
+    // Here: seed torn-down state. Run destroy twice. Both 0.
+    let ais = tempdir_with_project("destroy-twice");
+    let dir = ais.parent().unwrap().to_path_buf();
+    write_state(&dir, None);
+    std::fs::write(dir.join("stack.yml"), "# placeholder").expect("write stack");
+
+    let first = bin_no_docker().args(["destroy"]).arg(&ais).output()
+        .expect("spawn 1");
+    let second = bin_no_docker().args(["destroy"]).arg(&ais).output()
+        .expect("spawn 2");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(first.status.success(),  "first destroy must exit 0");
+    assert!(second.status.success(), "second destroy must exit 0");
 }
