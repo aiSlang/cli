@@ -45,6 +45,30 @@ SCHEMA_VERSION = 2  # v2 adds Claude-session token tallying
 # message timestamps that fall on dates the week table claims.
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
+# ── Pricing reference (Anthropic Claude Sonnet 4.6, late 2025/early
+# 2026 list prices, USD per 1M tokens).  These ratios are stable
+# across providers within ~2× — Sonnet is the de-facto reference for
+# v0.1 / v0.2 work.  Change the constants here to recompute against
+# a different model class without touching the rest of the code.
+# ──
+PRICE_INPUT_PER_M:          float = 3.00   # uncached input
+PRICE_OUTPUT_PER_M:         float = 15.00  # output (5× input)
+PRICE_CACHE_CREATION_PER_M: float = 3.75   # 1.25× input (one-time)
+PRICE_CACHE_READ_PER_M:     float = 0.30   # 0.1× input (subsequent reads)
+
+
+def compute_usd_cost(tokens: dict[str, int]) -> float:
+    """Return total USD-equivalent for one date / week's token bucket
+    using the Sonnet-4.6 reference rates above.  Multiply by your
+    model's ratio if comparing to e.g. Haiku ($0.80/$4 vs $3/$15 →
+    ~3.75× cheaper) or Opus (more expensive)."""
+    return (
+        tokens.get("input",          0) / 1_000_000 * PRICE_INPUT_PER_M
+      + tokens.get("output",         0) / 1_000_000 * PRICE_OUTPUT_PER_M
+      + tokens.get("cache_creation", 0) / 1_000_000 * PRICE_CACHE_CREATION_PER_M
+      + tokens.get("cache_read",     0) / 1_000_000 * PRICE_CACHE_READ_PER_M
+    )
+
 # `Week 9 Mon: …` or `Week 10 Wed+Thu (prio swap): …` etc.  We accept
 # any single-day marker on the first hit per commit (multi-day combos
 # like `Wed+Thu` still count as 1 SP — they're one commit closing
@@ -266,24 +290,45 @@ def summary(
     for r in rows:
         for d in r.get("dates", []):
             unique_dates.add(d)
-    total_tokens_unique = sum(
-        tokens_per_date.get(d, {}).get("total", 0) for d in unique_dates
-    )
+
+    # Per-class totals across unique dates.
+    totals = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0, "total": 0}
+    for d in unique_dates:
+        if d in tokens_per_date:
+            for k in totals:
+                totals[k] += tokens_per_date[d][k]
+
     # tokens / SP using unique-date totals divided by total SP across
     # SP-claiming weeks.  This is the most-honest per-SP number.
     total_sp = sum(r["sp"] for r in rows if r["sp"] > 0)
-    tokens_per_sp = (total_tokens_unique / total_sp) if total_sp > 0 else 0
+    tokens_per_sp = (totals["total"] / total_sp) if total_sp > 0 else 0
+
+    # USD cost — weighted sum at the reference rates.  Single bottom-
+    # line $ figure makes "tokens 1B vs 3B" comparable when one mix
+    # is mostly cache-reads (cheap) and the other is heavy output
+    # (expensive).
+    total_usd     = compute_usd_cost(totals)
+    usd_per_sp    = (total_usd / total_sp) if total_sp > 0 else 0
 
     return {
-        "n_weeks":           n,
-        "mean_velocity":     round(mean, 2),
-        "std_velocity":      round(std, 2),
+        "n_weeks":               n,
+        "mean_velocity":         round(mean, 2),
+        "std_velocity":          round(std, 2),
         # Also report extremes — useful when std is high.
-        "min_velocity":      round(min(velocities), 2),
-        "max_velocity":      round(max(velocities), 2),
-        # Schema v2: token totals — unique-date-summed.
-        "total_tokens":      total_tokens_unique,
-        "tokens_per_sp_avg": int(tokens_per_sp),
+        "min_velocity":          round(min(velocities), 2),
+        "max_velocity":          round(max(velocities), 2),
+        # Schema v2.1: token totals — unique-date-summed, split by class
+        # so the renderer can show the mix (cheap cache reads vs
+        # expensive output).
+        "total_tokens":          totals["total"],
+        "total_input":           totals["input"],
+        "total_output":          totals["output"],
+        "total_cache_creation":  totals["cache_creation"],
+        "total_cache_read":      totals["cache_read"],
+        "tokens_per_sp_avg":     int(tokens_per_sp),
+        # USD-equivalent cost at the reference rates (Sonnet 4.6).
+        "total_usd":             round(total_usd, 4),
+        "usd_per_sp_avg":        round(usd_per_sp, 4),
     }
 
 
@@ -301,6 +346,18 @@ def _fmt_tokens(n: int) -> str:
     return f"{n:>5}"
 
 
+def _fmt_usd(d: float) -> str:
+    """Format a small USD amount.  Below $1: dollars+cents.  $1+: round to
+    nearest dollar.  Zero shows as '—'."""
+    if d <= 0:
+        return "    —"
+    if d < 1:
+        return f"${d:>4.2f}"
+    if d < 1000:
+        return f"${d:>4.0f}"
+    return f"${d/1000:>4.1f}k"
+
+
 def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
     out: list[str] = []
     # Token columns appear only when at least one week has tokens
@@ -310,15 +367,27 @@ def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
     )
 
     if has_tokens:
-        out.append("Week  SP   Days  Vel.   Tokens   T/SP    T/Day")
-        out.append("----  ---  ----  -----  -------  ------  ------")
+        # v2.1 split-by-token-class columns + USD cost.  The pricing-
+        # reference USD column uses Anthropic Sonnet 4.6 list prices
+        # (configurable as PRICE_*_PER_M constants at the top).  Cost
+        # is weighted by class: output is 5× input, cache reads are
+        # 10× cheaper than uncached input.  This makes per-week
+        # comparison meaningful even when token mixes differ wildly.
+        out.append("Week  SP   Days  Vel.   In       Cache-R  Out      $ cost")
+        out.append("----  ---  ----  -----  -------  -------  -------  -------")
         for r in rows:
-            tot = r.get("tokens", {}).get("total", 0)
+            tk = r.get("tokens", {})
+            # "In" = uncached input + cache writes (both billed at
+            # input-ish rates; combine for legibility).
+            in_combined = tk.get("input", 0) + tk.get("cache_creation", 0)
+            usd = compute_usd_cost(tk)
             out.append(
                 f"{r['week']:<4}  {r['sp']:<3}  {r['alex_days']:<4}  "
-                f"{r['velocity']:>5.2f}  {_fmt_tokens(tot):>7}  "
-                f"{_fmt_tokens(r.get('tokens_per_sp', 0)):>6}  "
-                f"{_fmt_tokens(r.get('tokens_per_alex_day', 0)):>6}"
+                f"{r['velocity']:>5.2f}  "
+                f"{_fmt_tokens(in_combined):>7}  "
+                f"{_fmt_tokens(tk.get('cache_read', 0)):>7}  "
+                f"{_fmt_tokens(tk.get('output', 0)):>7}  "
+                f"{_fmt_usd(usd):>7}"
             )
     else:
         out.append("Week  SP   Alex-days  Velocity (SP/day)")
@@ -341,30 +410,76 @@ def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
         if has_tokens:
             total_tokens = s.get("total_tokens", 0)
             per_sp       = s.get("tokens_per_sp_avg", 0)
+            total_usd    = s.get("total_usd", 0.0)
+            usd_per_sp   = s.get("usd_per_sp_avg", 0.0)
+            out.append("")
+            out.append("         ── tokens (counts) ──")
             out.append(
-                f"         total tokens (all weeks)   = {_fmt_tokens(total_tokens).strip()}"
+                f"         total tokens                = {_fmt_tokens(total_tokens).strip()}"
             )
             out.append(
-                f"         tokens / SP (mean)         = {_fmt_tokens(per_sp).strip()}"
+                f"         tokens / SP (mean)          = {_fmt_tokens(per_sp).strip()}"
             )
-            # Bottom-line tokens-per-LoC ratio if code-stat cache exists.
+            # Class breakdown.
+            tot_in     = s.get("total_input",          0)
+            tot_out    = s.get("total_output",         0)
+            tot_cr     = s.get("total_cache_read",     0)
+            tot_cc     = s.get("total_cache_creation", 0)
+            grand = max(tot_in + tot_out + tot_cr + tot_cc, 1)
+            out.append(
+                f"             input (uncached)        = {_fmt_tokens(tot_in).strip():>7}"
+                f"  ({100*tot_in/grand:>4.1f}%)"
+            )
+            out.append(
+                f"             cache writes (one-time) = {_fmt_tokens(tot_cc).strip():>7}"
+                f"  ({100*tot_cc/grand:>4.1f}%)"
+            )
+            out.append(
+                f"             cache reads (cheap)     = {_fmt_tokens(tot_cr).strip():>7}"
+                f"  ({100*tot_cr/grand:>4.1f}%)"
+            )
+            out.append(
+                f"             output (expensive)      = {_fmt_tokens(tot_out).strip():>7}"
+                f"  ({100*tot_out/grand:>4.1f}%)"
+            )
+            out.append("")
+            out.append("         ── cost (USD-equiv at Sonnet 4.6 rates) ──")
+            out.append(
+                f"         total $ cost                = ${total_usd:,.2f}"
+            )
+            out.append(
+                f"         $ per SP (mean)             = ${usd_per_sp:,.2f}"
+            )
+            # Bottom-line tokens/USD per LoC if code-stat cache exists.
             code_stat_cache = SCRIPT_DIR.parent / "code-stat" / "cache.txt"
             if code_stat_cache.exists():
                 try:
                     loc_now = int(code_stat_cache.read_text().strip().replace(",", ""))
                     if loc_now > 0:
-                        ratio = total_tokens / loc_now
+                        out.append("")
+                        out.append("         ── per Rust LoC (rough, current LoC not delta) ──")
                         out.append(
-                            f"         current Rust LoC           = {loc_now}"
+                            f"         current Rust LoC            = {loc_now:,}"
                         )
                         out.append(
-                            f"         total tokens / current LoC = "
-                            f"{ratio:,.0f}  "
-                            f"(rough — current LoC is a cumulative cap, "
-                            f"not the LoC delta over the token window)"
+                            f"         tokens / LoC                = "
+                            f"{total_tokens / loc_now:,.0f}"
+                        )
+                        out.append(
+                            f"         $ / LoC                     = "
+                            f"${total_usd / loc_now:.3f}"
                         )
                 except (ValueError, OSError):
                     pass
+            # Pricing reference footer.
+            out.append("")
+            out.append(
+                f"         (Sonnet 4.6: ${PRICE_INPUT_PER_M:.2f}/M in, "
+                f"${PRICE_OUTPUT_PER_M:.2f}/M out, "
+                f"${PRICE_CACHE_CREATION_PER_M:.2f}/M cache-write, "
+                f"${PRICE_CACHE_READ_PER_M:.2f}/M cache-read; "
+                f"adjust PRICE_*_PER_M in analyze.py for other models.)"
+            )
     else:
         out.append("Summary: no SP-claiming weeks yet.")
     return "\n".join(out)
