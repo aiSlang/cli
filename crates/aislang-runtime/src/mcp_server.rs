@@ -46,8 +46,13 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
+
+use crate::Session;
 
 // ============================================================================
 // Errors
@@ -85,13 +90,61 @@ pub enum ServerError {
 /// The `tool_router` field is built by the `#[tool_router]` macro
 /// from the `#[tool]`-annotated methods below; we never construct
 /// it directly.
-#[derive(Debug, Clone)]
+/// Identifies one conversational session.  v0.1's `Session` is bound
+/// to (source_dir, agent_label) — same .ais file + same agent label
+/// → same Session.  Week-12 Thu's MCP layer caches sessions by this
+/// key in `AislangServer.sessions` so each `aislang_chat_turn` call
+/// reuses the open LiteLLM connection + MCP children rather than
+/// re-spawning them per turn.
+///
+/// Future v0.3+ may grow this with an explicit `conversation_id`
+/// field for client-supplied identity (Claude Desktop conversation
+/// ID, etc.) — for now we assume one conversation per (dir, agent).
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct SessionKey {
+    source_dir:  PathBuf,
+    agent_label: String,
+}
+
+#[derive(Clone)]
 pub struct AislangServer {
     // Read indirectly by the `#[tool_handler]` macro's generated
     // `call_tool` / `list_tools` dispatcher.  Dead-code analysis
     // doesn't see through the macro, so we explicitly allow.
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+
+    // Week-12 Thu: session pool for `aislang_chat_turn`.
+    //
+    // Keyed by (source_dir, agent_label).  First call opens the
+    // Session (validate source → find agent → resolve model/prompt
+    // → spawn MCP children → open LiteLLM client → optional budget
+    // tracker); subsequent calls reuse the cached Arc<Session>.
+    //
+    // Lifetime: as long as the mcp-serve process lives.  When the
+    // host client (Claude Desktop, Cursor) shuts down the stdio
+    // transport, mcp-serve exits and Drop runs through every
+    // Session — including the MCP children which get killed cleanly.
+    //
+    // Outer Arc<RwLock<…>> lets multiple chat_turn invocations
+    // share the cache safely; the inner Arc<Session> lets the
+    // turn run after the map lock is released (the call to
+    // `Session::turn` itself takes &self so multiple in-flight
+    // turns against the same session don't need exclusion at this
+    // layer — Session's internals handle their own state).
+    sessions: Arc<RwLock<HashMap<SessionKey, Arc<Session>>>>,
+}
+
+// Hand-rolled Debug so AislangServer stays debuggable without
+// requiring Session: Debug (which v0.1 doesn't impl because of the
+// nested rmcp + reqwest client types).
+impl std::fmt::Debug for AislangServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AislangServer")
+            .field("tool_router", &"<ToolRouter>")
+            .field("sessions", &"<RwLock<HashMap<…>>>")
+            .finish()
+    }
 }
 
 impl Default for AislangServer {
@@ -104,10 +157,13 @@ impl Default for AislangServer {
 impl AislangServer {
     /// Construct a fresh server.  Cheap — just builds the rmcp
     /// tool-routing table from the `#[tool]` annotations in this
-    /// `impl` block.
+    /// `impl` block.  The session cache starts empty; sessions are
+    /// created lazily on first `aislang_chat_turn` call against a
+    /// given (source_dir, agent_label) key.
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            sessions:    Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -852,6 +908,229 @@ impl AislangServer {
 
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Week-12 Thu: conversation tier — chat_turn + eval.
+    //
+    // The architectural payoff of v0.2 Track A decision #3
+    // ("proxy-via-MCP"): the v0.1 Session that previously lived
+    // inside `aislang chat`'s in-process loop now lives inside
+    // `aislang mcp-serve`.  Same Session implementation; same
+    // LiteLLM + MCP-children plumbing; one cache (sessions field on
+    // AislangServer) keyed by (source_dir, agent_label) so each
+    // (project, agent) conversation gets exactly one Session for
+    // the lifetime of the mcp-serve process.
+    //
+    // Token counts: chat_turn attaches a SpendTracker to the Session
+    // when a budget block is declared in the source.  Session::turn
+    // (week 7 Wed) calls tracker.add(model_id, cost) after each
+    // LiteLLM round-trip, which writes to ~/.aislang/spend.json
+    // atomically — same persistence layer v0.1's chat / eval use.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Run one turn of conversation against a deployed agent.  First
+    /// call for a given (source_dir, agent_label) pair opens a
+    /// Session (validates source → finds agent → resolves model +
+    /// system_prompt → spawns MCP children → opens LiteLLM client →
+    /// attaches optional budget + spend tracker); subsequent calls
+    /// reuse the cached Session.
+    ///
+    /// The Session holds the full conversation context internally
+    /// (LiteLLM message history) — every chat_turn call adds to it.
+    /// Sessions live for the lifetime of the mcp-serve process; v0.3
+    /// may add explicit `aislang_session_close`.
+    ///
+    /// Not marked destructive: chat_turn doesn't write to disk
+    /// directly, but it DOES dispatch LLM calls that consume budget
+    /// + emit OTel traces.  Best treated as `open_world_hint = true`
+    /// (talks to external services) without confirmation gating.
+    #[tool(
+        name = "aislang_chat_turn",
+        description = "Run one turn of conversation against a deployed \
+            agent. Maintains per-(source_dir, agent_label) session state: \
+            first call opens the Session (spawns MCP children, opens \
+            LiteLLM client, hashes prompt), subsequent calls reuse it. \
+            Returns the assistant's reply as text. Tool-use loop is hard-\
+            capped at 8 iterations per turn (Decision 4). Budget caps \
+            from the .ais source are enforced — over-cap aborts the turn \
+            with a `budget exceeded:` synthetic reply.",
+        annotations(
+            title             = "Send chat turn",
+            destructive_hint  = false,
+            read_only_hint    = false,
+            idempotent_hint   = false,
+            open_world_hint   = true,
+        )
+    )]
+    pub async fn chat_turn(&self,
+        Parameters(p): Parameters<ChatTurnParameters>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let key = SessionKey {
+            source_dir:  source_dir.clone(),
+            agent_label: p.agent_label.clone(),
+        };
+
+        // ── Get-or-create the session for this key.
+        let session = {
+            // Fast path: read lock, hit cache.
+            let map = self.sessions.read().await;
+            if let Some(s) = map.get(&key) {
+                Arc::clone(s)
+            } else {
+                drop(map);
+                // Slow path: write lock + build.  Double-check
+                // under the write lock to handle the race where
+                // another task built it while we waited.
+                let mut map = self.sessions.write().await;
+                if let Some(s) = map.get(&key) {
+                    Arc::clone(s)
+                } else {
+                    let built = build_session_for_agent(
+                        &p.source, &source_dir, &p.agent_label,
+                    ).await
+                    .map_err(|e| RmcpError::invalid_params(
+                        format!("open session: {e}"), None))?;
+                    let arc = Arc::new(built);
+                    map.insert(key.clone(), Arc::clone(&arc));
+                    arc
+                }
+            }
+        };
+
+        // ── Dispatch the turn.  Session::turn does the tool-use
+        // loop (LiteLLM call → if tool_calls, dispatch via rmcp
+        // client → loop, hard-capped at 8 iters).  Token counts +
+        // cost accounting happen inside Session.
+        //
+        // Why spawn_blocking + inner current_thread runtime:
+        // Session::turn holds a tokio OTel `ContextGuard` across
+        // awaits, which makes its future !Send.  rmcp's #[tool]
+        // macro requires `dyn Future + Send` for tool dispatch.
+        // v0.1's chat CLI sidesteps this by running on a
+        // `Runtime::new_current_thread()` where Send isn't
+        // required.  Here we reproduce that posture: hand the
+        // !Send turn future off to a blocking-pool thread that
+        // owns its own current_thread runtime, await the join
+        // handle (which IS Send).  Overhead: one thread per
+        // turn; not hot-path so acceptable.  v0.3 may refactor
+        // Session::turn to scope its guards tighter and make
+        // the future Send — then this dance goes away.
+        let user_input = p.user_input.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("build inner runtime: {e}"))?;
+            rt.block_on(session.turn(&user_input))
+                .map_err(|e| format!("{e}"))
+        }).await
+        .map_err(|e| RmcpError::internal_error(
+            format!("join blocking turn task: {e}"), None))?
+        .map_err(|e| RmcpError::internal_error(
+            format!("chat turn: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(reply)]))
+    }
+
+    /// Run a declared eval against the deployed stack.  Loads the
+    /// dataset, opens a fresh Session, scores every case, aggregates,
+    /// returns the EvalReport as pretty JSON.
+    ///
+    /// `eval_label` selects which eval block to run; when omitted
+    /// every `eval` block in the source runs and the report is a
+    /// JSON array.  Without an `agent = agent.X` field on the eval
+    /// block, the project's single agent is used (matches v0.1 CLI
+    /// disambiguation rules).
+    ///
+    /// Each eval creates its own Session (no reuse from chat_turn's
+    /// pool) — eval semantics need a fresh conversation per case,
+    /// matching v0.1's `aislang eval` behaviour.
+    #[tool(
+        name = "aislang_eval",
+        description = "Run a declared eval against the deployed stack. \
+            Loads the dataset (JSONL file referenced by eval.dataset), \
+            opens a Session, scores every case via the declared metric \
+            (exact_match | f1; v0.2 may add llm_judge), aggregates with \
+            the declared aggregator (mean by default), returns EvalReport \
+            as pretty JSON. Without `eval_label`, every eval block runs \
+            and the response is a JSON array of EvalReports.",
+        annotations(
+            title             = "Run aiSlang eval",
+            destructive_hint  = false,
+            read_only_hint    = false,
+            idempotent_hint   = false,
+            open_world_hint   = true,
+        )
+    )]
+    pub async fn eval(&self,
+        Parameters(p): Parameters<EvalParameters>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let (project, _warnings) = aislang_core::validate(&p.source)
+            .map_err(|e| RmcpError::invalid_params(
+                format!("parse error: {e}"), None))?;
+
+        // Filter evals: explicit label or all.
+        let evals: Vec<&aislang_core::ast::Eval> = match p.eval_label.as_deref() {
+            Some(name) => match project.evals.iter().find(|e| e.label == name) {
+                Some(e) => vec![e],
+                None => {
+                    let available: Vec<&str> = project.evals.iter()
+                        .map(|e| e.label.as_str()).collect();
+                    return Err(RmcpError::invalid_params(
+                        format!("no eval named `{name}`; available: {}",
+                            if available.is_empty() { "(none declared)".to_string() }
+                            else { available.join(", ") }),
+                        None));
+                }
+            },
+            None => project.evals.iter().collect(),
+        };
+        if evals.is_empty() {
+            return Err(RmcpError::invalid_params(
+                "no `eval` blocks declared in source".to_string(), None));
+        }
+
+        // Run each eval, collect reports.  Same spawn_blocking +
+        // inner current_thread runtime dance as chat_turn (see
+        // comment there): run_eval_for_mcp's loop awaits Session::turn
+        // whose future is !Send.  Project + eval refs are kept
+        // by-value via clones into the closure.
+        let mut reports: Vec<crate::EvalReport> = Vec::with_capacity(evals.len());
+        for eval in evals {
+            // Clone the project + eval into the blocking closure since
+            // they're borrowed from p.source — the closure outlives
+            // this method's stack frame.
+            let project_owned = project.clone();
+            let eval_owned    = eval.clone();
+            let source_dir_owned = source_dir.clone();
+            let eval_label_for_err = eval.label.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("build inner runtime: {e}"))?;
+                rt.block_on(run_eval_for_mcp(&project_owned, &eval_owned, &source_dir_owned))
+            }).await
+            .map_err(|e| RmcpError::internal_error(
+                format!("join eval task `{eval_label_for_err}`: {e}"), None))?
+            .map_err(|e| RmcpError::internal_error(
+                format!("eval `{eval_label_for_err}`: {e}"), None))?;
+            reports.push(report);
+        }
+
+        // Render: single report stays as one JSON object; multiple
+        // get wrapped in an array (matches v0.1 CLI behaviour where
+        // multi-eval runs emit one JSON line per report on stdout).
+        let body = if reports.len() == 1 {
+            serde_json::to_string_pretty(&reports[0])
+        } else {
+            serde_json::to_string_pretty(&reports)
+        }.map_err(|e| RmcpError::internal_error(
+            format!("serialize eval report: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
 }
 
 // ============================================================================
@@ -957,6 +1236,400 @@ pub struct StatusParameters {
     /// the CLI's `--model-spend [=MODEL]` semantics.
     #[serde(default)]
     pub model_spend: Option<String>,
+}
+
+// ── Thu: conversation-tier parameter types ─────────────────────────
+
+/// `chat_turn` parameters.  The `(source_dir, agent_label)` pair
+/// keys into the Session cache — same key → same Session
+/// (conversation history persists across calls).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ChatTurnParameters {
+    /// The complete `.ais` source file as a UTF-8 text body.  Used
+    /// to validate the project, find the agent by label, and resolve
+    /// its model + system_prompt on first call.  Subsequent calls
+    /// with the same (source_dir, agent_label) ignore changes here
+    /// — the cached Session was built from the initial source.
+    pub source: String,
+    /// Filesystem path that prompt-file paths in the source resolve
+    /// against, and where `aislang.lock` is read for prompt-hash
+    /// verification.  Defaults to cwd.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+    /// Agent label declared in the source (e.g. `"support"`).  The
+    /// chat turn runs against this agent — its model, system prompt,
+    /// and tools.
+    pub agent_label: String,
+    /// User message to send.  Will be appended to the cached
+    /// Session's message history; assistant reply is returned.
+    pub user_input: String,
+}
+
+/// `eval` parameters.  No agent_label — each `eval` block in the
+/// source declares its own agent (or defaults to the project's
+/// single agent).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct EvalParameters {
+    /// The complete `.ais` source file as a UTF-8 text body.
+    pub source: String,
+    /// Filesystem path that prompt files + JSONL datasets in the
+    /// source resolve against.  Defaults to cwd.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+    /// Optional eval-block label.  When omitted, every `eval` block
+    /// in the source runs and the response is a JSON array of
+    /// EvalReports.  When set, only the named eval runs.
+    #[serde(default)]
+    pub eval_label: Option<String>,
+}
+
+// ── Thu: conversation-tier helpers ──────────────────────────────────
+
+/// Build the OCI-image string from a parsed `OciImage`.  Mirrors the
+/// CLI's `format_image` helper; copied here to keep the MCP layer
+/// self-contained.
+fn format_image(img: &aislang_core::types::OciImage) -> String {
+    let base = format!("{}/{}", img.registry, img.repository);
+    match (&img.tag, &img.digest) {
+        (Some(t), Some(d)) => format!("{base}:{t}@{d}"),
+        (Some(t), None)    => format!("{base}:{t}"),
+        (None,    Some(d)) => format!("{base}@{d}"),
+        (None,    None)    => base,
+    }
+}
+
+/// Walk one mcp_server's `secrets = [secret.X, ...]` refs and resolve
+/// them to `(label, value)` env pairs.  Mirrors the CLI's
+/// `resolve_mcp_secrets` (Decision 9: secrets reach ONLY the declared
+/// scope's child env — no cross-resource leakage).
+fn resolve_mcp_secrets_for_agent(
+    project:    &aislang_core::ast::Project,
+    mcp:        &aislang_core::ast::McpServer,
+    source_dir: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let refs = match &mcp.secrets {
+        Some(refs) if !refs.is_empty() => refs,
+        _ => return Ok(Vec::new()),
+    };
+    let mut env = Vec::with_capacity(refs.len());
+    for s_ref in refs {
+        let secret = project.secrets.iter()
+            .find(|s| s.label == s_ref.label)
+            .ok_or_else(|| format!(
+                "mcp_server `{}` references secret `{}` which doesn't exist",
+                mcp.label, s_ref.label))?;
+        let value = crate::resolve_secret(&secret.label, &secret.source, source_dir)
+            .map_err(|e| format!("resolve secret `{}`: {e}", secret.label))?;
+        env.push((secret.label.clone(), value));
+    }
+    Ok(env)
+}
+
+/// Open a fresh Session for `(source, source_dir, agent_label)`.
+/// Mirrors v0.1's `chat_interactive` setup logic exactly: validate
+/// → find agent → resolve model + prompt → optional budget +
+/// tracker → spawn MCP children → list tools → open LiteLLM client.
+///
+/// Used by both `chat_turn` (cached via the SessionKey-keyed map)
+/// and `eval` (fresh per eval run, never cached).
+async fn build_session_for_agent(
+    source:      &str,
+    source_dir:  &Path,
+    agent_label: &str,
+) -> Result<Session, String> {
+    use crate::{BudgetConfig, SpawnConfig, StdioChild, ToolRegistry};
+
+    // ── 1. validate + find agent ──
+    let (project, _warnings) = aislang_core::validate(source)
+        .map_err(|e| format!("parse error: {e}"))?;
+    let agent = project.agents.iter()
+        .find(|a| a.label == agent_label)
+        .ok_or_else(|| {
+            let labels: Vec<&str> = project.agents.iter()
+                .map(|a| a.label.as_str()).collect();
+            format!("no agent named `{agent_label}`; available: {}",
+                if labels.is_empty() { "(none declared)".to_string() }
+                else { labels.join(", ") })
+        })?;
+    let model_label = agent.model.label.clone();
+
+    // ── 2. resolve prompt + hash-verify against aislang.lock ──
+    let prompt_block = project.prompts.iter()
+        .find(|p| p.label == agent.system_prompt.label)
+        .ok_or_else(|| format!(
+            "agent `{}` references prompt `{}` which doesn't exist",
+            agent.label, agent.system_prompt.label))?;
+    let prompt_path = source_dir.join(&prompt_block.file);
+    let lock_path   = source_dir.join("aislang.lock");
+    let expected_hash: Option<String> =
+        match aislang_resolver::lockfile::read(&lock_path) {
+            Ok(Some(lock)) => lock.prompt_hashes.get(&prompt_block.label).cloned(),
+            _              => None,
+        };
+    let system_prompt = crate::load_system_prompt(
+        &prompt_path, expected_hash.as_deref(),
+    ).map_err(|e| format!("load prompt: {e}"))?;
+
+    // ── 3. budget config + persistent spend tracker (when declared) ──
+    let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
+        Some(b) => {
+            let resolved = aislang_resolver::resolve_against_bundled_catalog(
+                &project, source_dir,
+            ).map_err(|e| format!("resolve: {e}"))?;
+            let model_id = resolved.model_bindings.get(&model_label)
+                .ok_or_else(|| format!(
+                    "model `{model_label}` has no resolved binding"))?;
+            let catalog = aislang_catalog::bundled()
+                .map_err(|e| format!("catalog load: {e}"))?;
+            let entry = catalog.find(model_id)
+                .ok_or_else(|| format!(
+                    "catalog entry `{}.{}` not found",
+                    model_id.provider, model_id.name))?;
+            Some(BudgetConfig {
+                per_run_cap:        b.hard_cap_per_run,
+                per_day_cap:        b.hard_cap_per_day,
+                cost_input_per_1k:  entry.cost_input,
+                cost_output_per_1k: entry.cost_output,
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
+            })
+        }
+        None => None,
+    };
+    let tracker = match budget_cfg.as_ref() {
+        Some(_) => Some(crate::SpendTracker::open_default(&project.name)
+            .map_err(|e| format!("open spend tracker: {e}"))?),
+        None => None,
+    };
+
+    // ── 4. collect MCP-child specs for the agent's tools ──
+    let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
+    for tool_ref in &agent.tools {
+        if tool_ref.kind != aislang_core::ast::RefKind::McpServer {
+            return Err(format!(
+                "agent `{}.tools` ref `{}` is not an mcp_server ref",
+                agent.label, tool_ref.label));
+        }
+        let mcp = project.mcp_servers.iter()
+            .find(|m| m.label == tool_ref.label)
+            .ok_or_else(|| format!(
+                "agent `{}` references mcp_server `{}` which doesn't exist",
+                agent.label, tool_ref.label))?;
+        let mount = mcp.mount.as_ref().map(|p| {
+            let resolved = source_dir.join(p);
+            std::fs::canonicalize(&resolved).unwrap_or(resolved)
+        });
+        let env = resolve_mcp_secrets_for_agent(&project, mcp, source_dir)?;
+        mcp_specs.push((mcp.label.clone(), SpawnConfig {
+            image: format_image(&mcp.image),
+            args:  Vec::new(),
+            mount,
+            env,
+        }));
+    }
+
+    // ── 5. spawn MCP children + list tools ──
+    let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
+    let mut server_tools: Vec<(String, Vec<crate::ToolSpec>)> = Vec::new();
+    for (label, cfg) in &mcp_specs {
+        let child = StdioChild::spawn(cfg).await
+            .map_err(|e| format!("spawn MCP `{label}`: {e}"))?;
+        let tools = child.list_tools().await
+            .map_err(|e| format!("list tools `{label}`: {e}"))?;
+        server_tools.push((label.clone(), tools));
+        mcp_clients.push(child);
+    }
+    let tool_registry = ToolRegistry::from_servers(&server_tools);
+
+    // ── 6. open Session with optional budget + tracker ──
+    let s = Session::open_with_tools(
+        &model_label, system_prompt, None,
+        mcp_clients, tool_registry,
+    ).map_err(|e| format!("open session: {e}"))?;
+    let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };
+    let s = match tracker    { Some(t) => s.with_tracker(t),    None => s };
+    Ok(s)
+}
+
+/// Run one eval block end-to-end: open a Session for its agent, load
+/// the dataset, score every case via the declared metric, aggregate,
+/// shut the Session down cleanly.  Mirrors v0.1's `run_eval_inner`
+/// minus the OTel tracing + stderr progress (MCP returns a single
+/// EvalReport JSON; the host LLM client owns the progress UX).
+async fn run_eval_for_mcp(
+    project:    &aislang_core::ast::Project,
+    eval:       &aislang_core::ast::Eval,
+    source_dir: &Path,
+) -> Result<crate::EvalReport, String> {
+    // ── 1. resolve which agent this eval runs against (Decision 13) ──
+    let agent = match &eval.agent {
+        Some(a_ref) => project.agents.iter().find(|a| a.label == a_ref.label)
+            .ok_or_else(|| format!(
+                "eval `{}` references agent `{}` which doesn't exist",
+                eval.label, a_ref.label))?,
+        None => match project.agents.len() {
+            1 => &project.agents[0],
+            0 => return Err(format!(
+                "eval `{}` has no `agent = …` and the project declares zero agents",
+                eval.label)),
+            n => return Err(format!(
+                "eval `{}` has no `agent = …` but the project declares {n} agents",
+                eval.label)),
+        },
+    };
+
+    // ── 2. open Session via the shared builder (validates + resolves
+    // model/prompt + spawns MCP children + attaches budget/tracker).
+    // We need the source to call the builder; rebuild it from the AST
+    // would be expensive — pass the source as a parameter would be
+    // cleaner.  For now, build the Session directly using the same
+    // recipe.  (Refactor: extract `build_session_from_project` to
+    // skip re-validating; v0.3.)
+    let source_str = serde_json::to_string(&project)
+        .map_err(|e| format!("re-serialize project: {e}"))?;
+    let _ = source_str;  // unused — we use the AST directly below.
+
+    use crate::{BudgetConfig, SpawnConfig, StdioChild, ToolRegistry};
+
+    let model_label = agent.model.label.clone();
+    let prompt_block = project.prompts.iter()
+        .find(|p| p.label == agent.system_prompt.label)
+        .ok_or_else(|| format!(
+            "agent `{}` references prompt `{}` which doesn't exist",
+            agent.label, agent.system_prompt.label))?;
+    let prompt_path = source_dir.join(&prompt_block.file);
+    let lock_path   = source_dir.join("aislang.lock");
+    let expected_hash: Option<String> =
+        match aislang_resolver::lockfile::read(&lock_path) {
+            Ok(Some(lock)) => lock.prompt_hashes.get(&prompt_block.label).cloned(),
+            _              => None,
+        };
+    let system_prompt = crate::load_system_prompt(
+        &prompt_path, expected_hash.as_deref(),
+    ).map_err(|e| format!("load prompt: {e}"))?;
+
+    let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
+        Some(b) => {
+            let resolved = aislang_resolver::resolve_against_bundled_catalog(
+                project, source_dir,
+            ).map_err(|e| format!("resolve: {e}"))?;
+            let model_id = resolved.model_bindings.get(&model_label)
+                .ok_or_else(|| format!(
+                    "model `{model_label}` has no resolved binding"))?;
+            let catalog = aislang_catalog::bundled()
+                .map_err(|e| format!("catalog load: {e}"))?;
+            let entry = catalog.find(model_id)
+                .ok_or_else(|| format!(
+                    "catalog entry `{}.{}` not found",
+                    model_id.provider, model_id.name))?;
+            Some(BudgetConfig {
+                per_run_cap:        b.hard_cap_per_run,
+                per_day_cap:        b.hard_cap_per_day,
+                cost_input_per_1k:  entry.cost_input,
+                cost_output_per_1k: entry.cost_output,
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
+            })
+        }
+        None => None,
+    };
+    let tracker = match budget_cfg.as_ref() {
+        Some(_) => Some(crate::SpendTracker::open_default(&project.name)
+            .map_err(|e| format!("open spend tracker: {e}"))?),
+        None => None,
+    };
+
+    let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
+    for tool_ref in &agent.tools {
+        if tool_ref.kind != aislang_core::ast::RefKind::McpServer {
+            return Err(format!("agent `{}.tools` non-mcp_server ref", agent.label));
+        }
+        let mcp = project.mcp_servers.iter()
+            .find(|m| m.label == tool_ref.label)
+            .ok_or_else(|| format!("mcp_server `{}` missing", tool_ref.label))?;
+        let mount = mcp.mount.as_ref().map(|p| {
+            let resolved = source_dir.join(p);
+            std::fs::canonicalize(&resolved).unwrap_or(resolved)
+        });
+        let env = resolve_mcp_secrets_for_agent(project, mcp, source_dir)?;
+        mcp_specs.push((mcp.label.clone(), SpawnConfig {
+            image: format_image(&mcp.image),
+            args:  Vec::new(),
+            mount,
+            env,
+        }));
+    }
+
+    let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
+    let mut server_tools: Vec<(String, Vec<crate::ToolSpec>)> = Vec::new();
+    for (label, cfg) in &mcp_specs {
+        let child = StdioChild::spawn(cfg).await
+            .map_err(|e| format!("spawn MCP `{label}`: {e}"))?;
+        let tools = child.list_tools().await
+            .map_err(|e| format!("list tools `{label}`: {e}"))?;
+        server_tools.push((label.clone(), tools));
+        mcp_clients.push(child);
+    }
+    let tool_registry = ToolRegistry::from_servers(&server_tools);
+
+    let session = {
+        let s = Session::open_with_tools(
+            &model_label, system_prompt, None,
+            mcp_clients, tool_registry,
+        ).map_err(|e| format!("open session: {e}"))?;
+        let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };
+        match tracker { Some(t) => s.with_tracker(t), None => s }
+    };
+
+    // ── 3. load dataset + iterate cases ──
+    let dataset_path = source_dir.join(&eval.dataset);
+    let dataset = crate::load_dataset(&dataset_path)
+        .map_err(|e| format!("load dataset: {e}"))?;
+
+    let mut case_results: Vec<crate::CaseResult> = Vec::with_capacity(dataset.len());
+    for case in &dataset {
+        let t0 = std::time::Instant::now();
+        let (actual, _ok) = match session.turn(&case.input).await {
+            Ok(s)  => (s, true),
+            Err(e) => (format!("(turn errored: {e})"), false),
+        };
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let score = crate::metric_score(eval.metric, &case.expected, &actual)
+            .map_err(|e| format!("metric scoring: {e}"))?;
+        case_results.push(crate::CaseResult {
+            id:       case.id.clone(),
+            input:    case.input.clone(),
+            expected: case.expected.clone(),
+            actual,
+            score,
+            latency_ms,
+            trace_url: None,   // MCP layer doesn't open per-case spans (v0.3)
+        });
+    }
+
+    let scores: Vec<f64> = case_results.iter().map(|c| c.score).collect();
+    let aggregate_score = crate::eval_aggregate(eval.aggregator, &scores);
+    let pass = aggregate_score >= eval.threshold.ratio;
+
+    session.shutdown().await
+        .map_err(|e| format!("shutdown MCP children: {e}"))?;
+
+    let metric_str = serde_json::to_value(eval.metric).ok()
+        .and_then(|j| j.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "(unserializable)".to_string());
+    let aggregator_str = serde_json::to_value(eval.aggregator).ok()
+        .and_then(|j| j.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "(unserializable)".to_string());
+
+    Ok(crate::EvalReport {
+        eval_label:      eval.label.clone(),
+        dataset_path:    dataset_path.display().to_string(),
+        metric:          metric_str,
+        aggregator:      aggregator_str,
+        threshold:       eval.threshold.ratio,
+        aggregate_score,
+        pass,
+        trace_url:       None,   // MCP layer doesn't open root span (v0.3)
+        cases:           case_results,
+    })
 }
 
 // ── Wed: shared helpers (apply / destroy / status) ──────────────────
@@ -1764,6 +2437,206 @@ mod tests {
         let text = body_text(&result);
         assert!(text.contains("spend by model"),
             "should show by-model breakdown header; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Week-12 Thu: conversation-tier tools
+    // ────────────────────────────────────────────────────────────────
+    //
+    // We can't drive a real Session::turn at the unit-test level
+    // without standing up a wiremock LiteLLM (v0.1 does this in
+    // session.rs but it's a substantial harness).  Thu's unit tests
+    // therefore focus on:
+    //   1. Tool annotations + parameter shapes (compile-time pinned).
+    //   2. SessionKey semantics — equality + cache lookup.
+    //   3. Error-path branches that don't require an LLM (parse
+    //      errors, missing agent, missing prompt file, no eval blocks).
+    // Full chat_turn happy path is exercised live via Claude Desktop
+    // after merge (DoD note).
+
+    /// Same project shape as Wed's APPLY_TEST_SOURCE but with an
+    /// agent the chat_turn caller can ask for.
+    const CHAT_TURN_TEST_SOURCE: &str = r#"project "demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  model "fast" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+  }
+  prompt "system" {
+    file    = "./system.md"
+    version = "1.0.0"
+  }
+  agent "support" {
+    model         = model.fast
+    system_prompt = prompt.system
+    tools         = []
+  }
+}
+"#;
+
+    /// Project with multiple agents but no eval block — useful for
+    /// the "no eval declared" error path.
+    const NO_EVAL_SOURCE: &str = r#"project "noeval" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+}
+"#;
+
+    // ── SessionKey unit tests ────────────────────────────────────
+
+    #[test]
+    fn session_key_equality_pins_dir_plus_label() {
+        let a = SessionKey {
+            source_dir:  PathBuf::from("/tmp/x"),
+            agent_label: "support".to_string(),
+        };
+        let b = SessionKey {
+            source_dir:  PathBuf::from("/tmp/x"),
+            agent_label: "support".to_string(),
+        };
+        let c = SessionKey {
+            source_dir:  PathBuf::from("/tmp/y"),
+            agent_label: "support".to_string(),
+        };
+        let d = SessionKey {
+            source_dir:  PathBuf::from("/tmp/x"),
+            agent_label: "admin".to_string(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c, "different source_dir → different key");
+        assert_ne!(a, d, "different agent_label → different key");
+    }
+
+    // ── chat_turn parameter-validation paths ─────────────────────
+
+    #[tokio::test]
+    async fn chat_turn_parse_error_returns_invalid_params() {
+        let _path = PathGuard::no_docker();
+        let s = AislangServer::new();
+        let err = s.chat_turn(Parameters(ChatTurnParameters {
+            source:      "not aislang".to_string(),
+            source_dir:  None,
+            agent_label: "support".to_string(),
+            user_input:  "hi".to_string(),
+        })).await.expect_err("parse error must bubble");
+        assert!(err.to_string().contains("parse error"),
+            "should mention parse error; got: {err}");
+    }
+
+    #[tokio::test]
+    async fn chat_turn_unknown_agent_returns_invalid_params() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("chat-unknown-agent");
+        // Don't write system.md — we expect the agent-lookup to fail
+        // BEFORE the prompt-file load.
+        let s = AislangServer::new();
+        let err = s.chat_turn(Parameters(ChatTurnParameters {
+            source:      CHAT_TURN_TEST_SOURCE.to_string(),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+            agent_label: "nope".to_string(),
+            user_input:  "hi".to_string(),
+        })).await.expect_err("unknown agent must error");
+        let msg = err.to_string();
+        assert!(msg.contains("no agent named") || msg.contains("`nope`"),
+            "should name the missing agent + list available; got: {msg}");
+        // Available list should mention the actual agent.
+        assert!(msg.contains("support"),
+            "should mention available agent names; got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chat_turn_missing_prompt_file_errors() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("chat-no-prompt");
+        // Source references system.md but we don't write it.  The
+        // build_session_for_agent path tries to load the prompt and
+        // fails.
+        let s = AislangServer::new();
+        let err = s.chat_turn(Parameters(ChatTurnParameters {
+            source:      CHAT_TURN_TEST_SOURCE.to_string(),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+            agent_label: "support".to_string(),
+            user_input:  "hi".to_string(),
+        })).await.expect_err("missing prompt must error");
+        let msg = err.to_string();
+        assert!(msg.contains("prompt") || msg.contains("system.md")
+                || msg.contains("load"),
+            "should mention prompt loading failure; got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── eval parameter-validation paths ──────────────────────────
+
+    #[tokio::test]
+    async fn eval_parse_error_returns_invalid_params() {
+        let _path = PathGuard::no_docker();
+        let s = AislangServer::new();
+        let err = s.eval(Parameters(EvalParameters {
+            source:     "not aislang".to_string(),
+            source_dir: None,
+            eval_label: None,
+        })).await.expect_err("parse error must bubble");
+        assert!(err.to_string().contains("parse error"));
+    }
+
+    #[tokio::test]
+    async fn eval_no_eval_blocks_errors() {
+        let _path = PathGuard::no_docker();
+        let s = AislangServer::new();
+        let err = s.eval(Parameters(EvalParameters {
+            source:     NO_EVAL_SOURCE.to_string(),
+            source_dir: None,
+            eval_label: None,
+        })).await.expect_err("no eval blocks → error");
+        let msg = err.to_string();
+        assert!(msg.contains("no `eval` blocks"),
+            "should mention missing eval blocks; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn eval_unknown_label_lists_available() {
+        let _path = PathGuard::no_docker();
+        // Use the support-agent example: it has one `eval` block
+        // ("factual_accuracy").
+        const SOURCE: &str = include_str!("../../../examples/support-agent.ais");
+        let s = AislangServer::new();
+        let err = s.eval(Parameters(EvalParameters {
+            source:     SOURCE.to_string(),
+            source_dir: None,
+            eval_label: Some("does_not_exist".to_string()),
+        })).await.expect_err("unknown eval label must error");
+        let msg = err.to_string();
+        assert!(msg.contains("no eval named") && msg.contains("does_not_exist"),
+            "should name the missing label; got: {msg}");
+        assert!(msg.contains("factual_accuracy"),
+            "should list `factual_accuracy` as available; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn build_session_for_agent_missing_agent_errors() {
+        // Direct unit test of the helper (not via the tool wrapper)
+        // so we exercise the "available agents" listing logic.
+        // Session doesn't impl Debug (rmcp client types nested
+        // inside) so we can't use expect_err — match manually.
+        let dir = fresh_tempdir("build-session-unknown");
+        let err = match build_session_for_agent(
+            CHAT_TURN_TEST_SOURCE, &dir, "missing_agent_label"
+        ).await {
+            Ok(_)  => panic!("expected error for unknown agent"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no agent named"));
+        assert!(err.contains("support"),
+            "should list the actual agent in the suggestion");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
