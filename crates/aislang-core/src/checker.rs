@@ -78,6 +78,7 @@ pub(crate) enum BlockKind {
     Eval,
     Secret,
     Deploy,
+    Main,   // v0.2 Fri
 }
 
 impl BlockKind {
@@ -90,6 +91,7 @@ impl BlockKind {
             Self::Eval      => "eval",
             Self::Secret    => "secret",
             Self::Deploy    => "deploy",
+            Self::Main      => "main",
         }
     }
 
@@ -148,6 +150,10 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
     for e in &project.evals       { add_block(&mut graph, &mut nodes, BlockKind::Eval,      &e.label)?; }
     for s in &project.secrets     { add_block(&mut graph, &mut nodes, BlockKind::Secret,    &s.label)?; }
     for d in &project.deploys     { add_block(&mut graph, &mut nodes, BlockKind::Deploy,    &d.label)?; }
+    // v0.2 Fri: main blocks join the graph so duplicate-label
+    // detection works (`main "x"` + `main "x"` → error) AND so
+    // future graph-renderers visualize them alongside agents.
+    for m in &project.mains       { add_block(&mut graph, &mut nodes, BlockKind::Main,      &m.label)?; }
 
     Ok(ResourceGraph { graph, nodes })
 }
@@ -199,6 +205,16 @@ fn check_refs(project: &Project, graph: &ResourceGraph) -> Result<(), String> {
             check_one_ref(graph, tool,
                 "agent", &agent.label, &format!("tools[{i}]"))?;
         }
+    }
+    // v0.2 Fri: `main` block ref validation.  Same shape as agent —
+    // both fields are required Ref's.  `chat_client` + `pattern` are
+    // enum members already validated at parse time, so no ref work
+    // for them.
+    for main in &project.mains {
+        check_one_ref(graph, &main.model,
+            "main", &main.label, "model")?;
+        check_one_ref(graph, &main.system_prompt,
+            "main", &main.label, "system_prompt")?;
     }
     for secret in &project.secrets {
         for (i, scope_ref) in secret.scope.iter().enumerate() {
@@ -354,6 +370,11 @@ fn populate_edges(project: &Project, graph: &mut ResourceGraph) -> Result<(), St
             add_ref_edge(graph, BlockKind::Agent, &agent.label,
                 &format!("tools[{i}]"), tool)?;
         }
+    }
+    // v0.2 Fri: main edges (same shape as agent — model + system_prompt).
+    for main in &project.mains {
+        add_ref_edge(graph, BlockKind::Main, &main.label, "model",         &main.model)?;
+        add_ref_edge(graph, BlockKind::Main, &main.label, "system_prompt", &main.system_prompt)?;
     }
     for secret in &project.secrets {
         for (i, scope_ref) in secret.scope.iter().enumerate() {
@@ -831,5 +852,151 @@ mod tests {
         assert!(json.contains("\"edges\""));
         assert!(json.contains("\"model\""));
         assert!(json.contains("\"system_prompt\""));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v0.2 Week-12 Fri: main-block checker tests.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn main_block_with_valid_refs_passes() {
+        let body = r#"
+            model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+            }
+            prompt "main_brief" {
+                file    = "./main_brief.md"
+                version = "1.0.0"
+            }
+            main "user_facing" {
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.main_brief
+            }
+        "#;
+        assert!(check_src(body).is_ok(),
+            "main block with valid refs should pass checker");
+    }
+
+    #[test]
+    fn main_block_with_undeclared_model_errors() {
+        let body = r#"
+            prompt "main_brief" { file = "./b.md"  version = "1.0.0" }
+            main "user_facing" {
+                model         = model.nonexistent
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.main_brief
+            }
+        "#;
+        let err = check_src(body).expect_err("undeclared model should error");
+        assert!(err.contains("main `user_facing` field `model` references undeclared model"),
+            "error should name source main + field + missing model; got: {err}");
+    }
+
+    #[test]
+    fn main_block_with_undeclared_system_prompt_errors() {
+        let body = r#"
+            model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+            }
+            main "user_facing" {
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.missing
+            }
+        "#;
+        let err = check_src(body).expect_err("undeclared prompt should error");
+        assert!(err.contains("main `user_facing` field `system_prompt` references undeclared prompt"),
+            "error should name source main + field + missing prompt; got: {err}");
+    }
+
+    #[test]
+    fn duplicate_main_labels_error() {
+        let body = r#"
+            model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+            }
+            prompt "b1" { file = "./b1.md"  version = "1.0.0" }
+            prompt "b2" { file = "./b2.md"  version = "1.0.0" }
+            main "user_facing" {
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.b1
+            }
+            main "user_facing" {
+                model         = model.primary
+                chat_client   = cursor
+                pattern       = supervisor
+                system_prompt = prompt.b2
+            }
+        "#;
+        let err = check_src(body).expect_err("duplicate main labels should error");
+        assert!(err.contains("main") && err.contains("user_facing"),
+            "error should name the duplicate kind+label; got: {err}");
+    }
+
+    #[test]
+    fn main_block_label_shares_space_with_agent_but_disjoint_kinds() {
+        // `agent "x"` and `main "x"` MAY both be declared — they're
+        // different BlockKinds in the graph, so they don't collide.
+        // Pinned because future graph-rendering work may erroneously
+        // collapse the namespace.
+        let body = r#"
+            model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+            }
+            prompt "b" { file = "./b.md"  version = "1.0.0" }
+            agent "x" {
+                model         = model.primary
+                system_prompt = prompt.b
+                tools         = []
+            }
+            main "x" {
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.b
+            }
+        "#;
+        assert!(check_src(body).is_ok(),
+            "agent and main blocks can share a label (different kinds)");
+    }
+
+    #[test]
+    fn graph_includes_main_nodes() {
+        // Pin that `main` blocks land in the resource graph so future
+        // graph-rendering tooling can visualize them.
+        let body = r#"
+            model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+            }
+            prompt "b" { file = "./b.md"  version = "1.0.0" }
+            main "user_facing" {
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.b
+            }
+        "#;
+        let g = graph_for(body);
+        let json = serde_json::to_string(&g).expect("serializes");
+        assert!(json.contains("\"main\""),
+            "graph should expose main node kind; got: {json}");
+        assert!(json.contains("\"user_facing\""),
+            "graph should expose the main's label");
     }
 }

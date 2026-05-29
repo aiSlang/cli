@@ -540,6 +540,63 @@ pub enum EvalAggregator {
 }
 
 // ============================================================================
+// v0.2 additions — `main` block + `model.source` enum (Week 12 Fri,
+// planning-doc Track A architectural decision #7).
+//
+// `Pattern`:     the relationship between the `main` entry and deployed
+//                agents. Closed set; each shipping its own default
+//                system-prompt template + tool-surface visibility rules.
+// `ChatClient`:  identifies which host LLM client is acting as the
+//                `main` entry (so the MCP server can adapt — e.g.
+//                inject the system prompt where the transport allows).
+// `ModelSource`: where the model's inference path runs.  `api`
+//                (v0.1 default) routes through LiteLLM with hard
+//                budget enforcement.  `subscription` runs in the
+//                host chat app's subscription tier (Claude Pro,
+//                Cursor Team, etc.) — tokens counted, costs estimated,
+//                no hard cap (we can't gate the chat app's calls).
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pattern {
+    Orchestrator,
+    Supervisor,
+    Router,
+    Reflector,
+    PlannerExecutor,
+    Coordinator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatClient {
+    ClaudeDesktop,
+    Cursor,
+    Chatgpt,
+    OpenWebui,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSource {
+    #[default]
+    Api,
+    Subscription,
+}
+
+impl ModelSource {
+    /// Used by `#[serde(skip_serializing_if = "ModelSource::is_default")]`
+    /// on `Model.source` so v0.1 demo files that don't declare `source`
+    /// re-serialize without the field.  Keeps the expected-AST JSON
+    /// fixtures byte-stable across the v0.1 → v0.2 grammar transition.
+    pub fn is_default(&self) -> bool {
+        matches!(self, ModelSource::Api)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
