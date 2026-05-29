@@ -59,6 +59,16 @@ project "support-agent" {
 
   deploy "local" {
     target = compose
-    expose = { port = 8080 }
+    expose {
+      # `port` is informational; surfaces in the YAML header but no
+      # v0.2 service binds it (the v0.2+ containerized agent runtime
+      # via `aislang mcp-serve --http` will).
+      port = 8080
+      # When true, `aislang apply` brings up an Open WebUI sidecar at
+      # http://localhost:3000 wired to the in-stack LiteLLM router.
+      # `aislang destroy` wipes the named volume so chat history +
+      # local user accounts go away alongside the stack.
+      web_ui = true
+    }
   }
 }

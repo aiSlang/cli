@@ -16,7 +16,6 @@
 //! The week-2 parser will plug into [`assert_parser_matches_expected`] —
 //! marked `#[ignore]` until then.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -122,13 +121,13 @@ fn expected_support_agent() -> Project {
     let deploy_local = Deploy {
         label:  "local".into(),
         target: DeployTarget::Compose,
-        // Turbofish on BTreeMap::from to make the array element types
-        // (`(String, u16)`) determined locally rather than by backward
-        // inference through `Some<Option<...>>` — older RustRover analyzer
-        // bundles fail the latter and flag a mismatched-type error here.
-        expose: Some(BTreeMap::<String, u16>::from([
-            ("port".to_string(), 8080u16),
-        ])),
+        // v0.2 Tue: `expose` is a typed nested block (port +
+        // web_ui).  support-agent.ais demos both: informational
+        // port AND Open WebUI sidecar opt-in.
+        expose: Some(Expose {
+            port:   Some(8080),
+            web_ui: true,
+        }),
     };
 
     Project {

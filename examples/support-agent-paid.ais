@@ -69,6 +69,9 @@ project "support-agent" {
 
   deploy "local" {
     target = compose
-    expose = { port = 8080 }
+    expose {
+      port = 8080
+      # web_ui = true   # uncomment to add Open WebUI at localhost:3000
+    }
   }
 }
