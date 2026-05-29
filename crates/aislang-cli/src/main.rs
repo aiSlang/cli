@@ -1622,30 +1622,49 @@ fn render_service_rows(rows: &[ComposeService], drift: &mut bool) {
 // `aislang chat` — Monday of week 6 (stub) → Wednesday (live LiteLLM loop)
 // ============================================================================
 
-/// Open an interactive chat session against a declared agent.
+/// Open an interactive chat session against a declared agent — week
+/// 12 Fri carry-over from Thu (the proxy-via-MCP refactor that the
+/// Thu DoD deferred to v0.3).
 ///
-/// Flow:
-///   1. Read + validate the project source. Surface parse / type-check
-///      errors via the source-aware diagnostic pipeline so the UX
-///      matches `aislang validate`.
-///   2. Find the agent by label (with Levenshtein "did you mean…?"
-///      suggestions on misses — same UX as cross-resource refs).
-///   3. Resolve the agent's `model.label` reference and `prompt.label`
-///      reference into the concrete bindings the runtime needs.
-///   4. Load the system-prompt file's contents. If `aislang.lock` is
-///      present in the source directory and carries a hash for this
-///      prompt, verify it — otherwise read without verification (the
-///      user may have skipped lockfile creation via `--no-lock` at
-///      plan time).
-///   5. Open a `Session` against the compose-default LiteLLM URL.
-///   6. Loop: read one line from stdin, run a turn, print the
-///      assistant message. `/exit` or EOF cleanly closes.
+/// v0.1 ran the chat loop in-process: parse source → find agent →
+/// resolve refs → spawn MCP children directly → open `Session`
+/// against LiteLLM → stdin loop. All the heavy lifting lived in
+/// the CLI.
 ///
-/// The interactive loop is async (LiteLLM is HTTP-backed via reqwest).
-/// We spin up a single-thread tokio runtime on entry and `block_on`
-/// the whole session — keeps the rest of the CLI sync.
+/// v0.2 (this function) refactors `aislang chat` to be a **thin MCP
+/// client of `aislang mcp-serve`**, materialising planning-doc Track
+/// A architectural decision #3 ("proxy-via-MCP — the MCP server IS
+/// the agent runtime"). Concretely:
+///   1. CLI does validate + agent-existence check upfront so the
+///      user sees the same diagnostics they'd see in `aislang
+///      validate` for bad source / wrong agent label.
+///   2. CLI then spawns `aislang mcp-serve --stdio` as a child via
+///      `current_exe()` and connects via rmcp's client side.
+///   3. Stdin loop reads one line at a time and dispatches each as
+///      `aislang_chat_turn(source, source_dir, agent_label, user_input)`
+///      — same Session pool the Claude Desktop / Cursor chat uses.
+///   4. `/exit` and EOF close the MCP connection cleanly; mcp-serve
+///      drops the cached Session + MCP children on its end.
+///
+/// What this gives us:
+///   - One Session-pool implementation (mcp-serve) feeding both the
+///     `aislang chat` CLI AND any external MCP client. No surface
+///     duplication between the in-CLI loop and the MCP-tool path.
+///   - Same OTel span tree regardless of whether chat is driven by
+///     the CLI or by Claude Desktop — mcp-serve owns the root span.
+///   - Prompt-hash verification, budget enforcement, spend tracking,
+///     tool-use loop — all happen exactly once, in mcp-serve.
+///
+/// What we lose (acceptable):
+///   - The chat CLI no longer prints "connected to LiteLLM at …" or
+///     "tools: N available" up front. Both were nice-to-have status
+///     lines whose information is now discovered lazily on the first
+///     `aislang_chat_turn` call. We trade them for the architectural
+///     simplification.
+///   - The CLI's OTel tracing init moves to mcp-serve. The chat CLI
+///     itself emits no spans now — just dispatches MCP tool calls.
 fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
-    // ── 1. validate ──
+    // ── 1. read + validate source ──
     let source = std::fs::read_to_string(&file)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
     let (project, _warnings) = match aislang_core::validate(&source) {
@@ -1656,7 +1675,12 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         }
     };
 
-    // ── 2. find agent ──
+    // ── 2. find agent (with did-you-mean + available-list UX) ──
+    // We do this in the CLI rather than letting mcp-serve report it
+    // because v0.1's chat tests pin the error message shape — and
+    // having the CLI fail fast on a bad agent label is better UX
+    // than starting mcp-serve and surfacing the same error from a
+    // failed `aislang_chat_turn` call.
     let agent = match project.agents.iter().find(|a| a.label == agent_label) {
         Some(a) => a,
         None => {
@@ -1681,165 +1705,137 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         }
     };
 
-    // ── 3. resolve model + prompt refs ──
-    let model_label  = agent.model.label.clone();
-    let prompt_label = agent.system_prompt.label.clone();
-    let prompt_block = project.prompts.iter()
-        .find(|p| p.label == prompt_label)
-        .ok_or_else(|| anyhow::anyhow!(
-            "agent `{agent_label}` references prompt `{prompt_label}` \
-             which doesn't exist in {}", file.display()))?;
+    // Stash the model alias for the banner (the only thing we know
+    // upfront about the resolved chat target).  The actual model
+    // resolution, prompt loading, MCP children spawning, budget +
+    // tracker setup all happen inside mcp-serve on the first
+    // `aislang_chat_turn` call.
+    let model_label = agent.model.label.clone();
 
-    // Prompt file path is recorded relative to the source file's dir.
-    let source_dir   = file.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let prompt_path  = source_dir.join(&prompt_block.file);
+    // Canonical source_dir for the MCP server's prompt-resolution.
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let source_dir = std::fs::canonicalize(source_dir)
+        .map_err(|e| anyhow::anyhow!(
+            "source dir `{}` not readable: {e}", source_dir.display()))?;
 
-    // ── 4. load + verify prompt ──
-    // If aislang.lock exists in source_dir and carries a hash for
-    // this prompt label, verify it. Missing lockfile = no verification.
-    let lock_path = source_dir.join("aislang.lock");
-    let expected_hash: Option<String> =
-        match aislang_resolver::lockfile::read(&lock_path) {
-            Ok(Some(lock)) => lock.prompt_hashes.get(&prompt_label).cloned(),
-            _              => None,
-        };
-    let system_prompt = aislang_runtime::load_system_prompt(
-        &prompt_path,
-        expected_hash.as_deref(),
-    ).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // ── 5. collect MCP server specs the CLI must spawn for this agent ──
-    // For each ref in `agent.tools[]`, find the matching mcp_server
-    // block, capture its image + mount, AND resolve its declared
-    // secrets into env pairs (week 7 Fri, Decisions 8/9). Resolution
-    // failures here surface BEFORE we spin up the tokio runtime so
-    // the error path is sync.
-    use aislang_runtime::SpawnConfig;
-    let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
-    for tool_ref in &agent.tools {
-        // v0.1 only supports `mcp_server.X` tools (per spec §4.6).
-        if tool_ref.kind != aislang_core::ast::RefKind::McpServer {
-            return Err(anyhow::anyhow!(
-                "agent `{agent_label}.tools` ref `{}` has kind `{:?}` — \
-                 v0.1 only supports `mcp_server` tool refs",
-                tool_ref.label, tool_ref.kind));
-        }
-        let mcp = project.mcp_servers.iter()
-            .find(|m| m.label == tool_ref.label)
-            .ok_or_else(|| anyhow::anyhow!(
-                "agent `{agent_label}` references mcp_server `{}` \
-                 which doesn't exist in {}",
-                tool_ref.label, file.display()))?;
-        // Canonicalise the mount path (StdioChild's docker -v needs absolute).
-        let mount = mcp.mount.as_ref().map(|p| {
-            // Resolve relative to the source file's directory, matching
-            // how aislang plan handles paths.
-            let resolved = source_dir.join(p);
-            std::fs::canonicalize(&resolved).unwrap_or(resolved)
-        });
-        // Resolve mcp.secrets[] into env pairs (Decision 9: by
-        // construction — only secrets the user EXPLICITLY listed in
-        // this server's `secrets = [...]` field reach this child's
-        // env. No global env leakage; no other secret blocks visible).
-        let env = resolve_mcp_secrets(&project, mcp, source_dir)
-            .map_err(|e| anyhow::anyhow!(
-                "secret resolution failed for mcp_server `{}`: {e}",
-                mcp.label))?;
-        mcp_specs.push((mcp.label.clone(), SpawnConfig {
-            image: format_image(&mcp.image),
-            args:  Vec::new(),
-            mount,
-            env,
-        }));
-    }
-
-    // ── 6. resolve model + build per-run budget config (week 7 Wed) ──
-    // The session needs catalog-derived per-1k-token prices to compute
-    // running cost. We run the resolver inline (same logic as `plan`)
-    // to find the primary `ModelId` for this agent's model, then look
-    // up its catalog entry. Resolution failures bubble — same UX as
-    // `aislang plan` on the same source.
-    use aislang_runtime::BudgetConfig;
-    let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
-        Some(b) => {
-            let resolved = aislang_resolver::resolve_against_bundled_catalog(
-                &project, source_dir,
-            ).map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
-            let model_id = resolved.model_bindings.get(&model_label)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "model `{model_label}` has no resolved binding — \
-                     resolver returned an empty set?"))?;
-            let catalog = aislang_catalog::bundled()
-                .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
-            let entry = catalog.find(model_id)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "catalog entry `{}.{}` (resolved primary for `{model_label}`) \
-                     not found in bundled catalog",
-                    model_id.provider, model_id.name))?;
-            Some(BudgetConfig {
-                per_run_cap:        b.hard_cap_per_run,
-                per_day_cap:        b.hard_cap_per_day,
-                cost_input_per_1k:  entry.cost_input,
-                cost_output_per_1k: entry.cost_output,
-                // Canonical model id form — matches `aislang.lock`'s
-                // `model_bindings` values verbatim. Week 10 Tue stamps
-                // this on every `SpendTracker::add()` so today's
-                // `by_model` breakdown stays accurate per Decision 32.
-                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
-            })
-        }
-        None => None,
-    };
-
-    // ── 7. open per-day spend tracker (week 7 Thu) ─────────────
-    // Only attach a tracker when a budget block is present — there's
-    // no point persisting spend for projects that don't declare
-    // caps. Failures to open the tracker (missing $HOME, corrupt
-    // file, future schema_version) bubble; the CLI surfaces the
-    // error and the user fixes the file.
-    let tracker = match budget_cfg.as_ref() {
-        Some(_) => Some(aislang_runtime::SpendTracker::open_default(&project.name)
-            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?),
-        None => None,
-    };
-
-    // ── 8. open session, run interactive loop ──
-    //
-    // OTel-GenAI tracing (week 9 Mon, Decisions 18 + 21 + 22):
-    // the simple+blocking exporter requires sync ctx for both span
-    // export and provider shutdown. So init + RootSpan creation +
-    // RootSpan drop + shutdown all happen OUTSIDE rt.block_on; the
-    // async fn just re-attaches the root context on the tokio
-    // worker thread so any child spans (Tue/Wed) inherit.
-    if let Err(e) = aislang_runtime::init_tracer("aislang") {
-        eprintln!("tracing disabled: {e}");
-    }
-    let root_span = aislang_runtime::RootSpan::for_chat(&agent_label);
-    let root_ctx  = root_span.context();
-
+    // ── 3. spin tokio runtime + drive the MCP-proxied chat loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-    let result = rt.block_on(async move {
-        let _g = root_ctx.attach();
-        chat_interactive(
-            &agent_label,
-            &model_label,
-            system_prompt,
-            mcp_specs,
-            budget_cfg,
-            tracker,
-        ).await
-    });
-    // Drop the tokio runtime in sync ctx — clean teardown.
+    let result = rt.block_on(chat_via_mcp_serve(
+        source, source_dir, agent_label, model_label,
+    ));
     drop(rt);
-    // Drop the root span in sync ctx → simple processor exports via
-    // blocking reqwest. Stderr breadcrumb prints here.
-    drop(root_span);
-    // Flush+shutdown the provider in sync ctx.
-    aislang_runtime::shutdown_tracer();
     result
+}
+
+/// Drive an interactive chat session by spawning `aislang mcp-serve
+/// --stdio` as a child process and proxying each stdin line through
+/// the `aislang_chat_turn` MCP tool.  Returns Ok on clean close
+/// (EOF or `/exit`); bubbles errors that occur before the chat loop
+/// starts (spawn failure, MCP handshake failure).
+///
+/// Per-turn errors (parse error in source / unknown agent / LiteLLM
+/// HTTP failure / etc.) print to stderr but DON'T abort the session,
+/// matching the v0.1 in-process chat behaviour: the user can
+/// continue typing.
+async fn chat_via_mcp_serve(
+    source:      String,
+    source_dir:  PathBuf,
+    agent_label: String,
+    model_label: String,
+) -> Result<()> {
+    use rmcp::{ServiceExt,
+        model::{CallToolRequestParams, RawContent},
+        transport::TokioChildProcess};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    // ── Spawn the same `aislang` binary as a `mcp-serve --stdio`
+    // child.  `current_exe()` returns the path to this running
+    // binary, so the child shares our build + version (no PATH
+    // lookup risk; no version drift if multiple `aislang` binaries
+    // exist on the system).
+    let bin = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("locate own binary: {e}"))?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("mcp-serve").arg("--stdio");
+    // Inherit our stderr: mcp-serve's "starting stdio MCP server …"
+    // banner + any internal warnings still surface to the user.
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let transport = TokioChildProcess::new(cmd)
+        .map_err(|e| anyhow::anyhow!("spawn aislang mcp-serve: {e}"))?;
+    let client = ().serve(transport).await
+        .map_err(|e| anyhow::anyhow!("MCP handshake failed: {e}"))?;
+
+    // ── Banner.  Stderr so stdout stays pipe-clean for assistant
+    // replies.  v0.1's chat banner mentioned the LiteLLM URL +
+    // tool count; both move into mcp-serve and surface lazily on
+    // the first `aislang_chat_turn` call.  The CLI knows only the
+    // agent label + model alias upfront.
+    eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`) \
+               via aislang mcp-serve --stdio");
+    eprintln!("connected to LiteLLM via mcp-serve's Session pool.");
+    eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
+    eprintln!();
+
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+
+    let exit_reason = loop {
+        eprint!("> ");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+
+        let line = match reader.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None)    => break "(end of input)",
+            Err(e)      => {
+                client.cancel().await.ok();
+                return Err(anyhow::anyhow!("stdin read error: {e}"));
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if line == "/exit" { break "(/exit — session ended)"; }
+
+        // ── Dispatch one turn via the MCP tool.  Same Session
+        // pool the Claude Desktop / Cursor chat uses (planning-doc
+        // Track A architectural decision #3).
+        let params = CallToolRequestParams::new("aislang_chat_turn".to_string())
+            .with_arguments(serde_json::json!({
+                "source":      source,
+                "source_dir":  source_dir.to_string_lossy(),
+                "agent_label": agent_label,
+                "user_input":  line,
+            }).as_object().unwrap().clone());
+        match client.peer().call_tool(params).await {
+            Ok(result) => {
+                let reply = result.content.first()
+                    .and_then(|c| match &c.raw {
+                        RawContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("(empty response)");
+                println!("{reply}");
+            }
+            Err(e) => {
+                // Per-turn error — don't abort the session.  Same
+                // posture v0.1's chat loop took: surface the error
+                // on stderr and let the user retry or `/exit`.
+                eprintln!("aislang chat: {e}");
+            }
+        }
+    };
+
+    // Clean shutdown — closes the stdio pipe; mcp-serve sees EOF
+    // and exits.
+    eprintln!("{exit_reason}");
+    client.cancel().await
+        .map_err(|e| anyhow::anyhow!("shutdown mcp-serve child: {e}"))?;
+    Ok(())
 }
 
 /// Render an `OciImage` into the docker-friendly form. Mirrors
@@ -1902,113 +1898,6 @@ fn resolve_mcp_secrets(
         env.push((secret.label.clone(), value));
     }
     Ok(env)
-}
-
-/// The async interactive loop. Separate from `run_chat` to keep the
-/// sync arg-parsing + resolution phase out of the tokio runtime.
-async fn chat_interactive(
-    agent_label:   &str,
-    model_label:   &str,
-    system_prompt: String,
-    mcp_specs:     Vec<(String, aislang_runtime::SpawnConfig)>,
-    budget_cfg:    Option<aislang_runtime::BudgetConfig>,
-    tracker:       Option<aislang_runtime::SpendTracker>,
-) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    // (OTel tracing init + RootSpan are owned by the sync wrapper
-    // `run_chat` — they MUST drop in sync ctx because the blocking
-    // OTLP exporter would otherwise panic dropping its internal
-    // tokio runtime inside ours. The root context is already
-    // attached on this worker thread by `run_chat`'s `_g` guard.)
-
-    // ── Spawn MCP children + list their tools to populate the registry ──
-    let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
-    let mut server_tools: Vec<(String, Vec<aislang_runtime::ToolSpec>)> = Vec::new();
-    for (label, cfg) in &mcp_specs {
-        let child = aislang_runtime::StdioChild::spawn(cfg).await
-            .map_err(|e| anyhow::anyhow!(
-                "spawn MCP server `{label}` ({}): {e}", cfg.image))?;
-        let tools = child.list_tools().await
-            .map_err(|e| anyhow::anyhow!(
-                "list tools from MCP server `{label}`: {e}"))?;
-        eprintln!("  mcp server `{label}` connected ({} tool{})",
-            tools.len(), if tools.len() == 1 { "" } else { "s" });
-        server_tools.push((label.clone(), tools));
-        mcp_clients.push(child);
-    }
-
-    let tool_registry = aislang_runtime::ToolRegistry::from_servers(&server_tools);
-    let tool_count    = tool_registry.len();
-
-    let session = {
-        let s = aislang_runtime::Session::open_with_tools(
-            model_label,
-            system_prompt,
-            None, // default http://127.0.0.1:4000
-            mcp_clients,
-            tool_registry,
-        ).map_err(|e| anyhow::anyhow!("open session: {e}"))?;
-        let s = match budget_cfg {
-            Some(b) => s.with_budget(b),
-            None    => s,
-        };
-        match tracker {
-            Some(t) => s.with_tracker(t),
-            None    => s,
-        }
-    };
-
-    // Banner — stderr so stdout stays pipe-clean for the model output.
-    eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`)");
-    eprintln!("connected to LiteLLM at {}", aislang_runtime::LiteLlmClient::DEFAULT_URL);
-    if tool_count > 0 {
-        eprintln!("tools: {tool_count} available across {} MCP server{}",
-            mcp_specs.len(), if mcp_specs.len() == 1 { "" } else { "s" });
-    }
-    if session.has_budget() {
-        eprintln!("budget: per-run cap enforcement enabled");
-    }
-    eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
-    eprintln!();
-
-    // Read one line at a time from stdin.
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
-
-    let exit_reason = loop {
-        eprint!("> ");
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
-
-        let line = match reader.next_line().await {
-            Ok(Some(l)) => l,
-            Ok(None)    => break "(end of input)",
-            Err(e)      => {
-                // Print AFTER shutting down MCP children to leave a
-                // clean host state.
-                session.shutdown().await.ok();
-                return Err(anyhow::anyhow!("stdin read error: {e}"));
-            }
-        };
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "/exit" { break "(/exit — session ended)"; }
-
-        match session.turn(line).await {
-            Ok(reply) => println!("{reply}"),
-            Err(e)    => {
-                eprintln!("aislang chat: {e}");
-                continue;
-            }
-        }
-    };
-
-    // Clean shutdown — kill MCP children.
-    eprintln!("{exit_reason}");
-    session.shutdown().await
-        .map_err(|e| anyhow::anyhow!("shutdown MCP children: {e}"))?;
-    Ok(())
 }
 
 /// Levenshtein-style "closest match" heuristic. Threshold ≤2 edits;
