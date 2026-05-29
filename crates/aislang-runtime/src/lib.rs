@@ -53,7 +53,12 @@ pub use litellm::{
     Tool, ToolCall, ToolFunction, FunctionCall, UsageStats,
 };
 pub use mcp::{StdioChild, SpawnConfig, ToolSpec, ToolContent, McpError};
-pub use mcp_server::{AislangServer, ServerError as McpServerError, serve_stdio as mcp_serve_stdio};
+pub use mcp_server::{
+    AislangServer,
+    ServerError as McpServerError,
+    serve_stdio as mcp_serve_stdio,
+    serve_http  as mcp_serve_http,   // week-13 Mon
+};
 pub use cost::{cost_of_usage, sum as money_sum, format_money};
 pub use spend::{SpendTracker, SpendError};
 pub use state::{

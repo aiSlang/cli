@@ -3,6 +3,7 @@
 //! v0.1 subcommand surface (most are stubs until their scheduled week).
 //! See PLAN-90-days-v0_1.md for the implementation schedule.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -185,19 +186,35 @@ enum Command {
     /// lands Tue–Thu per PLAN-90-days-v0_2.md Phase 1 Week 12.
     ///
     /// **Transports:** `--stdio` (default — for parent-spawned use by
-    /// Claude Desktop, Cursor, etc.) is wired this week.  `--http`
-    /// transport for k8s/cloud deployments arrives Week 13 Mon.
+    /// Claude Desktop, Cursor, etc.) is wired week 12 Mon.  `--http
+    /// <ADDR>` (week 13 Mon) hosts the same tool surface over rmcp's
+    /// Streamable-HTTP transport at `http://ADDR/mcp`; suitable for
+    /// k8s/cloud deployments where the server is reached by N
+    /// independent MCP clients over the network.  The Session pool
+    /// (chat_turn / eval) is shared across HTTP clients — two
+    /// clients hitting the same `(source_dir, agent_label)` pair
+    /// reuse the same in-process conversational Session, same as
+    /// stdio (extended from N=1 to N).
     ///
     /// Typical local invocation comes from the client's MCP config,
     /// not from the user shell directly — but `aislang mcp-serve` IS
-    /// runnable from a TTY for testing (it'll block on stdin reads,
-    /// which is the point).
+    /// runnable from a TTY for testing (it'll block on stdin reads
+    /// or wait for HTTP connections, which is the point).
     #[command(name = "mcp-serve")]
     McpServe {
-        /// Use the stdio transport (default and only option in week
-        /// 12 Mon). `--http :PORT` lands Week 13 Mon.
-        #[arg(long, default_value_t = true)]
+        /// Use the stdio transport (default). Mutually exclusive
+        /// with `--http`. When neither flag is provided, stdio
+        /// wins; when both are provided, clap rejects the call.
+        #[arg(long, conflicts_with = "http", default_value_t = true)]
         stdio: bool,
+        /// Use the Streamable-HTTP transport at the given bind
+        /// address. Accepts any `host:port` form `SocketAddr`
+        /// parses — `127.0.0.1:8080`, `0.0.0.0:8080`, `[::1]:8080`,
+        /// etc. The MCP endpoint is mounted at `/mcp` (the rmcp
+        /// convention); a client URL therefore looks like
+        /// `http://<host>:<port>/mcp`.
+        #[arg(long, value_name = "ADDR", conflicts_with = "stdio")]
+        http: Option<SocketAddr>,
     },
 }
 
@@ -237,47 +254,51 @@ fn run() -> Result<ExitCode> {
         Command::Status { file, spend, model_spend } =>
             run_status(file, spend, model_spend)?,
         Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
-        Command::McpServe { stdio }   => run_mcp_serve(stdio).map(|_| ExitCode::SUCCESS)?,
+        Command::McpServe { stdio, http } =>
+            run_mcp_serve(stdio, http).map(|_| ExitCode::SUCCESS)?,
     };
     Ok(code)
 }
 
 // ============================================================================
-// `aislang mcp-serve` — week 12 Mon scaffolding
+// `aislang mcp-serve` — week 12 Mon scaffolding, week 13 Mon HTTP
 // ============================================================================
 //
-// PLAN-90-days-v0_2.md Phase 1 Week 12 Mon: registers a single
-// `aislang_ping` tool over stdio.  Validates the rmcp-server
-// pipeline on a trivial case before scaling to 9 tool families
-// Tue-Thu.  The actual server implementation lives in
-// `aislang-runtime::mcp_server`; this function is just the
-// async-runtime bring-up + transport dispatch.
+// Week 12 Mon: registers a single `aislang_ping` tool over stdio.
+// Validates the rmcp-server pipeline on a trivial case before
+// scaling to 9 tool families Tue-Thu.  The actual server
+// implementation lives in `aislang-runtime::mcp_server`; this
+// function is the async-runtime bring-up + transport dispatch.
 //
-// Stdio is the only supported transport this week (Decision 39);
-// `--http :PORT` arrives Week 13 Mon.  We accept `--stdio` as a
-// flag anyway so the CLI shape doesn't change between week 12 and
-// week 13 (Week 13 adds `--http` as an alternative, keeping `--stdio`
-// as the documented default).
+// Week 13 Mon (Decision 39 follow-through): HTTP/SSE transport
+// alongside stdio.  Both transports drive the SAME `AislangServer`
+// struct — only the wire integration differs.  `--http <ADDR>`
+// brings up axum-hosted rmcp `StreamableHttpService` at
+// `http://ADDR/mcp`.
 
 /// Bring up the aiSlang MCP server.  Blocks until the connected
-/// client disconnects (EOF on stdin) or the user interrupts.
+/// client disconnects (stdio EOF) or Ctrl-C signals shutdown (HTTP).
 ///
-/// Runtime: we build a small single-thread tokio runtime rather
-/// than reuse the existing chat/eval runtimes — `mcp-serve` is
-/// long-lived and benefits from a dedicated executor without the
-/// noise of other CLI subcommands sharing it.  rmcp itself only
-/// requires the multi-thread runtime when serving multiple
-/// concurrent clients; stdio is inherently single-client so
-/// `current_thread` is sufficient and saves a worker thread.
-fn run_mcp_serve(stdio: bool) -> Result<()> {
+/// Runtime selection:
+///   - **stdio** is inherently single-client.  A small
+///     `current_thread` runtime is sufficient and saves a worker
+///     thread.
+///   - **http** serves N concurrent MCP clients.  We need
+///     `multi_thread` so axum's connection accept loop, per-session
+///     workers, and the !Send `Session::turn` `spawn_blocking`
+///     workers can all overlap.
+fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
+    if let Some(addr) = http {
+        return run_mcp_serve_http(addr);
+    }
+
+    // Stdio is the default (clap's `default_value_t = true` on
+    // `--stdio`).  If somebody forces `--stdio=false` without
+    // `--http`, clap's `conflicts_with` won't catch it (--stdio is
+    // just `false`); guard explicitly.
     if !stdio {
-        // Defensive — clap's default-value-true means this branch
-        // is unreachable today, but we want a clear error if Week
-        // 13 wires --http but somebody passes --stdio=false to
-        // both transports.
         return Err(anyhow::anyhow!(
-            "no transport selected; --http :PORT arrives Week 13 Mon \
-             (PLAN-90-days-v0_2.md Phase 1 Week 13)"));
+            "no transport selected; pass either --stdio or --http <ADDR>"));
     }
 
     // Log the start to stderr — stdout belongs to the MCP wire
@@ -296,6 +317,55 @@ fn run_mcp_serve(stdio: bool) -> Result<()> {
     })?;
 
     eprintln!("aislang mcp-serve: client disconnected; shutting down.");
+    Ok(())
+}
+
+/// HTTP variant of [`run_mcp_serve`].
+///
+/// Binds a TCP listener at the user-supplied `addr`, hands it to
+/// the runtime's `serve_http`, and serves until Ctrl-C.  Ctrl-C
+/// fires a `CancellationToken` which axum uses for graceful
+/// shutdown (drain active SSE streams, refuse new connections,
+/// propagate cancellation into per-session rmcp workers).
+///
+/// The MCP endpoint is at `http://<addr>/mcp`.  We print the full
+/// URL on startup so users can paste it into Claude Desktop's MCP
+/// server config / Cursor / a raw `curl` directly.
+fn run_mcp_serve_http(addr: SocketAddr) -> Result<()> {
+    eprintln!("aislang mcp-serve: starting HTTP MCP server on http://{addr}/mcp …");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+        // Log the actual port (resolves the ephemeral case where
+        // the user passed :0 — useful for ad-hoc local testing).
+        let bound = listener.local_addr()
+            .map_err(|e| anyhow::anyhow!("query bound addr: {e}"))?;
+        eprintln!("aislang mcp-serve: listening on http://{bound}/mcp \
+                   (Ctrl-C to shut down).");
+
+        let ct = tokio_util::sync::CancellationToken::new();
+        let ct_signal = ct.clone();
+        tokio::spawn(async move {
+            // Best-effort Ctrl-C handling.  If the OS doesn't
+            // give us SIGINT, we fall back to running until the
+            // listener errors out for some other reason.
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("aislang mcp-serve: Ctrl-C received; draining …");
+                ct_signal.cancel();
+            }
+        });
+
+        aislang_runtime::mcp_serve_http(listener, ct).await
+            .map_err(|e| anyhow::anyhow!("mcp-serve: {e}"))
+    })?;
+
+    eprintln!("aislang mcp-serve: HTTP server shut down cleanly.");
     Ok(())
 }
 

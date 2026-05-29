@@ -35,6 +35,10 @@ opentelemetry    = { workspace = true }
 # (`TokioChildProcess`) the integration tests use, promoted from
 # dev-deps to main deps.
 rmcp             = { workspace = true }
+# week-13 Mon: `aislang mcp-serve --http <ADDR>` plumbing —
+# CancellationToken bridges Ctrl-C to axum's graceful-shutdown
+# path inside the runtime's `mcp_serve_http`.
+tokio-util       = { workspace = true }
 
 [dev-dependencies]
 # week-12 Mon: `cli_mcp_serve` integration tests spawn the freshly

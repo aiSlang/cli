@@ -43,9 +43,20 @@ sha2        = "0.10"
 # `#[tool]` / `#[tool_router]` / `#[tool_handler]`. schemars is
 # required by the macros for JSON-schema generation of tool
 # parameter types.
-rmcp        = { version = "1.7", features = ["client", "server", "macros", "transport-child-process", "transport-io", "schemars"] }
+# week-13 Mon: `transport-streamable-http-server` adds the
+# `StreamableHttpService` tower service we plug into axum for
+# `aislang mcp-serve --http :PORT`. Pulls in the in-memory
+# `LocalSessionManager` (`local` feature).
+rmcp        = { version = "1.7", features = ["client", "server", "macros", "transport-child-process", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "schemars"] }
 schemars    = "1.0"
-tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "time", "sync"] }
+# week-13 Mon: HTTP transport for `aislang mcp-serve --http`.
+# `axum` is the tower-Service host that `StreamableHttpService`
+# attaches to; matches the rmcp example pattern. `tokio-util` gives
+# us the `CancellationToken` we hand into the service config so
+# Ctrl-C cleanly drains active SSE streams.
+axum        = "0.7"
+tokio-util  = "0.7"
+tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "time", "sync", "signal", "net"] }
 # week-6 Wed: LiteLLM HTTP client + non-streaming chat loop
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # week-9 Mon: OTel-GenAI tracing — official Rust SDK + OTLP HTTP exporter
