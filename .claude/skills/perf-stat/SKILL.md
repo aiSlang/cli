@@ -1,6 +1,6 @@
 ---
 name: perf-stat
-description: Story-Points-style velocity tracking against PLAN-90-days.md. Treats each `Week N <Mon|Tue|Wed|Thu|Fri>` day-row as 1 SP (Story Point — one planned man-day for an unaccelerated solo dev). Cross-references git log for actual completion timestamps, clusters by calendar date, and reports per-week velocity (SP/Alex-day). Use after each milestone closes to record factual velocity; use before any new sprint to convert SP estimates into Alex-day projections.
+description: Story-Points-style velocity tracking against PLAN-90-days.md PLUS token-spend tracking from Claude Code session JSONLs (schema v2, added Phase 1 Week 12 close). Treats each `Week N <Mon|Tue|Wed|Thu|Fri>` day-row as 1 SP. Cross-references git log for completion timestamps; walks ~/.claude/projects/*/*.jsonl for per-message token usage; aggregates both per calendar date. Per-week report shows velocity (SP/Alex-day) + tokens (total, T/SP, T/day). Summary appends project-wide token totals + tokens/SP + tokens/Rust-LoC bottom-line ratio.
 ---
 
 # perf-stat
@@ -86,18 +86,67 @@ The helper script (`run.sh`) is a thin bash dispatcher; the actual analysis live
 
 ## Cache file
 
-`.claude/skills/perf-stat/cache.json` is gitignored. Shape:
+`.claude/skills/perf-stat/cache.json` is gitignored. Schema v2 (Phase 1 Week 12 close):
 
 ```json
 {
-  "schema_version": 1,
-  "computed_at": "2026-05-28T18:00:00+02:00",
+  "schema_version": 2,
+  "computed_at": "2026-05-29T...",
   "weeks": [
-    { "week": 1, "sp": 5, "alex_days": 2, "velocity": 2.50, "dates": ["2026-..."] },
+    {
+      "week": 12,
+      "sp": 5,
+      "alex_days": 1,
+      "velocity": 5.00,
+      "tokens": {
+        "input":          12345,
+        "output":         67890,
+        "cache_creation": 11111,
+        "cache_read":     22222,
+        "total":         113568
+      },
+      "tokens_per_sp":       22713,
+      "tokens_per_alex_day": 113568,
+      "dates": ["2026-05-29"]
+    },
     ...
   ],
-  "summary": { "n_weeks": 11, "mean_velocity": 2.10, "std_velocity": 0.45 }
+  "summary": {
+    "n_weeks":           11,
+    "mean_velocity":     4.09,
+    "std_velocity":      1.61,
+    "min_velocity":      1.00,
+    "max_velocity":      7.00,
+    "total_tokens":      2933000000,
+    "tokens_per_sp_avg": 55300000
+  }
 }
 ```
 
+Two new schema-v2 derived ratios appear in the rendered summary but not in cache.json:
+
+- **`current Rust LoC`** — read from `.claude/skills/code-stat/cache.txt` at report time.
+- **`total tokens / current LoC`** — `summary.total_tokens / current_loc`. Rough proxy for "tokens per LoC produced." See the limitation note below — this divides by current LoC, not LoC delta over the token window.
+
 The schema is intentionally explicit so future tooling (a v0.2+ "perf dashboard") can consume it.
+
+## Token tracking — what's counted, what isn't
+
+`aggregate_tokens_per_date()` walks **every** subdirectory of `~/.claude/projects/` and tallies tokens by message timestamp.  Why all subdirs: Claude Code names each subdir after the CWD it was launched from, but a session might touch multiple repos (you launch from one dir and `cd` to another).  Date-bucketing keeps the per-week numbers honest — only dates that have git commits to THIS repo land in THIS repo's week buckets.
+
+What we count per message:
+- `input_tokens`              — uncached input
+- `output_tokens`             — model output
+- `cache_creation_input_tokens` — input being cached now (~1.25× normal price)
+- `cache_read_input_tokens`   — input read from cache (~0.1× normal price)
+- `total` = sum of all four
+
+**Caveats:**
+
+1. **Cross-week date double-counting in per-week columns.**  A calendar day with commits attributed to multiple weeks (e.g. Week 10 Fri close-out and Week 11 Mon scaffold land on the same day) contributes its tokens to BOTH weeks' per-week totals.  The summary's `total_tokens` uses unique dates across all weeks so the project-wide total isn't inflated — but the per-week column will sometimes appear "duplicated" for cross-week days.  Documented; v0.3 may add per-commit token attribution if a finer grain is needed.
+
+2. **All Claude work in the date window counts.**  If you spent half a day on aiSlang and half on another project, both halves' tokens land in this repo's perf-stat (because we filter by date, not by which repo the work was for).  This is a feature: tokens spent on a date with aiSlang commits represent the "total Claude Code spend that contributed to your aiSlang velocity that day," including reading docs, side-tasks, etc.  Not just aiSlang code generation.
+
+3. **`tokens / LoC` is `total tokens / CURRENT LoC`**, NOT `tokens / LoC delta`.  The skill doesn't track historical LoC at past commits.  For a more accurate per-period ratio, divide per-week token totals by the LoC delta you tracked manually via `code-stat` that week.  v0.3 may track per-week LoC deltas natively.
+
+4. **Failed parses are silent.**  Corrupt JSONL lines or missing `usage` fields contribute zero.  Token metric is informational; broken telemetry shouldn't break the perf-stat run.
