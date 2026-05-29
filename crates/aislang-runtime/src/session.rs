@@ -99,6 +99,105 @@ pub const PER_TURN_TIMEOUT_SECS: u64 =
 pub const TOOL_NAME_SEPARATOR: &str = "__";
 
 // ============================================================================
+// Progress reporting — week 13 Wed
+// ============================================================================
+
+/// Lifecycle events emitted by [`Session::turn_with_progress`] during
+/// a multi-iteration tool-use cycle.
+///
+/// Wired by Phase 1 Week 13 Wed (Track A — chat-turn streaming via
+/// MCP progress notifications).  The MCP server's `aislang_chat_turn`
+/// tool subscribes the caller's `progressToken` to this stream and
+/// forwards each event as an MCP `notifications/progress` message,
+/// so external clients (Claude Desktop, Cursor, `aislang chat`'s own
+/// MCP-client banner) see incremental updates instead of a long
+/// silence punctuated by the final reply.
+///
+/// **Token ordering.**  Each enum variant carries a `step` field
+/// that monotonically increases within one `turn` call.  Callers
+/// that map to MCP `ProgressNotificationParam.progress` should pass
+/// `step as f64` directly — rmcp validates monotonicity, so emitting
+/// them in source order is required.
+///
+/// **PII posture (Decision 21 extended).**  v0.2 Wed emits sizes
+/// and labels, never argument content or tool-output bodies.  The
+/// human-readable `message()` form may include the tool name +
+/// args-bytes count (already in OTel spans); it never embeds the
+/// raw arguments JSON or the response text.  Same posture v0.1's
+/// `mcp::mcp_call_tool_attrs` takes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionProgress {
+    /// A new tool-use iteration is about to make a LiteLLM call.
+    /// `iteration` is 0-indexed; `max` is [`MAX_TOOL_ITERS`].
+    IterationStart { step: u64, iteration: u32, max: u32 },
+    /// LiteLLM returned with tool calls; about to dispatch them.
+    /// `count` is the number of calls in this iteration (usually 1,
+    /// but the model can request several in parallel — same loop
+    /// `Session::turn` runs sequentially today).
+    ToolDispatchStart { step: u64, iteration: u32, count: usize },
+    /// One specific MCP tool call dispatched. `server` is the
+    /// declared label; `tool` is the MCP tool name; `args_bytes` is
+    /// the JSON-encoded size of the arguments (NOT the args body).
+    ToolCall { step: u64, iteration: u32, server: String, tool: String, args_bytes: usize },
+    /// That call returned. `fragments` counts the number of MCP
+    /// content fragments in the response; `bytes` is their total
+    /// rendered text size; `is_error` is the MCP error flag.
+    ToolResult {
+        step:      u64,
+        iteration: u32,
+        server:    String,
+        tool:      String,
+        fragments: usize,
+        bytes:     usize,
+        is_error:  bool,
+    },
+    /// LiteLLM returned a `tool_calls`-free response — the turn's
+    /// final answer.  Caller can use this as the "drain" / "done"
+    /// marker before the function result arrives over the wire.
+    FinalAnswer { step: u64, iteration: u32, bytes: usize },
+}
+
+impl SessionProgress {
+    /// Monotonic counter the caller can pass to rmcp's
+    /// `ProgressNotificationParam.progress`.  Identical to the inner
+    /// `step` field across all variants; centralised here so future
+    /// enum variants stay forward-compat with the rmcp contract.
+    pub fn step(&self) -> u64 {
+        match self {
+            Self::IterationStart    { step, .. } => *step,
+            Self::ToolDispatchStart { step, .. } => *step,
+            Self::ToolCall          { step, .. } => *step,
+            Self::ToolResult        { step, .. } => *step,
+            Self::FinalAnswer       { step, .. } => *step,
+        }
+    }
+
+    /// One-line human-readable form for the MCP progress message
+    /// field + the CLI banner.  PII-safe by construction: labels +
+    /// sizes only.
+    pub fn message(&self) -> String {
+        match self {
+            Self::IterationStart { iteration, max, .. } =>
+                format!("iteration {}/{} — calling LLM", iteration + 1, max),
+            Self::ToolDispatchStart { iteration, count, .. } =>
+                format!("iteration {} — dispatching {count} tool call{}",
+                        iteration + 1, if *count == 1 { "" } else { "s" }),
+            Self::ToolCall { server, tool, args_bytes, .. } =>
+                format!("tool `{server}.{tool}` ({args_bytes}B args)"),
+            Self::ToolResult { server, tool, fragments, bytes, is_error, .. } =>
+                format!(
+                    "tool `{server}.{tool}` returned {fragments} fragment{} \
+                     ({bytes}B{})",
+                    if *fragments == 1 { "" } else { "s" },
+                    if *is_error { ", is_error=true" } else { "" },
+                ),
+            Self::FinalAnswer { bytes, .. } =>
+                format!("final answer ready ({bytes}B)"),
+        }
+    }
+}
+
+// ============================================================================
 // Errors
 // ============================================================================
 
@@ -430,10 +529,47 @@ impl Session {
     ///      answer, return a synthetic
     ///      `"max tool calls exceeded (N)"` reply.
     pub async fn turn(&self, user_input: &str) -> Result<String, SessionError> {
+        // Delegate to the progress-aware variant with a no-op callback.
+        // Keeps the public signature stable for callers that don't care
+        // about per-iteration streaming (v0.1 chat CLI's in-process
+        // loop pre-week-12-Fri, v0.2's `aislang_eval`, all tests).
+        self.turn_with_progress(user_input, |_| {}).await
+    }
+
+    /// `turn` variant that fires `on_progress` for every
+    /// [`SessionProgress`] event during the tool-use loop.  Wired by
+    /// Week 13 Wed (Track A — chat-turn streaming).
+    ///
+    /// `on_progress` is `Fn` (NOT `FnMut`) so multiple events within
+    /// the same iteration don't require interior mutability at the
+    /// callback level.  Typical implementation is a closure that
+    /// pushes onto a `tokio::sync::mpsc::UnboundedSender` — see
+    /// `mcp_server::chat_turn` for the canonical wiring.
+    ///
+    /// **Send-ness.** The callback bound is `Fn(SessionProgress) +
+    /// Send + Sync + 'static`.  The Session-internal !Send (OTel
+    /// `ContextGuard` across awaits) means callers still wrap the
+    /// returned future in `spawn_blocking + inner current_thread`
+    /// — see chat_turn.  The callback itself crosses the
+    /// !Send boundary cleanly because it's invoked from the same
+    /// !Send context, not awaited.
+    pub async fn turn_with_progress<F>(
+        &self,
+        user_input: &str,
+        on_progress: F,
+    ) -> Result<String, SessionError>
+    where
+        F: Fn(SessionProgress) + Send + Sync + 'static,
+    {
         let mut messages: Vec<ChatMessage> = vec![
             ChatMessage::text(Role::System, &self.system_prompt),
             ChatMessage::text(Role::User,   user_input),
         ];
+        // Monotonic step counter for SessionProgress events — passed
+        // verbatim to rmcp `ProgressNotificationParam.progress` (rmcp
+        // requires monotonicity).
+        let mut step: u64 = 0;
+        let mut bump = || { let s = step; step += 1; s };
 
         // ── OTel: open the turn-level span (week 9 Wed) ──
         // Parent = `Context::current()` (per-command root attached
@@ -475,6 +611,16 @@ impl Session {
                 .start(&tracer);
             let iter_ctx   = Context::current_with_span(iter_span);
             let _iter_guard = iter_ctx.attach();
+
+            // ── Progress event: starting iteration ───────────────
+            // Fired BEFORE the LiteLLM call so the host UI shows
+            // "calling LLM" during what is typically the dominant
+            // wait of the whole turn (provider HTTP latency).
+            on_progress(SessionProgress::IterationStart {
+                step:      bump(),
+                iteration: _iter as u32,
+                max:       MAX_TOOL_ITERS as u32,
+            });
 
             let req = ChatRequest {
                 model:      self.model_label.clone(),
@@ -556,7 +702,13 @@ impl Session {
                 Some(c) if !c.is_empty() => c.clone(),
                 _ => {
                     // No tool calls → final answer.
-                    return Ok(assistant.content.unwrap_or_default());
+                    let body = assistant.content.unwrap_or_default();
+                    on_progress(SessionProgress::FinalAnswer {
+                        step:      bump(),
+                        iteration: _iter as u32,
+                        bytes:     body.len(),
+                    });
+                    return Ok(body);
                 }
             };
 
@@ -577,13 +729,57 @@ impl Session {
             // Record the assistant's tool-call request in history.
             messages.push(assistant);
 
+            // ── Progress event: about to dispatch tool calls ────
+            on_progress(SessionProgress::ToolDispatchStart {
+                step:      bump(),
+                iteration: _iter as u32,
+                count:     calls.len(),
+            });
+
             // Dispatch each call sequentially. (Parallel is a v0.2
             // optimization — see PLAN week-6 Decision 5 forward
             // direction. For v0.1 demo with 1 MCP server + ≤1
             // call/turn it's indistinguishable; reduces Arc<Self>
             // complexity.)
             for call in &calls {
+                // Resolve the routed (server, mcp_name) BEFORE
+                // dispatch_tool_call so the per-call progress
+                // events name the server + MCP-side tool, not the
+                // LiteLLM-side `server__tool` mash.
+                let (server_label, mcp_name) = match self.tools.route(&call.function.name) {
+                    Some((idx, name)) => (self.tools.server_label_of(idx).to_owned(),
+                                          name.to_owned()),
+                    None => (String::new(), call.function.name.clone()),
+                };
+                let args_bytes = call.function.arguments.len();
+
+                on_progress(SessionProgress::ToolCall {
+                    step:       bump(),
+                    iteration:  _iter as u32,
+                    server:     server_label.clone(),
+                    tool:       mcp_name.clone(),
+                    args_bytes,
+                });
+
                 let result_text = self.dispatch_tool_call(call).await?;
+
+                on_progress(SessionProgress::ToolResult {
+                    step:      bump(),
+                    iteration: _iter as u32,
+                    server:    server_label,
+                    tool:      mcp_name,
+                    fragments: 1,                 // result_text already
+                    bytes:     result_text.len(), // concatenates frags;
+                                                  // the per-fragment
+                                                  // count is lost here
+                                                  // but the bytes total
+                                                  // is the useful UX
+                                                  // signal anyway.
+                    is_error:  false,             // dispatch_tool_call
+                                                  // returns Err for
+                                                  // error paths above.
+                });
+
                 messages.push(ChatMessage::tool_response(&call.id, result_text));
             }
         }
@@ -902,6 +1098,149 @@ mod tests {
         let err = s.turn("hi").await.err().expect("must error");
         assert!(matches!(err, SessionError::LiteLlm(LiteLlmError::Transport { .. })),
             "expected Transport; got {err:?}");
+    }
+
+    // ---- SessionProgress shape (week-13 Wed) ----
+
+    #[test] fn session_progress_step_matches_inner_field() {
+        // step() is the canonical accessor used by chat_turn when
+        // dispatching MCP progress notifications.  Pin the contract
+        // that every variant returns its own `step` field.
+        let cases = [
+            SessionProgress::IterationStart    { step: 0, iteration: 0, max: 8 },
+            SessionProgress::ToolDispatchStart { step: 1, iteration: 0, count: 2 },
+            SessionProgress::ToolCall          { step: 2, iteration: 0,
+                                                 server: "docs".into(),
+                                                 tool:   "read_file".into(),
+                                                 args_bytes: 42 },
+            SessionProgress::ToolResult        { step: 3, iteration: 0,
+                                                 server: "docs".into(),
+                                                 tool:   "read_file".into(),
+                                                 fragments: 1, bytes: 128,
+                                                 is_error:  false },
+            SessionProgress::FinalAnswer       { step: 4, iteration: 1, bytes: 7 },
+        ];
+        for (i, ev) in cases.iter().enumerate() {
+            assert_eq!(ev.step(), i as u64,
+                "step() must return the inner field for variant {ev:?}");
+        }
+    }
+
+    #[test] fn session_progress_message_is_pii_safe_human_readable() {
+        // PII posture (Decision 21 carry-over): messages contain
+        // labels + sizes only, never arg content / tool output bodies.
+        let m = SessionProgress::ToolCall {
+            step: 0, iteration: 0,
+            server: "secret_docs".into(),
+            tool:   "read".into(),
+            args_bytes: 999,
+        }.message();
+        assert!(m.contains("secret_docs.read"),
+            "message must name the server.tool; got: {m}");
+        assert!(m.contains("999"),
+            "message must include the args size; got: {m}");
+
+        let m2 = SessionProgress::ToolResult {
+            step: 1, iteration: 0,
+            server: "x".into(), tool: "y".into(),
+            fragments: 3, bytes: 50, is_error: true,
+        }.message();
+        assert!(m2.contains("3 fragment"));
+        assert!(m2.contains("50B"));
+        assert!(m2.contains("is_error=true"));
+
+        let m3 = SessionProgress::IterationStart {
+            step: 0, iteration: 2, max: 8,
+        }.message();
+        assert!(m3.contains("iteration 3/8"),
+            "1-indexed display; iteration field is 0-indexed; got: {m3}");
+    }
+
+    // ---- turn_with_progress callback firing (week-13 Wed) ----
+
+    #[tokio::test]
+    async fn turn_with_progress_fires_iteration_start_and_final_answer() {
+        // Single-iteration no-tools path: the model returns a
+        // tool-call-free message immediately.  Expect exactly two
+        // progress events:
+        //   1. IterationStart { iteration: 0 }
+        //   2. FinalAnswer    { iteration: 0, bytes: <len of "ack: hi"> }
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use std::sync::{Arc, Mutex};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ack: hi"}}]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server).await;
+
+        let s = Session::open("fast", "you are helpful", Some(&server.uri()))
+            .expect("open");
+
+        // Collect events into a shared Vec the callback writes to.
+        // Arc<Mutex<...>> keeps both Send + 'static for the callback's
+        // bound on Session::turn_with_progress.
+        let events: Arc<Mutex<Vec<SessionProgress>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        let out = s.turn_with_progress("hi", move |ev| {
+            events_clone.lock().unwrap().push(ev);
+        }).await.expect("turn ok");
+
+        // Final reply unchanged from the bare `turn()` path.
+        assert_eq!(out, "ack: hi");
+
+        // Exactly two events, in order, both for iteration 0.
+        let evs = events.lock().unwrap();
+        assert_eq!(evs.len(), 2, "expected 2 events; got: {evs:?}");
+        match &evs[0] {
+            SessionProgress::IterationStart { step: 0, iteration: 0, max } => {
+                assert_eq!(*max, MAX_TOOL_ITERS as u32);
+            }
+            other => panic!("expected IterationStart{{step:0, iter:0}}; got {other:?}"),
+        }
+        match &evs[1] {
+            SessionProgress::FinalAnswer { step: 1, iteration: 0, bytes } => {
+                assert_eq!(*bytes, "ack: hi".len());
+            }
+            other => panic!("expected FinalAnswer{{step:1, iter:0}}; got {other:?}"),
+        }
+        // step() values are monotonically increasing (rmcp's
+        // notify_progress requires this).
+        assert!(evs[0].step() < evs[1].step());
+    }
+
+    #[tokio::test]
+    async fn turn_no_op_callback_preserves_bare_turn_behaviour() {
+        // Equivalence test: `turn` and `turn_with_progress(_, |_| {})`
+        // must produce the same reply.  Guards against the refactor
+        // accidentally diverging behaviour when the callback is a
+        // no-op.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "same"}}]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server).await;
+
+        let s = Session::open("fast", "sys", Some(&server.uri())).expect("open");
+        let bare    = s.turn("q").await.expect("bare turn ok");
+        // `turn` itself calls `turn_with_progress(_, |_| {})`, so the
+        // equivalence is established by construction.  This test
+        // re-asserts it from the outside to guard against future
+        // refactors that might re-implement bare `turn` independently.
+        let cb_out  = s.turn_with_progress("q", |_| {}).await.expect("cb turn ok");
+        assert_eq!(bare, cb_out);
     }
 
     // ---- ToolRegistry construction + LiteLLM tools[] shape ----

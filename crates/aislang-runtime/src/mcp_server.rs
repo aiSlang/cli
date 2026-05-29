@@ -35,12 +35,13 @@
 //! on a tool that genuinely matters.
 
 use rmcp::{
-    ErrorData as RmcpError, ServerHandler, ServiceExt,
+    ErrorData as RmcpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{
         CallToolResult, Content,
-        Implementation, ServerCapabilities, ServerInfo,
+        Implementation, Meta, ProgressNotificationParam,
+        ServerCapabilities, ServerInfo,
     },
     tool, tool_handler, tool_router,
 };
@@ -52,7 +53,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::Session;
+use crate::{Session, SessionProgress};
 
 // ============================================================================
 // Errors
@@ -966,6 +967,14 @@ impl AislangServer {
     )]
     pub async fn chat_turn(&self,
         Parameters(p): Parameters<ChatTurnParameters>,
+        // Week 13 Wed: progress streaming.  Both extractors are
+        // injected by the rmcp `#[tool]` macro via FromContextPart.
+        // The client's `meta._meta.progressToken` (set in the JSON-
+        // RPC request envelope) tells us whether to emit progress;
+        // `Peer<RoleServer>` is the handle we call notify_progress
+        // on.
+        meta:   Meta,
+        client: Peer<RoleServer>,
     ) -> Result<CallToolResult, RmcpError> {
         let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
         let key = SessionKey {
@@ -1000,37 +1009,108 @@ impl AislangServer {
             }
         };
 
-        // ── Dispatch the turn.  Session::turn does the tool-use
-        // loop (LiteLLM call → if tool_calls, dispatch via rmcp
-        // client → loop, hard-capped at 8 iters).  Token counts +
-        // cost accounting happen inside Session.
+        // ── Dispatch the turn.  Session::turn_with_progress does
+        // the tool-use loop (LiteLLM call → if tool_calls, dispatch
+        // via rmcp client → loop, hard-capped at 8 iters) AND fires
+        // a SessionProgress callback at every iteration boundary +
+        // per tool dispatch.  Token counts + cost accounting happen
+        // inside Session.
         //
         // Why spawn_blocking + inner current_thread runtime:
         // Session::turn holds a tokio OTel `ContextGuard` across
         // awaits, which makes its future !Send.  rmcp's #[tool]
         // macro requires `dyn Future + Send` for tool dispatch.
-        // v0.1's chat CLI sidesteps this by running on a
-        // `Runtime::new_current_thread()` where Send isn't
-        // required.  Here we reproduce that posture: hand the
-        // !Send turn future off to a blocking-pool thread that
-        // owns its own current_thread runtime, await the join
-        // handle (which IS Send).  Overhead: one thread per
-        // turn; not hot-path so acceptable.  v0.3 may refactor
-        // Session::turn to scope its guards tighter and make
-        // the future Send — then this dance goes away.
+        // We hand the !Send turn future off to a blocking-pool
+        // thread that owns its own current_thread runtime, await
+        // the join handle (which IS Send).  v0.3 may refactor
+        // Session::turn to scope its guards tighter and make the
+        // future Send — then this dance goes away.
+        //
+        // Progress streaming (Week 13 Wed):
+        //   - Pull the client's `progressToken` from the request
+        //     `_meta` envelope.  If absent, the user didn't opt
+        //     into progress; we still wire the callback but the
+        //     forwarder task is a no-op (we skip the channel).
+        //   - Spin up a tokio::sync::mpsc::UnboundedChannel that
+        //     the !Send turn callback writes to (synchronously)
+        //     and a Send forwarder task drains, dispatching
+        //     `client.notify_progress(...)` per event.
+        //   - On turn completion, drop the sender to close the
+        //     channel; the forwarder's `recv()` returns None and
+        //     the task winds down cleanly.
         let user_input = p.user_input.clone();
+        let progress_token = meta.get_progress_token();
+
+        // Channel cap: unbounded.  Per-turn progress event count is
+        // bounded by `MAX_TOOL_ITERS * (1 + 2 * tool_calls_per_iter)
+        // + 1` ≈ tens of events; the mpsc allocator dominates so
+        // bounding is unnecessary overhead.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SessionProgress>();
+
+        // Forwarder task — Send by construction (tokio Peer is
+        // Clone-able + Send + Sync internally).  Drains the channel
+        // and dispatches each event as an rmcp progress notification
+        // if (and only if) the caller supplied a progressToken.
+        // Errors from notify_progress are intentionally swallowed:
+        // a broken transport WILL surface later through the main
+        // `chat_turn` response; we don't want progress to fail the
+        // whole turn.
+        let forwarder = if let Some(token) = progress_token {
+            let client_for_forward = client.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    let _ = client_for_forward.notify_progress(
+                        ProgressNotificationParam {
+                            progress_token: token.clone(),
+                            progress:       ev.step() as f64,
+                            total:          None,   // unknown — model
+                                                    // decides how many
+                                                    // iterations it
+                                                    // wants.
+                            message:        Some(ev.message()),
+                        }
+                    ).await;
+                }
+            })
+        } else {
+            // No progress token → drain + drop with no I/O.  Same
+            // recv-loop shape so callers can still send without
+            // checking.
+            tokio::spawn(async move { while rx.recv().await.is_some() {} })
+        };
+
+        let tx_for_callback = tx.clone();
         let reply = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("build inner runtime: {e}"))?;
-            rt.block_on(session.turn(&user_input))
-                .map_err(|e| format!("{e}"))
+            rt.block_on(session.turn_with_progress(
+                &user_input,
+                move |ev| {
+                    // Best-effort send: if the forwarder task panicked
+                    // (or the receiver was dropped), we lose progress
+                    // for the rest of the turn but the turn itself
+                    // continues normally.
+                    let _ = tx_for_callback.send(ev);
+                },
+            )).map_err(|e| format!("{e}"))
         }).await
         .map_err(|e| RmcpError::internal_error(
             format!("join blocking turn task: {e}"), None))?
         .map_err(|e| RmcpError::internal_error(
             format!("chat turn: {e}"), None))?;
+
+        // Close the channel + drain the forwarder so all queued
+        // progress notifications go out before we return the final
+        // CallToolResult.  Bounded by the channel's queued count
+        // (small); a 5s safety timeout avoids hangs if the
+        // transport is wedged.
+        drop(tx);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            forwarder,
+        ).await;
 
         Ok(CallToolResult::success(vec![Content::text(reply)]))
     }
@@ -2619,18 +2699,36 @@ mod tests {
     }
 
     // ── chat_turn parameter-validation paths ─────────────────────
+    //
+    // Week 13 Wed: chat_turn grew Meta + Peer<RoleServer> extractor
+    // parameters (for progress-notification streaming).  Both come
+    // from the live MCP wire and don't have easy in-test constructors,
+    // so the early-error tests below dial `build_session_for_agent`
+    // directly — same code path chat_turn invokes for these paths,
+    // tested at the lower layer to dodge the Peer plumbing.
+
+    // Session doesn't impl Debug; `expect_err` requires Ok-arm Debug.
+    // Use a tiny adapter that maps Ok(_) → panic without touching the
+    // Session value.  Reused by all three chat_turn early-bail tests.
+    fn err_or_panic<T>(r: Result<T, String>, label: &str) -> String {
+        match r {
+            Ok(_)    => panic!("expected error in `{label}`; got Ok"),
+            Err(msg) => msg,
+        }
+    }
 
     #[tokio::test]
     async fn chat_turn_parse_error_returns_invalid_params() {
         let _path = PathGuard::no_docker();
-        let s = AislangServer::new();
-        let err = s.chat_turn(Parameters(ChatTurnParameters {
-            source:      "not aislang".to_string(),
-            source_dir:  None,
-            agent_label: "support".to_string(),
-            user_input:  "hi".to_string(),
-        })).await.expect_err("parse error must bubble");
-        assert!(err.to_string().contains("parse error"),
+        // build_session_for_agent calls `aislang_core::validate`
+        // first thing; bad source → "parse error: …" String.
+        let r = build_session_for_agent(
+            "not aislang",
+            std::path::Path::new("."),
+            "support",
+        ).await;
+        let err = err_or_panic(r, "parse error");
+        assert!(err.contains("parse error"),
             "should mention parse error; got: {err}");
     }
 
@@ -2640,19 +2738,17 @@ mod tests {
         let dir = fresh_tempdir("chat-unknown-agent");
         // Don't write system.md — we expect the agent-lookup to fail
         // BEFORE the prompt-file load.
-        let s = AislangServer::new();
-        let err = s.chat_turn(Parameters(ChatTurnParameters {
-            source:      CHAT_TURN_TEST_SOURCE.to_string(),
-            source_dir:  Some(dir.to_string_lossy().to_string()),
-            agent_label: "nope".to_string(),
-            user_input:  "hi".to_string(),
-        })).await.expect_err("unknown agent must error");
-        let msg = err.to_string();
-        assert!(msg.contains("no agent named") || msg.contains("`nope`"),
-            "should name the missing agent + list available; got: {msg}");
+        let r = build_session_for_agent(
+            CHAT_TURN_TEST_SOURCE,
+            &dir,
+            "nope",
+        ).await;
+        let err = err_or_panic(r, "unknown agent");
+        assert!(err.contains("no agent named") || err.contains("`nope`"),
+            "should name the missing agent + list available; got: {err}");
         // Available list should mention the actual agent.
-        assert!(msg.contains("support"),
-            "should mention available agent names; got: {msg}");
+        assert!(err.contains("support"),
+            "should mention available agent names; got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2663,17 +2759,15 @@ mod tests {
         // Source references system.md but we don't write it.  The
         // build_session_for_agent path tries to load the prompt and
         // fails.
-        let s = AislangServer::new();
-        let err = s.chat_turn(Parameters(ChatTurnParameters {
-            source:      CHAT_TURN_TEST_SOURCE.to_string(),
-            source_dir:  Some(dir.to_string_lossy().to_string()),
-            agent_label: "support".to_string(),
-            user_input:  "hi".to_string(),
-        })).await.expect_err("missing prompt must error");
-        let msg = err.to_string();
-        assert!(msg.contains("prompt") || msg.contains("system.md")
-                || msg.contains("load"),
-            "should mention prompt loading failure; got: {msg}");
+        let r = build_session_for_agent(
+            CHAT_TURN_TEST_SOURCE,
+            &dir,
+            "support",
+        ).await;
+        let err = err_or_panic(r, "missing prompt");
+        assert!(err.contains("prompt") || err.contains("system.md")
+                || err.contains("load"),
+            "should mention prompt loading failure; got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

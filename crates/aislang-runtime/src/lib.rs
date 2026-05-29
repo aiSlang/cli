@@ -47,6 +47,7 @@ pub mod tracing;
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
     load_system_prompt, hex_sha256,
+    SessionProgress,   // week 13 Wed — chat-turn streaming
 };
 pub use litellm::{
     LiteLlmClient, LiteLlmError, ChatRequest, ChatMessage, Role,
