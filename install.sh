@@ -86,28 +86,40 @@ detect_target() {
     MINGW*|MSYS*|CYGWIN*|Windows*)
       # Soft-bail with explicit WSL2 guidance — running aislang
       # natively on Windows would require porting Docker shellouts,
-      # MCP stdio framing, and ~5-15 tests (see v0.2 plan §Track A.5
-      # for the eventual PowerShell wrapper). Since Docker Desktop on
+      # MCP stdio framing, and ~5-15 tests. Since Docker Desktop on
       # Windows runs through WSL2 anyway, the Linux build of aislang
       # is what every Windows user actually needs — installed inside
       # WSL where ELF binaries are first-class.
+      #
+      # As of v0.2 Phase 1 Week 13 Mon (b), `install.ps1` is the
+      # supported one-liner for Windows users; this branch fires
+      # only if somebody piped install.sh into Git-Bash / MSYS /
+      # Cygwin directly (bypassing the PowerShell wrapper).
       cat >&2 <<EOF
 
-==> Windows is not natively supported in v0.1.
+==> Windows is not natively supported.
 
     aiSlang depends on Docker, which on Windows runs through WSL2
     anyway — so the Linux build of aislang is what you want,
-    installed inside WSL.  One-time setup (PowerShell, as admin):
+    installed inside WSL.  Use the PowerShell installer instead:
+
+        irm https://github.com/${REPO}/releases/latest/download/install.ps1 | iex
+
+    It checks for WSL2, installs aislang inside your default WSL
+    distro, and prints the same success banner you'd see on Linux.
+
+    One-time WSL2 setup (only if you haven't installed it yet),
+    from an *elevated* PowerShell prompt (Run as Administrator):
 
         wsl --install
 
-    Then re-run this installer from inside a WSL shell:
+    Then reboot and re-run the install.ps1 one-liner above.
+
+    If you'd rather skip the PowerShell wrapper and stay in a
+    Linux shell, open WSL and re-run THIS script:
 
         wsl
         curl -sSfL https://github.com/${REPO}/releases/latest/download/install.sh | sh
-
-    (A native PowerShell wrapper that does the WSL hop for you is
-    planned for v0.2 — see ROADMAP.)
 
 EOF
       exit 1

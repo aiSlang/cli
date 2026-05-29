@@ -166,6 +166,26 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # ─── Stage installer scripts alongside the binaries ────────
+      # install.sh has always been referenced in the release notes
+      # (`curl ... /install.sh | sh`), but the v0.1 workflow forgot
+      # to actually upload it as a release asset — every v0.1
+      # release relied on the install URL hitting a broken 404.
+      # Week 13 Mon (b) fixes that AND adds the Windows-WSL
+      # PowerShell wrapper alongside.
+      #
+      # Note (Decision 34): public irm/curl one-liners are gated
+      # on v0.3.  These assets ship now so the `gh release
+      # download` flow + the cold-VM rehearsal both work.
+      - name: Stage installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp install.sh  dist/install.sh
+          cp install.ps1 dist/install.ps1
+          chmod +x dist/install.sh
+          ls -la dist/install.{sh,ps1}
+
       - name: Create GitHub Release draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -185,17 +205,24 @@ jobs:
 
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<EOF
-          aiSlang $TAG — v0.1 internal milestone.
+          aiSlang $TAG — v0.2 internal milestone.
 
-          See \`PLAN-90-days-v0_1.md\` §Week 11 for the close-out plan.
+          See \`PLAN-90-days-v0_2.md\` for the milestone plan.
           This is a tagged internal release, not a public launch
-          (which is gated on v0.2's commercial-moat features and
-          v0.3's docs site).
+          (which is gated on v0.3's docs site).
 
           ## Install
 
+          **Linux / macOS:**
+
           \`\`\`sh
           curl -sSfL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | sh
+          \`\`\`
+
+          **Windows (WSL2 required):**
+
+          \`\`\`powershell
+          irm https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.ps1 | iex
           \`\`\`
 
           Or download the matching tarball below, verify against
@@ -209,6 +236,8 @@ jobs:
           | \`aislang-${VERSION}-aarch64-unknown-linux-gnu.tar.gz\` | Linux ARM64 |
           | \`aislang-${VERSION}-x86_64-apple-darwin.tar.gz\`       | macOS Intel |
           | \`aislang-${VERSION}-aarch64-apple-darwin.tar.gz\`      | macOS Apple Silicon |
+          | \`install.sh\`                                            | POSIX installer (Linux + macOS) |
+          | \`install.ps1\`                                           | PowerShell wrapper (Windows → WSL2) |
           | \`checksums.txt\`                                         | sha256 of every tarball |
           EOF
 
@@ -216,7 +245,7 @@ jobs:
             --draft \
             --title "aislang $TAG" \
             --notes-file "$NOTES_FILE" \
-            dist/*.tar.gz dist/checksums.txt
+            dist/*.tar.gz dist/checksums.txt dist/install.sh dist/install.ps1
           rm -f "$NOTES_FILE"
           echo
           echo "Draft created at: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"

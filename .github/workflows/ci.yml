@@ -97,3 +97,50 @@ jobs:
       # `|| true` — informational only; never fails the workflow.
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets --locked || true
+
+  # ──────────────────────────────────────────────────────────────
+  # install.ps1 syntax check on a real Windows runner — Week 13
+  # Mon (b), Track A.5.  This catches PowerShell parse errors
+  # before they hit a release (since the Linux dev environment
+  # can't run pwsh natively without an apt-install).
+  #
+  # We do NOT run install.ps1 end-to-end — the runner would need
+  # WSL2 set up + Internet access to a real release, and that's
+  # the cold-VM rehearsal's job (Decision 38).
+  #
+  # PSScriptAnalyzer is pre-installed on github-hosted windows
+  # runners; we use it for style + safety checks in addition to
+  # the bare AST parse.
+  # ──────────────────────────────────────────────────────────────
+  install-ps1-lint:
+    name: install.ps1 (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell AST parse
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "install.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly."
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # Severity 'Error' is gated; warnings + info are
+          # informational (printed but don't fail the job) — same
+          # posture as the clippy job above.
+          $results = Invoke-ScriptAnalyzer -Path install.ps1 -Severity @('Error','Warning','Information')
+          $results | Format-Table -AutoSize
+          $errors = $results | Where-Object Severity -eq 'Error'
+          if ($errors) {
+            Write-Error "PSScriptAnalyzer found $($errors.Count) error(s) in install.ps1"
+            exit 1
+          }
