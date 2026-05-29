@@ -2,7 +2,7 @@
 //!
 //! See LANGUAGE-SPEC-v0.md for the authoritative reference.
 //!
-//! Week-by-week plan (PLAN-90-days.md):
+//! Week-by-week plan (PLAN-90-days-v0_1.md):
 //!   week 2: parser + AST
 //!   week 3: type checker + resource graph
 //!   week 4: model resolver + lockfile

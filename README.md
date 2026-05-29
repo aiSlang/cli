@@ -2,7 +2,7 @@
 
 > Declarative infrastructure for AI projects. One file describes your agents, models, prompts, MCP servers, evals, budgets, and deployment — `aislang apply` ships it.
 
-**Status:** pre-v0.1 (scaffolding). See [PLAN-90-days.md](PLAN-90-days.md) for the roadmap and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
+**Status:** pre-v0.1 (scaffolding). See [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the roadmap and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
 
 ## Quick taste
 
@@ -270,12 +270,12 @@ aiSlang is a *compile-then-deploy* tool, not an interpreter. A single `.ais` sou
 |---|---|---|---|
 | 1. **Parse + type-check** | `aislang validate` | Lex source, build AST per LANGUAGE-SPEC §8 grammar, validate types and resource-shape semantics from §8.1 | `aislang-core::parser`, `aislang-core::ast` |
 | 2. **Resolve** | `aislang plan` | For each `model` block: walk constraints (`requires`, `cost_max`, `latency_p95`, `residency`, `prefer`, `fallback`) against the bundled model catalog; pick the best satisfying entry. Hash prompt files. Pin image tags to digests. Reconcile with `aislang.lock`. Output the resolved IR | `aislang-core::resolver` (week 4) + `aislang-catalog` |
-| 3. **Emit** | `aislang plan` / `aislang apply` | Translate the resolved IR to standard target artifacts. v0.1 emits a `stack.yml` (Compose) with LiteLLM as the central router, Jaeger for OTel-GenAI traces, and a budget-enforcement sidecar, plus a `litellm_config.yaml` (mounted into the LiteLLM container) and a `.env.example` (union of provider-derived credentials + env vars referenced by `secret` blocks — see [Secrets handling](#secrets-handling) below). MCP servers are declared in the `.ais` but **spawned as `docker run -i` stdio children by `aislang chat`**, not as long-running Compose services (the published MCP images are stdio-only — see PLAN-90-days.md Decision 5; v0.2 changes this) | `aislang-compose` (v0.1); later: `aislang-k8s`, `aislang-helm`, `aislang-databricks`, etc. |
+| 3. **Emit** | `aislang plan` / `aislang apply` | Translate the resolved IR to standard target artifacts. v0.1 emits a `stack.yml` (Compose) with LiteLLM as the central router, Jaeger for OTel-GenAI traces, and a budget-enforcement sidecar, plus a `litellm_config.yaml` (mounted into the LiteLLM container) and a `.env.example` (union of provider-derived credentials + env vars referenced by `secret` blocks — see [Secrets handling](#secrets-handling) below). MCP servers are declared in the `.ais` but **spawned as `docker run -i` stdio children by `aislang chat`**, not as long-running Compose services (the published MCP images are stdio-only — see PLAN-90-days-v0_1.md Decision 5; v0.2 changes this) | `aislang-compose` (v0.1); later: `aislang-k8s`, `aislang-helm`, `aislang-databricks`, etc. |
 | 4. **Apply / operate** | `aislang apply` / `chat` / `eval` / `cost` / `destroy` | Hand artifacts to Docker / K8s / target platform. The running stack honours the declared budgets, exposes the declared port surface, runs declared evals on demand, and emits OTel traces | shells out to platform CLIs (`docker compose`, `kubectl apply`, etc.) |
 
 ### What's in the v0.1 scope vs. phased
 
-- **v0.1** — Docker Compose target only. Catalog bundled in the binary (JSON, immutable per release). Single-file projects. Static prompts with a fixed set of template variables. No LSP yet. See [PLAN-90-days.md](PLAN-90-days.md) for the 12-week schedule and definition of done.
+- **v0.1** — Docker Compose target only. Catalog bundled in the binary (JSON, immutable per release). Single-file projects. Static prompts with a fixed set of template variables. No LSP yet. See [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the 12-week schedule and definition of done.
 - **Phase 1** — Kubernetes + Helm targets; LSP via JSON Schema export of the AST; remote catalog updates; multi-file projects via `include`.
 - **Phase 2** — Managed cloud (`aislang.cloud`), compliance pack (EU AI Act / ISO 42001 evidence export), ArgoCD / Flux GitOps wrappers, Databricks / MS Fabric / Spark targets, dynamic prompt composition (decorators / guardrails) if user demand pulls for it.
 

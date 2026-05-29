@@ -1,7 +1,7 @@
 //! `aislang` — declarative AI infrastructure CLI.
 //!
 //! v0.1 subcommand surface (most are stubs until their scheduled week).
-//! See PLAN-90-days.md for the implementation schedule.
+//! See PLAN-90-days-v0_1.md for the implementation schedule.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
