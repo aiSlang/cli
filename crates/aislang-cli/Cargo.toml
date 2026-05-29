@@ -29,3 +29,12 @@ tokio            = { workspace = true }   # runtime for the chat subcommand (wee
 # transparent — the CLI is where the case loop lives, so the span
 # lifecycle belongs here.
 opentelemetry    = { workspace = true }
+
+[dev-dependencies]
+# week-12 Mon: `cli_mcp_serve` integration tests spawn the freshly
+# built `aislang mcp-serve --stdio` binary as a stdio child and
+# exercise it via rmcp's client side (TokioChildProcess transport).
+# Same dep aislang-runtime uses; redeclared here for the test crate's
+# scope.
+rmcp  = { workspace = true }
+tokio = { workspace = true }

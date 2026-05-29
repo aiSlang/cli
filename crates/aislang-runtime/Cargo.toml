@@ -13,6 +13,10 @@ rust-version.workspace = true
 # Decision 5 (PLAN week 6): v0.1 spawns MCP servers as `docker run -i`
 # stdio children; rmcp's TokioChildProcess is the wire integration.
 rmcp         = { workspace = true }
+# week-12 Mon: rmcp's `#[tool]` / `#[tool_router]` / `#[tool_handler]`
+# macros need schemars at the call site for JsonSchema derives on tool
+# parameter types.
+schemars     = { workspace = true }
 tokio        = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/aislang/aislang"
@@ -19,11 +19,11 @@ rust-version = "1.78"
 
 [workspace.dependencies]
 # Internal crates
-aislang-core     = { path = "crates/aislang-core",     version = "0.1.0-dev" }
-aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.1.0-dev" }
-aislang-resolver = { path = "crates/aislang-resolver", version = "0.1.0-dev" }
-aislang-compose  = { path = "crates/aislang-compose",  version = "0.1.0-dev" }
-aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.1.0-dev" }
+aislang-core     = { path = "crates/aislang-core",     version = "0.2.0-dev" }
+aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.2.0-dev" }
+aislang-resolver = { path = "crates/aislang-resolver", version = "0.2.0-dev" }
+aislang-compose  = { path = "crates/aislang-compose",  version = "0.2.0-dev" }
+aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.2.0-dev" }
 
 # External
 clap        = { version = "4.5", features = ["derive"] }
@@ -36,8 +36,15 @@ thiserror   = "1"
 anyhow      = "1"
 semver      = { version = "1",   features = ["serde"] }
 sha2        = "0.10"
-# week-6 Tue: in-CLI agent runtime
-rmcp        = { version = "1.7", features = ["client", "transport-child-process"] }
+# week-6 Tue: in-CLI agent runtime (client). week-12 Mon: server side
+# for `aislang mcp-serve` — needs the `server` feature for the
+# ServerHandler trait + `tool_router`/`tool` macros, and
+# `transport-io` for the stdio entry point. macros gives us
+# `#[tool]` / `#[tool_router]` / `#[tool_handler]`. schemars is
+# required by the macros for JSON-schema generation of tool
+# parameter types.
+rmcp        = { version = "1.7", features = ["client", "server", "macros", "transport-child-process", "transport-io", "schemars"] }
+schemars    = "1.0"
 tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "time", "sync"] }
 # week-6 Wed: LiteLLM HTTP client + non-streaming chat loop
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
