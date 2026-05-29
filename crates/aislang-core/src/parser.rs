@@ -620,11 +620,16 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
             "eval"       => project.evals.push(to_eval(block)?),
             "secret"     => project.secrets.push(to_secret(block)?),
             "deploy"     => project.deploys.push(to_deploy(block)?),
+            // v0.2 Fri (planning-doc Track A architectural decision #7):
+            // `main` block declares the user-facing LLM as first-class
+            // topology.  Multiple `main` blocks are allowed per project
+            // (different chat_clients → different entry points).
+            "main"       => project.mains.push(to_main(block)?),
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
-                     v0.1 supports: budget, model, prompt, mcp_server, \
-                     agent, eval, secret, deploy"
+                     v0.2 supports: budget, model, prompt, mcp_server, \
+                     agent, eval, secret, deploy, main"
                 ));
             }
         }
@@ -709,6 +714,66 @@ fn expect_optimize_for(v: RawValue) -> Result<OptimizeFor, String> {
         },
         other => Err(format!(
             "`optimize_for` expects a bare enum member (cost / latency / quality); got {other:?}"
+        )),
+    }
+}
+
+// ============================================================================
+// v0.2 Fri: enum helpers for `main` block + `model.source`.
+// Closed-set membership checks at parse time; the type-checker (week 3
+// pipeline) doesn't need to re-validate.
+// ============================================================================
+
+fn expect_pattern(field: &str, v: RawValue) -> Result<Pattern, String> {
+    match v {
+        RawValue::EnumMember(e) => match e.as_str() {
+            "orchestrator"     => Ok(Pattern::Orchestrator),
+            "supervisor"       => Ok(Pattern::Supervisor),
+            "router"           => Ok(Pattern::Router),
+            "reflector"        => Ok(Pattern::Reflector),
+            "planner_executor" => Ok(Pattern::PlannerExecutor),
+            "coordinator"      => Ok(Pattern::Coordinator),
+            other => Err(format!(
+                "`{field}` must be one of orchestrator / supervisor / router / \
+                 reflector / planner_executor / coordinator; got `{other}`"
+            )),
+        },
+        other => Err(format!(
+            "`{field}` expects a bare enum member; got {other:?}"
+        )),
+    }
+}
+
+fn expect_chat_client(field: &str, v: RawValue) -> Result<ChatClient, String> {
+    match v {
+        RawValue::EnumMember(e) => match e.as_str() {
+            "claude_desktop" => Ok(ChatClient::ClaudeDesktop),
+            "cursor"         => Ok(ChatClient::Cursor),
+            "chatgpt"        => Ok(ChatClient::Chatgpt),
+            "open_webui"     => Ok(ChatClient::OpenWebui),
+            "custom"         => Ok(ChatClient::Custom),
+            other => Err(format!(
+                "`{field}` must be one of claude_desktop / cursor / chatgpt / \
+                 open_webui / custom; got `{other}`"
+            )),
+        },
+        other => Err(format!(
+            "`{field}` expects a bare enum member; got {other:?}"
+        )),
+    }
+}
+
+fn expect_model_source(field: &str, v: RawValue) -> Result<ModelSource, String> {
+    match v {
+        RawValue::EnumMember(e) => match e.as_str() {
+            "api"          => Ok(ModelSource::Api),
+            "subscription" => Ok(ModelSource::Subscription),
+            other => Err(format!(
+                "`{field}` must be one of api / subscription; got `{other}`"
+            )),
+        },
+        other => Err(format!(
+            "`{field}` expects a bare enum member (api or subscription); got {other:?}"
         )),
     }
 }
@@ -941,6 +1006,7 @@ fn to_model(raw: RawBlock) -> Result<Model, String> {
     let mut prefer:      Option<Vec<ModelId>>        = None;
     let mut fallback:    Option<Vec<ModelId>>        = None;
     let mut pin:         Option<ModelId>             = None;
+    let mut source:      Option<ModelSource>         = None;  // v0.2 Fri
 
     for item in raw.body {
         let attr = expect_attr_only("model", item)?;
@@ -953,10 +1019,16 @@ fn to_model(raw: RawBlock) -> Result<Model, String> {
             "prefer"      => prefer      = Some(expect_model_id_list(&attr.name, attr.value)?),
             "fallback"    => fallback    = Some(expect_model_id_list(&attr.name, attr.value)?),
             "pin"         => pin         = Some(expect_model_id(&attr.name, attr.value)?),
+            // v0.2 Fri (Decision 42): optional `source = subscription | api`.
+            // Absence → ModelSource::default() = Api (v0.1 behaviour, hard
+            // budget enforcement through LiteLLM).  Subscription disables
+            // emit-side LiteLLM config + budget hard-cap enforcement; the
+            // tracker still records observed tokens.
+            "source"      => source      = Some(expect_model_source(&attr.name, attr.value)?),
             other => return Err(format!(
                 "unknown attribute `{other}` in model block; allowed: \
                  requires, context_min, cost_max, latency_p95, residency, \
-                 prefer, fallback, pin"
+                 prefer, fallback, pin, source"
             )),
         }
     }
@@ -977,6 +1049,57 @@ fn to_model(raw: RawBlock) -> Result<Model, String> {
         prefer:   prefer.unwrap_or_default(),
         fallback: fallback.unwrap_or_default(),
         pin,
+        source:   source.unwrap_or_default(),
+    })
+}
+
+// ============================================================================
+// v0.2 Fri: `main` block converter.
+// ============================================================================
+//
+// Structurally identical to `to_agent` — labeled block with model +
+// system_prompt refs.  Adds: `chat_client` enum + `pattern` enum.
+// Does NOT have `tools` (main blocks don't dispatch deployed-agent
+// tools directly; the host LLM client uses MCP tools instead).
+
+fn to_main(raw: RawBlock) -> Result<Main, String> {
+    let label = require_single_label("main", raw.labels)?;
+    let mut model:         Option<Ref>          = None;
+    let mut system_prompt: Option<Ref>          = None;
+    let mut chat_client:   Option<ChatClient>   = None;
+    let mut pattern:       Option<Pattern>      = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("main", item)?;
+        match attr.name.as_str() {
+            "model"         => model         = Some(expect_ref(
+                &attr.name, RefKind::Model, attr.value)?),
+            "system_prompt" => system_prompt = Some(expect_ref(
+                &attr.name, RefKind::Prompt, attr.value)?),
+            "chat_client"   => chat_client   = Some(expect_chat_client(
+                &attr.name, attr.value)?),
+            "pattern"       => pattern       = Some(expect_pattern(
+                &attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in main block; \
+                 allowed: model, system_prompt, chat_client, pattern"
+            )),
+        }
+    }
+
+    Ok(Main {
+        label,
+        model: model.ok_or_else(||
+            "main block missing required attribute `model`".to_string())?,
+        system_prompt: system_prompt.ok_or_else(||
+            "main block missing required attribute `system_prompt`".to_string())?,
+        chat_client: chat_client.ok_or_else(||
+            "main block missing required attribute `chat_client` \
+             (one of: claude_desktop, cursor, chatgpt, open_webui, custom)".to_string())?,
+        pattern: pattern.ok_or_else(||
+            "main block missing required attribute `pattern` \
+             (one of: orchestrator, supervisor, router, reflector, \
+             planner_executor, coordinator)".to_string())?,
     })
 }
 
@@ -2349,5 +2472,359 @@ mod project_tests {
             }
         "#;
         assert_parse_err_contains(src, "Money literal");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v0.2 Week-12 Fri: `main` block + `model.source` grammar
+    // additions (planning-doc Track A architectural decision #7).
+    // ────────────────────────────────────────────────────────────────
+
+    /// Shorthand for building a project that already has the
+    /// prereq `model "primary"` + `prompt "main_brief"` blocks
+    /// that a `main` block references.  Saves repeating ~10 lines
+    /// per test.
+    fn project_with_main_prereqs(main_body: &str) -> String {
+        format!(r#"
+            project "demo" {{
+              budget {{
+                hard_cap_per_day = $1
+                hard_cap_per_run = $0.01
+              }}
+              model "primary" {{
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+              }}
+              prompt "main_brief" {{
+                file    = "./main_brief.md"
+                version = "1.0.0"
+              }}
+              main "user_facing" {{
+                {main_body}
+              }}
+            }}
+        "#)
+    }
+
+    // ── `main` block: parse happy paths ──────────────────────────
+
+    #[test] fn main_block_parses_with_orchestrator_pattern() {
+        let src = project_with_main_prereqs(r#"
+            model         = model.primary
+            chat_client   = claude_desktop
+            pattern       = orchestrator
+            system_prompt = prompt.main_brief
+        "#);
+        let project = assert_parse_ok(&src);
+        assert_eq!(project.mains.len(), 1);
+        let m = &project.mains[0];
+        assert_eq!(m.label, "user_facing");
+        assert_eq!(m.pattern, Pattern::Orchestrator);
+        assert_eq!(m.chat_client, ChatClient::ClaudeDesktop);
+    }
+
+    #[test] fn main_block_accepts_all_six_patterns() {
+        for (name, expected) in [
+            ("orchestrator",     Pattern::Orchestrator),
+            ("supervisor",       Pattern::Supervisor),
+            ("router",           Pattern::Router),
+            ("reflector",        Pattern::Reflector),
+            ("planner_executor", Pattern::PlannerExecutor),
+            ("coordinator",      Pattern::Coordinator),
+        ] {
+            let src = project_with_main_prereqs(&format!(r#"
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = {name}
+                system_prompt = prompt.main_brief
+            "#));
+            let project = assert_parse_ok(&src);
+            assert_eq!(project.mains[0].pattern, expected,
+                "pattern `{name}` should parse to {expected:?}");
+        }
+    }
+
+    #[test] fn main_block_accepts_all_five_chat_clients() {
+        for (name, expected) in [
+            ("claude_desktop", ChatClient::ClaudeDesktop),
+            ("cursor",         ChatClient::Cursor),
+            ("chatgpt",        ChatClient::Chatgpt),
+            ("open_webui",     ChatClient::OpenWebui),
+            ("custom",         ChatClient::Custom),
+        ] {
+            let src = project_with_main_prereqs(&format!(r#"
+                model         = model.primary
+                chat_client   = {name}
+                pattern       = orchestrator
+                system_prompt = prompt.main_brief
+            "#));
+            let project = assert_parse_ok(&src);
+            assert_eq!(project.mains[0].chat_client, expected);
+        }
+    }
+
+    #[test] fn multiple_main_blocks_per_project_allowed() {
+        // Customer-facing + admin entry, both legal.  Validated by
+        // ref resolution (model + system_prompt exist) but otherwise
+        // the parser doesn't constrain main-block count.
+        let src = r#"
+            project "two-mains" {
+              budget {
+                hard_cap_per_day = $1
+                hard_cap_per_run = $0.01
+              }
+              model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+              }
+              prompt "user_brief"  { file = "./u.md" version = "1.0.0" }
+              prompt "admin_brief" { file = "./a.md" version = "1.0.0" }
+              main "user" {
+                model         = model.primary
+                chat_client   = claude_desktop
+                pattern       = orchestrator
+                system_prompt = prompt.user_brief
+              }
+              main "admin" {
+                model         = model.primary
+                chat_client   = cursor
+                pattern       = supervisor
+                system_prompt = prompt.admin_brief
+              }
+            }
+        "#;
+        let project = assert_parse_ok(src);
+        assert_eq!(project.mains.len(), 2);
+        assert_eq!(project.mains[0].label, "user");
+        assert_eq!(project.mains[1].label, "admin");
+    }
+
+    // ── `main` block: error paths ────────────────────────────────
+
+    #[test] fn main_block_unknown_pattern_value_errors() {
+        let src = project_with_main_prereqs(r#"
+            model         = model.primary
+            chat_client   = claude_desktop
+            pattern       = unknown_pattern_value
+            system_prompt = prompt.main_brief
+        "#);
+        assert_parse_err_contains(&src,
+            "`pattern` must be one of orchestrator");
+    }
+
+    #[test] fn main_block_unknown_chat_client_errors() {
+        let src = project_with_main_prereqs(r#"
+            model         = model.primary
+            chat_client   = some_unknown_client
+            pattern       = orchestrator
+            system_prompt = prompt.main_brief
+        "#);
+        assert_parse_err_contains(&src,
+            "`chat_client` must be one of claude_desktop");
+    }
+
+    #[test] fn main_block_missing_model_errors() {
+        let src = project_with_main_prereqs(r#"
+            chat_client   = claude_desktop
+            pattern       = orchestrator
+            system_prompt = prompt.main_brief
+        "#);
+        assert_parse_err_contains(&src,
+            "main block missing required attribute `model`");
+    }
+
+    #[test] fn main_block_missing_system_prompt_errors() {
+        let src = project_with_main_prereqs(r#"
+            model       = model.primary
+            chat_client = claude_desktop
+            pattern     = orchestrator
+        "#);
+        assert_parse_err_contains(&src,
+            "main block missing required attribute `system_prompt`");
+    }
+
+    #[test] fn main_block_missing_pattern_errors() {
+        let src = project_with_main_prereqs(r#"
+            model         = model.primary
+            chat_client   = claude_desktop
+            system_prompt = prompt.main_brief
+        "#);
+        assert_parse_err_contains(&src,
+            "main block missing required attribute `pattern`");
+    }
+
+    #[test] fn main_block_missing_chat_client_errors() {
+        let src = project_with_main_prereqs(r#"
+            model         = model.primary
+            pattern       = orchestrator
+            system_prompt = prompt.main_brief
+        "#);
+        assert_parse_err_contains(&src,
+            "main block missing required attribute `chat_client`");
+    }
+
+    #[test] fn main_block_unknown_attribute_errors() {
+        let src = project_with_main_prereqs(r#"
+            model         = model.primary
+            chat_client   = claude_desktop
+            pattern       = orchestrator
+            system_prompt = prompt.main_brief
+            tools         = [mcp_server.docs]
+        "#);
+        assert_parse_err_contains(&src,
+            "unknown attribute `tools` in main block");
+    }
+
+    // ── `model.source` enum: parse paths ─────────────────────────
+
+    #[test] fn model_source_subscription_parses() {
+        let src = r#"
+            project "demo" {
+              budget {
+                hard_cap_per_day = $1
+                hard_cap_per_run = $0.01
+              }
+              model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+                source      = subscription
+              }
+            }
+        "#;
+        let project = assert_parse_ok(src);
+        assert_eq!(project.models[0].source, ModelSource::Subscription);
+    }
+
+    #[test] fn model_source_api_explicit_parses() {
+        let src = r#"
+            project "demo" {
+              budget {
+                hard_cap_per_day = $1
+                hard_cap_per_run = $0.01
+              }
+              model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+                source      = api
+              }
+            }
+        "#;
+        let project = assert_parse_ok(src);
+        assert_eq!(project.models[0].source, ModelSource::Api);
+    }
+
+    #[test] fn model_source_defaults_to_api_when_absent() {
+        // Forward-compat invariant: v0.1 model blocks (no `source`
+        // field declared) continue to validate AND default to Api.
+        let src = r#"
+            project "demo" {
+              budget {
+                hard_cap_per_day = $1
+                hard_cap_per_run = $0.01
+              }
+              model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+              }
+            }
+        "#;
+        let project = assert_parse_ok(src);
+        assert_eq!(project.models[0].source, ModelSource::Api);
+    }
+
+    #[test] fn model_source_unknown_value_errors() {
+        let src = r#"
+            project "demo" {
+              budget {
+                hard_cap_per_day = $1
+                hard_cap_per_run = $0.01
+              }
+              model "primary" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_sonnet_4_6]
+                source      = local_inference
+              }
+            }
+        "#;
+        assert_parse_err_contains(src,
+            "`source` must be one of api / subscription");
+    }
+
+    // ── JSON round-trip: forward-compat invariants ───────────────
+
+    #[test] fn project_without_mains_omits_field_in_json() {
+        // Forward-compat: serializing a v0.1-shape project (no main
+        // blocks declared) must not emit `"mains": []` — that would
+        // break byte-stable round-trip against existing
+        // examples/*.expected-ast.json fixtures.
+        let project = Project {
+            name: "demo".into(),
+            ..Project::default()
+        };
+        let json = serde_json::to_string(&project).unwrap();
+        assert!(!json.contains("mains"),
+            "empty mains Vec must not serialize; got: {json}");
+    }
+
+    #[test] fn project_with_mains_includes_field_in_json() {
+        // The complement check: when there IS a main, it serializes.
+        let project = Project {
+            name: "demo".into(),
+            mains: vec![Main {
+                label:         "u".into(),
+                model:         Ref { kind: RefKind::Model,  label: "primary".into() },
+                system_prompt: Ref { kind: RefKind::Prompt, label: "b".into() },
+                chat_client:   ChatClient::ClaudeDesktop,
+                pattern:       Pattern::Orchestrator,
+            }],
+            ..Project::default()
+        };
+        let json = serde_json::to_string(&project).unwrap();
+        assert!(json.contains("\"mains\""),
+            "populated mains must serialize");
+        assert!(json.contains("\"orchestrator\""));
+    }
+
+    #[test] fn model_with_default_source_omits_field_in_json() {
+        // Forward-compat: serializing a v0.1-shape model (no `source`
+        // declared, defaults to Api) must NOT emit `"source": "api"`.
+        let model = Model {
+            label:       "f".into(),
+            requires:    vec![Capability::Chat],
+            context_min: Size { units: 32 * 1024 },
+            cost_max:    None,
+            latency_p95: None,
+            residency:   None,
+            prefer:      vec![],
+            fallback:    vec![],
+            pin:         None,
+            source:      ModelSource::Api,
+        };
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(!json.contains("source"),
+            "default source must not serialize; got: {json}");
+    }
+
+    #[test] fn model_with_subscription_source_includes_field_in_json() {
+        let model = Model {
+            label:       "f".into(),
+            requires:    vec![Capability::Chat],
+            context_min: Size { units: 32 * 1024 },
+            cost_max:    None,
+            latency_p95: None,
+            residency:   None,
+            prefer:      vec![],
+            fallback:    vec![],
+            pin:         None,
+            source:      ModelSource::Subscription,
+        };
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(json.contains("\"source\":\"subscription\""),
+            "subscription source must serialize; got: {json}");
     }
 }

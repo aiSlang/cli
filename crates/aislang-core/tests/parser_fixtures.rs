@@ -78,7 +78,10 @@ fn expected_support_agent() -> Project {
         fallback:    vec![
             ModelId { provider: "ollama".into(), name: "llama_3_1_8b".into() },
         ],
-        pin: None,
+        pin:    None,
+        // v0.2 Fri: source defaults to Api when absent from .ais
+        // source.  The support-agent example doesn't declare source.
+        source: ModelSource::default(),
     };
 
     let prompt_system = Prompt {
@@ -142,6 +145,10 @@ fn expected_support_agent() -> Project {
         evals:       vec![eval_accuracy],
         secrets:     vec![],
         deploys:     vec![deploy_local],
+        // v0.2 Fri: v0.1 demo file has no `main` block.
+        // Forward-compat: existing `.ais` files continue to validate
+        // with an empty mains Vec (serde(default) on the field).
+        mains:       vec![],
     }
 }
 

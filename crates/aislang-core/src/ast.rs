@@ -53,6 +53,17 @@ pub struct Project {
     #[serde(default)] pub evals:       Vec<Eval>,
     #[serde(default)] pub secrets:     Vec<Secret>,
     #[serde(default)] pub deploys:     Vec<Deploy>,
+    // v0.2 Week-12 Fri: `main` entry blocks (planning-doc Track A
+    // architectural decision #7).  Empty Vec for v0.1 files —
+    // serde(default) makes existing JSON / lock files load without
+    // the field present; skip_serializing_if = Vec::is_empty makes
+    // them re-serialize without the field, so v0.1 expected-AST
+    // JSON fixtures continue to round-trip byte-stably.  `main`
+    // blocks are never deployed; they exist as declarative topology
+    // so the MCP server can describe the principal-LLM's expected
+    // role to the host client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mains: Vec<Main>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +88,17 @@ pub struct Model {
     pub fallback:    Vec<ModelId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin:         Option<ModelId>,
+    // v0.2 Week-12 Fri: where the inference path runs.  Defaults to
+    // `Api` (v0.1 behaviour — route through LiteLLM with hard budget
+    // enforcement).  `Subscription` indicates the inference happens
+    // in the host chat app's subscription tier; we count tokens
+    // and estimate cost but can't gate calls.  serde(default) makes
+    // v0.1 files load without the field present;
+    // skip_serializing_if = ModelSource::is_default re-serializes
+    // the default-Api case without the field so v0.1 expected-AST
+    // JSON fixtures round-trip byte-stably.
+    #[serde(default, skip_serializing_if = "ModelSource::is_default")]
+    pub source: ModelSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +128,30 @@ pub struct Agent {
     pub model:         Ref,
     pub system_prompt: Ref,
     pub tools:         Vec<Ref>,
+}
+
+/// v0.2 Week-12 Fri.  Declares the user-facing LLM as the explicit
+/// entry point of the agentic system — same role `fn main` plays in
+/// a Rust binary.  The `pattern` field names the relationship to
+/// deployed agents (orchestrator, supervisor, router, reflector,
+/// planner_executor, coordinator).
+///
+/// Multiple `main` blocks per project are allowed (e.g. a customer-
+/// facing entry + an admin escalation entry).  The MCP server picks
+/// which one to activate based on the `chat_client` field matching
+/// the connecting client's identity.
+///
+/// `main` blocks are NEVER deployed — no Compose service, no k8s
+/// pod, no LiteLLM routing entry.  Declarative-only; the emitter
+/// ignores them.  See planning doc Track A architectural decision
+/// #7 for the full design + the naming-iteration history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Main {
+    pub label:         String,
+    pub model:         Ref,
+    pub system_prompt: Ref,
+    pub chat_client:   ChatClient,
+    pub pattern:       Pattern,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
