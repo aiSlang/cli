@@ -85,6 +85,8 @@ async fn handshake_succeeds_and_lists_all_phase_1_tools() {
         "aislang_apply",      // Wed
         "aislang_destroy",    // Wed
         "aislang_status",     // Wed
+        "aislang_chat_turn",  // Thu
+        "aislang_eval",       // Thu
     ];
     for tool in expected {
         assert!(names.contains(tool),
@@ -351,6 +353,91 @@ async fn wed_destroy_wire_returns_nothing_to_destroy_for_clean_dir() {
 
     client.cancel().await.expect("clean shutdown");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ────────────────────────────────────────────────────────────────
+// Thu — chat_turn + eval (wire annotations + error paths)
+// ────────────────────────────────────────────────────────────────
+//
+// chat_turn happy-path requires a real LiteLLM endpoint — can't
+// pin in integration tests without a wiremock server, which is
+// deferred to v0.3 polish.  The wire-side annotations + error
+// paths ARE testable cleanly and that's what we cover here.
+
+#[tokio::test]
+async fn thu_conversation_tools_have_open_world_annotations() {
+    // Verifies the annotation shape: chat_turn + eval are NOT
+    // marked destructive (no confirmation gate), but ARE marked
+    // open_world (they talk to LiteLLM + MCP children + spend
+    // tracker — observable side effects beyond the call's body).
+    let client = spawn_mcp_serve().await;
+    let tools = client.peer().list_tools(Default::default()).await
+        .expect("list_tools failed");
+
+    let lookup = |name: &str| tools.tools.iter()
+        .find(|t| t.name.as_ref() == name)
+        .unwrap_or_else(|| panic!("tool `{name}` not in tool list"));
+
+    let chat_turn = lookup("aislang_chat_turn");
+    let eval      = lookup("aislang_eval");
+
+    let chat_ann = chat_turn.annotations.as_ref()
+        .expect("chat_turn must have annotations");
+    assert_eq!(chat_ann.destructive_hint, Some(false),
+        "chat_turn should NOT be destructive (no confirmation gate)");
+    assert_eq!(chat_ann.read_only_hint, Some(false),
+        "chat_turn modifies external state via LLM/MCP calls");
+    assert_eq!(chat_ann.open_world_hint, Some(true),
+        "chat_turn observably interacts with external services");
+
+    let eval_ann = eval.annotations.as_ref()
+        .expect("eval must have annotations");
+    assert_eq!(eval_ann.destructive_hint, Some(false));
+    assert_eq!(eval_ann.open_world_hint, Some(true));
+}
+
+#[tokio::test]
+async fn thu_chat_turn_wire_parse_error_returns_clean_error() {
+    let client = spawn_mcp_serve().await;
+    let params = CallToolRequestParams::new("aislang_chat_turn".to_string())
+        .with_arguments(serde_json::json!({
+            "source":      "not aislang",
+            "agent_label": "support",
+            "user_input":  "hi",
+        }).as_object().unwrap().clone());
+    let result = client.peer().call_tool(params).await;
+    // Parse errors come back as MCP-level errors (RmcpError invalid_params).
+    assert!(result.is_err(),
+        "malformed source should produce an MCP error; got: {result:?}");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(err_msg.contains("parse error"),
+        "error should mention parse error; got: {err_msg}");
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn thu_eval_wire_no_eval_blocks_errors_cleanly() {
+    let client = spawn_mcp_serve().await;
+    // Project with no eval blocks at all (block bodies use
+    // whitespace-separated attributes, NOT commas).
+    let source = r#"project "noeval" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+}
+"#;
+    let params = CallToolRequestParams::new("aislang_eval".to_string())
+        .with_arguments(serde_json::json!({ "source": source })
+            .as_object().unwrap().clone());
+    let result = client.peer().call_tool(params).await;
+    assert!(result.is_err(),
+        "eval against project-with-no-evals should error; got: {result:?}");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(err_msg.contains("no `eval` blocks") ||
+            err_msg.contains("no eval"),
+        "error should explain there's nothing to evaluate; got: {err_msg}");
+    client.cancel().await.expect("clean shutdown");
 }
 
 #[tokio::test]
