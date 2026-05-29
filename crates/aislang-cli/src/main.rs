@@ -160,6 +160,34 @@ enum Command {
         /// `aislang.lock` in the current directory.
         file:  PathBuf,
     },
+    /// Run the aiSlang MCP server (v0.2 Track A — week 12 Mon scaffold)
+    ///
+    /// Starts an MCP server that exposes the aislang CLI surface as
+    /// MCP tools, so MCP-aware LLM clients (Claude Desktop, Cursor,
+    /// ChatGPT-with-MCP, custom rmcp clients) can author and operate
+    /// aiSlang stacks without learning the DSL.
+    ///
+    /// **Week 12 Mon (this commit):** scaffolding only — registers a
+    /// single `aislang_ping` health-check tool that returns "pong".
+    /// The substantive tool surface (lang_spec / examples / describe /
+    /// validate / plan / apply / destroy / status / chat_turn / eval)
+    /// lands Tue–Thu per PLAN-90-days-v0_2.md Phase 1 Week 12.
+    ///
+    /// **Transports:** `--stdio` (default — for parent-spawned use by
+    /// Claude Desktop, Cursor, etc.) is wired this week.  `--http`
+    /// transport for k8s/cloud deployments arrives Week 13 Mon.
+    ///
+    /// Typical local invocation comes from the client's MCP config,
+    /// not from the user shell directly — but `aislang mcp-serve` IS
+    /// runnable from a TTY for testing (it'll block on stdin reads,
+    /// which is the point).
+    #[command(name = "mcp-serve")]
+    McpServe {
+        /// Use the stdio transport (default and only option in week
+        /// 12 Mon). `--http :PORT` lands Week 13 Mon.
+        #[arg(long, default_value_t = true)]
+        stdio: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -198,8 +226,66 @@ fn run() -> Result<ExitCode> {
         Command::Status { file, spend, model_spend } =>
             run_status(file, spend, model_spend)?,
         Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
+        Command::McpServe { stdio }   => run_mcp_serve(stdio).map(|_| ExitCode::SUCCESS)?,
     };
     Ok(code)
+}
+
+// ============================================================================
+// `aislang mcp-serve` — week 12 Mon scaffolding
+// ============================================================================
+//
+// PLAN-90-days-v0_2.md Phase 1 Week 12 Mon: registers a single
+// `aislang_ping` tool over stdio.  Validates the rmcp-server
+// pipeline on a trivial case before scaling to 9 tool families
+// Tue-Thu.  The actual server implementation lives in
+// `aislang-runtime::mcp_server`; this function is just the
+// async-runtime bring-up + transport dispatch.
+//
+// Stdio is the only supported transport this week (Decision 39);
+// `--http :PORT` arrives Week 13 Mon.  We accept `--stdio` as a
+// flag anyway so the CLI shape doesn't change between week 12 and
+// week 13 (Week 13 adds `--http` as an alternative, keeping `--stdio`
+// as the documented default).
+
+/// Bring up the aiSlang MCP server.  Blocks until the connected
+/// client disconnects (EOF on stdin) or the user interrupts.
+///
+/// Runtime: we build a small single-thread tokio runtime rather
+/// than reuse the existing chat/eval runtimes — `mcp-serve` is
+/// long-lived and benefits from a dedicated executor without the
+/// noise of other CLI subcommands sharing it.  rmcp itself only
+/// requires the multi-thread runtime when serving multiple
+/// concurrent clients; stdio is inherently single-client so
+/// `current_thread` is sufficient and saves a worker thread.
+fn run_mcp_serve(stdio: bool) -> Result<()> {
+    if !stdio {
+        // Defensive — clap's default-value-true means this branch
+        // is unreachable today, but we want a clear error if Week
+        // 13 wires --http but somebody passes --stdio=false to
+        // both transports.
+        return Err(anyhow::anyhow!(
+            "no transport selected; --http :PORT arrives Week 13 Mon \
+             (PLAN-90-days-v0_2.md Phase 1 Week 13)"));
+    }
+
+    // Log the start to stderr — stdout belongs to the MCP wire
+    // bytes and must not be polluted (a single rogue println! on
+    // stdout corrupts the JSON-RPC framing).
+    eprintln!("aislang mcp-serve: starting stdio MCP server …");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async {
+        aislang_runtime::mcp_serve_stdio().await
+            .map_err(|e| anyhow::anyhow!("mcp-serve: {e}"))
+    })?;
+
+    eprintln!("aislang mcp-serve: client disconnected; shutting down.");
+    Ok(())
 }
 
 fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {

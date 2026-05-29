@@ -24,6 +24,11 @@
 //! exactly as they are.
 
 pub mod mcp;
+// week-12 Mon: aiSlang's MCP server-side scaffolding for `aislang
+// mcp-serve`.  Lives alongside `mcp.rs` (client side) so the rmcp
+// dep is shared and aislang-owned wire types can be reused as the
+// tool surface grows Tue-Thu.  PLAN-90-days-v0_2.md Phase 1 Week 12.
+pub mod mcp_server;
 pub mod litellm;
 pub mod session;
 pub mod cost;
@@ -48,6 +53,7 @@ pub use litellm::{
     Tool, ToolCall, ToolFunction, FunctionCall, UsageStats,
 };
 pub use mcp::{StdioChild, SpawnConfig, ToolSpec, ToolContent, McpError};
+pub use mcp_server::{AislangServer, ServerError as McpServerError, serve_stdio as mcp_serve_stdio};
 pub use cost::{cost_of_usage, sum as money_sum, format_money};
 pub use spend::{SpendTracker, SpendError};
 pub use state::{
