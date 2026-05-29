@@ -2098,7 +2098,7 @@ fn print_summary(project: &aislang_core::ast::Project) {
     eprintln!();
     eprintln!("summary:");
     eprintln!("  project:     {}", project.name);
-    let counts: [(&str, usize); 8] = [
+    let counts: [(&str, usize); 9] = [
         ("budget",      project.budget.is_some() as usize),
         ("models",      project.models.len()),
         ("prompts",     project.prompts.len()),
@@ -2107,6 +2107,10 @@ fn print_summary(project: &aislang_core::ast::Project) {
         ("evals",       project.evals.len()),
         ("secrets",     project.secrets.len()),
         ("deploys",     project.deploys.len()),
+        // v0.2 Fri: new `main` resource type.  Only printed when
+        // present (count > 0) — preserves the existing terse
+        // verbose-output shape for v0.1-shape files.
+        ("mains",       project.mains.len()),
     ];
     for (kind, count) in counts {
         if count > 0 {
