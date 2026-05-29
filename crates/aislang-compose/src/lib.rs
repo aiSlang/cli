@@ -669,27 +669,31 @@ mod tests {
 
     #[test] fn litellm_forwards_resolved_provider_env_vars() {
         // The bug this prevents: LiteLLM reads `os.environ/OLLAMA_API_BASE`
-        // from its own env, but if our compose YAML doesn't FORWARD
-        // OLLAMA_API_BASE from .env into the container, it resolves to
-        // the empty string and LiteLLM falls back to `localhost:11434`
-        // — which from inside the container means LiteLLM itself.
-        // Result: "Cannot connect to host localhost:11434" at the
-        // first /v1/chat/completions call.
+        // / `os.environ/ANTHROPIC_API_KEY` from its own env, but if our
+        // compose YAML doesn't FORWARD these vars from .env into the
+        // container, they resolve to the empty string and the first
+        // /v1/chat/completions call dies with an auth/connection error.
         //
-        // For the demo (resolved primary = ollama), we expect the
-        // litellm service's environment block to include the line
-        //   OLLAMA_API_BASE=${OLLAMA_API_BASE}
-        // — the `${X}` syntax triggers Docker Compose substitution
-        // from the user's .env at `up` time.
+        // For the demo, v0.2 Tue follow-up: primary is haiku
+        // (anthropic), fallbacks include gpt-4o-mini (openai) and
+        // llama3 (ollama).  All three provider env vars must be
+        // forwarded via the `${X}` Compose-substitution syntax so
+        // the user's .env populates them at `up` time.
         let yaml = emit_demo_yaml();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let env = value["services"]["litellm"]["environment"].as_sequence()
             .expect("litellm.environment is a list");
         let strs: Vec<&str> = env.iter()
             .filter_map(|v| v.as_str()).collect();
-        assert!(strs.contains(&"OLLAMA_API_BASE=${OLLAMA_API_BASE}"),
-            "OLLAMA_API_BASE must be forwarded via Compose interpolation; \
-             got env: {strs:?}");
+        for expected in &[
+            "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}",
+            "OPENAI_API_KEY=${OPENAI_API_KEY}",
+            "OLLAMA_API_BASE=${OLLAMA_API_BASE}",
+        ] {
+            assert!(strs.contains(expected),
+                "{expected} must be forwarded via Compose interpolation; \
+                 got env: {strs:?}");
+        }
     }
 
     #[test] fn litellm_env_forwarding_covers_all_referenced_providers() {

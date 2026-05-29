@@ -485,28 +485,37 @@ resolve(model_block, catalog, lockfile):
     residency ⊆ catalog.residency        (if set)
     not deprecated
 
-  ordered = []
-  for m in model_block.prefer:
-    if m in candidates: ordered.append(m)
-  for m in model_block.fallback:
-    if m in candidates and m not in ordered: ordered.append(m)
+  # v0.2 Tue follow-up: spec-conformant prefer/fallback walk.
+  # `prefer` is an ORDERED preference list; `fallback` is used
+  # only if no prefer candidate satisfies constraints.
+  # `optimize_for` does NOT re-order — it stays on the budget
+  # block as a forward-compat hint for v0.3+ multi-row catalog
+  # matches (currently a no-op because catalog IDs are unique).
 
   if model_block.pin is set:
-    if pin not in ordered: error("pin violates constraints")
-    chosen = pin
-  else if ordered is empty:
-    error("no model satisfies constraints", show rejection reason per model)
-  else:
-    if budget.optimize_for == cost:
-      chosen = candidate in ordered with lowest cost_input_per_1k_tokens
-    elif budget.optimize_for == latency:
-      chosen = candidate in ordered with lowest latency_p95
+    if pin in candidates and pin in (prefer ∪ fallback):
+      chosen = pin
     else:
-      chosen = ordered[0]
+      error("pin violates constraints or not in prefer/fallback")
+  else:
+    chosen = None
+    for m in model_block.prefer:                  # walk in declared order
+      if m in candidates:
+        chosen = m
+        break
+    if chosen is None:
+      for m in model_block.fallback:              # walk in declared order
+        if m in candidates:
+          chosen = m
+          break
+    if chosen is None:
+      error("no model satisfies constraints", show rejection reason per model)
 
   write to lockfile
   return chosen
 ```
+
+> **v0.1 → v0.2 Tue follow-up behaviour change.**  v0.1 built a candidate pool from `prefer ∪ fallback` and let `optimize_for = cost | latency` re-sort it, which silently overrode the declared preference order — `prefer = [anthropic.claude_haiku_4_5]` could lose to a free `fallback = [ollama.llama_3_1_8b]` under the default `optimize_for = cost`.  v0.2 Tue follow-up makes the resolver match the prose above this code block: walk `prefer` in declared order, fall back only when no prefer satisfies, treat `optimize_for` as informational at the resolver layer.  No-`pin`-no-`prefer`-no-`fallback` projects still error as before (resolver has nothing to walk).
 
 ### 6.1 Lockfile
 

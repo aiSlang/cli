@@ -291,11 +291,41 @@ fn provider_creds(provider: &str) -> ProviderCreds {
 /// landed.
 pub fn referenced_env_vars(resolved: &ResolvedProject) -> BTreeSet<String> {
     let mut vars: BTreeSet<String> = BTreeSet::new();
+
+    // (1) Resolved primaries — what `aislang chat` and the deployed
+    //     `fast` alias dial at first request.
     for model_id in resolved.model_bindings.values() {
         let creds = provider_creds(&model_id.provider);
         if let Some(v) = creds.api_key  { vars.insert(v.to_string()); }
         if let Some(v) = creds.api_base { vars.insert(v.to_string()); }
     }
+
+    // (2) v0.2 Tue follow-up: walk every ModelId in prefer + fallback
+    //     too.  `build_config` emits a model_list entry per ModelId
+    //     in `prefer ∪ fallback` (so LiteLLM's router_settings can
+    //     chain them); each entry carries `api_key: os.environ/X`
+    //     references.  Without their env vars in `.env.example` (and
+    //     forwarded into the litellm container by build_litellm_service),
+    //     the alternates dial with an empty key and the user hits an
+    //     AuthError the moment they pick a fallback alias from Open
+    //     WebUI's dropdown.
+    //
+    //     The pre-Tue-follow-up demo masked this — the resolver picked
+    //     the free Ollama fallback as primary, so the .env.example
+    //     listed OLLAMA_API_BASE only.  Anthropic/OpenAI keys WERE
+    //     referenced in the emitted litellm_config.yaml but weren't
+    //     in .env.example → silent gap that surfaced as an AuthError
+    //     in live Open WebUI testing.  See user-reported bug for the
+    //     full trail.
+    for block in &resolved.project.models {
+        for id in block.prefer.iter().chain(block.fallback.iter()) {
+            let creds = provider_creds(&id.provider);
+            if let Some(v) = creds.api_key  { vars.insert(v.to_string()); }
+            if let Some(v) = creds.api_base { vars.insert(v.to_string()); }
+        }
+    }
+
+    // (3) User-declared `secret` blocks with `env://VAR` URIs.
     for s in &resolved.project.secrets {
         if let Some(var) = s.source.strip_prefix("env://") {
             vars.insert(var.to_string());
@@ -452,15 +482,17 @@ mod tests {
     // ---------- happy path ----------
 
     #[test] fn demo_emits_primary_plus_fallbacks() {
-        // Week-5 Thursday: each model block produces ONE primary entry
-        // + one secondary entry per alternate (de-duplicated, no self-
-        // reference). Demo has prefer=[haiku, gpt_4o_mini],
-        // fallback=[llama_3_1_8b]; resolves to llama (primary).
-        // So we expect:
-        //   primary entry: "fast"   → ollama/llama3.1:8b
-        //   alt entry #1:  "fast-fb-anthropic-claude-haiku-4-5"
-        //   alt entry #2:  "fast-fb-openai-gpt-4o-mini"
-        // Llama isn't an alt — it IS the primary.
+        // Each model block produces ONE primary entry + one secondary
+        // entry per alternate (de-duplicated, no self-reference).
+        //
+        // v0.2 Tue follow-up: resolver now walks prefer in declared
+        // order — see resolver §`resolve_one_model`.  Demo has
+        // prefer=[haiku, gpt-4o-mini], fallback=[llama3]; resolves to
+        // haiku (prefer[0]).  So we expect:
+        //   primary entry: "fast"   → anthropic/claude-haiku-4-5
+        //   alt entry #1:  "fast-fb-openai-gpt-4o-mini"
+        //   alt entry #2:  "fast-fb-ollama-llama-3-1-8b"
+        // (No `fast-fb-anthropic-…` because haiku IS the primary.)
         let (resolved, catalog) = resolve_demo();
         let cfg = build_config(&resolved, &catalog).expect("build");
         assert_eq!(cfg.model_list.len(), 3,
@@ -469,13 +501,15 @@ mod tests {
         let names: Vec<&str> = cfg.model_list.iter()
             .map(|e| e.model_name.as_str()).collect();
         assert!(names.contains(&"fast"));
-        assert!(names.contains(&"fast-fb-anthropic-claude-haiku-4-5"));
         assert!(names.contains(&"fast-fb-openai-gpt-4o-mini"));
+        assert!(names.contains(&"fast-fb-ollama-llama-3-1-8b"));
+        assert!(!names.contains(&"fast-fb-anthropic-claude-haiku-4-5"),
+            "haiku IS the primary now; must NOT appear as its own fallback");
 
-        // Primary still uses the resolved litellm_name.
+        // Primary uses the resolved litellm_name (Haiku via Anthropic).
         let primary = cfg.model_list.iter()
             .find(|e| e.model_name == "fast").expect("primary entry");
-        assert_eq!(primary.litellm_params.model, "ollama/llama3.1:8b");
+        assert_eq!(primary.litellm_params.model, "anthropic/claude-haiku-4-5");
     }
 
     #[test] fn yaml_round_trips_through_serde_yaml() {
@@ -489,11 +523,15 @@ mod tests {
     }
 
     #[test] fn yaml_contains_expected_keys() {
+        // v0.2 Tue follow-up: primary is now anthropic/claude-haiku
+        // (prefer[0]), not ollama (the old cost-pierced winner).
         let (resolved, catalog) = resolve_demo();
         let yaml = generate_config(&resolved, &catalog).expect("generate");
         assert!(yaml.contains("model_list:"));
         assert!(yaml.contains("model_name: fast"));
         assert!(yaml.contains("litellm_params:"));
+        assert!(yaml.contains("model: anthropic/claude-haiku-4-5"));
+        // Ollama still appears, but as a fallback now.
         assert!(yaml.contains("model: ollama/llama3.1:8b"));
     }
 
@@ -593,14 +631,18 @@ mod tests {
     // Wednesday: API-key plumbing + .env.example generation
     // ----------------------------------------------------------------
 
-    #[test] fn ollama_entry_gets_api_base_not_api_key() {
-        // Demo resolves to ollama under cost-opt; Ollama uses
-        // OLLAMA_API_BASE (no API key).
+    #[test] fn ollama_fallback_entry_gets_api_base_not_api_key() {
+        // v0.2 Tue follow-up: ollama appears as a FALLBACK entry now
+        // (primary is haiku per prefer order).  Find the Ollama entry
+        // explicitly rather than indexing model_list[0].
         let (resolved, catalog) = resolve_demo();
         let cfg = build_config(&resolved, &catalog).expect("build");
-        let params = &cfg.model_list[0].litellm_params;
-        assert_eq!(params.api_key,  None);
-        assert_eq!(params.api_base, Some("os.environ/OLLAMA_API_BASE".into()));
+        let ollama = cfg.model_list.iter()
+            .find(|e| e.litellm_params.model == "ollama/llama3.1:8b")
+            .expect("ollama fallback entry must be present");
+        assert_eq!(ollama.litellm_params.api_key,  None);
+        assert_eq!(ollama.litellm_params.api_base,
+                   Some("os.environ/OLLAMA_API_BASE".into()));
     }
 
     #[test] fn anthropic_entry_gets_api_key_not_api_base() {
@@ -635,14 +677,22 @@ mod tests {
         assert!(yaml.contains("api_base: os.environ/OLLAMA_API_BASE"));
     }
 
-    #[test] fn env_example_demo_has_ollama_only() {
-        // Demo resolves to ollama → only OLLAMA_API_BASE in
-        // the .env.example.
+    #[test] fn env_example_demo_includes_every_provider_in_prefer_and_fallback() {
+        // v0.2 Tue follow-up: with strict prefer order, the demo
+        // resolves to anthropic.claude_haiku_4_5 as the PRIMARY.  The
+        // emitter still walks prefer ∪ fallback to build the fallback
+        // model_list entries (so LiteLLM router_settings can chain
+        // them).  So .env.example must include API keys for EVERY
+        // provider referenced in prefer or fallback — anthropic +
+        // openai + ollama for the demo.
         let (resolved, _catalog) = resolve_demo();
         let env = generate_env_example(&resolved);
-        assert!(env.contains("OLLAMA_API_BASE="));
-        assert!(!env.contains("ANTHROPIC_API_KEY"));
-        assert!(!env.contains("OPENAI_API_KEY"));
+        assert!(env.contains("ANTHROPIC_API_KEY="),
+            "primary haiku → need ANTHROPIC_API_KEY; got:\n{env}");
+        assert!(env.contains("OPENAI_API_KEY="),
+            "fallback gpt-4o-mini → need OPENAI_API_KEY; got:\n{env}");
+        assert!(env.contains("OLLAMA_API_BASE="),
+            "fallback llama3 → need OLLAMA_API_BASE; got:\n{env}");
     }
 
     #[test] fn env_example_multi_provider_has_all() {
@@ -661,11 +711,12 @@ mod tests {
     }
 
     #[test] fn env_example_includes_ollama_host_hint_when_ollama_resolved() {
-        // When the resolved primary is Ollama, the .env.example
-        // surfaces the host.docker.internal:11434 recipe so users
-        // running Ollama on the same machine know exactly what to
-        // set. Pairs with the extra_hosts wire in build_litellm_service.
-        let (resolved, _) = resolve_demo();   // demo resolves to ollama
+        // The .env.example surfaces the host.docker.internal:11434
+        // recipe whenever OLLAMA_API_BASE appears in the var list —
+        // regardless of whether Ollama is primary or just a fallback.
+        // (After v0.2 Tue follow-up the demo's primary is haiku, but
+        // ollama still appears as a fallback so the hint fires.)
+        let (resolved, _) = resolve_demo();
         let env = generate_env_example(&resolved);
         assert!(env.contains("Ollama-on-host hint"),
             "footer must announce the Ollama hint when OLLAMA_API_BASE present:\n{env}");
@@ -744,32 +795,36 @@ mod tests {
 
     #[test] fn demo_router_settings_has_fallback_chain() {
         // The fallbacks map should contain one key "fast" pointing at
-        // the two alternates (haiku before gpt-4o-mini per prefer order).
+        // the alternates in prefer-then-fallback order, with the
+        // resolved primary excluded.
+        //
+        // v0.2 Tue follow-up: demo resolves to haiku (prefer[0]) now.
+        // Walking prefer ∪ fallback = [haiku, gpt-4o-mini, llama3] +
+        // dropping haiku (primary) leaves [gpt-4o-mini, llama3].
         let (resolved, catalog) = resolve_demo();
         let cfg = build_config(&resolved, &catalog).expect("build");
         let router = cfg.router_settings.as_ref()
             .expect("router_settings must be present for demo");
         let fast_fb = find_fallbacks(router, "fast")
             .expect("fast key in fallbacks list");
-        // Order from source: prefer = [haiku, gpt-4o-mini], fallback = [llama_3_1_8b].
-        // Llama is primary (excluded). Remaining: haiku, gpt-4o-mini.
         assert_eq!(fast_fb, &vec![
-            "fast-fb-anthropic-claude-haiku-4-5".to_string(),
             "fast-fb-openai-gpt-4o-mini".to_string(),
+            "fast-fb-ollama-llama-3-1-8b".to_string(),
         ]);
     }
 
     #[test] fn primary_excluded_from_own_fallback_list() {
         // The resolved primary's ModelId must NOT appear as an alias
-        // in the fallbacks list.
+        // in the fallbacks list.  v0.2 Tue follow-up: primary is haiku
+        // (anthropic) now.
         let (resolved, catalog) = resolve_demo();
         let cfg = build_config(&resolved, &catalog).expect("build");
         let router = cfg.router_settings.as_ref().unwrap();
         let fast_fb = find_fallbacks(router, "fast").unwrap();
         for alias in fast_fb {
-            assert!(!alias.contains("ollama"),
-                "primary (ollama) must not appear in own fallback list; \
-                 got alias `{alias}`");
+            assert!(!alias.contains("anthropic"),
+                "primary (haiku via anthropic) must not appear in own \
+                 fallback list; got alias `{alias}`");
         }
     }
 
@@ -850,6 +905,9 @@ mod tests {
         // so we look for `- fast:` (list-item with the primary as a
         // single dict key) rather than just `fast:` (which would be
         // a top-level map, the v0.1-rejected shape).
+        //
+        // v0.2 Tue follow-up: primary is haiku now → not in fallbacks;
+        // remaining alternates are gpt-4o-mini + llama3.
         let (resolved, catalog) = resolve_demo();
         let yaml = generate_config(&resolved, &catalog).expect("generate");
         assert!(yaml.contains("router_settings:"));
@@ -857,8 +915,8 @@ mod tests {
         assert!(yaml.contains("- fast:"),
             "fallbacks entry must be a list-item single-key dict (`- fast:`); \
              got:\n{yaml}");
-        assert!(yaml.contains("- fast-fb-anthropic-claude-haiku-4-5"));
         assert!(yaml.contains("- fast-fb-openai-gpt-4o-mini"));
+        assert!(yaml.contains("- fast-fb-ollama-llama-3-1-8b"));
     }
 
     #[test] fn env_example_deduplicates_across_models() {
@@ -946,13 +1004,25 @@ mod tests {
         let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
             .expect("resolve");
         let env = generate_env_example(&resolved);
-        // Note: .env.example collects vars from RESOLVED primaries only,
-        // not from fallback alternates. So ollama (fallback of secondary)
-        // doesn't appear unless a primary uses it.
+        // v0.2 Tue follow-up: .env.example now collects vars from BOTH
+        // resolved primaries AND every ModelId in prefer + fallback —
+        // because `build_config` emits a model_list entry per alternate
+        // (with `api_key: os.environ/X` references that LiteLLM tries
+        // to dereference at startup).  See `referenced_env_vars` for
+        // the rationale.
+        //
+        // So ollama (fallback of `secondary`) now appears in
+        // .env.example even though no primary uses it.  The old "no
+        // OLLAMA_API_BASE" expectation was the bug that produced
+        // AuthErrors when Open WebUI users picked a fallback alias
+        // from the model dropdown.
         assert!(env.contains("ANTHROPIC_API_KEY="));
         assert!(env.contains("OPENAI_API_KEY="));
-        // Ollama is only in fallback, primary is openai — so no OLLAMA_API_BASE.
-        assert!(!env.contains("OLLAMA_API_BASE="));
+        assert!(env.contains("OLLAMA_API_BASE="),
+            "ollama is a declared fallback; its env var must surface in \
+             .env.example so the litellm container can dial it when \
+             that alias is picked from the UI / a /v1/chat/completions \
+             call");
     }
 
     #[test] fn no_models_no_router_settings() {

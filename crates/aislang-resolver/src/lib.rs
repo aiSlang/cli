@@ -222,10 +222,43 @@ fn hash_file(path: &Path) -> Result<String, std::io::Error> {
 }
 
 fn resolve_one_model(
-    block:        &Model,
-    catalog:      &Catalog,
-    optimize_for: OptimizeFor,
+    block:         &Model,
+    catalog:       &Catalog,
+    _optimize_for: OptimizeFor,
 ) -> Result<ModelId, ResolveError> {
+    // ── Spec-conformant prefer/fallback semantics (v0.2 Tue follow-up).
+    //
+    // LANGUAGE-SPEC §4.4 reads:
+    //   prefer   : List<ModelId>   # ordered preference
+    //   fallback : List<ModelId>   # used if no `prefer` candidate
+    //                              # satisfies constraints
+    //
+    // The v0.1 resolver built a candidate pool from prefer ∪ fallback
+    // and then let `optimize_for` (cost / latency / quality) re-sort
+    // the pool — which silently overrode the declared preference order
+    // whenever the cheapest/fastest entry sat in `fallback`.  Users
+    // who wrote `prefer = [anthropic.claude_haiku_4_5]` reasonably
+    // expected Haiku, but a free `fallback = [ollama.llama_3_1_8b]`
+    // would win under `optimize_for = cost` (the demo's default).
+    // See the Week 13 Tue follow-up PR for the live demo that
+    // surfaced this.
+    //
+    // New behaviour:
+    //   1. Walk `prefer` in declared order.  First candidate that
+    //      satisfies every hard constraint (capabilities, context_min,
+    //      cost_max, latency_p95, residency intersect) wins.
+    //   2. If NO prefer candidate satisfies, walk `fallback` in declared
+    //      order; first satisfier wins.
+    //   3. If neither, surface the per-entry rejections (unchanged).
+    //
+    // `optimize_for` becomes effectively informational at the resolver
+    // layer.  Catalog IDs are unique, so a single `ModelId` in prefer
+    // never matches two catalog rows — there's no resolution-time tie
+    // to break.  v0.2 keeps the field on the AST (and threads it
+    // through here for future use as a cost-routing hint at runtime
+    // / for v0.3+ multi-row catalog matches), but it no longer
+    // re-orders prefer.
+
     // Step 1: filter catalog entries against the model block's hard
     // constraints, collecting per-entry rejection reasons for the
     // "no candidate" diagnostic.
@@ -239,35 +272,24 @@ fn resolve_one_model(
         }
     }
 
-    // Step 2: order candidates by `prefer` then `fallback`. Spec §6:
-    // ordered contains only catalog entries that BOTH (a) satisfy
-    // constraints AND (b) are named in prefer/fallback.
-    let mut ordered: Vec<&CatalogModel> = Vec::new();
-    for pref_id in &block.prefer {
-        if let Some(c) = candidates.iter().find(|c| matches_id(c, pref_id)) {
-            ordered.push(*c);
-        }
-    }
-    for fall_id in &block.fallback {
-        if !ordered.iter().any(|c| matches_id(c, fall_id)) {
-            if let Some(c) = candidates.iter().find(|c| matches_id(c, fall_id)) {
-                ordered.push(*c);
-            }
-        }
-    }
-
-    // Step 3: pin enforcement (if set, pin MUST be selected).
+    // Step 2: pin enforcement (if set, pin MUST be the selection).
+    // Pin must appear in prefer or fallback (declared spec) AND
+    // satisfy every constraint.  Independent of prefer-order walk
+    // below: pin short-circuits everything else.
     if let Some(pin) = &block.pin {
-        if ordered.iter().any(|c| matches_id(c, pin)) {
+        let in_prefer    = block.prefer.iter().any(|p| p == pin);
+        let in_fallback  = block.fallback.iter().any(|f| f == pin);
+        let in_candidates = candidates.iter().any(|c| matches_id(c, pin));
+
+        if (in_prefer || in_fallback) && in_candidates {
             return Ok(pin.clone());
         }
-        // Pin didn't make it into ordered — figure out why.
+
+        // Pin didn't make it through — figure out why.
         let pin_dotted = format!("{}.{}", pin.provider, pin.name);
         let reason = match rejections.iter().find(|(id, _)| *id == pin_dotted) {
             Some((_, r)) => format!("constraint mismatch: {r}"),
             None => {
-                let in_prefer   = block.prefer.iter().any(|p| p == pin);
-                let in_fallback = block.fallback.iter().any(|f| f == pin);
                 if in_prefer || in_fallback {
                     "satisfies constraints but is not in catalog (bug?)".to_string()
                 } else {
@@ -282,45 +304,40 @@ fn resolve_one_model(
         });
     }
 
-    // Step 4: no pin — error if nothing satisfies, else apply
-    // optimize_for tiebreaker over the ordered candidates.
-    if ordered.is_empty() {
-        let detail = if rejections.is_empty() {
-            "catalog has no models at all".to_string()
-        } else if block.prefer.is_empty() && block.fallback.is_empty() {
-            "model block has empty prefer + fallback + no pin; \
-             must specify at least one of these so the resolver \
-             knows which catalog entries to consider".to_string()
-        } else {
-            let lines: Vec<String> = rejections.iter()
-                .map(|(id, r)| format!("    - {id}: {r}"))
-                .collect();
-            format!("constraint-rejections per catalog entry:\n{}",
-                    lines.join("\n"))
-        };
-        return Err(ResolveError::NoCandidate {
-            label: block.label.clone(),
-            detail,
-        });
+    // Step 3: walk `prefer` in declared order.  First candidate that
+    // satisfies all hard constraints wins.  Spec-conformant.
+    for pref_id in &block.prefer {
+        if let Some(c) = candidates.iter().find(|c| matches_id(c, pref_id)) {
+            return Ok(parse_catalog_id(&c.id));
+        }
     }
 
-    let chosen: &CatalogModel = match optimize_for {
-        OptimizeFor::Cost => ordered.iter()
-            // Use Money's Ord impl directly: Unlimited sorts as
-            // greater than any Capped, so an Unlimited-cost candidate
-            // never wins "cheapest". Capped(0) (e.g. local Ollama)
-            // wins ties against pricier candidates.
-            .min_by(|a, b| a.cost_input.cmp(&b.cost_input))
-            .copied()
-            .expect("ordered non-empty"),
-        OptimizeFor::Latency => ordered.iter()
-            .min_by_key(|c| c.latency_p95.nanos)
-            .copied()
-            .expect("ordered non-empty"),
-        OptimizeFor::Quality => ordered[0],   // first preference wins
-    };
+    // Step 4: no `prefer` candidate satisfies — walk `fallback`.
+    for fall_id in &block.fallback {
+        if let Some(c) = candidates.iter().find(|c| matches_id(c, fall_id)) {
+            return Ok(parse_catalog_id(&c.id));
+        }
+    }
 
-    Ok(parse_catalog_id(&chosen.id))
+    // Step 5: nothing in prefer or fallback satisfied — surface the
+    // per-entry rejections (same diagnostic shape as v0.1).
+    let detail = if rejections.is_empty() {
+        "catalog has no models at all".to_string()
+    } else if block.prefer.is_empty() && block.fallback.is_empty() {
+        "model block has empty prefer + fallback + no pin; \
+         must specify at least one of these so the resolver \
+         knows which catalog entries to consider".to_string()
+    } else {
+        let lines: Vec<String> = rejections.iter()
+            .map(|(id, r)| format!("    - {id}: {r}"))
+            .collect();
+        format!("constraint-rejections per catalog entry:\n{}",
+                lines.join("\n"))
+    };
+    Err(ResolveError::NoCandidate {
+        label: block.label.clone(),
+        detail,
+    })
 }
 
 /// Returns `Ok(())` if the catalog entry satisfies every hard constraint
@@ -697,25 +714,27 @@ mod tests {
         }
     }
 
-    #[test] fn demo_model_resolves_under_cost_optimization() {
+    #[test] fn demo_model_resolves_via_prefer_order() {
         // End-to-end on the actual support-agent.ais model block against
-        // the real bundled catalog with `budget.optimize_for = cost`.
+        // the real bundled catalog.
         //
-        // Per LANGUAGE-SPEC §6: `ordered` is built from
-        // prefer + fallback (all satisfying entries together), then
-        // optimize_for picks from that union. Under `cost`, the
-        // CHEAPEST satisfying entry wins — not the first in prefer.
+        // LANGUAGE-SPEC §4.4 says `prefer` is an ORDERED preference list
+        // and `fallback` is "used if no `prefer` candidate satisfies
+        // constraints".  v0.2 Tue follow-up made the resolver match the
+        // spec: walk prefer in declared order, first satisfier wins;
+        // fall back only when no prefer item satisfies.
         //
-        // The demo's fallback `ollama.llama_3_1_8b` is FREE (cost=0)
-        // and satisfies every constraint (chat+tool_use, 128k≥32k,
-        // 2s≤2s, us+eu residency). So it wins the cost tiebreaker
-        // over the preferred Anthropic/OpenAI entries.
+        // The demo declares `prefer = [haiku, gpt-4o-mini]` + `fallback
+        // = [llama3]`.  Haiku is in the catalog, satisfies every hard
+        // constraint (chat+tool_use, 200k≥32k context, $0.001/1k ≤ the
+        // demo's $0.001/1k cost_max, 1.5s ≤ 2s latency_p95, us+eu
+        // residency intersect non-empty).  So it wins — regardless of
+        // `optimize_for`.
         //
-        // This is the correct spec behavior, even if unintuitive on
-        // first read. The demo shows that local-LLM fallbacks are
-        // selected when they're free — a desirable property! Users
-        // who want prefer-order-dominant selection should set
-        // `optimize_for = quality` (next test).
+        // The v0.1 behaviour (cost optimization piercing prefer order)
+        // is gone: a free Ollama fallback no longer silently displaces
+        // a declared paid preference.  Users who want cost-driven
+        // selection should declare it in prefer order directly.
         let src = std::fs::read_to_string(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("..").join("..")
@@ -724,21 +743,21 @@ mod tests {
         let (project, _) = aislang_core::validate(&src)
             .expect("demo must validate");
         let cat = aislang_catalog::bundled().expect("bundled catalog");
-        // The demo references `./prompts/system.md` — resolve relative
-        // to examples/ so prompt hashing finds it.
         let examples_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..").join("..").join("examples");
         let resolved = resolve(&project, &cat, &examples_dir).expect("must resolve");
         let fast = resolved.model_bindings.get("fast")
             .expect("model `fast` binding");
         assert_eq!(fast,
-            &ModelId { provider: "ollama".into(), name: "llama_3_1_8b".into() },
-            "under optimize_for=cost the free Ollama fallback wins; \
-             see test comment for the spec-§6 semantics");
+            &ModelId { provider: "anthropic".into(), name: "claude_haiku_4_5".into() },
+            "prefer[0] = anthropic.claude_haiku_4_5 satisfies every \
+             constraint and therefore wins under the v0.2 Tue follow-up \
+             resolver semantics (LANGUAGE-SPEC §4.4)");
     }
 
-    #[test] fn optimize_for_cost_picks_cheapest() {
-        // Both prefer entries satisfy; cost-optimized picks the cheaper.
+    #[test] fn first_prefer_wins_when_satisfying() {
+        // Spec-conformant: prefer[0] is picked when it satisfies all
+        // constraints, regardless of optimize_for.
         let body = r#"
             model "m" {
                 requires    = [chat]
@@ -748,11 +767,19 @@ mod tests {
         "#;
         let id = resolve_model(body, &variety_catalog(), "m")
             .expect("must resolve");
-        assert_eq!(id.name, "cheap_slow");
+        assert_eq!(id.name, "cheap_slow",
+            "prefer[0] wins when satisfying — `optimize_for = cost` is \
+             default but no longer reorders prefer (v0.2 Tue follow-up)");
     }
 
-    #[test] fn optimize_for_latency_picks_fastest() {
-        // Override optimize_for via budget block.
+    #[test] fn optimize_for_latency_does_not_override_prefer_order() {
+        // v0.1: `optimize_for = latency` reordered prefer to pick the
+        // fastest satisfier.  v0.2 Tue follow-up: optimize_for is a
+        // no-op for selection; prefer[0] wins whenever it satisfies.
+        //
+        // This test pins that change: prefer = [cheap_slow,
+        // fast_expensive] + optimize_for = latency MUST yield
+        // cheap_slow (the declared first preference), NOT fast_expensive.
         let src = r#"project "p" {
             budget {
                 hard_cap_per_day = $1   hard_cap_per_run = $0.01
@@ -766,7 +793,76 @@ mod tests {
         }"#;
         let (project, _) = aislang_core::validate(src).expect("validate");
         let resolved = resolve(&project, &variety_catalog(), std::path::Path::new(".")).expect("resolve");
-        assert_eq!(resolved.model_bindings.get("m").unwrap().name, "fast_expensive");
+        assert_eq!(resolved.model_bindings.get("m").unwrap().name, "cheap_slow",
+            "prefer[0] = test.cheap_slow MUST win — optimize_for is no \
+             longer a re-orderer (v0.2 Tue follow-up; see resolver \
+             rewrite comment for the spec-vs-v0.1 contrast)");
+    }
+
+    #[test] fn optimize_for_cost_does_not_override_prefer_order() {
+        // Symmetric to the latency test above.  `optimize_for = cost`
+        // (the demo's default) MUST NOT cause the cheaper fallback to
+        // displace a satisfying prefer[0].  This is the literal bug
+        // the user surfaced via Open WebUI live testing.
+        let src = r#"project "p" {
+            budget {
+                hard_cap_per_day = $1   hard_cap_per_run = $0.01
+                optimize_for     = cost
+            }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [test.fast_expensive]
+                fallback    = [test.cheap_slow]
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let resolved = resolve(&project, &variety_catalog(), std::path::Path::new(".")).expect("resolve");
+        assert_eq!(resolved.model_bindings.get("m").unwrap().name, "fast_expensive",
+            "prefer[0] = fast_expensive satisfies → wins.  cheap_slow \
+             stays in the fallback chain (LiteLLM router_settings) but \
+             does not become the primary alias.  This is the literal \
+             user-reported bug — `optimize_for = cost` no longer hijacks \
+             prefer order.");
+    }
+
+    #[test] fn cost_max_constraint_skips_first_prefer_falls_to_second() {
+        // The hard-constraint path: prefer[0] violates `cost_max`, so
+        // it's not in `candidates`, so the resolver walks past it to
+        // prefer[1].  Pins that the prefer-walk doesn't blindly pick
+        // unconditionally — it still respects the constraint set.
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1   hard_cap_per_run = $0.01 }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                cost_max    = $0.05 per 1k_tokens
+                prefer      = [test.fast_expensive, test.cheap_slow]
+            }
+        }"#;
+        // variety_catalog: fast_expensive costs $0.01/k input ($10000 µ
+        // per 1024 tokens), well above $0.05/k = $50000µ / 1024.
+        // Actually compute: cost_max = $0.05 per 1k_tokens = 50_000µ /
+        // 1024.  fast_expensive cost_input = 10_000µ / 1024.
+        // 10_000µ < 50_000µ → fast_expensive satisfies.  So this body
+        // would pick fast_expensive, not the desired skip.
+        //
+        // Drop cost_max way down so fast_expensive (10_000µ/1024) fails
+        // and cheap_slow (50µ/1024) passes.
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1   hard_cap_per_run = $0.01 }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                cost_max    = $0.0001 per 1k_tokens
+                prefer      = [test.fast_expensive, test.cheap_slow]
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let resolved = resolve(&project, &variety_catalog(), std::path::Path::new(".")).expect("resolve");
+        assert_eq!(resolved.model_bindings.get("m").unwrap().name, "cheap_slow",
+            "prefer[0] fast_expensive ($0.01/k > cost_max $0.0001/k) \
+             fails the constraint → resolver walks to prefer[1] cheap_slow");
     }
 
     #[test] fn optimize_for_quality_picks_first_preference() {
