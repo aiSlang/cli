@@ -82,6 +82,9 @@ async fn handshake_succeeds_and_lists_all_phase_1_tools() {
         "aislang_describe",   // Tue
         "aislang_validate",   // Tue
         "aislang_plan",       // Tue
+        "aislang_apply",      // Wed
+        "aislang_destroy",    // Wed
+        "aislang_status",     // Wed
     ];
     for tool in expected {
         assert!(names.contains(tool),
@@ -237,6 +240,117 @@ async fn validate_wire_ok_summary_and_error_diagnostic() {
         "malformed source must not give OK: summary; got: {text}");
 
     client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn wed_destructive_tools_carry_destructive_hint_annotation() {
+    // Verifies the `destructive_hint: true` annotation reaches the
+    // client over the wire — that's what Claude Desktop / Cursor look
+    // at when deciding whether to show a confirmation dialog before
+    // tool invocation.  Pins the v0.2 architectural decision #5
+    // (planning doc Track A — "PreToolUse via MCP annotations").
+    let client = spawn_mcp_serve().await;
+
+    let tools = client.peer().list_tools(Default::default()).await
+        .expect("list_tools failed");
+
+    let lookup = |name: &str| tools.tools.iter()
+        .find(|t| t.name.as_ref() == name)
+        .unwrap_or_else(|| panic!("tool `{name}` not in tool list"));
+
+    let apply = lookup("aislang_apply");
+    let destroy = lookup("aislang_destroy");
+    let status = lookup("aislang_status");
+
+    // apply + destroy must carry destructive_hint = true.
+    let apply_ann = apply.annotations.as_ref()
+        .expect("apply must have annotations");
+    assert_eq!(apply_ann.destructive_hint, Some(true),
+        "aislang_apply must declare destructive_hint = true");
+    assert_eq!(apply_ann.read_only_hint, Some(false),
+        "aislang_apply is not read-only");
+
+    let destroy_ann = destroy.annotations.as_ref()
+        .expect("destroy must have annotations");
+    assert_eq!(destroy_ann.destructive_hint, Some(true),
+        "aislang_destroy must declare destructive_hint = true");
+    assert_eq!(destroy_ann.idempotent_hint, Some(true),
+        "aislang_destroy must declare idempotent_hint = true (Decision 27 idempotency)");
+
+    // status must carry read_only_hint = true; never destructive.
+    let status_ann = status.annotations.as_ref()
+        .expect("status must have annotations");
+    assert_eq!(status_ann.read_only_hint, Some(true),
+        "aislang_status must declare read_only_hint = true");
+    assert_eq!(status_ann.destructive_hint, Some(false),
+        "aislang_status must NOT be destructive");
+
+    client.cancel().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn wed_status_wire_returns_not_applied_for_fresh_dir() {
+    // End-to-end wire roundtrip for aislang_status against an empty
+    // source_dir → expects the `not applied` body.
+    let client = spawn_mcp_serve().await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "aislang-mcp-wire-status-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source = r#"project "demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+}
+"#;
+
+    let params = CallToolRequestParams::new("aislang_status".to_string())
+        .with_arguments(serde_json::json!({
+            "source":     source,
+            "source_dir": dir.to_string_lossy(),
+        }).as_object().unwrap().clone());
+    let result = client.peer().call_tool(params).await
+        .expect("call_tool(aislang_status)");
+    let text = body_text(&result);
+    assert!(text.contains("project:  demo"),
+        "status header should include project name; got: {text}");
+    assert!(text.contains("not applied"),
+        "fresh dir status should report not applied; got: {text}");
+
+    client.cancel().await.expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn wed_destroy_wire_returns_nothing_to_destroy_for_clean_dir() {
+    let client = spawn_mcp_serve().await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "aislang-mcp-wire-destroy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let params = CallToolRequestParams::new("aislang_destroy".to_string())
+        .with_arguments(serde_json::json!({
+            "source_dir": dir.to_string_lossy(),
+        }).as_object().unwrap().clone());
+    let result = client.peer().call_tool(params).await
+        .expect("call_tool(aislang_destroy)");
+    let text = body_text(&result);
+    assert!(text.contains("nothing to destroy"),
+        "destroy on clean dir should report nothing to destroy; got: {text}");
+
+    client.cancel().await.expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

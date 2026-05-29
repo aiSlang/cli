@@ -410,6 +410,448 @@ impl AislangServer {
         );
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Week-12 Wed: stateful tier — apply / destroy / status.  These
+    // are the first MCP tools that touch the filesystem + Docker.
+    // Apply + destroy carry `destructive_hint = true` annotations so
+    // compliant MCP clients (Claude Desktop, Cursor) gate them
+    // behind a confirmation dialog before invocation (planning-doc
+    // Track A architectural decision #5 — "PreToolUse via MCP
+    // annotations").
+    //
+    // All three tools mirror the v0.1 CLI subcommands' logic
+    // (`run_apply` / `run_destroy` / `run_status` in main.rs) but
+    // accumulate their human-readable output into a String body
+    // instead of writing to stderr.  We don't refactor the CLI
+    // functions — the duplication is small, the surfaces have
+    // genuinely different needs (CLI streams to stderr live; MCP
+    // returns a single string when the operation completes), and
+    // each can evolve independently without coupling.
+    //
+    // Long-running ops note: `aislang_apply` invokes `docker compose
+    // up -d` which can take 30s+ on first image pull.  MCP's tool-
+    // call shape is single-shot (no streaming) in v0.2; the client
+    // sees a "Claude is thinking…" spinner for the duration.  v0.3
+    // may add progress notifications via rmcp's progress API.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Deploy the stack: resolve + emit artifacts to disk, then
+    /// `docker compose -f stack.yml up -d`, then record state.
+    /// Returns a single human-readable summary string capturing every
+    /// generated file path + the docker outcome.
+    ///
+    /// **Destructive.** Writes `stack.yml`, `litellm_config.yaml`,
+    /// `.env.example`, `aislang.lock` to `source_dir`; starts Docker
+    /// containers; writes `.aislang/state.json` after the stack
+    /// confirms up.  Compliant MCP clients gate this behind a
+    /// confirmation prompt before invoking — see `destructive_hint`
+    /// annotation below.
+    ///
+    /// Graceful degrade: if `docker` isn't on PATH, the artifacts are
+    /// still written and the response body tells the user how to
+    /// bring the stack up manually.  This matches the v0.1 CLI's
+    /// `apply` behaviour for the same case.
+    #[tool(
+        name = "aislang_apply",
+        description = "Deploy the aiSlang stack to Docker: resolve + \
+            emit artifacts to disk, then `docker compose up -d`, then \
+            record .aislang/state.json. Writes 5 files (stack.yml, \
+            litellm_config.yaml, .env.example, aislang.lock, state.json) \
+            into source_dir. Starts Docker containers — destructive. \
+            On first run, image pulls can take 30-60s; the response \
+            comes back when `docker compose up -d` returns.",
+        annotations(
+            title             = "Deploy aiSlang stack",
+            destructive_hint  = true,
+            idempotent_hint   = false,
+            open_world_hint   = true,
+            read_only_hint    = false,
+        )
+    )]
+    pub async fn apply(&self,
+        Parameters(p): Parameters<ApplyParameters>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let mut out = String::new();
+        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+
+        // ── Stage 1: full plan pipeline (validate → catalog → resolve → emit)
+        let (project, _warnings) = aislang_core::validate(&p.source)
+            .map_err(|e| RmcpError::invalid_params(
+                format!("parse error: {e}"), None))?;
+        aislang_resolver::check_against_bundled_catalog(&project)
+            .map_err(|e| RmcpError::invalid_params(
+                format!("catalog error: {e}"), None))?;
+        let resolved = aislang_resolver::resolve_against_bundled_catalog(
+            &project, &source_dir,
+        ).map_err(|e| RmcpError::invalid_params(
+            format!("resolve error: {e}"), None))?;
+        let catalog = aislang_catalog::bundled()
+            .map_err(|e| RmcpError::internal_error(
+                format!("catalog load: {e}"), None))?;
+        let artifacts = aislang_compose::emit(&resolved, &catalog, &source_dir)
+            .map_err(|e| RmcpError::invalid_params(
+                format!("compose emit: {e}"), None))?;
+
+        // ── Stage 2: write artifacts.  All four files use the same
+        // location convention v0.1's `aislang plan -o <dir>` uses.
+        let stack_path   = source_dir.join(aislang_compose::STACK_YAML_FILENAME);
+        let litellm_path = source_dir.join(aislang_compose::LITELLM_CONFIG_FILENAME);
+        let env_path     = source_dir.join(aislang_compose::ENV_EXAMPLE_FILENAME);
+        let lock_path    = source_dir.join("aislang.lock");
+
+        std::fs::write(&stack_path, &artifacts.docker_compose)
+            .map_err(|e| RmcpError::internal_error(
+                format!("write {}: {e}", stack_path.display()), None))?;
+        std::fs::write(&litellm_path, &artifacts.litellm_config)
+            .map_err(|e| RmcpError::internal_error(
+                format!("write {}: {e}", litellm_path.display()), None))?;
+        std::fs::write(&env_path, &artifacts.env_example)
+            .map_err(|e| RmcpError::internal_error(
+                format!("write {}: {e}", env_path.display()), None))?;
+        // Lockfile via the resolver's helper so format matches v0.1
+        // `aislang plan` exactly (byte-stable reproducibility).
+        let lock = aislang_resolver::Lockfile::build(&p.source, &resolved);
+        aislang_resolver::lockfile::write(&lock_path, &lock)
+            .map_err(|e| RmcpError::internal_error(
+                format!("write {}: {e}", lock_path.display()), None))?;
+
+        use std::fmt::Write;
+        let _ = writeln!(out, "generated:");
+        let _ = writeln!(out, "  stack:           {}", stack_path.display());
+        let _ = writeln!(out, "  litellm config:  {}", litellm_path.display());
+        let _ = writeln!(out, "  env example:     {}", env_path.display());
+        let _ = writeln!(out, "  lockfile:        {}", lock_path.display());
+
+        // ── Stage 3: docker compose up -d (with graceful degrade).
+        if !docker_on_path() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "docker not on PATH — artifacts written but stack NOT started.");
+            let _ = writeln!(out, "install Docker and run:");
+            let _ = writeln!(out, "  docker compose -f {} up -d", stack_path.display());
+            return Ok(CallToolResult::success(vec![Content::text(out)]));
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "bringing stack up: docker compose -f {} up -d",
+                         stack_path.display());
+        let status = std::process::Command::new("docker")
+            .args(["compose", "-f"])
+            .arg(&stack_path)
+            .args(["up", "-d"])
+            // Swallow docker's stdout (compose logs) so it doesn't
+            // pollute our return body; stderr is fine to drop too
+            // since we report the exit status explicitly.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| RmcpError::internal_error(
+                format!("invoke docker compose: {e}"), None))?;
+        if !status.success() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "docker compose up -d exited {:?}", status.code());
+            let _ = writeln!(out, "(stack.yml + lockfile + .env.example are still on disk; \
+                                   inspect with `docker compose -f {} logs`)",
+                             stack_path.display());
+            return Ok(CallToolResult::success(vec![Content::text(out)]));
+        }
+
+        // ── Stage 4: write state.json (after stack confirms up — same
+        // ordering as v0.1's run_apply).  Failure here is a warning,
+        // not an error: the stack IS up, we just couldn't persist
+        // the audit trail.
+        let state_path  = crate::state_path_in(&source_dir);
+        let source_hash = crate::hex_sha256(p.source.as_bytes());
+        let state = crate::new_applied_state(
+            &project.name,
+            source_hash,
+            &resolved.catalog_version,
+            stack_path.clone(),
+        );
+        match crate::write_state_atomic(&state_path, &state) {
+            Ok(()) => { let _ = writeln!(out, "  state:           {}", state_path.display()); }
+            Err(e) => { let _ = writeln!(out,
+                "warning: stack is up but failed to write {}: {e}",
+                state_path.display()); }
+        }
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "stack is up — project `{}` deployed.", project.name);
+        let _ = writeln!(out, "next steps:");
+        if let Some(agent) = project.agents.first() {
+            let _ = writeln!(out, "  chat:    aislang chat {} <source.ais>", agent.label);
+        }
+        let _ = writeln!(out, "  teardown: call aislang_destroy with source_dir = {}",
+                         source_dir.display());
+
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    /// Tear down a deployed stack: `docker compose -f stack.yml down
+    /// -v`, then flip `applied_at` to null in state.json.  Idempotent
+    /// — re-running on an already-torn-down stack returns "nothing to
+    /// destroy" in the success body (Decision 27).
+    ///
+    /// **Destructive.** Removes Docker containers, networks, and
+    /// volumes for the stack at `source_dir`.  Compliant MCP clients
+    /// gate this behind a confirmation prompt — see annotation.
+    ///
+    /// `force = true` bypasses the idempotency check, exactly mirroring
+    /// the CLI's `--force` flag (Decision 29).
+    #[tool(
+        name = "aislang_destroy",
+        description = "Tear down a deployed aiSlang stack: \
+            `docker compose down -v` removes containers, networks, and \
+            volumes for the stack at source_dir, then state.json's \
+            applied_at field flips to null. Idempotent — calling on an \
+            already-torn-down stack returns 'nothing to destroy' as a \
+            successful body. Use `force = true` to bypass the idempotency \
+            check and run docker compose down -v unconditionally. \
+            Destructive.",
+        annotations(
+            title             = "Tear down aiSlang stack",
+            destructive_hint  = true,
+            idempotent_hint   = true,
+            open_world_hint   = true,
+            read_only_hint    = false,
+        )
+    )]
+    pub async fn destroy(&self,
+        Parameters(p): Parameters<DestroyParameters>,
+    ) -> Result<CallToolResult, RmcpError> {
+        let mut out = String::new();
+        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let stack_path = source_dir.join(aislang_compose::STACK_YAML_FILENAME);
+        let state_path = crate::state_path_in(&source_dir);
+        let force      = p.force.unwrap_or(false);
+
+        use std::fmt::Write;
+
+        // ── Idempotency check (Decision 27) ─────────────────────────
+        if !force {
+            match crate::read_state(&state_path) {
+                Ok(Some(state)) if state.applied_at.is_none() => {
+                    let _ = writeln!(out,
+                        "nothing to destroy: state file at `{}` shows the stack was already torn down.",
+                        state_path.display());
+                    let _ = writeln!(out,
+                        "(set force=true to run `docker compose down -v` against `{}` anyway.)",
+                        stack_path.display());
+                    return Ok(CallToolResult::success(vec![Content::text(out)]));
+                }
+                Ok(None) if !stack_path.exists() => {
+                    let _ = writeln!(out,
+                        "nothing to destroy: neither `{}` nor `{}` exists.",
+                        state_path.display(), stack_path.display());
+                    return Ok(CallToolResult::success(vec![Content::text(out)]));
+                }
+                Ok(_) => {}   // proceed.
+                Err(e) => {
+                    return Err(RmcpError::internal_error(
+                        format!("read state file `{}`: {e}", state_path.display()),
+                        None));
+                }
+            }
+        }
+
+        // ── Stack.yml required for the actual docker compose down ──
+        if !stack_path.exists() {
+            return Err(RmcpError::invalid_params(
+                format!("no stack.yml at `{}` — call aislang_apply first to recreate it",
+                        stack_path.display()), None));
+        }
+        if !docker_on_path() {
+            return Err(RmcpError::internal_error(
+                format!("docker not on PATH; cannot tear down stack at `{}`",
+                        stack_path.display()), None));
+        }
+
+        let _ = writeln!(out, "tearing down stack: docker compose -f {} down -v",
+                         stack_path.display());
+        let status = std::process::Command::new("docker")
+            .args(["compose", "-f"])
+            .arg(&stack_path)
+            .args(["down", "-v"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| RmcpError::internal_error(
+                format!("invoke docker compose: {e}"), None))?;
+        if !status.success() {
+            return Err(RmcpError::internal_error(
+                format!("docker compose down -v exited {:?}", status.code()), None));
+        }
+
+        // ── Mark state torn down (Decision 27).  Log-and-continue
+        // on failure: the stack IS down; we just couldn't update the
+        // audit trail.
+        if let Err(e) = crate::mark_state_torn_down(&state_path) {
+            let _ = writeln!(out,
+                "warning: stack torn down but failed to update state file `{}`: {e}",
+                state_path.display());
+        }
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "stack torn down — containers, networks, and volumes removed.");
+        let _ = writeln!(out, "stack.yml is preserved at `{}` (remove manually if desired).",
+                         stack_path.display());
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
+
+    /// Render the same three sections the v0.1 `aislang status` CLI
+    /// surfaces: stack (state.json + `docker compose ps`), optional
+    /// today's spend total, optional by-model spend breakdown.
+    /// Always returns a success body — drift is reported in-text, not
+    /// as an MCP error, so the LLM can read the diagnostic and act.
+    ///
+    /// Read-only.  No destructive_hint, no side effects.
+    #[tool(
+        name = "aislang_status",
+        description = "Render stack health (.aislang/state.json + \
+            `docker compose ps` roll-up), optionally with today's spend \
+            total and/or by-model breakdown. Read-only; reports drift \
+            (state missing, applied_at null, services not up) in-text. \
+            For the CLI exit-code spectrum (0 clean / 1 drift / 2 \
+            docker-unavailable) use `aislang status` from a terminal — \
+            MCP returns the same information as a single text body.",
+        annotations(
+            title             = "Inspect aiSlang stack status",
+            destructive_hint  = false,
+            read_only_hint    = true,
+            open_world_hint   = true,
+            idempotent_hint   = true,
+        )
+    )]
+    pub async fn status(&self,
+        Parameters(p): Parameters<StatusParameters>,
+    ) -> Result<CallToolResult, RmcpError> {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let (project, _warnings) = aislang_core::validate(&p.source)
+            .map_err(|e| RmcpError::invalid_params(
+                format!("parse error: {e}"), None))?;
+
+        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let state_path = crate::state_path_in(&source_dir);
+        let stack_path = source_dir.join(aislang_compose::STACK_YAML_FILENAME);
+
+        let _ = writeln!(out, "project:  {}", project.name);
+        let _ = writeln!(out, "source_dir: {}", source_dir.display());
+        let _ = writeln!(out);
+        let _ = writeln!(out, "stack:");
+
+        match crate::read_state(&state_path) {
+            Ok(Some(state)) => match state.applied_at {
+                Some(ref ts) => {
+                    let _ = writeln!(out, "  applied_at:      {ts}");
+                    let _ = writeln!(out, "  catalog_version: {}", state.catalog_version);
+                    let _ = writeln!(out, "  source_hash:     {}…",
+                        &state.source_hash[..12.min(state.source_hash.len())]);
+                    let _ = writeln!(out, "  stack.yml:       {}", state.stack_yaml_path.display());
+                    // Docker check is best-effort — failures surface
+                    // in-text, never bubble as MCP errors.
+                    if stack_path.exists() && docker_on_path() {
+                        match docker_compose_ps_lines(&stack_path) {
+                            Ok(lines) if lines.is_empty() => {
+                                let _ = writeln!(out, "  services: (none running — compose ps returned empty)");
+                            }
+                            Ok(lines) => {
+                                let _ = writeln!(out, "  services:");
+                                for line in lines {
+                                    let _ = writeln!(out, "    {line}");
+                                }
+                            }
+                            Err(e) => {
+                                let _ = writeln!(out, "  services: (failed to query docker: {e})");
+                            }
+                        }
+                    } else if !docker_on_path() {
+                        let _ = writeln!(out, "  services: (docker not on PATH — cannot query live status)");
+                    } else {
+                        let _ = writeln!(out, "  services: (stack.yml missing at `{}`)",
+                                         stack_path.display());
+                    }
+                }
+                None => {
+                    let _ = writeln!(out, "  status:  torn down (applied_at: null)");
+                    let _ = writeln!(out, "  catalog_version: {}", state.catalog_version);
+                    let _ = writeln!(out, "  hint:    call aislang_apply to redeploy");
+                }
+            }
+            Ok(None) => {
+                let _ = writeln!(out, "  status:  not applied (no state file at `{}`)",
+                                 state_path.display());
+                let _ = writeln!(out, "  hint:    call aislang_apply to deploy the stack");
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  status:  ERROR reading state file: {e}");
+            }
+        }
+
+        // ── Optional spend total ───────────────────────────────────
+        if p.spend.unwrap_or(false) {
+            let tracker = crate::SpendTracker::open_default(&project.name)
+                .map_err(|e| RmcpError::internal_error(
+                    format!("open spend tracker: {e}"), None))?;
+            let _ = writeln!(out);
+            let _ = writeln!(out, "spend ({} UTC):",
+                crate::spend::utc_today());
+            let total = tracker.today_spend();
+            let _ = writeln!(out, "  total:   {}",
+                crate::format_money(&total));
+            if let Some(b) = project.budget.as_ref() {
+                if let (Some(cap_mu), Some(spent_mu)) =
+                    (b.hard_cap_per_day.micro_units(), total.micro_units())
+                {
+                    if cap_mu > 0 {
+                        let pct = (spent_mu as f64 / cap_mu as f64) * 100.0;
+                        let _ = writeln!(out, "  cap:     {} ({:.1}% used)",
+                            crate::format_money(&b.hard_cap_per_day),
+                            pct);
+                    }
+                }
+            }
+        }
+
+        // ── Optional by-model spend ─────────────────────────────────
+        if let Some(ref filter) = p.model_spend {
+            let tracker = crate::SpendTracker::open_default(&project.name)
+                .map_err(|e| RmcpError::internal_error(
+                    format!("open spend tracker: {e}"), None))?;
+            let by_model = tracker.today_by_model();
+            let _ = writeln!(out);
+            if filter.is_empty() {
+                let _ = writeln!(out, "spend by model ({} UTC):",
+                    crate::spend::utc_today());
+            } else {
+                let _ = writeln!(out, "spend for model `{}` ({} UTC):",
+                    filter, crate::spend::utc_today());
+            }
+            if by_model.is_empty() {
+                let _ = writeln!(out, "  (no spend recorded today)");
+            } else if filter.is_empty() {
+                let mut rows: Vec<_> = by_model.iter().collect();
+                rows.sort_by(|a, b| b.1.micro_units().cmp(&a.1.micro_units()));
+                let pad = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+                for (model, amount) in rows {
+                    let _ = writeln!(out, "  {model:<pad$}  {}",
+                        crate::format_money(amount));
+                }
+            } else {
+                match by_model.get(filter) {
+                    Some(amount) => {
+                        let _ = writeln!(out, "  {}",
+                            crate::format_money(amount));
+                    }
+                    None => {
+                        let _ = writeln!(out, "  (no spend recorded for `{filter}` today)");
+                    }
+                }
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(out)]))
+    }
 }
 
 // ============================================================================
@@ -454,6 +896,152 @@ pub struct PlanParameters {
     /// paths.
     #[serde(default)]
     pub source_dir: Option<String>,
+}
+
+// ── Wed: stateful-tier parameter types ──────────────────────────────
+
+/// `apply` parameters — same shape as `plan` (source + source_dir).
+/// Renaming for documentation clarity; the runtime semantics differ
+/// (apply writes to disk + starts Docker, plan is in-memory).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ApplyParameters {
+    /// The complete `.ais` source file as a UTF-8 text body.
+    pub source: String,
+    /// Filesystem path that will receive the emitted artifacts
+    /// (stack.yml, litellm_config.yaml, .env.example, aislang.lock,
+    /// .aislang/state.json) and where prompt-file paths in the source
+    /// are resolved against. Defaults to the MCP server's current
+    /// working directory when omitted. Prompt files referenced by the
+    /// source MUST already exist at the resolved paths.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+}
+
+/// `destroy` parameters.  Doesn't need the `source` field — state
+/// + stack.yml living in `source_dir` are sufficient.  But the v0.1
+/// CLI's `aislang destroy <file>` does take a source file, so we
+/// keep the API surface symmetric with `apply` + `status` and just
+/// ignore `source` here.  Future v0.3+ may use `source` for a
+/// pre-destroy diff against the currently-applied state.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct DestroyParameters {
+    /// Filesystem path holding the deployed stack's state.json +
+    /// stack.yml.  Defaults to cwd when omitted.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+    /// When true, bypass the idempotency check (state-shows-torn-down
+    /// + nothing-to-destroy) and run `docker compose down -v` against
+    /// the stack.yml unconditionally.  Use when state.json was lost
+    /// or manually edited away. Defaults to false.
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+/// `status` parameters: source-for-project-name + source_dir + the
+/// two optional spend toggles.  Mirrors the CLI flags 1:1.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct StatusParameters {
+    /// The complete `.ais` source file as a UTF-8 text body — used to
+    /// resolve the project name (which keys spend.json's tracker).
+    pub source: String,
+    /// Filesystem path containing .aislang/state.json + stack.yml.
+    /// Defaults to cwd.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+    /// When true, append today's UTC spend total + cap utilization %.
+    #[serde(default)]
+    pub spend: Option<bool>,
+    /// When set, append today's by-model spend breakdown.  Empty
+    /// string filters to "all models"; a non-empty string filters to
+    /// one model id (e.g. `"anthropic.claude_haiku_4_5"`). Matches
+    /// the CLI's `--model-spend [=MODEL]` semantics.
+    #[serde(default)]
+    pub model_spend: Option<String>,
+}
+
+// ── Wed: shared helpers (apply / destroy / status) ──────────────────
+
+/// Resolve a caller-supplied `source_dir` parameter into a canonical
+/// `PathBuf`.  Mirrors what the CLI does at the start of every
+/// stateful command: explicit path wins, fall back to cwd, then
+/// canonicalize so emitted Compose YAML embeds an unambiguous
+/// absolute mount path.
+fn resolve_source_dir(arg: Option<&str>) -> Result<PathBuf, rmcp::ErrorData> {
+    let raw: PathBuf = match arg {
+        Some(s) => PathBuf::from(s),
+        None    => std::env::current_dir()
+            .map_err(|e| rmcp::ErrorData::internal_error(
+                format!("cwd: {e}"), None))?,
+    };
+    std::fs::canonicalize(&raw).map_err(|e| rmcp::ErrorData::invalid_params(
+        format!("source_dir `{}` doesn't exist or unreadable: {e}", raw.display()),
+        None))
+}
+
+/// Check whether `docker` is callable.  Same predicate as the CLI's
+/// `docker_on_path()` (apply graceful-degrades when absent; destroy
+/// hard-errors).
+fn docker_on_path() -> bool {
+    std::process::Command::new("docker")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Query `docker compose -f <stack> ps --format json` and return one
+/// human-readable line per service.  Returns an empty vec when no
+/// services are running.  Mirrors the CLI's `docker_compose_ps_json`
+/// + `render_service_rows` pipeline but collapsed: we don't need the
+/// "drift" accumulator at the MCP layer (drift reporting happens
+/// in-text, never as exit codes).
+fn docker_compose_ps_lines(stack_path: &std::path::Path)
+    -> std::io::Result<Vec<String>>
+{
+    let out = std::process::Command::new("docker")
+        .args(["compose", "-f"])
+        .arg(stack_path)
+        .args(["ps", "--format", "json"])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "docker compose ps exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Docker Compose 24+ emits NDJSON; older versions emit a JSON
+    // array.  Tolerate both — same logic as the CLI.
+    #[derive(serde::Deserialize)]
+    struct PsRow {
+        #[serde(rename = "Name",    alias = "name",    default)]
+        name:    String,
+        #[serde(rename = "Service", alias = "service", default)]
+        service: String,
+        #[serde(rename = "State",   alias = "state",   default)]
+        state:   String,
+        #[serde(rename = "Status",  alias = "status",  default)]
+        status:  String,
+    }
+    let rows: Vec<PsRow> = if body.starts_with('[') {
+        serde_json::from_str(body).map_err(std::io::Error::other)?
+    } else {
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<PsRow>(l).map_err(std::io::Error::other))
+            .collect::<std::io::Result<Vec<_>>>()?
+    };
+    Ok(rows.into_iter().map(|r| {
+        let label = if r.service.is_empty() { r.name } else { r.service };
+        let mark  = if matches!(r.state.as_str(), "running" | "Up" | "up") { "✓" } else { "✗" };
+        format!("{mark} {label}  {}", r.status)
+    }).collect())
 }
 
 // ============================================================================
@@ -880,5 +1468,302 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("parse error"),
             "should fail with parse error before reaching resolve; got: {msg}");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Week-12 Wed: stateful-tier tools
+    // ────────────────────────────────────────────────────────────────
+    //
+    // These exercise the apply/destroy/status code paths *without*
+    // requiring Docker — we use PATH-clobbering to force the
+    // graceful-degrade branches.  Tests that need a real docker
+    // shellout are deferred to integration tests (cli_mcp_serve.rs)
+    // where the binary is actually spawned.
+
+    /// Same shape as `PROJECT_WITH_PROMPT` from the plan tests but
+    /// kept inline so the Wed test block can be moved later without
+    /// dragging the Tue constant with it.
+    const APPLY_TEST_SOURCE: &str = r#"project "demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  model "fast" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+  }
+  prompt "system" {
+    file    = "./system.md"
+    version = "1.0.0"
+  }
+  agent "support" {
+    model         = model.fast
+    system_prompt = prompt.system
+    tools         = []
+  }
+}
+"#;
+
+    /// PATH clobber: force `docker_on_path()` to return false.  Used
+    /// in tests that exercise the no-docker graceful-degrade paths
+    /// without needing a real docker daemon.
+    struct PathGuard(Option<std::ffi::OsString>);
+    impl PathGuard {
+        fn no_docker() -> Self {
+            let prev = std::env::var_os("PATH");
+            // SAFETY: tests run in cargo's default single-thread
+            // ordering per #[tokio::test] only when --test-threads=1;
+            // workspace tests already use the default multi-thread.
+            // We accept the (small) chance of cross-test PATH races
+            // by using a per-test guard that restores on drop —
+            // matches the v0.1 cli_apply_destroy tempdir pattern.
+            // For full isolation, future v0.3 work could pull docker
+            // detection behind a trait + a test seam.
+            unsafe { std::env::set_var("PATH", "/nonexistent-aislang-mcp-test-path"); }
+            Self(prev)
+        }
+    }
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None    => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    // ── aislang_apply ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn apply_writes_artifacts_then_graceful_degrade_without_docker() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("apply-no-docker");
+        std::fs::write(dir.join("system.md"), "test prompt").unwrap();
+
+        let s = AislangServer::new();
+        let result = s.apply(Parameters(ApplyParameters {
+            source:     APPLY_TEST_SOURCE.to_string(),
+            source_dir: Some(dir.to_string_lossy().to_string()),
+        })).await.expect("apply degrades cleanly without docker");
+        let text = body_text(&result);
+
+        // All four artifacts written to disk regardless of docker.
+        assert!(dir.join("stack.yml").exists(),
+            "stack.yml must be written even without docker");
+        assert!(dir.join("litellm_config.yaml").exists(),
+            "litellm_config.yaml must be written");
+        assert!(dir.join(".env.example").exists(),
+            ".env.example must be written");
+        assert!(dir.join("aislang.lock").exists(),
+            "aislang.lock must be written");
+        // State file is NOT written when stack failed to come up
+        // (no docker == no `docker compose up -d`).  Same as v0.1 CLI.
+        assert!(!dir.join(".aislang/state.json").exists(),
+            "state.json must NOT be written when stack didn't come up");
+
+        // Response body mentions the manual fallback command.
+        assert!(text.contains("docker not on PATH"),
+            "response should call out docker absence; got: {text}");
+        assert!(text.contains("docker compose -f") && text.contains("up -d"),
+            "response should print the manual command; got: {text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_parse_error_returns_invalid_params() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("apply-bad-source");
+        let s = AislangServer::new();
+        let err = s.apply(Parameters(ApplyParameters {
+            source:     "this is not aislang".to_string(),
+            source_dir: Some(dir.to_string_lossy().to_string()),
+        })).await.expect_err("malformed source must error");
+        assert!(err.to_string().contains("parse error"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_resolve_error_when_prompt_file_missing() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("apply-no-prompt");
+        // Deliberately DO NOT write system.md.
+        let s = AislangServer::new();
+        let err = s.apply(Parameters(ApplyParameters {
+            source:     APPLY_TEST_SOURCE.to_string(),
+            source_dir: Some(dir.to_string_lossy().to_string()),
+        })).await.expect_err("resolve must fail when prompt missing");
+        let msg = err.to_string();
+        assert!(msg.contains("resolve") || msg.contains("hash") || msg.contains("system.md"),
+            "error should mention resolve/hash/system.md; got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── aislang_destroy ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn destroy_returns_nothing_to_destroy_when_no_state_no_stack() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("destroy-clean-dir");
+        let s = AislangServer::new();
+        let result = s.destroy(Parameters(DestroyParameters {
+            source_dir: Some(dir.to_string_lossy().to_string()),
+            force:      None,
+        })).await.expect("destroy on clean dir succeeds");
+        let text = body_text(&result);
+        assert!(text.contains("nothing to destroy"),
+            "should say `nothing to destroy`; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn destroy_idempotent_when_state_shows_torn_down() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("destroy-already-torn-down");
+        // Seed a torn-down state file directly.
+        let state_path = crate::state_path_in(&dir);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let mut torn = crate::new_applied_state(
+            "demo",
+            "deadbeef".to_string(),
+            "2026-05-25",
+            dir.join("stack.yml"),
+        );
+        torn.applied_at = None;
+        crate::write_state_atomic(&state_path, &torn).unwrap();
+
+        let s = AislangServer::new();
+        let result = s.destroy(Parameters(DestroyParameters {
+            source_dir: Some(dir.to_string_lossy().to_string()),
+            force:      None,
+        })).await.expect("destroy on already-torn-down state succeeds");
+        let text = body_text(&result);
+        assert!(text.contains("already torn down"),
+            "should mention already-torn-down state; got: {text}");
+        // Note: response also hints about force=true.
+        assert!(text.contains("force"),
+            "should mention the force option as a workaround; got: {text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn destroy_no_stack_yml_and_no_force_is_clean_exit() {
+        // No state file + no stack.yml is the "nothing was ever
+        // applied here" case — clean success body, no error.
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("destroy-no-stack");
+        let s = AislangServer::new();
+        let result = s.destroy(Parameters(DestroyParameters {
+            source_dir: Some(dir.to_string_lossy().to_string()),
+            force:      None,
+        })).await.expect("destroy on empty dir is clean exit");
+        let text = body_text(&result);
+        assert!(text.contains("nothing to destroy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── aislang_status ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_not_applied_when_no_state_file() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("status-no-state");
+        let s = AislangServer::new();
+        let result = s.status(Parameters(StatusParameters {
+            source:      APPLY_TEST_SOURCE.to_string(),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+            spend:       None,
+            model_spend: None,
+        })).await.expect("status with no state succeeds");
+        let text = body_text(&result);
+        assert!(text.contains("project:  demo"),
+            "header should print project name");
+        assert!(text.contains("not applied"),
+            "stack section should say not applied; got: {text}");
+        assert!(text.contains("aislang_apply") || text.contains("hint"),
+            "should hint at the apply tool; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn status_reports_torn_down_when_applied_at_null() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("status-torn-down");
+        let state_path = crate::state_path_in(&dir);
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let mut torn = crate::new_applied_state(
+            "demo", "deadbeef".to_string(), "2026-05-25",
+            dir.join("stack.yml"),
+        );
+        torn.applied_at = None;
+        crate::write_state_atomic(&state_path, &torn).unwrap();
+
+        let s = AislangServer::new();
+        let result = s.status(Parameters(StatusParameters {
+            source:      APPLY_TEST_SOURCE.to_string(),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+            spend:       None,
+            model_spend: None,
+        })).await.expect("status succeeds on torn-down state");
+        let text = body_text(&result);
+        assert!(text.contains("torn down"),
+            "stack section should say torn down; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn status_with_spend_flag_appends_spend_section() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("status-spend");
+        let s = AislangServer::new();
+        let result = s.status(Parameters(StatusParameters {
+            source:      APPLY_TEST_SOURCE.to_string(),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+            spend:       Some(true),
+            model_spend: None,
+        })).await.expect("status with spend flag succeeds");
+        let text = body_text(&result);
+        assert!(text.contains("spend ("),
+            "spend section should be present; got: {text}");
+        // Project has $1/day cap → expect cap-utilization line too.
+        assert!(text.contains("cap:") || text.contains("total:"),
+            "spend section should include total + cap; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn status_parse_error_returns_invalid_params() {
+        let _path = PathGuard::no_docker();
+        let s = AislangServer::new();
+        let err = s.status(Parameters(StatusParameters {
+            source:      "not aislang".to_string(),
+            source_dir:  None,
+            spend:       None,
+            model_spend: None,
+        })).await.expect_err("malformed source must error");
+        assert!(err.to_string().contains("parse error"));
+    }
+
+    #[tokio::test]
+    async fn status_with_model_spend_empty_filter_shows_all_models() {
+        let _path = PathGuard::no_docker();
+        let dir = fresh_tempdir("status-model-spend-all");
+        let s = AislangServer::new();
+        let result = s.status(Parameters(StatusParameters {
+            source:      APPLY_TEST_SOURCE.to_string(),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+            spend:       None,
+            // Empty string filter = "all models" (matches CLI --model-spend semantics).
+            model_spend: Some(String::new()),
+        })).await.expect("status with empty model_spend filter succeeds");
+        let text = body_text(&result);
+        assert!(text.contains("spend by model"),
+            "should show by-model breakdown header; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
