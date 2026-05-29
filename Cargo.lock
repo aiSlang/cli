@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-catalog"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "aislang-core",
  "serde",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-cli"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "aislang-catalog",
  "aislang-compose",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-compose"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "aislang-catalog",
  "aislang-core",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-core"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "chumsky",
  "petgraph",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-resolver"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "aislang-catalog",
  "aislang-core",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-runtime"
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 dependencies = [
  "aislang-core",
  "opentelemetry",

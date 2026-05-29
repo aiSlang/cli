@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.2.0-dev"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/aislang/aislang"
@@ -19,11 +19,11 @@ rust-version = "1.78"
 
 [workspace.dependencies]
 # Internal crates
-aislang-core     = { path = "crates/aislang-core",     version = "0.1.0-dev" }
-aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.1.0-dev" }
-aislang-resolver = { path = "crates/aislang-resolver", version = "0.1.0-dev" }
-aislang-compose  = { path = "crates/aislang-compose",  version = "0.1.0-dev" }
-aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.1.0-dev" }
+aislang-core     = { path = "crates/aislang-core",     version = "0.2.0-dev" }
+aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.2.0-dev" }
+aislang-resolver = { path = "crates/aislang-resolver", version = "0.2.0-dev" }
+aislang-compose  = { path = "crates/aislang-compose",  version = "0.2.0-dev" }
+aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.2.0-dev" }
 
 # External
 clap        = { version = "4.5", features = ["derive"] }
