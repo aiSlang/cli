@@ -358,7 +358,8 @@ impl AislangServer {
                      agents:      {}\n\
                      mcp_servers: {}\n\
                      evals:       {}\n\
-                     secrets:     {}",
+                     secrets:     {}\n\
+                     mains:       {}",
                     project.name,
                     project.models.len(),
                     project.prompts.len(),
@@ -366,6 +367,7 @@ impl AislangServer {
                     project.mcp_servers.len(),
                     project.evals.len(),
                     project.secrets.len(),
+                    project.mains.len(),
                 );
                 if !warnings.is_empty() {
                     out.push_str("\n\nwarnings:");
@@ -2008,6 +2010,15 @@ mod tests {
             "OK summary should name the project block");
         assert!(text.contains("models:"),
             "OK summary should report model count");
+        // v0.2 follow-up: every resource type the spec declares
+        // appears in the summary, including `mains` (zero for v0.1
+        // demo files).  Pinned so future grammar additions don't
+        // accidentally drop a kind.
+        for kind in &["models:", "prompts:", "agents:", "mcp_servers:",
+                      "evals:", "secrets:", "mains:"] {
+            assert!(text.contains(kind),
+                "OK summary should report `{kind}` count; got: {text:?}");
+        }
     }
 
     #[tokio::test]
