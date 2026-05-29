@@ -1564,6 +1564,7 @@ fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result
         }
         if by_model.is_empty() {
             println!("  (no spend recorded today)");
+            print_external_client_spend_hint(&project);
         } else if filter.is_empty() {
             // All models. Sort by amount descending for readability.
             let mut rows: Vec<_> = by_model.iter().collect();
@@ -1580,6 +1581,7 @@ fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result
                 }
                 None => {
                     println!("  (no spend recorded for `{filter}` today)");
+                    print_external_client_spend_hint(&project);
                     // NOT drift — absent model just means the agent
                     // didn't use that one today. v0.2 might warn when
                     // the requested model isn't in the project's
@@ -1600,6 +1602,46 @@ fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Print a hint about the v0.2 spend-tracking gap when the project
+/// has Open WebUI enabled (`expose { web_ui = true }` on any deploy
+/// block) but `aislang status --model-spend` shows an empty bucket.
+///
+/// **Why this hint exists.**  v0.2 Tue (Track A2) adds Open WebUI as
+/// a second client surface for the deployed agents.  Open WebUI
+/// talks to LiteLLM over OpenAI-compatible HTTP — totally bypassing
+/// the in-process [`aislang_runtime::SpendTracker`], which only
+/// instruments `Session::turn` (called by `aislang chat` and the MCP
+/// `aislang_chat_turn` / `aislang_eval` tools).  So a user who
+/// chats from Open WebUI sees real provider-side billing tick up
+/// (Anthropic / OpenAI console) while `aislang status --model-spend`
+/// shows zero — a confusing mismatch the user surfaced first thing
+/// after Tue's live verification.
+///
+/// **What this function does NOT do.**  It does not actually count
+/// the missing spend — that's the v0.3 carry-over work (LiteLLM
+/// callbacks or `/spend/logs` query, see PLAN v0.3 carry-overs).
+/// It only nudges the reader to look in the right place.
+///
+/// Quiet on projects that never declared `web_ui = true` — the hint
+/// would just be noise there.
+fn print_external_client_spend_hint(project: &aislang_core::ast::Project) {
+    let has_web_ui = project.deploys.iter()
+        .any(|d| d.expose.as_ref().is_some_and(|e| e.web_ui));
+    if !has_web_ui {
+        return;
+    }
+    // Three short lines.  Stay terse — verbose hint text in a
+    // single-shot status command is its own UX bug.  Pointers to
+    // LiteLLM logs + v0.3 carry-overs let interested users dig
+    // further on their own time.
+    println!();
+    println!("  note: only spend from `aislang chat` / `aislang mcp-serve` is tracked here.");
+    println!("        Open WebUI talks to LiteLLM directly, bypassing the SpendTracker.");
+    println!("        see `docker logs $(docker ps -qf label=aislang.component=litellm)`");
+    println!("        for per-request model resolutions; unified counting is a v0.3");
+    println!("        carry-over (LiteLLM callback or `/spend/logs` query — see PLAN).");
 }
 
 /// Display the first 12 hex chars of the source hash for the status

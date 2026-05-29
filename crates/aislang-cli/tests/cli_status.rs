@@ -312,3 +312,118 @@ fn write_spend(home: &std::path::Path, total_mu: i64, by_model: &[(&str, i64)]) 
     assert!(total_pos < bymdl_pos,
         "total section must precede by-model section; got:\n{stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// v0.2 Tue follow-up: external-client spend-gap hint
+// ---------------------------------------------------------------------------
+
+/// `.ais` source whose `deploy` block opts into Open WebUI via
+/// `expose { web_ui = true }`.  Used to verify that the v0.2 Tue
+/// status follow-up nudges users to look at LiteLLM logs when
+/// `--model-spend` is empty.
+fn tempdir_with_web_ui_project(suffix: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "aislang-status-webui-{}-{suffix}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("system.md"), "you are helpful").expect("write prompt");
+    let src = r#"project "demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  model "fast" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+  }
+  prompt "system" {
+    file    = "./system.md"
+    version = "1.0.0"
+  }
+  agent "support" {
+    model         = model.fast
+    system_prompt = prompt.system
+    tools         = []
+  }
+  deploy "local" {
+    target = compose
+    expose {
+      web_ui = true
+    }
+  }
+}
+"#;
+    let ais_path = dir.join("demo.ais");
+    std::fs::write(&ais_path, src).expect("write demo.ais");
+    ais_path
+}
+
+#[test] fn web_ui_project_with_empty_spend_shows_external_client_hint() {
+    // Triggers: `expose { web_ui = true }` is declared, and there's
+    // no spend recorded today.  The hint should surface to explain
+    // why a user who chatted via Open WebUI sees zero here.
+    let ais = tempdir_with_web_ui_project("hint-empty");
+    let dir = ais.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // No write_spend call → empty spend file → "no spend recorded today".
+
+    let out = bin_isolated(&home)
+        .args(["status", "--model-spend"])
+        .arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no spend recorded today"),
+        "expected the empty-spend marker; got:\n{stdout}");
+    assert!(stdout.contains("Open WebUI talks to LiteLLM directly"),
+        "expected the external-client hint when web_ui is enabled; got:\n{stdout}");
+    assert!(stdout.contains("aislang.component=litellm"),
+        "expected the docker-logs CTA in the hint; got:\n{stdout}");
+}
+
+#[test] fn web_ui_project_with_filtered_empty_spend_shows_hint() {
+    // Same trigger via the filtered branch: spend recorded for
+    // OTHER models, but the requested filter has none today.
+    let ais = tempdir_with_web_ui_project("hint-filtered");
+    let dir = ais.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    write_spend(&home, 200_000, &[("anthropic.claude_haiku_4_5", 200_000)]);
+
+    let out = bin_isolated(&home)
+        .args(["status", "--model-spend=openai.gpt_4o_mini"])
+        .arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no spend recorded for `openai.gpt_4o_mini`"),
+        "filtered empty-spend marker missing; got:\n{stdout}");
+    assert!(stdout.contains("Open WebUI talks to LiteLLM directly"),
+        "expected hint on filtered empty branch too; got:\n{stdout}");
+}
+
+#[test] fn non_web_ui_project_with_empty_spend_stays_quiet() {
+    // Negative test: a project WITHOUT web_ui must NOT emit the
+    // external-client hint.  Otherwise every fresh aislang user who
+    // checked --model-spend before doing any chat work would see
+    // confusing pointers to Open WebUI they hadn't enabled.
+    let ais = tempdir_with_project("hint-quiet");   // base helper, no expose
+    let dir = ais.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin_isolated(&home)
+        .args(["status", "--model-spend"])
+        .arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no spend recorded today"),
+        "expected the empty-spend marker; got:\n{stdout}");
+    assert!(!stdout.contains("Open WebUI"),
+        "non-web_ui project must NOT emit the external-client hint; got:\n{stdout}");
+    assert!(!stdout.contains("docker logs"),
+        "non-web_ui project must NOT include the docker-logs CTA; got:\n{stdout}");
+}
