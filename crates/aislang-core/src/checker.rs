@@ -26,7 +26,7 @@ use std::collections::HashMap;
 // note + week-3 architecture comment.
 
 // ============================================================================
-// Warning type — see PLAN-90-days.md §Locked design decisions (deprecated
+// Warning type — see PLAN-90-days-v0_1.md §Locked design decisions (deprecated
 // catalog entries surface as warnings, not errors, for compliance audit)
 // ============================================================================
 

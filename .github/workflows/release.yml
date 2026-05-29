@@ -1,4 +1,4 @@
-# aiSlang release pipeline — PLAN-90-days.md §Week 11 Tue,
+# aiSlang release pipeline — PLAN-90-days-v0_1.md §Week 11 Tue,
 # Decisions 36 + 38.
 #
 # On tag `v[0-9]+.[0-9]+.[0-9]+*`:
@@ -187,7 +187,7 @@ jobs:
           cat > "$NOTES_FILE" <<EOF
           aiSlang $TAG — v0.1 internal milestone.
 
-          See \`PLAN-90-days.md\` §Week 11 for the close-out plan.
+          See \`PLAN-90-days-v0_1.md\` §Week 11 for the close-out plan.
           This is a tagged internal release, not a public launch
           (which is gated on v0.2's commercial-moat features and
           v0.3's docs site).

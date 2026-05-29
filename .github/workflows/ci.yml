@@ -1,4 +1,4 @@
-# aiSlang CI — PLAN-90-days.md §Week 11 Mon, Decision 35.
+# aiSlang CI — PLAN-90-days-v0_1.md §Week 11 Mon, Decision 35.
 #
 # Test on the two platforms v0.1 supports (Linux + macOS, both
 # x86_64+aarch64 via the github-hosted runner pools). Stable Rust

@@ -16,7 +16,7 @@
 //! Compose-managed LiteLLM and CLI-spawned MCP servers. The week-4
 //! placeholder service has been removed; the eventual containerized
 //! agent runtime (Open WebUI + per-agent service) is v0.2. See
-//! PLAN-90-days.md "Week 6 — Architectural decisions" (Decision 1).
+//! PLAN-90-days-v0_1.md "Week 6 — Architectural decisions" (Decision 1).
 //!
 //! **No `mcp_<label>` services in v0.1 either.** Decision 5 (week 6 Mon
 //! afternoon): the 2026 MCP ecosystem is overwhelmingly stdio-first —

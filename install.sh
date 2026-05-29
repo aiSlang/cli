@@ -1,5 +1,5 @@
 #!/bin/sh
-# aiSlang installer — PLAN-90-days.md §Week 11 Wed, Decision 37.
+# aiSlang installer — PLAN-90-days-v0_1.md §Week 11 Wed, Decision 37.
 #
 # Detects host OS+arch via `uname`, fetches the matching tarball from
 # GitHub Releases, verifies its sha256 against `checksums.txt`, and

@@ -47,7 +47,7 @@ pub enum MetricError {
     /// these metrics will start working without grammar changes
     /// once v0.2 lands.
     #[error("metric `{metric:?}` is not implemented in v0.1 — reserved for {v02_target}. \
-             See PLAN-90-days.md week 8 Decision 15 + the eval explainer section.")]
+             See PLAN-90-days-v0_1.md week 8 Decision 15 + the eval explainer section.")]
     Unimplemented {
         metric:     EvalMetric,
         v02_target: &'static str,

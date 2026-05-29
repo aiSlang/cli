@@ -2,7 +2,7 @@
 
 Status: **Authoritative for the v0.1 compiler.** Any change to this document after week 1 of the 90-day plan slips the schedule.
 
-This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days.md](PLAN-90-days.md)) compile, type-check, plan, deploy, and run. Anything not described here is out of scope for v0.1.
+This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run. Anything not described here is out of scope for v0.1.
 
 ---
 
