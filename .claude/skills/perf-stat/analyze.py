@@ -3,7 +3,11 @@
 
 Walks git log, attributes each `Week N <Day>:` commit to one SP, counts
 distinct calendar dates per week as Alex-days, computes per-week and
-overall velocity. stdlib only.
+overall velocity.  Schema v2 adds Claude-session token tallying: walks
+~/.claude/projects/*/*.jsonl, sums input + output + cache_creation +
+cache_read tokens per calendar date, buckets into the week dates.
+
+stdlib only.
 
 Modes:
     analyze.py retrofit      compute + write cache + print table
@@ -31,7 +35,15 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE = SCRIPT_DIR / "cache.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2 adds Claude-session token tallying
+
+# Where Claude Code persists session transcripts.  Each conversation
+# is one `.jsonl` file under a directory whose name encodes the
+# Claude-Code working directory.  We walk ALL project subdirs
+# (your work isn't necessarily one-project-per-dir — the same
+# Claude session might touch multiple repos) and filter by the
+# message timestamps that fall on dates the week table claims.
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # `Week 9 Mon: …` or `Week 10 Wed+Thu (prio swap): …` etc.  We accept
 # any single-day marker on the first hit per commit (multi-day combos
@@ -98,26 +110,148 @@ def aggregate(rows: list[tuple[str, str]]) -> dict[int, dict[str, Any]]:
     return dict(weeks)
 
 
-def compute_velocity(weeks: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
-    """Render the per-week table rows."""
+# ── token aggregation (schema v2) ──────────────────────────────────
+
+def _find_usage(obj: Any, depth: int = 0) -> dict | None:
+    """Recursive search for an 'usage' dict inside a JSONL message.
+    Claude Code's session lines are nested objects — the `usage` field
+    can appear at different depths depending on message shape.  Caps
+    at depth 6 to avoid stack blowup on adversarial input."""
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        if "usage" in obj and isinstance(obj["usage"], dict):
+            return obj["usage"]
+        for v in obj.values():
+            r = _find_usage(v, depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_usage(v, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def aggregate_tokens_per_date() -> dict[str, dict[str, int]]:
+    """Walk every Claude session JSONL across all project dirs;
+    return {YYYY-MM-DD: {input, output, cache_creation, cache_read, total}}.
+
+    Why all projects: Claude Code records sessions under a dir named
+    after the CWD where Claude was launched.  Your aiSlang work may
+    live under a non-aiSlang project dir (e.g. you launched Claude
+    from a different repo and then `cd`'d).  Aggregating all dirs
+    captures the full token spend; date-bucketing keeps the per-week
+    rollup honest (only dates with git commits to THIS repo count
+    toward THIS repo's week table — see compute_velocity's loop).
+
+    Failures swallowed silently: a corrupt jsonl line returns no
+    usage; an unparseable file is skipped.  Token metric is
+    informational; broken telemetry shouldn't break perf-stat.
+    """
+    out: dict[str, dict[str, int]] = defaultdict(lambda: {
+        "input":          0,
+        "output":         0,
+        "cache_creation": 0,
+        "cache_read":     0,
+        "total":          0,
+    })
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return {}
+    for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            try:
+                with jsonl.open() as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        ts = r.get("timestamp")
+                        if not ts or not isinstance(ts, str):
+                            continue
+                        # YYYY-MM-DD prefix of an ISO-8601 timestamp.
+                        date = ts[:10]
+                        if len(date) != 10:
+                            continue
+                        usage = _find_usage(r)
+                        if not usage:
+                            continue
+                        bucket = out[date]
+                        bucket["input"]          += int(usage.get("input_tokens", 0) or 0)
+                        bucket["output"]         += int(usage.get("output_tokens", 0) or 0)
+                        bucket["cache_creation"] += int(usage.get("cache_creation_input_tokens", 0) or 0)
+                        bucket["cache_read"]     += int(usage.get("cache_read_input_tokens", 0) or 0)
+            except OSError:
+                continue
+    for date, tok in out.items():
+        tok["total"] = (tok["input"] + tok["output"]
+                        + tok["cache_creation"] + tok["cache_read"])
+    return dict(out)
+
+
+def compute_velocity(
+    weeks:           dict[int, dict[str, Any]],
+    tokens_per_date: dict[str, dict[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    """Render the per-week table rows.  When `tokens_per_date` is
+    provided (schema v2), each row gains a `tokens` dict summed
+    across that week's dates + a tokens_per_sp ratio."""
+    tokens_per_date = tokens_per_date or {}
     out: list[dict[str, Any]] = []
     for w in sorted(weeks.keys()):
         info = weeks[w]
         sp = info["sp"]
         alex_days = len(info["dates"])
         velocity = sp / alex_days if alex_days > 0 else 0.0
+
+        # Sum tokens across this week's dates.  A date that doesn't
+        # appear in tokens_per_date contributes zero (Claude sessions
+        # for that day either don't exist or carried no usage telemetry).
+        week_tokens = {
+            "input":          0,
+            "output":         0,
+            "cache_creation": 0,
+            "cache_read":     0,
+            "total":          0,
+        }
+        for d in info["dates"]:
+            if d in tokens_per_date:
+                for k in week_tokens:
+                    week_tokens[k] += tokens_per_date[d][k]
+        tokens_per_sp = (week_tokens["total"] / sp) if sp > 0 else 0
+        tokens_per_alex_day = (week_tokens["total"] / alex_days) if alex_days > 0 else 0
+
         out.append({
-            "week":      w,
-            "sp":        sp,
-            "alex_days": alex_days,
-            "velocity":  round(velocity, 2),
-            "dates":     sorted(info["dates"]),
+            "week":                w,
+            "sp":                  sp,
+            "alex_days":           alex_days,
+            "velocity":            round(velocity, 2),
+            "tokens":              week_tokens,
+            "tokens_per_sp":       int(tokens_per_sp),
+            "tokens_per_alex_day": int(tokens_per_alex_day),
+            "dates":               sorted(info["dates"]),
         })
     return out
 
 
-def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Mean + stdev of velocity, restricted to weeks with SP > 0."""
+def summary(
+    rows:            list[dict[str, Any]],
+    tokens_per_date: dict[str, dict[str, int]] | None = None,
+) -> dict[str, Any]:
+    """Mean + stdev of velocity, restricted to weeks with SP > 0.
+    Schema v2 also rolls up project-wide token totals.
+
+    Per-week token sums (in the table) may double-count a day that
+    appears in multiple weeks' date sets (cross-week work commits
+    can share a calendar date — e.g. Week 10 close-out + Week 11
+    Mon both landed on the same day).  But the PROJECT-wide
+    `total_tokens` here uses unique dates across all weeks so the
+    bottom-line ratios aren't inflated.
+    """
     velocities = [r["velocity"] for r in rows if r["sp"] > 0]
     n = len(velocities)
     if n == 0:
@@ -125,27 +259,76 @@ def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     mean = sum(velocities) / n
     variance = sum((v - mean) ** 2 for v in velocities) / n if n > 1 else 0.0
     std = math.sqrt(variance)
+
+    # Project-wide token total: sum across UNIQUE dates from all weeks.
+    tokens_per_date = tokens_per_date or {}
+    unique_dates: set[str] = set()
+    for r in rows:
+        for d in r.get("dates", []):
+            unique_dates.add(d)
+    total_tokens_unique = sum(
+        tokens_per_date.get(d, {}).get("total", 0) for d in unique_dates
+    )
+    # tokens / SP using unique-date totals divided by total SP across
+    # SP-claiming weeks.  This is the most-honest per-SP number.
+    total_sp = sum(r["sp"] for r in rows if r["sp"] > 0)
+    tokens_per_sp = (total_tokens_unique / total_sp) if total_sp > 0 else 0
+
     return {
-        "n_weeks":       n,
-        "mean_velocity": round(mean, 2),
-        "std_velocity":  round(std, 2),
+        "n_weeks":           n,
+        "mean_velocity":     round(mean, 2),
+        "std_velocity":      round(std, 2),
         # Also report extremes — useful when std is high.
-        "min_velocity":  round(min(velocities), 2),
-        "max_velocity":  round(max(velocities), 2),
+        "min_velocity":      round(min(velocities), 2),
+        "max_velocity":      round(max(velocities), 2),
+        # Schema v2: token totals — unique-date-summed.
+        "total_tokens":      total_tokens_unique,
+        "tokens_per_sp_avg": int(tokens_per_sp),
     }
 
 
 # ── rendering ──────────────────────────────────────────────────────
 
+def _fmt_tokens(n: int) -> str:
+    """Compact: 1_234 → '1.2K', 1_234_567 → '1.2M'.  Empty cells show
+    as '—' rather than '0K' so it's obvious there's no data."""
+    if n <= 0:
+        return "    —"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:>5.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:>5.1f}K"
+    return f"{n:>5}"
+
+
 def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
     out: list[str] = []
-    out.append("Week  SP   Alex-days  Velocity (SP/day)")
-    out.append("----  ---  ---------  -----------------")
-    for r in rows:
-        out.append(
-            f"{r['week']:<4}  {r['sp']:<3}  {r['alex_days']:<9}  "
-            f"{r['velocity']:>5.2f}"
-        )
+    # Token columns appear only when at least one week has tokens
+    # data (i.e. ~/.claude/projects/ existed + had usable JSONLs).
+    has_tokens = any(
+        r.get("tokens", {}).get("total", 0) > 0 for r in rows
+    )
+
+    if has_tokens:
+        out.append("Week  SP   Days  Vel.   Tokens   T/SP    T/Day")
+        out.append("----  ---  ----  -----  -------  ------  ------")
+        for r in rows:
+            tot = r.get("tokens", {}).get("total", 0)
+            out.append(
+                f"{r['week']:<4}  {r['sp']:<3}  {r['alex_days']:<4}  "
+                f"{r['velocity']:>5.2f}  {_fmt_tokens(tot):>7}  "
+                f"{_fmt_tokens(r.get('tokens_per_sp', 0)):>6}  "
+                f"{_fmt_tokens(r.get('tokens_per_alex_day', 0)):>6}"
+            )
+    else:
+        out.append("Week  SP   Alex-days  Velocity (SP/day)")
+        out.append("----  ---  ---------  -----------------")
+        for r in rows:
+            out.append(
+                f"{r['week']:<4}  {r['sp']:<3}  {r['alex_days']:<9}  "
+                f"{r['velocity']:>5.2f}"
+            )
+
     out.append("")
     if s["n_weeks"] > 0:
         out.append(
@@ -155,6 +338,33 @@ def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
         out.append(
             f"         range: {s['min_velocity']:.2f} … {s['max_velocity']:.2f} SP/day"
         )
+        if has_tokens:
+            total_tokens = s.get("total_tokens", 0)
+            per_sp       = s.get("tokens_per_sp_avg", 0)
+            out.append(
+                f"         total tokens (all weeks)   = {_fmt_tokens(total_tokens).strip()}"
+            )
+            out.append(
+                f"         tokens / SP (mean)         = {_fmt_tokens(per_sp).strip()}"
+            )
+            # Bottom-line tokens-per-LoC ratio if code-stat cache exists.
+            code_stat_cache = SCRIPT_DIR.parent / "code-stat" / "cache.txt"
+            if code_stat_cache.exists():
+                try:
+                    loc_now = int(code_stat_cache.read_text().strip().replace(",", ""))
+                    if loc_now > 0:
+                        ratio = total_tokens / loc_now
+                        out.append(
+                            f"         current Rust LoC           = {loc_now}"
+                        )
+                        out.append(
+                            f"         total tokens / current LoC = "
+                            f"{ratio:,.0f}  "
+                            f"(rough — current LoC is a cumulative cap, "
+                            f"not the LoC delta over the token window)"
+                        )
+                except (ValueError, OSError):
+                    pass
     else:
         out.append("Summary: no SP-claiming weeks yet.")
     return "\n".join(out)
@@ -215,11 +425,15 @@ def cmd_retrofit() -> int:
               file=sys.stderr)
         return 1
     weeks = aggregate(rows_raw)
+    # v2: token aggregation.  Returns {} on missing / empty
+    # ~/.claude/projects/ — table render gracefully degrades to
+    # the v1 shape (no token columns) when this is empty.
+    tokens_per_date = aggregate_tokens_per_date()
     if not weeks:
         print("perf-stat: no `Week N <Day>:` commits found.", file=sys.stderr)
         return 1
-    rows = compute_velocity(weeks)
-    s = summary(rows)
+    rows = compute_velocity(weeks, tokens_per_date)
+    s = summary(rows, tokens_per_date)
     write_cache(rows, s)
     print(render_table(rows, s))
     return 0
