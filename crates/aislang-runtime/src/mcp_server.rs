@@ -1818,6 +1818,98 @@ pub async fn serve_stdio() -> Result<(), ServerError> {
 }
 
 // ============================================================================
+// HTTP entry point — week 13 Mon
+// ============================================================================
+
+/// Run the aiSlang MCP server over Streamable HTTP (the rmcp
+/// transport that wraps both POST request/response and SSE
+/// streaming under one tower service).
+///
+/// Unlike [`serve_stdio`], this entry point is multi-client: each
+/// MCP `initialize` handshake spins up its own MCP session within
+/// the underlying `StreamableHttpService`.  rmcp's
+/// `service_factory` callback hands every new session a freshly-
+/// cloned [`AislangServer`].
+///
+/// Crucially, **all clones share the same `sessions` map**
+/// (`Arc<RwLock<HashMap<…>>>` inside `AislangServer`), so the
+/// `aislang_chat_turn` Session pool is shared across HTTP clients
+/// — two MCP clients hitting the same `(source_dir, agent_label)`
+/// pair reuse the same in-process conversational Session.  Same
+/// posture stdio gives you (only client) but extended to N.
+///
+/// The caller owns the `TcpListener` so tests can bind to
+/// `127.0.0.1:0` and read back the kernel-assigned port; the CLI
+/// binds to the user-supplied `--http` socket address.
+///
+/// The caller also owns the [`tokio_util::sync::CancellationToken`]:
+/// firing it triggers axum's graceful-shutdown path (drain active
+/// SSE streams, refuse new connections) AND propagates into the
+/// per-session rmcp config so in-flight `chat_turn` futures see
+/// the cancellation too.  CLI wires Ctrl-C to it; tests fire it
+/// from the test body.
+///
+/// Routing: the MCP traffic is mounted at `/mcp`.  Same path
+/// rmcp's own examples use; the CLI banner advertises the full
+/// `http://host:port/mcp` URL so users can paste it straight into
+/// Claude Desktop / Cursor / curl.
+pub async fn serve_http(
+    listener: tokio::net::TcpListener,
+    ct:       tokio_util::sync::CancellationToken,
+) -> Result<(), ServerError> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::local::LocalSessionManager,
+    };
+
+    // ── Master AislangServer.  The Arc-shared `sessions` map
+    // inside it is what survives across per-session clones below.
+    let master = AislangServer::new();
+
+    // ── rmcp config.  `stateful_mode = true` (default) is what
+    // matches Claude Desktop / Cursor's HTTP-MCP expectations:
+    // each client sends an `initialize` and gets a session ID
+    // back, then carries it on subsequent requests.  We hand the
+    // shutdown-CT child to rmcp so it terminates active sessions
+    // when we fire the parent CT in the CLI.
+    let cfg = {
+        let mut c = StreamableHttpServerConfig::default();
+        c.cancellation_token = ct.child_token();
+        c
+    };
+
+    let service = StreamableHttpService::new(
+        // service_factory: called per new MCP session.  Cloning
+        // the master gives every session its own ToolRouter
+        // (cheap — it's a fn-pointer table) BUT shares the
+        // `sessions` Arc<RwLock<…>>, so the Session pool is
+        // process-wide across HTTP clients.
+        {
+            let master = master.clone();
+            move || Ok(master.clone())
+        },
+        Arc::new(LocalSessionManager::default()),
+        cfg,
+    );
+
+    // Mount the rmcp tower::Service under axum at `/mcp`.  Same
+    // path rmcp's own integration tests use; matches the de-facto
+    // convention for Streamable-HTTP MCP servers.
+    let router = axum::Router::new().nest_service("/mcp", service);
+
+    // axum::serve drives the bound TcpListener.  Graceful
+    // shutdown completes after either the cancellation token
+    // fires or the listener is otherwise closed.
+    let ct_shutdown = ct.clone();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move { ct_shutdown.cancelled_owned().await })
+        .await
+        .map_err(|e| ServerError::Runtime(format!("axum::serve: {e}")))?;
+
+    Ok(())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

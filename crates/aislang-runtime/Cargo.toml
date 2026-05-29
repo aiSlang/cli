@@ -45,6 +45,13 @@ opentelemetry                      = { workspace = true }
 opentelemetry_sdk                  = { workspace = true }
 opentelemetry-otlp                 = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
+# week-13 Mon: HTTP transport for `aislang mcp-serve --http`.
+# rmcp ships `StreamableHttpService` as a tower service that we
+# nest under an axum `Router`; `axum::serve` drives the TcpListener.
+# `tokio-util::CancellationToken` is used by rmcp's session config
+# so the server drains active sessions cleanly on shutdown.
+axum                               = { workspace = true }
+tokio-util                         = { workspace = true }
 
 [dev-dependencies]
 # wiremock — Rust port of WireMock; lets us spin up a fake HTTP server
