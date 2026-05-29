@@ -151,18 +151,21 @@ fn build_yaml_header(resolved: &ResolvedProject) -> String {
         let _ = writeln!(out, "# (v0.2 wraps each in aislang-mcp-gateway for SSE access; v0.1 = stdio.)");
     }
 
-    // (2) Declared deploy.expose ports — also stable iteration order.
+    // (2) Declared deploy.expose ports — v0.2 Tue grammar promoted
+    // `expose` to a nested block holding `port` (informational) +
+    // `web_ui` (functional — emits an Open WebUI sidecar handled
+    // below).  We surface `port` here exactly as v0.1 did.
     let mut declared: Vec<(String, u16)> = Vec::new();
     for d in &resolved.project.deploys {
         if let Some(expose) = &d.expose {
-            for (name, port) in expose {
-                declared.push((format!("deploy.{}.{name}", d.label), *port));
+            if let Some(port) = expose.port {
+                declared.push((format!("deploy.{}.port", d.label), port));
             }
         }
     }
     if !declared.is_empty() {
         let _ = writeln!(out, "#");
-        let _ = writeln!(out, "# Declared deploy.expose ports (informational; not bound in v0.1):");
+        let _ = writeln!(out, "# Declared deploy.expose ports (informational; not bound in v0.2):");
         for (path, port) in declared {
             let _ = writeln!(out, "#   {path} = {port}");
         }
@@ -258,16 +261,42 @@ fn build_compose(resolved: &ResolvedProject, output_dir: &Path) -> Result<Compos
     services.insert("budget_counter".to_string(),
                     build_budget_counter_service(resolved));
 
-    // (e) Agent runtime — REMOVED in week 6 Mon. v0.1 runs the agent
+    // (e) Open WebUI sidecar — v0.2 Tue (Track A2).  Emitted iff any
+    // `deploy` block carries `expose { web_ui = true }`.  Shared
+    // upstream LiteLLM endpoint means N deploys with web_ui = true
+    // get ONE sidecar (no aliasing — the UI lists all LiteLLM-routed
+    // models regardless of which deploy declared it).  See
+    // build_openwebui_service for the env-var + persistence-volume
+    // contract.
+    let mut volumes: BTreeMap<String, Volume> = BTreeMap::new();
+    if web_ui_requested(resolved) {
+        services.insert("openwebui".to_string(), build_openwebui_service());
+        // Named volume that `docker compose down -v` (which `aislang
+        // destroy` runs) wipes on teardown.  Matches the user-decided
+        // contract: "treat the OpenWebUI container as part of aislang
+        // runtime".
+        volumes.insert(OPENWEBUI_VOLUME_NAME.to_string(), Volume::default());
+    }
+
+    // (f) Agent runtime — REMOVED in week 6 Mon. v0.1 runs the agent
     // loop in the CLI (`aislang chat <agent>`); the prompt hashes that
     // used to flow through this service's env block are now consumed
-    // by the CLI from the lockfile. v0.2's containerized agent service
-    // re-introduces something at this layer.
+    // by the CLI from the lockfile. v0.2 Phase 1 Week 13 Mon's
+    // `aislang mcp-serve --http` is the moral successor at the proxy
+    // layer, but no per-agent Compose service comes back in v0.2.
 
     Ok(ComposeFile {
         services,
-        volumes: BTreeMap::new(),
+        volumes,
     })
+}
+
+/// True iff at least one `deploy` block has `expose.web_ui = true`.
+/// Pulled out so `build_compose` and the Open WebUI tests below stay
+/// readable.
+fn web_ui_requested(resolved: &ResolvedProject) -> bool {
+    resolved.project.deploys.iter()
+        .any(|d| d.expose.as_ref().is_some_and(|e| e.web_ui))
 }
 
 // ============================================================================
@@ -409,12 +438,89 @@ fn build_budget_counter_service(resolved: &ResolvedProject) -> Service {
 }
 
 // `build_agent_runtime_service` removed in week 6 Mon — see module-
-// level doc comment for the rationale. The v0.2 successor will be a
-// per-`agent`-block service that listens on `deploy.expose.port`,
-// dials LiteLLM/MCP itself, and pairs with an Open WebUI service for
-// presentation. The AST surface needed for that (`agent`, `deploy`,
-// `mcp_server`) is already frozen in LANGUAGE-SPEC §4; no .ais source
-// change is needed when v0.2 lands.
+// level doc comment for the rationale. The v0.2 successor lives at
+// the proxy layer (`aislang mcp-serve --http`, week 13 Mon); no
+// per-agent Compose service comes back in v0.2.  The Open WebUI
+// sidecar below pairs with the existing LiteLLM service for the
+// browser-presentation half of Track A2.
+
+/// Pinned image for the Open WebUI sidecar.  `:main` tracks the
+/// project's mainline; not a semver tag, but Open WebUI's docs
+/// recommend this for self-hosted Compose use (they cut versioned
+/// images far less frequently than upstream commits).  Pinned at
+/// digest time when v0.3 releases come up for repeatability.
+const OPENWEBUI_IMAGE: &str = "ghcr.io/open-webui/open-webui:main";
+
+/// Named volume used by `openwebui` for chat-history + user-account
+/// SQLite + uploaded files.  `aislang destroy` runs
+/// `docker compose down -v` which wipes named volumes alongside
+/// containers, matching the user-decided contract (Decision: "treat
+/// the OpenWebUI container as part of aislang runtime").
+const OPENWEBUI_VOLUME_NAME: &str = "openwebui-data";
+
+/// Hardcoded host port for v0.2 Tue.  PLAN says `localhost:3000`;
+/// Open WebUI's docs use the same.  Future field
+/// `expose { web_ui_port = N }` lets users override (Wed+, see
+/// LANGUAGE-SPEC v0.3 backlog).  Inside the container Open WebUI
+/// listens on 8080; the 3000:8080 mapping is the canonical shape.
+const OPENWEBUI_HOST_PORT: u16 = 3000;
+
+/// Build the `openwebui` Compose service.
+///
+/// Env-var contract (per Open WebUI docs §env-configuration):
+/// - `OPENAI_API_BASE_URL=http://litellm:4000/v1` — Open WebUI dials
+///   the in-stack LiteLLM via Compose's internal DNS, no host-side
+///   port-forward needed.
+/// - `OPENAI_API_KEY` — any non-empty value satisfies Open WebUI's
+///   client-side requirement; LiteLLM doesn't verify the key by
+///   default at this layer (user-side auth lives in LiteLLM's own
+///   master-key config, which v0.2 doesn't enable).
+/// - `WEBUI_AUTH=true` (default) — keeps Open WebUI's local sign-up
+///   flow.  User-decided: "let's keep it, as soon as I understand
+///   it's transparent for aiSlang runtime".  Persistence in the
+///   named volume means the first sign-up survives container
+///   restarts but is wiped by `aislang destroy -v`.
+fn build_openwebui_service() -> Service {
+    let mut env = BTreeMap::new();
+    env.insert(
+        "OPENAI_API_BASE_URL".to_string(),
+        // Internal Compose DNS: `litellm` is the service name.
+        // Port 4000 mirrors build_litellm_service's port binding.
+        "http://litellm:4000/v1".to_string(),
+    );
+    env.insert(
+        // Open WebUI requires a non-empty key on the OpenAI
+        // connection; LiteLLM accepts any "sk-" string at this
+        // hop.  No real auth happens here; user-side auth is
+        // Open WebUI's own sign-up flow (WEBUI_AUTH=true,
+        // default).
+        "OPENAI_API_KEY".to_string(),
+        "sk-aislang-litellm-internal".to_string(),
+    );
+    Service {
+        image:       OPENWEBUI_IMAGE.to_string(),
+        environment: Some(env_list(env)),
+        // Persistent SQLite + uploaded files + chat history.  The
+        // named volume is declared as a top-level Compose `volumes`
+        // entry by `build_compose`; `docker compose down -v` (used
+        // by `aislang destroy`) wipes it.
+        volumes:     Some(vec![
+            format!("{OPENWEBUI_VOLUME_NAME}:/app/backend/data"),
+        ]),
+        // Host:container mapping per Open WebUI docs.  3000 is the
+        // hardcoded host port for v0.2 Tue; the container always
+        // listens on 8080 internally.
+        ports:       Some(vec![format!("{OPENWEBUI_HOST_PORT}:8080")]),
+        // `depends_on` is a startup-order hint only — it doesn't
+        // wait for LiteLLM to be healthy, just to exist.  Good
+        // enough here because Open WebUI handles upstream
+        // unavailability with a retry-on-call posture.
+        depends_on:  Some(vec!["litellm".to_string()]),
+        command:     None,
+        extra_hosts: None,
+        labels:      Some(aislang_labels("openwebui")),
+    }
+}
 
 // ============================================================================
 // Helpers
@@ -863,5 +969,160 @@ mod tests {
         // YAML still parses cleanly.
         let _: serde_yaml::Value =
             serde_yaml::from_str(&artifacts.docker_compose).expect("parses back");
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Open WebUI sidecar — week 13 Tue (Track A2)
+    // ────────────────────────────────────────────────────────────
+
+    /// Build a synthetic minimal resolved project whose single
+    /// `deploy` block carries the given `Expose` field.  Lets the
+    /// test cases below assert on the emitter's behaviour without
+    /// hand-rolling a full demo .ais.
+    fn resolved_with_expose(expose: Option<aislang_core::ast::Expose>) -> ResolvedProject {
+        use aislang_core::ast::{Project, Deploy};
+        use aislang_core::types::DeployTarget;
+        let project = Project {
+            name: "ui-demo".into(),
+            deploys: vec![Deploy {
+                label:  "local".into(),
+                target: DeployTarget::Compose,
+                expose,
+            }],
+            ..Project::default()
+        };
+        ResolvedProject {
+            project,
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+        }
+    }
+
+    #[test] fn web_ui_true_emits_openwebui_service() {
+        let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
+            port: None, web_ui: true,
+        }));
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let yaml = &artifacts.docker_compose;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let services = value["services"].as_mapping().expect("services map");
+        assert!(services.contains_key(&serde_yaml::Value::String("openwebui".into())),
+            "expose.web_ui = true must emit the `openwebui` service; got:\n{yaml}");
+
+        let openwebui = &value["services"]["openwebui"];
+        // Image pin
+        assert_eq!(openwebui["image"].as_str(), Some("ghcr.io/open-webui/open-webui:main"));
+        // Port mapping — hardcoded 3000:8080 per user-decided v0.2 default
+        let ports = openwebui["ports"].as_sequence().expect("ports vec");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].as_str(), Some("3000:8080"));
+        // Depends on litellm (startup-order hint)
+        let deps = openwebui["depends_on"].as_sequence().expect("depends_on vec");
+        let dep_names: Vec<&str> = deps.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(dep_names, vec!["litellm"]);
+        // Env wired to in-stack LiteLLM via Compose DNS (list-form)
+        let env = openwebui["environment"].as_sequence().expect("env list");
+        let env_strs: Vec<&str> = env.iter().filter_map(|v| v.as_str()).collect();
+        assert!(env_strs.contains(&"OPENAI_API_BASE_URL=http://litellm:4000/v1"),
+            "openwebui must dial in-stack litellm; env=\n{env_strs:?}");
+        assert!(env_strs.iter().any(|s| s.starts_with("OPENAI_API_KEY=")),
+            "openwebui requires a non-empty OPENAI_API_KEY env var; env=\n{env_strs:?}");
+        // Persistent volume mount
+        let vols = openwebui["volumes"].as_sequence().expect("volumes vec");
+        let vol_strs: Vec<&str> = vols.iter().filter_map(|v| v.as_str()).collect();
+        assert!(vol_strs.contains(&"openwebui-data:/app/backend/data"),
+            "openwebui must mount the persistence volume; got {vol_strs:?}");
+        // Top-level named volume declared so `docker compose down -v` cleans it.
+        let top_volumes = value["volumes"].as_mapping().expect("top-level volumes map");
+        assert!(top_volumes.contains_key(&serde_yaml::Value::String("openwebui-data".into())),
+            "named volume `openwebui-data` must be declared at top level; got:\n{yaml}");
+    }
+
+    #[test] fn web_ui_false_omits_openwebui_service() {
+        // expose { web_ui = false } → no sidecar.  Same posture as
+        // an absent expose block (covered by the next test).
+        let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
+            port: Some(8080), web_ui: false,
+        }));
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let yaml = &artifacts.docker_compose;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let services = value["services"].as_mapping().expect("services map");
+        assert!(!services.contains_key(&serde_yaml::Value::String("openwebui".into())),
+            "expose.web_ui = false must NOT emit the openwebui service; got:\n{yaml}");
+        // Top-level `volumes:` is skipped when empty (skip_serializing_if).
+        assert!(value["volumes"].is_null() || value["volumes"].as_mapping().map_or(true, |m| m.is_empty()),
+            "no named volumes expected when web_ui = false; got:\n{yaml}");
+    }
+
+    #[test] fn no_expose_block_omits_openwebui_service() {
+        // Pure v0.1-shape deploy (no expose block) — must still
+        // emit a clean stack with NO openwebui.  Forward-compat
+        // contract: project files predating v0.2 Tue continue to
+        // work byte-stably.
+        let resolved = resolved_with_expose(None);
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let yaml = &artifacts.docker_compose;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let services = value["services"].as_mapping().expect("services map");
+        assert!(!services.contains_key(&serde_yaml::Value::String("openwebui".into())),
+            "deploy without expose must NOT emit openwebui; got:\n{yaml}");
+        // No openwebui ⇒ no `Declared deploy.expose ports` header (no port set).
+        assert!(!yaml.contains("Declared deploy.expose ports"),
+            "no port declared → no expose-ports header section");
+    }
+
+    #[test] fn web_ui_true_with_port_keeps_both_signals() {
+        // `port` (informational, header-only) AND `web_ui = true`
+        // (functional, emits sidecar) co-exist cleanly.
+        let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
+            port: Some(8080), web_ui: true,
+        }));
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let yaml = &artifacts.docker_compose;
+        // (1) Header still surfaces the port (informational).
+        assert!(yaml.contains("deploy.local.port = 8080"),
+            "port should still appear in header comment when web_ui also set");
+        // (2) Sidecar still present.
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let services = value["services"].as_mapping().expect("services map");
+        assert!(services.contains_key(&serde_yaml::Value::String("openwebui".into())));
+        // (3) The port:8080 from `expose.port` is NOT bound by openwebui —
+        //     openwebui owns 3000:8080, not 8080:N.
+        let ports = value["services"]["openwebui"]["ports"]
+            .as_sequence().unwrap();
+        for p in ports {
+            let s = p.as_str().unwrap_or("");
+            assert!(!s.starts_with("8080:"),
+                "openwebui must not bind 8080 host port (that's the informational \
+                 future-agent-runtime port); got: `{s}`");
+        }
+    }
+
+    #[test] fn openwebui_carries_aislang_labels() {
+        // Same label contract as litellm/jaeger/budget_counter — so
+        // `aislang status` and any future `docker ps -f label=…`
+        // tooling treats openwebui as part of the aislang-generated
+        // stack.
+        let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
+            port: None, web_ui: true,
+        }));
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
+            .expect("emit");
+        let yaml = &artifacts.docker_compose;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let labels = &value["services"]["openwebui"]["labels"];
+        assert_eq!(labels["aislang.generated"].as_str(), Some("true"));
+        assert_eq!(labels["aislang.component"].as_str(), Some("openwebui"));
     }
 }

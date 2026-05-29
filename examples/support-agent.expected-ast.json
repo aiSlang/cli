@@ -113,7 +113,8 @@
       "label": "local",
       "target": "compose",
       "expose": {
-        "port": 8080
+        "port": 8080,
+        "web_ui": true
       }
     }
   ]

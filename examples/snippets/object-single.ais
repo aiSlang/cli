@@ -1,3 +1,5 @@
 # `{ port = 8080 }` — single-attribute object literal.
-# This is the shape used by `deploy.expose = { port = 8080 }` in the demo.
+# Generic object-literal example; the `deploy.expose` field used to
+# accept this shape (v0.1) but has been promoted to a nested block in
+# v0.2 Tue, so this snippet now stands alone as a grammar primitive.
 { port = 8080 }

@@ -53,6 +53,23 @@ aislang eval examples/support-agent.ais
 aislang destroy examples/support-agent.ais
 ```
 
+### Browser chat via Open WebUI (v0.2 Tue, Track A2)
+
+Drop `web_ui = true` into your `deploy { expose { … } }` block to bring up an [Open WebUI](https://docs.openwebui.com/) sidecar pointed at the in-stack LiteLLM:
+
+```hcl
+deploy "local" {
+  target = compose
+  expose {
+    web_ui = true     # → http://localhost:3000 after `aislang apply`
+  }
+}
+```
+
+After `aislang apply`, browse to **http://localhost:3000**, sign up (local SQLite — first user is admin), and pick any model alias visible in the dropdown.  All models LiteLLM is configured to route appear there — useful for debugging "is this agent's chosen model actually replying?" without writing client code.
+
+`aislang destroy` runs `docker compose down -v` which wipes the `openwebui-data` named volume; chat history + local accounts go away alongside the rest of the stack.
+
 ### Observability
 
 Every `aislang chat` and `aislang eval` invocation emits OpenTelemetry traces over OTLP/HTTP to the bundled Jaeger sidecar (`localhost:16686`). The trace tree mirrors the chat loop's structure — each user turn becomes one `aislang.turn` span, the tool-use loop fans out into `tool_use_iteration[N]` spans, and each iteration carries one `chat <model>` LLM call + zero-or-more `mcp <server>.<tool>` dispatch spans. Attributes follow the [OTel-GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, …) plus our own `mcp.*` namespace for tool calls (sizes only, never argument content — PII-safe by construction).

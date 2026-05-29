@@ -11,7 +11,6 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// A reference to another resource by label. Resolved during validation.
@@ -176,9 +175,48 @@ pub struct Secret {
 pub struct Deploy {
     pub label:  String,
     pub target: DeployTarget,
-    /// Port mappings as a `BTreeMap` for deterministic JSON ordering. Source
-    /// syntax `expose = { port = 8080 }` mirrors the map form directly.
-    /// Spec §4.9: `Map<String, Int>`.
+    /// Optional `expose { … }` block on the deploy stanza — v0.2 Tue.
+    /// Holds Compose-stack-shaping flags (currently `port` —
+    /// informational — and `web_ui` — bring up Open WebUI).
+    ///
+    /// Grammar break vs. v0.1: this used to be an attribute-shape
+    /// `expose = { port = 8080 }` (a `Map<String, Int>`).  v0.2 Tue
+    /// promotes it to a typed nested block so the new `web_ui` flag
+    /// can join `port` without the heterogeneous-Map typing hazard.
+    /// Forward-compat note: v0.1 files with the old attribute form
+    /// hit a parser error with a migration hint pointing at the new
+    /// block syntax.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expose: Option<BTreeMap<String, u16>>,
+    pub expose: Option<Expose>,
+}
+
+/// `expose { … }` block on a `deploy` stanza — v0.2 Tue (Track A2).
+///
+/// Field-set is intentionally small in v0.2; future fields land here
+/// (e.g. `web_ui_port = N`, `metrics = true`, …) without further
+/// grammar reshape.
+///
+/// Forward-compat for v0.1 callers reading the serialized form: both
+/// fields use `skip_serializing_if`, so an Expose with no port and
+/// `web_ui = false` round-trips as `{}` — same JSON byte shape as a
+/// v0.1 project that never had `expose` (which is `null` because of
+/// `Option<Expose>`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Expose {
+    /// Optional port the user INTENDS the deployed agent runtime to
+    /// listen on.  Preserved from v0.1 as informational only — no
+    /// service in v0.2's emitted stack binds it yet (the v0.2+
+    /// containerized agent runtime via `aislang mcp-serve --http`
+    /// will).  Surfaced in the YAML header comment block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// When true, the Compose emitter inserts an `openwebui` sidecar
+    /// (`ghcr.io/open-webui/open-webui:main`) into the stack.yml,
+    /// mapped `3000:8080`, pre-pointed at the in-stack LiteLLM
+    /// (`OPENAI_API_BASE_URL=http://litellm:4000/v1`).  Persisted to a
+    /// named volume that `aislang destroy -v` wipes per Decision X
+    /// ("the OpenWebUI container is part of the aiSlang runtime;
+    /// `destroy` applies").  Default false → no sidecar emitted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub web_ui: bool,
 }

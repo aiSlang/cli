@@ -22,7 +22,6 @@ use crate::ast::*;
 use crate::types::*;
 use chumsky::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 // ============================================================================
@@ -843,17 +842,54 @@ fn to_mcp_server(raw: RawBlock) -> Result<McpServer, String> {
 
 fn to_deploy(raw: RawBlock) -> Result<Deploy, String> {
     let label = require_single_label("deploy", raw.labels)?;
-    let mut target: Option<DeployTarget>           = None;
-    let mut expose: Option<BTreeMap<String, u16>>  = None;
+    let mut target: Option<DeployTarget> = None;
+    let mut expose: Option<Expose>       = None;
 
+    // Mixed-item dispatch: deploy bodies accept both Attributes
+    // (`target = …`) AND a single nested `expose { … }` Block (v0.2
+    // Tue grammar break — see the migration error path on `expose =`
+    // below).  The rest of the resource bodies are still
+    // attribute-only per spec §8.1; deploy is the first nested-block
+    // exception, with `main` likely following in v0.2 Wed.
     for item in raw.body {
-        let attr = expect_attr_only("deploy", item)?;
-        match attr.name.as_str() {
-            "target" => target = Some(expect_deploy_target(&attr.name, attr.value)?),
-            "expose" => expose = Some(expect_port_map(&attr.name, attr.value)?),
-            other => return Err(format!(
-                "unknown attribute `{other}` in deploy block; allowed: target, expose"
-            )),
+        match item {
+            RawBodyItem::Attribute(attr) => match attr.name.as_str() {
+                "target" => target = Some(expect_deploy_target(&attr.name, attr.value)?),
+                "expose" => {
+                    // v0.1 used `expose = { port = 8080 }` (attribute,
+                    // Map<String, Int> value).  v0.2 Tue promotes
+                    // this to a typed nested block so `web_ui` can
+                    // join `port` without forcing a heterogeneous
+                    // Map.  Emit a clear migration message instead
+                    // of silently dropping or interpreting the old
+                    // form (which would mask user intent).
+                    return Err(
+                        "deploy `expose` is a nested block in v0.2, not an attribute. \
+                         Replace `expose = { port = N }` with `expose { port = N }` \
+                         (and add `web_ui = true` inside if you want Open WebUI). \
+                         Track A2 — see LANGUAGE-SPEC §4.9.".to_string()
+                    );
+                }
+                other => return Err(format!(
+                    "unknown attribute `{other}` in deploy block; \
+                     allowed: target (attr), expose (nested block)"
+                )),
+            },
+            RawBodyItem::Block(block) => match block.block_type.as_str() {
+                "expose" => {
+                    if expose.is_some() {
+                        return Err(
+                            "duplicate `expose { … }` block in deploy; at most one allowed"
+                            .to_string()
+                        );
+                    }
+                    expose = Some(to_expose(block)?);
+                }
+                other => return Err(format!(
+                    "unknown nested block `{other}` in deploy body; \
+                     allowed: expose (only)"
+                )),
+            },
         }
     }
 
@@ -863,6 +899,50 @@ fn to_deploy(raw: RawBlock) -> Result<Deploy, String> {
             "deploy missing required attribute `target`".to_string())?,
         expose,
     })
+}
+
+/// Parse the inner body of `expose { … }` — v0.2 Tue (Track A2).
+///
+/// Both `port` and `web_ui` are optional; an empty `expose {}` is
+/// allowed and emits the same `Expose::default()` (no web UI, no
+/// informational port).  Unknown attribute names are an error so
+/// typos surface immediately.
+fn to_expose(raw: RawBlock) -> Result<Expose, String> {
+    if !raw.labels.is_empty() {
+        return Err(format!(
+            "`expose` block takes no label; got {} label(s)", raw.labels.len()
+        ));
+    }
+    let mut port:   Option<u16> = None;
+    let mut web_ui: bool        = false;
+
+    for item in raw.body {
+        let attr = expect_attr_only("expose", item)?;
+        match attr.name.as_str() {
+            "port"   => port   = Some(expect_port_u16(&attr.name, attr.value)?),
+            "web_ui" => web_ui = expect_bool(&attr.name, attr.value)?,
+            other => return Err(format!(
+                "unknown attribute `{other}` in expose block; \
+                 allowed: port, web_ui"
+            )),
+        }
+    }
+
+    Ok(Expose { port, web_ui })
+}
+
+/// Single-port extractor used by `to_expose`.  Reuses the same
+/// 1..=65535 range check as the v0.1 `expect_port_map`.
+fn expect_port_u16(field: &str, v: RawValue) -> Result<u16, String> {
+    match v {
+        RawValue::Int(i) if (1..=65535).contains(&i) => Ok(i as u16),
+        RawValue::Int(i) => Err(format!(
+            "`{field}` expects a TCP port in 1..=65535; got {i}"
+        )),
+        other => Err(format!(
+            "`{field}` expects an integer port; got {other:?}"
+        )),
+    }
 }
 
 fn to_eval(raw: RawBlock) -> Result<Eval, String> {
@@ -1307,6 +1387,18 @@ fn expect_string(field: &str, v: RawValue) -> Result<String, String> {
     }
 }
 
+/// Bare-bool extractor.  v0.2 Tue: first added for `expose.web_ui`,
+/// promotes here so future bool attributes share one error message
+/// shape.
+fn expect_bool(field: &str, v: RawValue) -> Result<bool, String> {
+    match v {
+        RawValue::Bool(b) => Ok(b),
+        other => Err(format!(
+            "`{field}` expects a bare `true` or `false`; got {other:?}"
+        )),
+    }
+}
+
 fn expect_path(field: &str, v: RawValue) -> Result<PathBuf, String> {
     match v {
         RawValue::String(s) => Ok(PathBuf::from(s)),
@@ -1515,36 +1607,10 @@ fn expect_env_map(field: &str, v: RawValue) -> Result<Vec<(String, String)>, Str
     }).collect()
 }
 
-fn expect_port_map(field: &str, v: RawValue) -> Result<BTreeMap<String, u16>, String> {
-    let attrs = match v {
-        RawValue::Object(a) => a,
-        other => return Err(format!(
-            "`{field}` expects an object literal like `{{ port = 8080 }}`; got {other:?}"
-        )),
-    };
-    let mut map = BTreeMap::new();
-    for attr in attrs {
-        let port: u16 = match attr.value {
-            RawValue::Int(i) => {
-                if !(0..=65535).contains(&i) {
-                    return Err(format!(
-                        "`{field}.{}` port out of range [0, 65535]: {i}", attr.name
-                    ));
-                }
-                i as u16
-            }
-            other => return Err(format!(
-                "`{field}.{}` expects an integer port; got {other:?}", attr.name
-            )),
-        };
-        if map.insert(attr.name.clone(), port).is_some() {
-            return Err(format!(
-                "`{field}` has duplicate port mapping for `{}`", attr.name
-            ));
-        }
-    }
-    Ok(map)
-}
+// `expect_port_map` was removed in v0.2 Tue alongside the `expose`
+// grammar promotion from attribute (`= { port = N }`) to nested
+// block (`expose { port = N  web_ui = true }`).  Single-port extraction
+// moved to `expect_port_u16` near `to_expose`.
 
 // ============================================================================
 // Tests
@@ -2184,19 +2250,90 @@ mod project_tests {
     }
 
     #[test] fn deploy_block_parses() {
+        // v0.2 Tue: `expose` is a nested block, not an attribute.
         let src = project_with(
-            r#"deploy "local" { target = compose  expose = { port = 8080 } }"#);
+            r#"deploy "local" { target = compose  expose { port = 8080 } }"#);
         let p = assert_parse_ok(&src);
         assert_eq!(p.deploys.len(), 1);
         let d = &p.deploys[0];
         assert_eq!(d.target, DeployTarget::Compose);
-        assert_eq!(d.expose.as_ref().unwrap().get("port"), Some(&8080u16));
+        let expose = d.expose.as_ref().unwrap();
+        assert_eq!(expose.port, Some(8080));
+        assert!(!expose.web_ui);
+    }
+
+    #[test] fn deploy_expose_with_web_ui() {
+        // v0.2 Tue: full Open WebUI opt-in shape.
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose { web_ui = true } }"#);
+        let p = assert_parse_ok(&src);
+        let expose = p.deploys[0].expose.as_ref().unwrap();
+        assert_eq!(expose.port, None);
+        assert!(expose.web_ui);
+    }
+
+    #[test] fn deploy_expose_port_and_web_ui_together() {
+        let src = project_with(
+            r#"deploy "local" {
+                 target = compose
+                 expose {
+                   port   = 8080
+                   web_ui = true
+                 }
+               }"#);
+        let p = assert_parse_ok(&src);
+        let expose = p.deploys[0].expose.as_ref().unwrap();
+        assert_eq!(expose.port, Some(8080));
+        assert!(expose.web_ui);
+    }
+
+    #[test] fn deploy_expose_empty_block_ok() {
+        // `expose {}` is a no-op but valid — default Expose (no
+        // port, no web_ui).  Mirrors the v0.1 forward-compat
+        // posture (an `Expose::default()`-equivalent should round-
+        // trip as `{}` rather than refuse to parse).
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose {} }"#);
+        let p = assert_parse_ok(&src);
+        let expose = p.deploys[0].expose.as_ref().unwrap();
+        assert_eq!(expose.port, None);
+        assert!(!expose.web_ui);
     }
 
     #[test] fn deploy_port_out_of_range_fails() {
         let src = project_with(
-            r#"deploy "local" { target = compose  expose = { port = 99999 } }"#);
-        assert_parse_err_contains(&src, "out of range");
+            r#"deploy "local" { target = compose  expose { port = 99999 } }"#);
+        assert_parse_err_contains(&src, "1..=65535");
+    }
+
+    #[test] fn deploy_expose_legacy_attribute_form_errors_with_migration_hint() {
+        // v0.1 shape `expose = { port = 8080 }` MUST surface a
+        // migration message, not silently parse as something else.
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose = { port = 8080 } }"#);
+        assert_parse_err_contains(&src, "nested block in v0.2");
+    }
+
+    #[test] fn deploy_expose_unknown_attr_fails() {
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose { metrics = true } }"#);
+        assert_parse_err_contains(&src, "metrics");
+    }
+
+    #[test] fn deploy_expose_duplicate_block_fails() {
+        let src = project_with(
+            r#"deploy "local" {
+                 target = compose
+                 expose { port   = 8080 }
+                 expose { web_ui = true }
+               }"#);
+        assert_parse_err_contains(&src, "duplicate");
+    }
+
+    #[test] fn deploy_expose_web_ui_non_bool_fails() {
+        let src = project_with(
+            r#"deploy "local" { target = compose  expose { web_ui = "yes" } }"#);
+        assert_parse_err_contains(&src, "`true` or `false`");
     }
 
     #[test] fn deploy_unknown_target_fails() {

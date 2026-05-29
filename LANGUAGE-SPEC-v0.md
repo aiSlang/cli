@@ -246,9 +246,25 @@ Secrets are written into the container's environment only for the listed resourc
 ```
 deploy "<identifier>" {
   target : DeployTarget              # v0.1: must be `compose`
-  expose : Map<String, Int>?         # port mappings
+  expose { ... }?                    # v0.2 Tue: nested block, see below
 }
 ```
+
+**`expose { ... }` block** (v0.2 Tue, Track A2 — replaces the v0.1 `expose : Map<String, Int>` attribute):
+
+```
+expose {
+  port   : Int?            # informational; future agent-runtime port
+  web_ui : Bool?           # default false; true → Open WebUI sidecar
+}
+```
+
+Field semantics:
+
+- **`port`** — informational only.  Surfaces as a comment in the emitted `stack.yml` header but no v0.2 service binds it.  The v0.2+ containerized agent runtime (via `aislang mcp-serve --http`) will consume it.
+- **`web_ui = true`** — instructs the Compose emitter to add an Open WebUI sidecar (`ghcr.io/open-webui/open-webui:main`) mapped `3000:8080`, pre-pointed at the in-stack LiteLLM via `OPENAI_API_BASE_URL=http://litellm:4000/v1`.  Persisted to a named volume (`openwebui-data`) that `aislang destroy` wipes (`docker compose down -v`).
+
+**Grammar break vs. v0.1.** The v0.1 attribute form `expose = { port = 8080 }` (a `Map<String, Int>` value) is no longer accepted.  Parser rejects with a migration hint; replace with `expose { port = 8080 }` and optionally add `web_ui = true` inside.  Phase-1-pre-public-launch break per Decision 34 (no v0.1 users to migrate); v0.2+ files only.
 
 ### 4.10 `main` (v0.2, Week 12 Fri)
 
@@ -596,7 +612,7 @@ v0.1 supports `target = compose` only. Future targets fall into two categories w
 | Kubernetes, Helm, ECS, Nomad | Direct — containers, services, ports, volumes | **New emitter only; zero spec change.** Add `k8s`, `helm`, `ecs`, `nomad` to the `DeployTarget` enum and write the emitter. |
 | Databricks, MS Fabric, Spark, Vertex AI, Bedrock Agents | Conceptual mismatch — endpoints, MLflow artifacts, lakehouse-native primitives | **New emitter + additive resource types.** Most v0.1 resources map with caveats; some platform-native concepts (Unity Catalog, MLflow registry, Databricks Functions) need new resource types like `databricks.endpoint`, `unity_catalog`, `mlflow_artifact`. These are introduced via the v0.3 modules/packages mechanism (§7.2) — `databricks.*` lives in an importable module, not in the language core. |
 
-This keeps the v0.1 language small and stable while leaving room for the long tail of platforms. The `expose` field on `deploy` blocks is intentionally typed as `Map<String, Int>?` rather than something container-specific, so platform-specific emitters can reinterpret it (e.g. on Databricks, `expose = { endpoint_name = ... }` registers a model-serving endpoint).
+This keeps the v0.1 language small and stable while leaving room for the long tail of platforms. The `expose { ... }` block on `deploy` blocks (v0.2 Tue, replaces the v0.1 `Map<String, Int>` attribute) carries platform-agnostic fields (`port`, `web_ui`) by design — platform-specific emitters add their own fields under the same block as they grow (e.g. on Databricks, `expose { endpoint_name = "..." }` registers a model-serving endpoint; on k8s, `expose { ingress_host = "..." }` produces an Ingress resource).
 
 ### 7.4 Binary IR / wire format — not in v0.1
 
@@ -648,7 +664,11 @@ body              = { attribute | block } ;
                             • inside resource bodies (budget / model /
                               prompt / mcp_server / agent / eval /
                               secret / deploy): only attributes, no
-                              nested blocks. *)
+                              nested blocks.
+                          v0.2 Tue (Track A2) carves an exception:
+                            • inside `deploy { }`: one optional nested
+                              `expose { ... }` block is also permitted.
+                              See §4.9 for the field-set. *)
 
 attribute         = identifier , "=" , expression ;
 
@@ -675,9 +695,12 @@ list              = "[" , [ expression , { "," , expression } ] , "]" ;
 object            = "{" , [ attribute , { "," , attribute } ] , "}" ;
                        (* attributes inside an object literal are
                           comma-separated; attributes inside a block
-                          body are whitespace-separated.  Object
-                          literals appear as attribute values, e.g.
-                          `expose = { port = 8080 }`. *)
+                          body are whitespace-separated.  v0.1 used
+                          object literals for the `deploy.expose`
+                          attribute value; v0.2 Tue promoted that to
+                          a nested block (see §4.9).  Object literals
+                          remain a grammar primitive and may be used
+                          by future attributes. *)
 
 attribute_access  = identifier , "." , identifier , { "." , identifier } ;
                        (* always at least one dot — distinguishes from
