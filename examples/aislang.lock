@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "cbea368afd0d93b2ba76d9eed4e8a70c2bd2a67469fd9780b9156afc76debff3",
+  "source_hash": "5483c870726e64dfdb412b171063d7cb3af2d908dae3544f2de776e4fa0bc162",
   "model_bindings": {
     "fast": {
-      "provider": "ollama",
-      "name": "llama_3_1_8b"
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
     }
   },
   "prompt_hashes": {
-    "system": "0e226e398848d7526c9ee75e351429610878ac76c53b82fa2c0291a42857ec87"
+    "system": "9f9f1d04b853403a764bed3d9da0863ffccfaf0deafa67f641ebd3269d998e7a"
   },
   "oci_digests": {
     "docs": ""
