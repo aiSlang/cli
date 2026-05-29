@@ -80,7 +80,10 @@ dependencies = [
 name = "aislang-runtime"
 version = "0.2.0-dev"
 dependencies = [
+ "aislang-catalog",
+ "aislang-compose",
  "aislang-core",
+ "aislang-resolver",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
