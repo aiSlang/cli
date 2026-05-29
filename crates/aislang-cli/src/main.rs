@@ -9,10 +9,21 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+// Week-12 follow-up: full version string is "<cargo-pkg-version>
+// (<git-short-hash>[-dirty])" — built from CARGO_PKG_VERSION + the
+// two AISLANG_GIT_* env vars injected by `build.rs`.  Splicing at
+// compile time keeps the runtime --version reply zero-cost while
+// making "exactly which code is running?" unambiguous during the
+// v0.2 daily-build cadence.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (", env!("AISLANG_GIT_HASH"), env!("AISLANG_GIT_DIRTY"), ")",
+);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "aislang",
-    version,
+    version = VERSION,
     about = "Declarative infrastructure for AI projects",
     long_about = None,
 )]
