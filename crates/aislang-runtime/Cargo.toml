@@ -26,7 +26,15 @@ reqwest      = { workspace = true }
 sha2         = { workspace = true }
 # week-7 Tue: cost arithmetic needs Money + Currency from core's types.
 # Decision 6: budget enforcement lives in this crate, not LiteLLM config.
-aislang-core = { workspace = true }
+aislang-core     = { workspace = true }
+# week-12 Tue: `aislang mcp-serve`'s pure-tier tools (lang_spec, examples,
+# describe, validate, plan) wire to the resolver + catalog + compose
+# emitter.  Pulled in here so the MCP server lives alongside the v0.1
+# client.  Aligns with planning-doc Track A architectural decision #2
+# (subcommand reuses workspace) and #3 (mcp-serve IS the agent runtime).
+aislang-resolver = { workspace = true }
+aislang-catalog  = { workspace = true }
+aislang-compose  = { workspace = true }
 # week-9 Mon: OTel-GenAI tracing (Decision 18). Official Rust SDK +
 # OTLP HTTP/proto exporter; reqwest is reused for the OTLP transport
 # (see workspace dep features: http-proto + reqwest-client +
