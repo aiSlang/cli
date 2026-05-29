@@ -26,6 +26,23 @@ project "support-agent" {
     latency_p95 = 2s
     residency   = [eu, us]
 
+    # Resolver semantics (v0.2 Tue follow-up, LANGUAGE-SPEC §4.4):
+    # walk `prefer` in declared order; first candidate that satisfies
+    # all constraints wins.  `fallback` is used only if no prefer item
+    # satisfies (e.g. all prefer items violate `cost_max`).
+    #
+    # → THIS demo resolves `fast` to `anthropic.claude_haiku_4_5`
+    #   (prefer[0]).  `aislang chat`, `aislang plan --smoke-test-live`,
+    #   and Open WebUI chats all hit the Anthropic API — set
+    #   ANTHROPIC_API_KEY in `.env` before `aislang apply`.  Per-call
+    #   cost is small (haiku is $0.001/1k input tokens) but non-zero.
+    #
+    # For $0 local testing, swap the order:
+    #     prefer   = [ollama.llama_3_1_8b]
+    #     fallback = [anthropic.claude_haiku_4_5, openai.gpt_4o_mini]
+    # Ollama becomes the primary; the paid models stay configured as
+    # LiteLLM fallback aliases for explicit testing via the
+    # `fast-fb-anthropic-…` / `fast-fb-openai-…` dropdown entries.
     prefer   = [anthropic.claude_haiku_4_5, openai.gpt_4o_mini]
     fallback = [ollama.llama_3_1_8b]
   }
