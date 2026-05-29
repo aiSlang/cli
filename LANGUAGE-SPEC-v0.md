@@ -1,8 +1,14 @@
-# aiSlang Language Specification — v0 (frozen for v0.1 MVP)
+# aiSlang Language Specification — v0 (v0.1 baseline + v0.2 additions)
 
-Status: **Authoritative for the v0.1 compiler.** Any change to this document after week 1 of the 90-day plan slips the schedule.
+Status: **Authoritative for the v0.2 compiler.** The v0.1 baseline is frozen; v0.2 additions are purely additive and forward-compatible (any valid v0.1 file remains valid under v0.2 with identical typed-AST output — see §7).
 
-This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run. Anything not described here is out of scope for v0.1.
+This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run, **plus** the v0.2 grammar extensions that came in via Phase 1 Week 12 Fri:
+
+- New `main { … }` block — declares the user-facing LLM as first-class topology (planning-doc Track A architectural decision #7).
+- New `model.source = subscription | api` enum — opt-in declaration that a model's inference path lives in the host chat app's subscription tier (not LiteLLM).
+- Three new closed enums in §3.4: `Pattern` (6 variants), `ChatClient` (5 variants), `ModelSource` (2 variants).
+
+Anything not described here is out of scope for v0.2.
 
 ---
 
@@ -28,8 +34,12 @@ Syntax is HCL-like: blocks with labels, `key = value` assignments, nested blocks
 - **Comments.** Line comments: either `#` or `//` to end of line (both accepted, HCL convention). Block comments (`/* … */`) deferred to v0.2.
 - **Identifiers.** `[a-z][a-z0-9_]*` (snake_case). Resource labels follow the same rule.
 - **Whitespace** is insignificant except as a token separator.
-- **Reserved words** (v0): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`, `unlimited`. The `unlimited` keyword is a `Money` literal (Decision 10, week 7 Mon) — used in `budget.hard_cap_per_*` to mean "no cap" (free local models, infinite budget). Treated as the absorbing top in cost comparisons.
-- **Reserved words (forward-compatibility, no semantics in v0.1):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`, `catalog`, `catalog_model`, `secret_provider`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2; possible `.ais`-native model catalog — see §5.5; enterprise secret providers — see §5.7) so v0.1 files remain forward-compatible.
+- **Reserved words** (v0.1 baseline): `project`, `budget`, `model`, `prompt`, `mcp_server`, `agent`, `eval`, `secret`, `deploy`, `true`, `false`, `null`, `per`, `unlimited`. The `unlimited` keyword is a `Money` literal (Decision 10, week 7 Mon) — used in `budget.hard_cap_per_*` to mean "no cap" (free local models, infinite budget). Treated as the absorbing top in cost comparisons.
+- **Reserved words added in v0.2** (Week 12 Fri):
+  - `main` — new top-level block type inside `project { … }` (see §4.10).
+  - `pattern`, `chat_client`, `source` — new attribute names on `main` and `model` blocks.
+  - Closed enum members for the new fields: `orchestrator`, `supervisor`, `router`, `reflector`, `planner_executor`, `coordinator` (Pattern); `claude_desktop`, `cursor`, `chatgpt`, `open_webui`, `custom` (ChatClient); `api`, `subscription` (ModelSource).  Enum members are bare identifiers in expression position (§3.4) and don't collide with the user's identifier namespace — using `cursor` as a label is still legal.
+- **Reserved words (forward-compatibility, no semantics in v0.2):** `decorator`, `prompt_pipeline`, `guardrail`, `middleware`, `import`, `module`, `package`, `var`, `include`, `export`, `catalog`, `catalog_model`, `secret_provider`. Using any of these as an identifier is a compile error. They are claimed for Phase 1+ features (dynamic prompt composition — see §7.1; multi-file projects — see §7.2; possible `.ais`-native model catalog — see §5.5; enterprise secret providers — see §5.7) so v0.1+v0.2 files remain forward-compatible.
 - **Type literals** use suffixes (`32k`, `$50`, `2s`, `85%`) — see §3.
 
 ---
@@ -78,6 +88,7 @@ These are the types that move the needle. Each has a literal syntax and a normal
 Enum members are bare identifiers in expression position, looked up in the enum type expected by context.
 
 ```
+# v0.1 baseline:
 Capability     = chat | embedding | tool_use | vision | audio | reasoning | large_context | structured_output
 Residency      = us | eu | uk | apac
 DeployTarget   = compose                                   # v0.1 — non-exhaustive across versions (see note below)
@@ -85,6 +96,11 @@ Currency       = usd | eur | gbp | jpy                     # implied by Money li
 OptimizeFor    = cost | latency | quality
 EvalMetric     = exact_match | f1 | bleu | rouge_l | llm_judge
 EvalAggregator = mean | min | max | percentile_p95
+
+# v0.2 additions (Week 12 Fri — `main` block + `model.source`):
+Pattern        = orchestrator | supervisor | router | reflector | planner_executor | coordinator
+ChatClient     = claude_desktop | cursor | chatgpt | open_webui | custom
+ModelSource    = api | subscription                        # default: api (preserves v0.1 behaviour)
 ```
 
 The catalog (§5) defines two additional pseudo-enums populated at compile time from the catalog file:
@@ -104,7 +120,7 @@ There is no implicit coercion between domain types. `"$50"` (String) is not assi
 
 ## 4. Resource types
 
-Nine resource types in v0.1. Each is a labeled block. Labels are unique within their type.
+Ten resource types as of v0.2 (nine from v0.1 + `main` added Week 12 Fri).  Each is a labeled block; labels are unique within their type — meaning `main "x"` and `agent "x"` can both exist (different kinds, disjoint label spaces in the resource graph).
 
 ### 4.1 `project` (singleton, required)
 
@@ -141,10 +157,34 @@ model "<identifier>" {
   prefer      : List<ModelId>            # ordered preference
   fallback    : List<ModelId>            # used if no `prefer` candidate satisfies constraints
   pin         : ModelId?                 # if set, must equal the resolved model
+
+  source      : ModelSource = api        # NEW v0.2 (Week 12 Fri) — optional
+                                         # api          → route through LiteLLM
+                                         #                (v0.1 behaviour); hard
+                                         #                budget cap enforcement.
+                                         # subscription → host chat app handles
+                                         #                inference (Claude
+                                         #                Desktop / Cursor /
+                                         #                ChatGPT subscription).
+                                         #                Tokens counted +
+                                         #                cost estimated, no
+                                         #                hard cap (we can't
+                                         #                gate the chat app's
+                                         #                calls).
 }
 ```
 
 The compiler resolves `requires + constraints + prefer/fallback` against the catalog; see §6.
+
+**`source` semantics (v0.2 addition)**:
+
+- Default: `api`.  v0.1 files (no `source` declared) keep their existing v0.1 routing — LiteLLM + hard budget enforcement.
+- `subscription` indicates the inference path lives in the host chat app's subscription tier.  The model is still resolved against the catalog (so the user's choice of provider stays declarative), but:
+  - The compose-stage LiteLLM config does NOT include a routing entry for this model.
+  - The runtime spend tracker counts tokens for observability but does NOT enforce the budget cap (over-cap reports a warning instead of aborting the turn).
+  - `cost_max` is informational — the planner uses it for catalog filtering but doesn't enforce it at run time.
+
+This enables the cost-saving pattern: orchestrator runs free on the user's existing Claude Pro / Cursor Team subscription; only deployed agents hit the API.  Typical savings: 40–60 % vs an API-only deployment.  Forward-compat is preserved (every v0.1 model block continues to parse + validate + plan identically).
 
 ### 4.4 `prompt`
 
@@ -209,6 +249,70 @@ deploy "<identifier>" {
   expose : Map<String, Int>?         # port mappings
 }
 ```
+
+### 4.10 `main` (v0.2, Week 12 Fri)
+
+Declares the user-facing LLM as the explicit entry point of the agentic system — same role `fn main` plays in a Rust binary.  The `pattern` field names the *relationship* between this entry point and the deployed agents; the block name `main` is the pattern-agnostic role descriptor.
+
+```
+main "<identifier>" {
+  model         : Ref<Model>
+  chat_client   : ChatClient
+  pattern       : Pattern
+  system_prompt : Ref<Prompt>
+}
+```
+
+**Semantics:**
+
+- **`main` blocks are never deployed.**  Purely declarative — the resolver records them in the IR, the emitter ignores them (no Compose service, no k8s pod, no LiteLLM routing entry).  They exist so the MCP server can describe the principal-LLM's expected role to the host client.
+- **Multiple `main` blocks per project are allowed.**  Example: a customer-facing entry (`main "user_facing" { pattern = orchestrator … }`) AND an admin escalation entry (`main "admin" { pattern = supervisor … }`).  The MCP server picks which one to activate based on the `chat_client` field matching the connecting client's identity.
+- **`model` field**: references a `model` block, just like `agent.model`.  Typically paired with `source = subscription` on that model when the entry point runs on the user's chat-app subscription tier.
+- **`chat_client` field**: identifies the host LLM client this entry point is designed for.  `claude_desktop`, `cursor`, `chatgpt`, `open_webui`, `custom`.
+- **`pattern` field**: names the relationship to deployed agents.  Each pattern ships a default system-prompt template (v0.3 work).  All six variants are valid v0.2 syntax; the runtime behavioural distinction between them is v0.3+ implementation work.  Variants and intended roles:
+
+  | Pattern | Role of the `main` entry |
+  |---|---|
+  | `orchestrator` | Plans the overall task, dispatches sub-tasks to deployed agents in sequence, aggregates results. |
+  | `supervisor` | Monitors deployed-agent outputs, can intervene/redirect, makes final approve/reject calls. |
+  | `router` | Classifies user input, routes to exactly one deployed agent per turn. |
+  | `reflector` | Reviews/critiques outputs from deployed agents; produces refined final answers. |
+  | `planner_executor` | Plans the steps; delegates execution to deployed agents; reports aggregated outcome. |
+  | `coordinator` | Facilitates communication between multiple peer deployed agents (multi-agent collaboration). |
+
+- **`system_prompt` field**: required.  References a `prompt` block whose file contains the role/persona description for the `main` entry.  Validated for ref-resolution exactly like `agent.system_prompt`.
+
+**No `tools` field on `main` blocks.**  Deployed agents become the host LLM client's tools via the MCP server's `aislang_chat_turn` tool — there's no direct tool-call dispatch from `main` to MCP servers.  This is the architectural simplification of the proxy-via-MCP design (planning-doc Track A architectural decision #3).
+
+**No `budget` interaction at validate time.**  Budget enforcement is conditional on `model.source`:
+
+- `source = api` (default): hard fail-closed enforcement (v0.1 behaviour).
+- `source = subscription`: report-only — we surface estimated cost in `aislang status` but don't gate the host chat app's calls.
+
+**Example**:
+
+```
+main "user_facing" {
+  model         = model.primary     # → references `model "primary"` declared in the same project
+  chat_client   = claude_desktop
+  pattern       = orchestrator
+  system_prompt = prompt.main_brief
+}
+
+model "primary" {
+  requires = [chat, tool_use]
+  context_min = 200k
+  prefer   = [anthropic.claude_sonnet_4_6]
+  source   = subscription           # Claude Pro / Team subscription; no API charges
+}
+
+prompt "main_brief" {
+  file    = "./prompts/main_brief.md"
+  version = "1.0.0"
+}
+```
+
+The customer's Claude Pro subscription becomes the orchestrator infrastructure for the agentic system; only the deployed agents (`agent "triage"`, `agent "drafter"`, etc.) hit the API.
 
 ---
 
@@ -403,7 +507,9 @@ resolve(model_block, catalog, lockfile):
 
 ## 7. Out of scope for v0
 
-The following are explicitly deferred. Do not implement them in the v0.1 compiler.
+The following are explicitly deferred. Do not implement them in the v0.1 or v0.2 compiler.
+
+**Forward-compat invariant for v0.2 additions** (Week 12 Fri): the `main` block and `model.source` field are purely additive — every valid v0.1 file remains valid under v0.2 with byte-identical typed-AST output and byte-identical lockfile output.  Pinned by `crates/aislang-core/tests/parser_fixtures.rs` (existing v0.1 expected-AST JSON fixtures stay unchanged) plus four dedicated JSON-round-trip tests in `mod project_tests` of `parser.rs` (`project_without_mains_omits_field_in_json`, `model_with_default_source_omits_field_in_json`, etc.).  The same invariant applies to all v0.3+ additions: new resource types, new optional fields, new enum members.  Removing or renaming existing v0.1/v0.2 surface is a major-version break.
 
 - Functions, expressions beyond literals + references
 - Variables / interpolation (`${var.name}`)
