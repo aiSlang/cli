@@ -421,16 +421,12 @@ impl AislangServer {
     pub async fn plan(&self,
         Parameters(p): Parameters<PlanParameters>,
     ) -> Result<CallToolResult, RmcpError> {
-        // Stage 0 (week 13 Thu): resolve source_dir, then resolve
-        // source content (path > inline > error).  Same order the
-        // stateful-tier tools use — see `resolve_source` for the
-        // Claude-Desktop-preview rationale.
-        let source_dir: PathBuf = match p.source_dir.as_deref() {
-            Some(s) => PathBuf::from(s),
-            None    => std::env::current_dir()
-                .map_err(|e| RmcpError::internal_error(
-                    format!("cwd: {e}"), None))?,
-        };
+        // Stage 0: resolve source_dir (with week-13 Fri follow-up
+        // inference from absolute source_path) + source content.
+        let source_dir = resolve_source_dir_or_infer_from_path(
+            p.source_dir.as_deref(),
+            p.source_path.as_deref(),
+        )?;
         let source = resolve_source(p.source, p.source_path, &source_dir)?;
 
         // Stage 1: parse + typecheck.
@@ -551,7 +547,14 @@ impl AislangServer {
         Parameters(p): Parameters<ApplyParameters>,
     ) -> Result<CallToolResult, RmcpError> {
         let mut out = String::new();
-        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        // Week 13 Fri follow-up: infer source_dir from absolute
+        // source_path when no source_dir was supplied — common case
+        // for MCP hosts (Claude Desktop, Cursor) that omit source_dir
+        // and expect aislang to figure it out from the .ais file path.
+        let source_dir = resolve_source_dir_or_infer_from_path(
+            p.source_dir.as_deref(),
+            p.source_path.as_deref(),
+        )?;
         let source     = resolve_source(p.source, p.source_path, &source_dir)?;
 
         // ── Stage 1: full plan pipeline (validate → catalog → resolve → emit)
@@ -806,7 +809,10 @@ impl AislangServer {
         use std::fmt::Write;
         let mut out = String::new();
 
-        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let source_dir = resolve_source_dir_or_infer_from_path(
+            p.source_dir.as_deref(),
+            p.source_path.as_deref(),
+        )?;
         let source     = resolve_source(p.source, p.source_path, &source_dir)?;
 
         let (project, _warnings) = aislang_core::validate(&source)
@@ -1002,7 +1008,10 @@ impl AislangServer {
         meta:   Meta,
         client: Peer<RoleServer>,
     ) -> Result<CallToolResult, RmcpError> {
-        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let source_dir = resolve_source_dir_or_infer_from_path(
+            p.source_dir.as_deref(),
+            p.source_path.as_deref(),
+        )?;
         let source     = resolve_source(p.source, p.source_path, &source_dir)?;
         let key = SessionKey {
             source_dir:  source_dir.clone(),
@@ -1175,7 +1184,10 @@ impl AislangServer {
     pub async fn eval(&self,
         Parameters(p): Parameters<EvalParameters>,
     ) -> Result<CallToolResult, RmcpError> {
-        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let source_dir = resolve_source_dir_or_infer_from_path(
+            p.source_dir.as_deref(),
+            p.source_path.as_deref(),
+        )?;
         let source     = resolve_source(p.source, p.source_path, &source_dir)?;
         let (project, _warnings) = aislang_core::validate(&source)
             .map_err(|e| RmcpError::invalid_params(
@@ -1833,6 +1845,67 @@ fn resolve_source_dir(arg: Option<&str>) -> Result<PathBuf, rmcp::ErrorData> {
     std::fs::canonicalize(&raw).map_err(|e| rmcp::ErrorData::invalid_params(
         format!("source_dir `{}` doesn't exist or unreadable: {e}", raw.display()),
         None))
+}
+
+/// Variant of [`resolve_source_dir`] that infers the project
+/// directory from an absolute `source_path` when the caller didn't
+/// supply an explicit `source_dir`.
+///
+/// **Why this exists** (week 13 Fri follow-up — surfaced by live
+/// Claude Desktop testing): MCP hosts typically pass only
+/// `source_path` (the absolute file path of the `.ais` file) and
+/// expect aislang to figure out the project directory from there.
+/// `source_dir` defaults to the MCP server's cwd, which for
+/// Claude-Desktop-spawned mcp-serve is e.g. `/usr/lib/claude-desktop/`.
+/// A `.ais` `prompt "system" { file = "./prompts/system.md" }` then
+/// resolves to `/usr/lib/claude-desktop/./prompts/system.md` — file
+/// not found.  Inferring source_dir from source_path's parent fixes
+/// the common case without breaking the explicit form.
+///
+/// **Resolution policy** (priority order):
+///   1. Explicit `source_dir` wins (back-compat + lets callers
+///      override the inference for projects with a nested layout).
+///   2. Absolute `source_path` → parent dir of `source_path`.  The
+///      most common case for MCP clients; matches the v0.1 CLI's
+///      semantics where `aislang apply /a/b/c.ais` resolves prompts
+///      relative to `/a/b/`.
+///   3. Fall back to mcp-serve's cwd.  Same as v0.1 / pre-this-PR
+///      behaviour for the legacy in-memory caller that passes
+///      neither `source_dir` NOR an absolute `source_path`.
+///
+/// Returns a canonical absolute path (via `std::fs::canonicalize`),
+/// so all downstream path-joining is deterministic regardless of how
+/// the caller specified the inputs.
+fn resolve_source_dir_or_infer_from_path(
+    source_dir_arg:  Option<&str>,
+    source_path_arg: Option<&str>,
+) -> Result<PathBuf, rmcp::ErrorData> {
+    // (1) Explicit source_dir wins.  Same behaviour as
+    // resolve_source_dir; we factor through that helper so any future
+    // canonicalisation tweaks land in one place.
+    if source_dir_arg.is_some() {
+        return resolve_source_dir(source_dir_arg);
+    }
+
+    // (2) Infer from absolute source_path's parent.  Only kicks in
+    // when source_path is set AND absolute — relative source_paths
+    // need a cwd to resolve against, so we fall back to (3) for them.
+    if let Some(path_str) = source_path_arg {
+        let path = std::path::Path::new(path_str);
+        if path.is_absolute() {
+            if let Some(parent) = path.parent() {
+                return std::fs::canonicalize(parent).map_err(|e|
+                    rmcp::ErrorData::invalid_params(
+                        format!("source_dir inferred from source_path `{}` \
+                                 doesn't exist or unreadable: {e}",
+                                parent.display()),
+                        None));
+            }
+        }
+    }
+
+    // (3) Default: cwd (same as the legacy resolve_source_dir(None)).
+    resolve_source_dir(None)
 }
 
 /// Resolve a tool call's `.ais` source content from either the
@@ -2496,6 +2569,105 @@ mod tests {
             "error should name both fields; got: {msg}");
         assert!(msg.contains("recommended"),
             "error should nudge users toward source_path; got: {msg}");
+    }
+
+    // ── source_dir inference from source_path (week 13 Fri follow-up) ──
+    //
+    // Surfaced by live Claude Desktop test: MCP hosts typically pass
+    // only `source_path` (absolute) and omit `source_dir`.  Without
+    // inference, source_dir defaults to mcp-serve's cwd
+    // (`/usr/lib/claude-desktop/` when spawned by Claude Desktop), and
+    // the .ais's `prompt "system" { file = "./prompts/system.md" }`
+    // resolves to a nonexistent path.  Fix: when source_dir is unset
+    // AND source_path is absolute, infer source_dir from
+    // source_path's parent.
+
+    #[tokio::test]
+    async fn plan_infers_source_dir_from_absolute_source_path() {
+        // The bug case: source_path=/tmp/.../proj.ais, source_dir=None,
+        // prompt path = "./system.md".  Should resolve the prompt at
+        // /tmp/.../system.md (NOT cwd/system.md).
+        let dir = fresh_tempdir("infer-from-absolute");
+        std::fs::write(dir.join("system.md"),
+            "you are helpful").unwrap();
+        let ais_path = dir.join("project.ais");
+        std::fs::write(&ais_path, PROJECT_WITH_PROMPT).unwrap();
+
+        let s = AislangServer::new();
+        let result = s.plan(Parameters(PlanParameters {
+            source:      None,
+            source_path: Some(ais_path.to_string_lossy().to_string()),
+            source_dir:  None,   // ← the key — unset, must be inferred
+        })).await.expect("plan succeeds via source_path-inferred source_dir");
+        let text = body_text(&result);
+        assert!(text.contains("── docker-compose.yml ──"),
+            "plan should produce its standard output via inferred source_dir; got: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plan_explicit_source_dir_wins_over_inference() {
+        // Defence-in-depth: when source_dir IS provided, it must
+        // override the inference path.  Catches a future regression
+        // where someone "simplifies" the helper by always inferring.
+        let proj_dir   = fresh_tempdir("infer-override-proj");
+        let prompt_dir = fresh_tempdir("infer-override-prompts");
+        std::fs::write(prompt_dir.join("system.md"),
+            "you are helpful").unwrap();
+        let ais_path = proj_dir.join("project.ais");
+        std::fs::write(&ais_path, PROJECT_WITH_PROMPT).unwrap();
+
+        let s = AislangServer::new();
+        // With ONLY source_path: inference says prompt lives at
+        // proj_dir/system.md — which doesn't exist → fails.
+        let r_no_dir = s.plan(Parameters(PlanParameters {
+            source:      None,
+            source_path: Some(ais_path.to_string_lossy().to_string()),
+            source_dir:  None,
+        })).await;
+        assert!(r_no_dir.is_err(),
+            "plan should fail when inferred source_dir lacks the prompt file");
+
+        // With explicit source_dir = prompt_dir: caller's path wins,
+        // prompt is found, plan succeeds.
+        let r_with_dir = s.plan(Parameters(PlanParameters {
+            source:      None,
+            source_path: Some(ais_path.to_string_lossy().to_string()),
+            source_dir:  Some(prompt_dir.to_string_lossy().to_string()),
+        })).await.expect("plan succeeds when explicit source_dir overrides inference");
+        let text = body_text(&r_with_dir);
+        assert!(text.contains("── docker-compose.yml ──"),
+            "plan should succeed via explicit source_dir; got: {text}");
+
+        let _ = std::fs::remove_dir_all(&proj_dir);
+        let _ = std::fs::remove_dir_all(&prompt_dir);
+    }
+
+    #[tokio::test]
+    async fn relative_source_path_does_not_trigger_inference() {
+        // Edge case: source_path is RELATIVE (not absolute).  The
+        // inference path uses `Path::is_absolute()`, so relative
+        // source_paths should fall through to the cwd default.
+        //
+        // We can't easily test the "cwd default" branch directly
+        // because tests share cwd.  Instead, verify a relative
+        // source_path with NO source_dir RAISES the same error shape
+        // it always did when the file isn't reachable from cwd — i.e.,
+        // the inference path didn't accidentally interpret the
+        // relative source_path's parent (which is "") as a dir.
+        let s = AislangServer::new();
+        let err = s.validate(Parameters(SourceOnlyParameters {
+            source:      None,
+            source_path: Some("./does-not-exist-7f.ais".to_string()),
+        })).await.expect_err("missing relative source_path must error");
+        let msg = err.to_string();
+        assert!(msg.contains("cannot read source_path"),
+            "error should be the resolve_source missing-file error; got: {msg}");
+        // The inference SHOULD NOT have produced an absolute dir for
+        // an empty parent.  If it had, we'd see a different error
+        // shape (source_dir-related rather than source_path-related).
+        assert!(!msg.contains("source_dir inferred"),
+            "relative source_path must NOT trigger source_dir inference; got: {msg}");
     }
 
     // ── aislang_plan ──────────────────────────────────────────────
