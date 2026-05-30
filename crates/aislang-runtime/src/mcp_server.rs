@@ -533,7 +533,12 @@ impl AislangServer {
             litellm_config.yaml, .env.example, aislang.lock, state.json) \
             into source_dir. Starts Docker containers — destructive. \
             On first run, image pulls can take 30-60s; the response \
-            comes back when `docker compose up -d` returns.",
+            comes back when `docker compose up -d` returns. \
+            \n\nCALLING CONVENTION: pass `source_path` (filesystem path \
+            to the .ais file), NOT `source` (inline body).  The host \
+            renders this destructive-hint confirmation dialog from the \
+            raw request JSON; inline `source` produces a multi-line \
+            wall of escaped text the user can't scan before approving.",
         annotations(
             title             = "Deploy aiSlang stack",
             destructive_hint  = true,
@@ -972,7 +977,12 @@ impl AislangServer {
             Returns the assistant's reply as text. Tool-use loop is hard-\
             capped at 8 iterations per turn (Decision 4). Budget caps \
             from the .ais source are enforced — over-cap aborts the turn \
-            with a `budget exceeded:` synthetic reply.",
+            with a `budget exceeded:` synthetic reply. \
+            \n\nCALLING CONVENTION: pass `source_path` (filesystem path \
+            to the .ais file), NOT `source` (inline body).  The host's \
+            tool-call preview renders the request JSON to the user; \
+            inline `source` makes that preview a wall of escaped text \
+            on every turn.",
         annotations(
             title             = "Send chat turn",
             destructive_hint  = false,
@@ -1257,20 +1267,35 @@ pub struct ExamplesParameters {
 /// Week 13 Thu follow-up: `source` is now optional; `source_path`
 /// is the recommended alternative.  See [`resolve_source`] for the
 /// resolution policy + the Claude-Desktop-preview rationale.
+///
+/// Field order is intentional — `source_path` first so JSON-schema
+/// readers (including LLMs picking a calling shape) see the
+/// recommended form first.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SourceOnlyParameters {
+    /// **PREFERRED.**  Filesystem path to the `.ais` file.  Relative
+    /// paths resolve against the MCP server's current working
+    /// directory; absolute paths are used as-is.  When set, wins
+    /// over inline `source`.
+    ///
+    /// **MCP-host integrations (Claude Desktop, Cursor, ChatGPT-with-
+    /// MCP, etc.) MUST use this form.**  The inline `source` field
+    /// below puts the whole `.ais` file body into the JSON request
+    /// envelope, which UI hosts render verbatim in the tool-call
+    /// confirmation dialog — producing a multi-line wall of
+    /// `\n`-escaped text the user can't scan before approving.
+    /// Passing `source_path` keeps the dialog tiny + readable.
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// **For in-memory callers only** (synthetic test harnesses,
+    /// programmatic callers that materialise source on the fly).
     /// The complete `.ais` source file as a UTF-8 text body.  Must
     /// parse + typecheck for `describe`; can be malformed for
     /// `validate` (the diagnostic is the point).  When `source_path`
-    /// is also provided, it wins.
+    /// is also provided, it wins — see `source_path`'s docs for
+    /// why UI hosts must prefer that form.
     #[serde(default)]
     pub source: Option<String>,
-    /// Filesystem path to the `.ais` file.  Relative paths resolve
-    /// against the MCP server's current working directory.  Wins over
-    /// inline `source`.  RECOMMENDED for MCP-host integrations
-    /// (Claude Desktop, Cursor) — keeps the confirmation dialog tiny.
-    #[serde(default)]
-    pub source_path: Option<String>,
 }
 
 /// `plan` extends `SourceOnlyParameters` with an optional
@@ -1278,15 +1303,19 @@ pub struct SourceOnlyParameters {
 /// caller's project directory.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PlanParameters {
-    /// The complete `.ais` source file as a UTF-8 text body.
+    /// **PREFERRED.**  Filesystem path to the `.ais` file.  Relative
+    /// paths resolve against `source_dir` (or cwd if `source_dir`
+    /// unset); absolute paths are used as-is.  MCP-host integrations
+    /// (Claude Desktop, Cursor) MUST use this form — see
+    /// [`SourceOnlyParameters::source_path`] for the rationale.
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// **For in-memory callers only.**  The complete `.ais` source
+    /// file as a UTF-8 text body.  Inline form produces an unscannable
+    /// wall of `\n`-escaped text in UI hosts' confirmation dialogs.
     /// When `source_path` is also provided, it wins.
     #[serde(default)]
     pub source: Option<String>,
-    /// Filesystem path to the `.ais` file.  Relative paths resolve
-    /// against `source_dir` (or cwd if `source_dir` unset).
-    /// RECOMMENDED for MCP-host integrations.
-    #[serde(default)]
-    pub source_path: Option<String>,
     /// Absolute filesystem path that `prompt.file` and
     /// `mcp_server.mount` paths in the source are resolved against.
     /// Defaults to the MCP server's current working directory when
@@ -1303,14 +1332,18 @@ pub struct PlanParameters {
 /// (apply writes to disk + starts Docker, plan is in-memory).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ApplyParameters {
-    /// The complete `.ais` source file as a UTF-8 text body.
-    /// When `source_path` is also provided, it wins.
-    #[serde(default)]
-    pub source: Option<String>,
-    /// Filesystem path to the `.ais` file.  Relative paths resolve
-    /// against `source_dir`.  RECOMMENDED for MCP-host integrations.
+    /// **PREFERRED.**  Filesystem path to the `.ais` file.  Relative
+    /// paths resolve against `source_dir`.  MCP-host integrations
+    /// (Claude Desktop, Cursor) MUST use this form — keeps the
+    /// destructive-hint confirmation dialog scannable instead of
+    /// dumping the whole `.ais` body as JSON-escaped text.
     #[serde(default)]
     pub source_path: Option<String>,
+    /// **For in-memory callers only.**  The complete `.ais` source
+    /// file as a UTF-8 text body.  When `source_path` is also
+    /// provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Filesystem path that will receive the emitted artifacts
     /// (stack.yml, litellm_config.yaml, .env.example, aislang.lock,
     /// .aislang/state.json) and where prompt-file paths in the source
@@ -1345,15 +1378,17 @@ pub struct DestroyParameters {
 /// two optional spend toggles.  Mirrors the CLI flags 1:1.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct StatusParameters {
-    /// The complete `.ais` source file as a UTF-8 text body — used to
-    /// resolve the project name (which keys spend.json's tracker).
-    /// When `source_path` is also provided, it wins.
-    #[serde(default)]
-    pub source: Option<String>,
-    /// Filesystem path to the `.ais` file.  Relative paths resolve
-    /// against `source_dir`.  RECOMMENDED for MCP-host integrations.
+    /// **PREFERRED.**  Filesystem path to the `.ais` file.  Relative
+    /// paths resolve against `source_dir`.  MCP-host integrations
+    /// (Claude Desktop, Cursor) MUST use this form.
     #[serde(default)]
     pub source_path: Option<String>,
+    /// **For in-memory callers only.**  The complete `.ais` source
+    /// file as a UTF-8 text body — used to resolve the project name
+    /// (which keys spend.json's tracker).  When `source_path` is
+    /// also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Filesystem path containing .aislang/state.json + stack.yml.
     /// Defaults to cwd.
     #[serde(default)]
@@ -1376,20 +1411,22 @@ pub struct StatusParameters {
 /// (conversation history persists across calls).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ChatTurnParameters {
-    /// The complete `.ais` source file as a UTF-8 text body.  Used
-    /// to validate the project, find the agent by label, and resolve
-    /// its model + system_prompt on first call.  Subsequent calls
-    /// with the same (source_dir, agent_label) ignore changes here
-    /// — the cached Session was built from the initial source.
-    /// When `source_path` is also provided, it wins.
-    #[serde(default)]
-    pub source: Option<String>,
-    /// Filesystem path to the `.ais` file.  Relative paths resolve
-    /// against `source_dir`.  RECOMMENDED for MCP-host integrations
-    /// — keeps the chat-turn confirmation preview tiny + scannable
-    /// instead of dumping the whole .ais source as JSON-escaped text.
+    /// **PREFERRED.**  Filesystem path to the `.ais` file.  Relative
+    /// paths resolve against `source_dir`.  MCP-host integrations
+    /// (Claude Desktop, Cursor) MUST use this form — keeps the
+    /// chat-turn confirmation preview tiny + scannable instead of
+    /// dumping the whole `.ais` source as JSON-escaped text.
     #[serde(default)]
     pub source_path: Option<String>,
+    /// **For in-memory callers only.**  The complete `.ais` source
+    /// file as a UTF-8 text body.  Used to validate the project,
+    /// find the agent by label, and resolve its model + system_prompt
+    /// on first call.  Subsequent calls with the same (source_dir,
+    /// agent_label) ignore changes here — the cached Session was
+    /// built from the initial source.  When `source_path` is also
+    /// provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Filesystem path that prompt-file paths in the source resolve
     /// against, and where `aislang.lock` is read for prompt-hash
     /// verification.  Defaults to cwd.
@@ -1409,14 +1446,16 @@ pub struct ChatTurnParameters {
 /// single agent).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct EvalParameters {
-    /// The complete `.ais` source file as a UTF-8 text body.
-    /// When `source_path` is also provided, it wins.
-    #[serde(default)]
-    pub source: Option<String>,
-    /// Filesystem path to the `.ais` file.  Relative paths resolve
-    /// against `source_dir`.  RECOMMENDED for MCP-host integrations.
+    /// **PREFERRED.**  Filesystem path to the `.ais` file.  Relative
+    /// paths resolve against `source_dir`.  MCP-host integrations
+    /// (Claude Desktop, Cursor) MUST use this form.
     #[serde(default)]
     pub source_path: Option<String>,
+    /// **For in-memory callers only.**  The complete `.ais` source
+    /// file as a UTF-8 text body.  When `source_path` is also
+    /// provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Filesystem path that prompt files + JSONL datasets in the
     /// source resolve against.  Defaults to cwd.
     #[serde(default)]
