@@ -31,8 +31,18 @@ fn demo_path() -> PathBuf {
 /// Write a tool-less .ais source to a tempfile + the matching prompt
 /// file. Caller is responsible for removing them. Returns the .ais
 /// path.
-fn toolless_path() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("aislang-chat-toolless-{}",
+///
+/// **Per-test `suffix` parameter**: cargo runs tests in this binary
+/// in parallel by default; without a per-test discriminator every
+/// `toolless_path()` call would resolve to the SAME `/tmp/aislang-
+/// chat-toolless-<pid>` directory (PID is the test-binary PID,
+/// constant across all tests in the same binary).  That race let
+/// one test's `remove_dir_all` win the cleanup while another test's
+/// child process was still reading the .ais — surfaced on GitHub
+/// CI as a flaky "source file ... not readable" failure.  Each
+/// caller now supplies a unique suffix so the dirs are disjoint.
+fn toolless_path(suffix: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("aislang-chat-toolless-{}-{suffix}",
         std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let prompt_path = dir.join("system.md");
@@ -77,7 +87,7 @@ fn bin() -> Command {
     // No tools → no MCP spawn → no Docker required. Validates the
     // happy path through validate + agent lookup + prompt load +
     // session.open + EOF clean-close WITHOUT requiring Docker.
-    let path = toolless_path();
+    let path = toolless_path("eof");
     let mut child = bin()
         .args(["chat", "support"])
         .arg(&path)
@@ -113,7 +123,7 @@ fn bin() -> Command {
 #[test] fn chat_exit_command_ends_session_cleanly() {
     // `/exit` typed at the prompt → "(/exit — session ended)" + exit 0.
     // Tool-less for the same Docker-free reasons.
-    let path = toolless_path();
+    let path = toolless_path("exit-cmd");
     let mut child = bin()
         .args(["chat", "support"])
         .arg(&path)
