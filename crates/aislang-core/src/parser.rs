@@ -1478,10 +1478,14 @@ fn expect_eval_aggregator(field: &str, v: RawValue) -> Result<EvalAggregator, St
 fn expect_deploy_target(field: &str, v: RawValue) -> Result<DeployTarget, String> {
     match v {
         RawValue::EnumMember(e) => match e.as_str() {
-            "compose" => Ok(DeployTarget::Compose),
+            // v0.1 baseline:
+            "compose"    => Ok(DeployTarget::Compose),
+            // v0.2 Phase 2 Week 14 Mon (Track B):
+            "kubernetes" => Ok(DeployTarget::Kubernetes),
             other => Err(format!(
-                "`{field}` must be `compose` in v0.1; got `{other}` \
-                 (k8s/helm/ecs deploy targets arrive in Phase 1 — see spec §7.3)"
+                "`{field}` must be `compose` or `kubernetes`; got `{other}` \
+                 (ecs / nomad / databricks targets are v0.3+ — see LANGUAGE-\
+                 SPEC §7.3)"
             )),
         },
         other => Err(format!(
@@ -2337,11 +2341,24 @@ mod project_tests {
     }
 
     #[test] fn deploy_unknown_target_fails() {
-        // `k8s` is not in v0.1's DeployTarget enum — gets EnumMember at
-        // parse time, rejected at convert time with a helpful diagnostic
-        // pointing at Phase 1.
+        // `k8s` is the SHORT form — not accepted; the spec says
+        // `kubernetes`.  Surfaces an error pointing at the LANGUAGE-
+        // SPEC §7.3 backlog for the rest (ecs / nomad / databricks).
         let src = project_with(r#"deploy "x" { target = k8s }"#);
         assert_parse_err_contains(&src, "k8s");
+    }
+
+    #[test] fn deploy_kubernetes_target_parses() {
+        // Phase 2 Week 14 Mon (Track B) — `target = kubernetes` joins
+        // `target = compose` as an accepted DeployTarget variant.
+        // Emission lives in the new `aislang-k8s` crate (raw manifests
+        // + Helm chart wrapper); this test only pins the grammar +
+        // typed-AST round-trip.
+        let src = project_with(r#"deploy "prod" { target = kubernetes }"#);
+        let p   = assert_parse_ok(&src);
+        assert_eq!(p.deploys.len(), 1);
+        assert_eq!(p.deploys[0].label, "prod");
+        assert_eq!(p.deploys[0].target, DeployTarget::Kubernetes);
     }
 
     #[test] fn eval_block_parses() {

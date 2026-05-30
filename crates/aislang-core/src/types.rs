@@ -509,7 +509,34 @@ pub enum Residency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeployTarget {
+    /// `target = compose` — emit Docker Compose `stack.yml` + ancillary
+    /// artifacts.  v0.1 baseline.  See `aislang-compose` crate.
     Compose,
+    /// `target = kubernetes` — emit a Helm chart + raw manifests for
+    /// `helm upgrade --install` deployment to a Kubernetes cluster
+    /// (kind, k3s, GKE, EKS, etc.).  Phase 2 Week 14 addition.  See
+    /// `aislang-k8s` crate.
+    ///
+    /// Resource mapping (locked Decisions 43.1-43.8):
+    ///   - LiteLLM / Jaeger / budget_counter → Deployment + Service
+    ///     + (LiteLLM) ConfigMap
+    ///   - `agent` runtime (via `aislang mcp-serve --http`) →
+    ///     Deployment + ClusterIP Service on `deploy.expose.port`
+    ///   - `prompt` blocks → ConfigMaps labelled with their lockfile
+    ///     hash so a body change triggers a rolling restart
+    ///   - `secret` blocks with provider creds → user-provided
+    ///     k8s Secret referenced via envFrom (chart docs the
+    ///     `kubectl create secret generic` recipe)
+    ///   - `deploy.expose.web_ui = true` → Open WebUI Deployment +
+    ///     Service + PVC + opt-in Ingress
+    ///   - `.ais` source + `aislang.lock` baked into an
+    ///     `aislang-project` ConfigMap mounted at /etc/aislang/
+    ///
+    /// `aislang apply` shells out to `helm upgrade --install`;
+    /// `aislang destroy` shells out to `helm uninstall`.  Both
+    /// graceful-degrade when `helm` isn't on PATH (same posture
+    /// as `docker` for `target = compose`).
+    Kubernetes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

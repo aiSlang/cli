@@ -66,6 +66,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aislang-k8s"
+version = "0.2.0-dev"
+dependencies = [
+ "aislang-catalog",
+ "aislang-compose",
+ "aislang-core",
+ "aislang-resolver",
+ "serde",
+ "serde_yaml",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "aislang-resolver"
 version = "0.2.0-dev"
 dependencies = [

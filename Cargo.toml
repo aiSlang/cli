@@ -6,6 +6,7 @@ members = [
     "crates/aislang-catalog",
     "crates/aislang-resolver",
     "crates/aislang-compose",
+    "crates/aislang-k8s",       # Phase 2 Week 14 Mon — K8s emitter
     "crates/aislang-runtime",
 ]
 
@@ -23,6 +24,7 @@ aislang-core     = { path = "crates/aislang-core",     version = "0.2.0-dev" }
 aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.2.0-dev" }
 aislang-resolver = { path = "crates/aislang-resolver", version = "0.2.0-dev" }
 aislang-compose  = { path = "crates/aislang-compose",  version = "0.2.0-dev" }
+aislang-k8s      = { path = "crates/aislang-k8s",      version = "0.2.0-dev" }   # Phase 2 Week 14 Mon
 aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.2.0-dev" }
 
 # External
