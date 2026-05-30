@@ -1,5 +1,4 @@
-//! Per-service Kubernetes resource builders — Phase 2 Week 14 Tue
-//! (Decision 43.2).
+//! Per-service Kubernetes resource builders — Phase 2 Week 14 Tue+Wed.
 //!
 //! Mirrors `aislang-compose::build_litellm_service` / `build_jaeger_
 //! service` / `build_budget_counter_service` — same resolver inputs,
@@ -8,19 +7,29 @@
 //! (ConfigMap when config-file-driven), instead of one Compose
 //! `services:` entry per role.
 //!
-//! ## Mapping summary (Decision 43.2, locked Phase 2 Sunday)
+//! ## Mapping summary (Decisions 43.2 + 43.3 + 43.4, locked Phase 2 Sunday)
 //!
-//! | Compose service   | K8s shape                           | Notes |
-//! |-------------------|-------------------------------------|-------|
-//! | `litellm`         | Deployment + Service + ConfigMap    | Router YAML → CM |
-//! | `jaeger`          | Deployment + Service                | Bundled defaults — no CM |
-//! | `budget_counter`  | Deployment only                     | Placeholder — no incoming traffic |
+//! | Component         | K8s shape                            | When | Notes |
+//! |-------------------|--------------------------------------|------|-------|
+//! | `litellm`         | Deployment + Service + ConfigMap     | Tue  | Router YAML → CM |
+//! | `jaeger`          | Deployment + Service                 | Tue  | Bundled defaults — no CM |
+//! | `budget_counter`  | Deployment only                      | Tue  | Placeholder — no incoming traffic |
+//! | `agent_runtime`   | Deployment + Service + ConfigMap     | Wed  | `aislang mcp-serve --http`; project CM |
+//!
+//! The `agent-runtime` row is Decision 43.3: the same `aislang`
+//! binary published to ghcr.io (Phase 2 Week 14 Mon's image job)
+//! runs in a pod as `aislang mcp-serve --http 0.0.0.0:<expose.port>
+//! /etc/aislang/project.ais`.  Its peer ConfigMap (`aislang-project`,
+//! Decision 43.4) bakes the .ais source + `aislang.lock` + every
+//! `prompt` body into a single mount at `/etc/aislang/`.  Pod-template
+//! annotations carry per-prompt SHA-256 hashes so any body change
+//! shifts the annotation → ReplicaSet rolls out → fresh prompts
+//! without a manual restart.
 //!
 //! ## What's NOT here yet
 //!
-//! - `agent_runtime` Deployment + Service — Wed (Decision 43.3).
 //! - `openwebui` Deployment + Service + PVC + opt-in Ingress — Thu (Decision 43.6).
-//! - The `aislang-project` ConfigMap (`.ais` + lockfile + prompts) — Wed (Decision 43.4).
+//! - Init-container that waits on LiteLLM `/health/liveliness` — Thu.
 
 use crate::k8s_types::*;
 use crate::labels::{aislang_labels, component_selector};
@@ -36,6 +45,29 @@ use std::collections::BTreeMap;
 const LITELLM_IMAGE: &str = "ghcr.io/berriai/litellm:main-stable";
 const JAEGER_IMAGE:  &str = "jaegertracing/all-in-one:latest";
 const BUDGET_COUNTER_IMAGE: &str = "alpine:3.19";
+
+/// Pinned image for the agent-runtime pod — same `aislang` binary
+/// published by Phase 2 Week 14 Mon's release.yml `image` job.
+/// `:latest` here is the v0.2 default; Thu's Helm chart promotes
+/// this to `values.yaml::image.{repository,tag}` so users can
+/// override per-deploy without touching the manifest.
+///
+/// Why `aislang/aislang` even though the actual ghcr owner varies
+/// per-fork: the chart override path is the supported way to point
+/// at a fork's own image; the manifest-only path (`kubectl apply
+/// -f manifests/`) is a power-user fallback that's expected to
+/// `sed -i` the image line.  Decision 43.7: the chart wraps four
+/// templating points (image.tag, ingress.enabled, openwebui.
+/// persistence, litellm.replicas); this is one of them.
+pub const AGENT_RUNTIME_IMAGE: &str = "ghcr.io/aislang/aislang:latest";
+
+/// Default port for the agent-runtime mcp-serve --http binding when
+/// the `deploy { expose { port = N } }` field is absent.  8080 matches
+/// the informational header line `aislang-compose` emits today
+/// (`deploy.<label>.port = 8080`) so behaviour parity holds when a
+/// .ais project switches `target = compose → kubernetes` without
+/// touching `expose`.
+pub const AGENT_RUNTIME_DEFAULT_PORT: u16 = 8080;
 
 // ============================================================================
 // Secret name — user-created (Decision 43.5).
@@ -366,4 +398,294 @@ pub fn build_budget_counter(
             template: pod_template,
         },
     )
+}
+
+// ============================================================================
+// agent-runtime — Deployment + Service (Decision 43.3, Phase 2 Week 14 Wed)
+// ============================================================================
+
+/// Filenames inside the `aislang-project` ConfigMap.  Pinned so the
+/// pod's `--config` / `--lockfile` paths (Wed onward) reference
+/// stable mount points + so `kubectl describe configmap aislang-
+/// project` shows expected keys.
+pub const PROJECT_CM_AIS_KEY:      &str = "project.ais";
+pub const PROJECT_CM_LOCKFILE_KEY: &str = "aislang.lock";
+
+/// Directory where the `aislang-project` ConfigMap mounts inside
+/// the agent-runtime pod.  Pod command: `aislang mcp-serve --http
+/// 0.0.0.0:<port> /etc/aislang/project.ais` (Decision 43.3).
+pub const PROJECT_MOUNT_DIR: &str = "/etc/aislang";
+
+/// Sub-directory inside [`PROJECT_MOUNT_DIR`] where per-prompt body
+/// files land.  One file per `prompt` block keyed by `prompt.label`
+/// (e.g. `/etc/aislang/prompts/system.md`).  The .ais source still
+/// declares prompts by relative path under the user's source dir;
+/// `aislang mcp-serve` doesn't (yet) override the lookup path inside
+/// the pod — that's a v0.3 carry-over (the source's `./prompts/foo
+/// .md` path won't resolve to /etc/aislang/prompts/foo.md by default).
+/// For Wed, the CM keys + mount paths are emitted; rewiring mcp-serve
+/// to consult `/etc/aislang/prompts/` first is tracked as Wed follow-up.
+pub const PROJECT_PROMPTS_SUBDIR: &str = "prompts";
+
+/// Per-prompt pod-template annotation prefix.  K8s pod-templates re-
+/// roll the ReplicaSet whenever any pod-template byte changes, so
+/// stamping `aislang.prompt-hash/<label>: <sha256>` on the template
+/// means a prompt body edit (which shifts the hash in
+/// `ResolvedProject.prompt_hashes`) automatically triggers a
+/// rolling restart on the next `helm upgrade` / `kubectl apply`.
+/// Decision 43.4 in one line of YAML per prompt.
+///
+/// Why per-prompt (not one aggregate hash): `kubectl describe pod
+/// agent-runtime-…` then shows exactly which prompt changed since
+/// last apply.  Operator debuggability over byte-thrift.
+pub const PROMPT_HASH_ANNOTATION_PREFIX: &str = "aislang.prompt-hash/";
+
+/// Annotation for the .ais source + lockfile fingerprint.  Same
+/// rollout-trigger pattern as the per-prompt annotations: any
+/// change to source or lockfile shifts this annotation → fresh
+/// pods.  One annotation key, deterministic SHA-256 of the
+/// concatenated `(.ais source || lockfile)` body.
+pub const PROJECT_HASH_ANNOTATION: &str = "aislang.project-hash";
+
+/// Resolve the agent-runtime listening port from the deploy block.
+/// Returns the user-declared `expose.port` when present, else the
+/// emitter's [`AGENT_RUNTIME_DEFAULT_PORT`] fallback.  Decision
+/// 43.3: `expose.port` finally becomes functional under K8s
+/// (Compose left it as a header comment only because no v0.1
+/// service bound it).
+pub fn agent_runtime_port(resolved: &ResolvedProject, deploy_label: &str) -> u16 {
+    resolved.project.deploys.iter()
+        .find(|d| d.label == deploy_label)
+        .and_then(|d| d.expose.as_ref())
+        .and_then(|e| e.port)
+        .unwrap_or(AGENT_RUNTIME_DEFAULT_PORT)
+}
+
+/// Build the `aislang-project` ConfigMap holding the .ais source +
+/// lockfile + per-prompt bodies (Decision 43.4).
+///
+/// Keys:
+///   - `project.ais`      — full .ais source verbatim
+///   - `aislang.lock`     — lockfile body (empty string if absent —
+///                          `--no-lock` path, or a project that's
+///                          never been `aislang plan`-ed before)
+///   - `<prompt-label>`   — prompt body, one entry per `prompt` block
+///                          (lives under the `prompts/` sub-directory
+///                          via the items[] indirection on the
+///                          ConfigMapVolumeSource — Wed wires that in
+///                          `build_agent_runtime` below)
+///
+/// Determinism: BTreeMap iteration is sorted by key, so the emitted
+/// ConfigMap YAML is byte-stable across plan runs.  Locked Decision
+/// 43 determinism contract — re-running `aislang plan` on unchanged
+/// inputs produces byte-identical artifacts.
+pub fn build_aislang_project_configmap(
+    deploy_label:  &str,
+    ais_source:    &str,
+    lockfile:      Option<&str>,
+    prompt_bodies: &BTreeMap<String, String>,
+) -> ConfigMap {
+    let labels = aislang_labels("agent_runtime", deploy_label);
+    let mut data = BTreeMap::new();
+    data.insert(PROJECT_CM_AIS_KEY.to_string(),      ais_source.to_string());
+    data.insert(PROJECT_CM_LOCKFILE_KEY.to_string(), lockfile.unwrap_or("").to_string());
+    for (label, body) in prompt_bodies {
+        // Prompt-label key.  Mounted as `/etc/aislang/prompts/<label>`
+        // via items[] mapping in build_agent_runtime — see the
+        // VolumeMount sub_path/items dance there.
+        data.insert(label.clone(), body.clone());
+    }
+    ConfigMap::new(
+        ObjectMeta::new("aislang-project", labels),
+        data,
+    )
+}
+
+/// Build the agent-runtime Deployment + Service.  The Deployment
+/// runs the published aiSlang binary as `aislang mcp-serve --http
+/// 0.0.0.0:<port> <PROJECT_MOUNT_DIR>/<PROJECT_CM_AIS_KEY>`; the
+/// Service is a ClusterIP exposing the same port.  envFrom:
+/// secretRef: aislang-providers (Decision 43.5) so the pod can
+/// dial providers via LiteLLM exactly like the in-cluster LiteLLM
+/// can.
+///
+/// Pod-template annotations carry one entry per prompt
+/// (`aislang.prompt-hash/<label>: <sha256>`) plus a single
+/// project-fingerprint annotation (`aislang.project-hash:
+/// <sha256-of-(source||lockfile)>`).  When any of these shift,
+/// K8s creates a new ReplicaSet → rolling restart picks up the
+/// updated ConfigMap content automatically.  Decision 43.4 in
+/// action.
+pub fn build_agent_runtime(
+    resolved:      &ResolvedProject,
+    deploy_label:  &str,
+    ais_source:    &str,
+    lockfile:      Option<&str>,
+) -> (Deployment, Service) {
+    let labels   = aislang_labels("agent_runtime", deploy_label);
+    let selector = component_selector("agent_runtime");
+    let port     = agent_runtime_port(resolved, deploy_label);
+
+    // ── Annotations on the pod template (NOT on the Deployment
+    //    metadata — only pod-template changes trigger rollouts).
+    let mut annotations = BTreeMap::new();
+    for (label, hash) in &resolved.prompt_hashes {
+        annotations.insert(
+            format!("{PROMPT_HASH_ANNOTATION_PREFIX}{label}"),
+            hash.clone(),
+        );
+    }
+    annotations.insert(
+        PROJECT_HASH_ANNOTATION.to_string(),
+        sha256_hex_of_source_and_lockfile(ais_source, lockfile),
+    );
+
+    // ── Volume mounts: aislang-project CM mounted at /etc/aislang.
+    //
+    // items[] selects + remaps keys: `project.ais` + `aislang.lock`
+    // land at the mount root; each `<prompt-label>` key lands inside
+    // the `prompts/` sub-directory.  Without items[], every CM key
+    // (including prompt-label keys) would mount at the root and
+    // overwrite each other if any label happened to be `project.ais`
+    // (unlikely but possible) — explicit remapping is safer + makes
+    // the on-disk layout match the .ais user's intuition.
+    let mut cm_items = vec![
+        KeyToPath {
+            key:  PROJECT_CM_AIS_KEY.to_string(),
+            path: PROJECT_CM_AIS_KEY.to_string(),
+        },
+        KeyToPath {
+            key:  PROJECT_CM_LOCKFILE_KEY.to_string(),
+            path: PROJECT_CM_LOCKFILE_KEY.to_string(),
+        },
+    ];
+    // Sorted iteration over prompt labels for determinism.
+    let mut prompt_labels: Vec<&String> =
+        resolved.prompt_hashes.keys().collect();
+    prompt_labels.sort();
+    for label in prompt_labels {
+        cm_items.push(KeyToPath {
+            key:  label.clone(),
+            path: format!("{PROJECT_PROMPTS_SUBDIR}/{label}"),
+        });
+    }
+
+    // ── Container spec.
+    let container = Container {
+        name:  "agent-runtime".to_string(),
+        image: AGENT_RUNTIME_IMAGE.to_string(),
+        ports: Some(vec![ContainerPort {
+            container_port: port,
+            name:           "mcp-http".to_string(),
+            protocol:       None,
+        }]),
+        // Provider creds via the same Secret LiteLLM uses (Decision
+        // 43.5).  mcp-serve dials providers via LiteLLM but ALSO
+        // takes provider creds directly when running .env-style
+        // fallbacks; keeping the same envFrom posture means a single
+        // Secret update covers both pods.
+        env_from: Some(vec![EnvFromSource {
+            secret_ref:     Some(SecretEnvSource {
+                name:     PROVIDERS_SECRET_NAME.to_string(),
+                optional: None,
+            }),
+            config_map_ref: None,
+        }]),
+        // Optional env tweaks — none needed Wed; Thu may add
+        // OTEL_EXPORTER_OTLP_ENDPOINT when wiring jaeger.
+        env: None,
+        // Default image entrypoint is `aislang`; pass the mcp-serve
+        // subcommand + flags as args.  `--http 0.0.0.0:<port>` binds
+        // on every pod interface so the Service can reach it; the
+        // trailing positional is the .ais source path inside the pod.
+        command: None,
+        args: Some(vec![
+            "mcp-serve".to_string(),
+            "--http".to_string(),
+            format!("0.0.0.0:{port}"),
+            format!("{PROJECT_MOUNT_DIR}/{PROJECT_CM_AIS_KEY}"),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name:       "project".to_string(),
+            mount_path: PROJECT_MOUNT_DIR.to_string(),
+            read_only:  Some(true),
+            // No sub_path here — we want the WHOLE CM mounted as a
+            // directory at /etc/aislang/, with items[] selecting
+            // which keys appear and where.
+            sub_path:   None,
+        }]),
+    };
+
+    let pod_template = PodTemplate {
+        metadata: ObjectMeta {
+            name:        String::new(),
+            namespace:   None,
+            labels:      labels.clone(),
+            annotations,
+        },
+        spec: PodSpec {
+            containers: vec![container],
+            volumes:    Some(vec![Volume {
+                name:                    "project".to_string(),
+                config_map:              Some(ConfigMapVolumeSource {
+                    name:  "aislang-project".to_string(),
+                    items: Some(cm_items),
+                }),
+                persistent_volume_claim: None,
+            }]),
+            init_containers: None,
+        },
+    };
+
+    let deployment = Deployment::new(
+        ObjectMeta::new("agent-runtime", labels.clone()),
+        DeploymentSpec {
+            replicas: 1,
+            selector: LabelSelector { match_labels: selector.clone() },
+            template: pod_template,
+        },
+    );
+
+    let service = Service::new(
+        ObjectMeta::new("agent-runtime", labels),
+        ServiceSpec {
+            selector,
+            ports: vec![ServicePort {
+                port,
+                target_port: "mcp-http".to_string(),
+                name:        "mcp-http".to_string(),
+                protocol:    None,
+            }],
+            type_: None,                                  // = ClusterIP
+        },
+    );
+
+    (deployment, service)
+}
+
+/// SHA-256 of `<.ais source>||<lockfile-or-empty>` rendered as hex.
+/// Drives the `aislang.project-hash` pod-template annotation —
+/// any byte change in either input shifts the hash → ReplicaSet
+/// rolls out.  Same `sha2` crate the resolver uses for prompt
+/// hashing (shared dep transitively via aislang-resolver).
+fn sha256_hex_of_source_and_lockfile(ais_source: &str, lockfile: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ais_source.as_bytes());
+    // `||` separator keeps source + lockfile unambiguously
+    // distinguishable from a single concatenated string when the
+    // hash is reverse-debugged.  Two pipe chars are unlikely in
+    // .ais bodies (comments could carry them, but the separator
+    // doesn't need to be input-free — it just needs to be present
+    // when we KNOW what to look for).
+    h.update(b"||");
+    if let Some(l) = lockfile {
+        h.update(l.as_bytes());
+    }
+    let bytes = h.finalize();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }

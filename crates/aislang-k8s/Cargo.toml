@@ -24,3 +24,9 @@ aislang-compose  = { workspace = true }
 serde            = { workspace = true }
 serde_yaml       = { workspace = true }
 thiserror        = { workspace = true }
+# Phase 2 Week 14 Wed: agent-runtime pod-template carries a
+# `aislang.project-hash` annotation = SHA-256 of (.ais source ||
+# lockfile body) — drives ReplicaSet rollouts on any input
+# change (Decision 43.4).  Same `sha2` workspace dep that
+# aislang-resolver uses for prompt-body hashing.
+sha2             = { workspace = true }
