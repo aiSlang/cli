@@ -70,6 +70,33 @@ After `aislang apply`, browse to **http://localhost:3000**, sign up (local SQLit
 
 `aislang destroy` runs `docker compose down -v` which wipes the `openwebui-data` named volume; chat history + local accounts go away alongside the rest of the stack.
 
+### MCP integration — drive aiSlang from Claude Desktop / Cursor (v0.2 Thu, Track A)
+
+`aislang mcp-serve` exposes the whole CLI surface as an MCP server, so MCP-aware LLM hosts can author, deploy, and chat with .ais agents without you touching a terminal.
+
+**Claude Desktop one-time setup** — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent on Linux/Windows:
+
+```json
+{
+  "mcpServers": {
+    "aislang": {
+      "command": "aislang",
+      "args": ["mcp-serve", "--stdio"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The aislang tools appear under the 🔌 icon. Try:
+
+- *"Validate /path/to/my.ais"* → calls `aislang_validate`, shows source-aware diagnostics.
+- *"Apply the support-agent stack at examples/support-agent.ais"* → calls `aislang_apply` (Claude Desktop renders the destructive-hint confirmation dialog before bringing up the Compose stack).
+- *"Run a chat turn against the support agent — ask it: what's the return policy?"* → calls `aislang_chat_turn` → progress notifications (week 13 Wed) render as the tool-use iterations unfold → final reply lands as the tool's response.
+
+This is the **principal-pattern demo**: Claude Desktop is the orchestrator (`pattern = orchestrator`), the deployed agent (`agent "support"`) is one of its tools, mcp-serve glues them. The `main` block in your .ais source declares this topology explicitly (week 12 Fri); `aislang status --main-spend` (week 13 Thu) surfaces the cost-split between the host LLM's tokens and the deployed agents' tokens.
+
+For HTTP-MCP hosts (k8s deployments, ChatGPT-with-MCP, custom rmcp clients): `aislang mcp-serve --http 0.0.0.0:8080` mounts the same toolset at `http://host:8080/mcp` (week 13 Mon).
+
 ### Observability
 
 Every `aislang chat` and `aislang eval` invocation emits OpenTelemetry traces over OTLP/HTTP to the bundled Jaeger sidecar (`localhost:16686`). The trace tree mirrors the chat loop's structure — each user turn becomes one `aislang.turn` span, the tool-use loop fans out into `tool_use_iteration[N]` spans, and each iteration carries one `chat <model>` LLM call + zero-or-more `mcp <server>.<tool>` dispatch spans. Attributes follow the [OTel-GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, …) plus our own `mcp.*` namespace for tool calls (sizes only, never argument content — PII-safe by construction).

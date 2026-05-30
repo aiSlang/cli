@@ -69,11 +69,38 @@ pub struct DayEntry {
     /// `by_model`; `aislang status --spend` reads from `micro_units`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_model: BTreeMap<String, i64>,
+    /// **Week 13 Thu addition — per-`main`-block spend.**
+    ///
+    /// Keys are `main` block labels (e.g. `"support_orchestrator"`).
+    /// Parallel to `by_model`, but tracks tokens spent by the
+    /// user-facing principal LLM declared in the .ais source via
+    /// `main "X" { … }`.  Sums DO NOT contribute to `micro_units`
+    /// when the main's `model.source = subscription` (no API charge);
+    /// for `source = api` mains the contribution is identical to
+    /// `by_model`.
+    ///
+    /// **v0.2 status: schema-only.**  Auto-recording requires v0.3's
+    /// OpenAI-compat adapter for `aislang mcp-serve` — until then the
+    /// host chat app's inference path bypasses every aislang
+    /// instrumentation point, so this map only fills via a
+    /// dedicated MCP tool (added in a Thu follow-up if it ships).
+    /// `aislang status --main-spend` reads from this field and
+    /// surfaces an empty-state hint pointing at the v0.3 carry-over.
+    ///
+    /// Same `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
+    /// posture as `by_model`: forward-compat with v0.1 / v0.2-pre-Thu
+    /// files, byte-stable serialization when no main spend is recorded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_main: BTreeMap<String, i64>,
 }
 
 impl Default for DayEntry {
     fn default() -> Self {
-        Self { micro_units: 0, by_model: BTreeMap::new() }
+        Self {
+            micro_units: 0,
+            by_model:    BTreeMap::new(),
+            by_main:     BTreeMap::new(),    // week 13 Thu
+        }
     }
 }
 
@@ -164,6 +191,31 @@ impl SpendTracker {
         let Some(p) = f.projects.get(&self.project_name) else { return BTreeMap::new(); };
         let Some(e) = p.get(&day)                        else { return BTreeMap::new(); };
         e.by_model.iter()
+            .map(|(k, &mu)| (k.clone(), Money::Capped {
+                currency: Currency::Usd,
+                micro_units: mu,
+            }))
+            .collect()
+    }
+
+    /// Per-`main`-block breakdown of today's spend (week 13 Thu).
+    /// Parallel to [`today_by_model`] but reads from `DayEntry.by_main`.
+    /// Empty map when no main-spend has been recorded today.
+    ///
+    /// **v0.2 status (week 13 Thu):** schema + read-side only.  No
+    /// callsite writes to `by_main` yet — the host chat app's
+    /// inference path (Claude Desktop, Cursor) is invisible to
+    /// aislang.  Filling this map automatically requires v0.3's
+    /// OpenAI-compatible adapter for `aislang mcp-serve` (see PLAN
+    /// v0.3 carry-overs).  Until then the accessor returns
+    /// `BTreeMap::new()` and `aislang status --main-spend` surfaces
+    /// an empty-state hint.
+    pub fn today_by_main(&self) -> BTreeMap<String, Money> {
+        let day = utc_today();
+        let f   = self.file.lock().expect("spend file mutex");
+        let Some(p) = f.projects.get(&self.project_name) else { return BTreeMap::new(); };
+        let Some(e) = p.get(&day)                        else { return BTreeMap::new(); };
+        e.by_main.iter()
             .map(|(k, &mu)| (k.clone(), Money::Capped {
                 currency: Currency::Usd,
                 micro_units: mu,
@@ -661,12 +713,50 @@ mod tests {
         // as `"by_model":{}` — that'd inflate every entry forever once
         // we ship the schema. `#[serde(skip_serializing_if = "BTreeMap::is_empty")]`
         // is what makes this work; the test pins the policy.
-        let entry = DayEntry { micro_units: 12, by_model: BTreeMap::new() };
+        let entry = DayEntry {
+            micro_units: 12,
+            by_model: BTreeMap::new(),
+            by_main:  BTreeMap::new(),
+        };
         let s = serde_json::to_string(&entry).unwrap();
         assert!(!s.contains("by_model"),
             "empty by_model must be omitted from JSON; got: {s}");
+        // v0.2 Thu addition: same policy must apply to `by_main`.
+        assert!(!s.contains("by_main"),
+            "empty by_main must be omitted from JSON; got: {s}");
         assert!(s.contains("\"micro_units\":12"),
             "micro_units must still serialise normally: {s}");
+    }
+
+    #[test] fn day_entry_v1_file_without_by_main_loads_cleanly() {
+        // Week 13 Thu addition: just as v0.1 files lack `by_model`
+        // and load cleanly via `#[serde(default)]`, v0.2-pre-Thu
+        // files lack `by_main` and must also load cleanly without
+        // a schema_version bump.  Forward-compat regression guard.
+        let s = r#"{"micro_units":42,"by_model":{"openai.gpt_4o":42}}"#;
+        let entry: DayEntry = serde_json::from_str(s)
+            .expect("v0.2-pre-Thu shape must deserialize");
+        assert_eq!(entry.micro_units, 42);
+        assert_eq!(entry.by_model.len(), 1);
+        assert!(entry.by_main.is_empty(),
+            "by_main must default to empty when absent from JSON; got {entry:?}");
+    }
+
+    #[test] fn day_entry_v0_2_thu_full_shape_round_trips() {
+        // The full week-13-Thu shape with by_main populated must
+        // round-trip cleanly through serde + preserve every field.
+        let entry = DayEntry {
+            micro_units: 5_000,
+            by_model:    [("anthropic.claude_haiku_4_5".to_string(), 5_000)]
+                .into_iter().collect(),
+            by_main:     [("support_orchestrator".to_string(), 1_200)]
+                .into_iter().collect(),
+        };
+        let s    = serde_json::to_string(&entry).unwrap();
+        assert!(s.contains("\"by_main\""),
+            "populated by_main must serialise as `by_main`: {s}");
+        let back: DayEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, entry);
     }
 
     // ---- utc_rfc3339_from_epoch_secs (pure, system-clock-free) ----

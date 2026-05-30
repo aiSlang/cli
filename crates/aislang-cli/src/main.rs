@@ -139,7 +139,10 @@ enum Command {
     /// With no flags: renders stack status (state file + docker compose
     /// ps). With `--spend`: appends today's UTC total. With
     /// `--model-spend [MODEL]`: appends today's by-model breakdown,
-    /// optionally filtered to one model id.
+    /// optionally filtered to one model id.  With `--main-spend`
+    /// (week 13 Thu): appends today's by-`main`-block breakdown
+    /// (currently empty pending v0.3's OpenAI-compat adapter that
+    /// would auto-record principal-LLM tokens).
     ///
     /// Exit codes (Decision 28):
     ///   0  stack matches state (or no flags + state present + applied_at Some)
@@ -159,6 +162,20 @@ enum Command {
               num_args = 0..=1, default_missing_value = "",
               require_equals = true)]
         model_spend: Option<String>,
+        /// Append today's by-`main`-block spend breakdown — the
+        /// principal-LLM side of the Track-A2 cost model.  Week 13
+        /// Thu adds the schema + read path; auto-recording requires
+        /// v0.3's OpenAI-compat `mcp-serve` adapter (until then the
+        /// section reports an empty state + the v0.3 carry-over
+        /// pointer, same shape `--model-spend` uses for Open-WebUI
+        /// users whose chats bypass the SpendTracker).
+        ///
+        /// Source-conditional output: `main` entries whose declared
+        /// `model.source = subscription` render `subscription
+        /// (no API charge)` instead of a dollar amount; `source = api`
+        /// entries render the same way as `--model-spend`.
+        #[arg(long = "main-spend")]
+        main_spend: bool,
     },
     /// Open a CLI chat session against a deployed agent
     ///
@@ -251,8 +268,8 @@ fn run() -> Result<ExitCode> {
         Command::Destroy { file, force } => run_destroy(file, force).map(|_| ExitCode::SUCCESS)?,
         Command::Eval { eval_label, file } => run_eval(eval_label, file).map(|_| ExitCode::SUCCESS)?,
         Command::Cost { file }       => run_cost(file).map(|_| ExitCode::SUCCESS)?,
-        Command::Status { file, spend, model_spend } =>
-            run_status(file, spend, model_spend)?,
+        Command::Status { file, spend, model_spend, main_spend } =>
+            run_status(file, spend, model_spend, main_spend)?,
         Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
         Command::McpServe { stdio, http } =>
             run_mcp_serve(stdio, http).map(|_| ExitCode::SUCCESS)?,
@@ -1451,7 +1468,7 @@ fn run_cost(file: PathBuf) -> Result<()> {
 //      shows services down
 //   2  docker unavailable when a stack check was attempted
 
-fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result<ExitCode> {
+fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>, main_spend: bool) -> Result<ExitCode> {
     // Validate so the user sees the same diagnostics as `aislang validate`
     // when the source is broken. Status is rare; the parse cost is
     // immaterial.
@@ -1591,6 +1608,64 @@ fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result
         }
     }
 
+    // ── Section 4: --main-spend breakdown (week 13 Thu) ────────
+    //
+    // Reads `~/.aislang/spend.json`'s `by_main` map for today and
+    // renders one line per declared `main` block.  Source-conditional
+    // formatting: `model.source = subscription` mains render
+    // `subscription (no API charge)`; `source = api` mains render
+    // the dollar amount.
+    //
+    // When the file's `by_main` map is empty AND the project declares
+    // at least one main block, surface a hint pointing at the v0.3
+    // OpenAI-compat adapter carry-over — same posture as Tue's
+    // --model-spend hint for Open WebUI users.
+    if main_spend {
+        let tracker = aislang_runtime::SpendTracker::open_default(&project.name)
+            .map_err(|e| anyhow::anyhow!("open spend tracker: {e}"))?;
+        let by_main = tracker.today_by_main();
+        println!();
+        println!("spend by main ({} UTC):", aislang_runtime::spend::utc_today());
+        if project.mains.is_empty() {
+            println!("  (no `main` blocks declared in this project)");
+        } else {
+            // Always walk declared mains in source order — even when
+            // by_main is empty, the per-main line communicates the
+            // source kind (subscription vs api) so the user can see
+            // at a glance which entries WILL incur API charges once
+            // the v0.3 OpenAI-compat adapter starts recording them.
+            let pad = project.mains.iter()
+                .map(|m| m.label.len()).max().unwrap_or(0);
+            for main in &project.mains {
+                let amount = by_main.get(&main.label);
+                let source = resolved_main_source(&project, main);
+                match (amount, source) {
+                    (Some(a), MainSourceKind::Api) =>
+                        println!("  {:<pad$}  {}",
+                            main.label, aislang_runtime::format_money(a)),
+                    (Some(a), MainSourceKind::Subscription) =>
+                        println!("  {:<pad$}  subscription (no API charge; \
+                                 tracked tokens-only: {} equivalent)",
+                            main.label, aislang_runtime::format_money(a)),
+                    (None, MainSourceKind::Api) =>
+                        println!("  {:<pad$}  (no spend recorded today)",
+                            main.label),
+                    (None, MainSourceKind::Subscription) =>
+                        println!("  {:<pad$}  subscription (no API charge)",
+                            main.label),
+                }
+            }
+            // When NONE of the declared mains have recorded spend,
+            // surface the v0.3-direction hint at the bottom (same
+            // posture --model-spend uses for the empty-spend case).
+            // Skipped when at least one main HAS recorded spend —
+            // the per-main lines speak for themselves there.
+            if by_main.is_empty() {
+                print_main_spend_empty_hint(&project);
+            }
+        }
+    }
+
     // ── Exit code resolution ───────────────────────────────────
     // Decision 28: 0/1/2. Docker-unavailable takes precedence over
     // generic drift — the user needs to fix docker before drift
@@ -1602,6 +1677,65 @@ fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>) -> Result
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Discriminator for `main` block source kinds, used by the
+/// `--main-spend` formatter (week 13 Thu).  The .ais grammar
+/// declares `model.source = subscription | api` on the model the
+/// main block points at; we resolve it once per main during
+/// status rendering so the dispatch table above stays terse.
+enum MainSourceKind { Api, Subscription }
+
+/// Resolve a main block's source kind by walking back to its
+/// model reference + reading the model's `source` field.  Used
+/// only by the status renderer (CLI cosmetic), so we tolerate
+/// the unlikely "model ref doesn't resolve" case by defaulting
+/// to Api (the v0.1-equivalent behaviour) rather than erroring.
+fn resolved_main_source(
+    project: &aislang_core::ast::Project,
+    main:    &aislang_core::ast::Main,
+) -> MainSourceKind {
+    use aislang_core::types::ModelSource;
+    project.models.iter()
+        .find(|m| m.label == main.model.label)
+        .map(|m| match m.source {
+            ModelSource::Subscription => MainSourceKind::Subscription,
+            ModelSource::Api          => MainSourceKind::Api,
+        })
+        .unwrap_or(MainSourceKind::Api)
+}
+
+/// Print a hint when `--main-spend` is empty but the project has
+/// declared `main` blocks.  Same UX shape as the `--model-spend`
+/// Open-WebUI hint (Tue follow-up) — explains why a user who
+/// expected to see their principal-LLM's token spend isn't seeing
+/// it, and points at the v0.3 OpenAI-compat adapter carry-over
+/// that closes the gap.
+///
+/// Quiet when the project has no main blocks (handled by the
+/// caller via `if project.mains.is_empty()` short-circuit).
+fn print_main_spend_empty_hint(project: &aislang_core::ast::Project) {
+    use aislang_core::types::ModelSource;
+    let has_subscription = project.mains.iter().any(|m| {
+        project.models.iter()
+            .find(|mm| mm.label == m.model.label)
+            .map(|mm| matches!(mm.source, ModelSource::Subscription))
+            .unwrap_or(false)
+    });
+    println!();
+    println!("  note: v0.2's SpendTracker only records spend that flowed through");
+    println!("        `aislang chat` / `aislang mcp-serve`'s chat_turn or eval tools.");
+    if has_subscription {
+        println!("        Subscription-source `main` entries (Claude Pro, Cursor Team) by");
+        println!("        design have no API cost — the empty-state above is correct for them.");
+        println!("        Token-count observability for subscription mains requires v0.3's");
+    } else {
+        println!("        Principal-LLM inference happens inside the host chat app (Claude");
+        println!("        Desktop, Cursor, etc.); aislang has no visibility into those tokens.");
+        println!("        Closing this gap requires v0.3's");
+    }
+    println!("        OpenAI-compatible adapter for `aislang mcp-serve` (see PLAN");
+    println!("        v0.3 carry-overs for the design sketch).");
 }
 
 /// Print a hint about the v0.2 spend-tracking gap when the project
