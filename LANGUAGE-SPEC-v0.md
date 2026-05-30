@@ -1,12 +1,12 @@
 # aiSlang Language Specification — v0 (v0.1 baseline + v0.2 additions)
 
-Status: **Authoritative for the v0.2 compiler.** The v0.1 baseline is frozen; v0.2 additions are purely additive and forward-compatible (any valid v0.1 file remains valid under v0.2 with identical typed-AST output — see §7).
+Status: **Authoritative for v0.2.0-rc1** (Phase 1 close — Week 13 Fri).  The v0.1 baseline is frozen; v0.2 additions are forward-compatible at the AST level (any valid v0.1 file produces an AST that v0.2 deserialises identically — see §7) and mostly purely-additive at the source level.  One controlled grammar break in v0.2 Tue: see §4.9.
 
-This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run, **plus** the v0.2 grammar extensions that came in via Phase 1 Week 12 Fri:
+This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run, **plus** the v0.2 grammar additions that landed in Phase 1:
 
-- New `main { … }` block — declares the user-facing LLM as first-class topology (planning-doc Track A architectural decision #7).
-- New `model.source = subscription | api` enum — opt-in declaration that a model's inference path lives in the host chat app's subscription tier (not LiteLLM).
-- Three new closed enums in §3.4: `Pattern` (6 variants), `ChatClient` (5 variants), `ModelSource` (2 variants).
+- **Week 12 Fri.**  New `main { … }` block — declares the user-facing LLM as first-class topology (planning-doc Track A architectural decision #7).  New `model.source = subscription | api` enum — opt-in declaration that a model's inference path lives in the host chat app's subscription tier (not LiteLLM).  Three new closed enums in §3.4: `Pattern` (6 variants), `ChatClient` (5 variants), `ModelSource` (2 variants).
+- **Week 13 Tue (Track A2).**  `deploy.expose` promoted from attribute (`expose = { port = N }`, v0.1) to nested block (`expose { port = N  web_ui = true }`, v0.2) — see §4.9.  New `web_ui: Bool?` field opt-ins an Open WebUI Compose sidecar.  Grammar break against v0.1; parser surfaces a migration hint for the legacy form.  Phase-1-pre-public-launch break per Decision 34 — no v0.1 users to migrate.
+- **Week 13 Tue follow-up.**  `prefer / fallback` resolver semantics changed to match LANGUAGE-SPEC §6 prose exactly: `prefer` is now an ORDERED preference list (walked in declared order; first satisfier wins).  `fallback` only used when no `prefer` candidate satisfies constraints.  `optimize_for = cost | latency` no longer re-orders the walk — became informational at the resolver layer (kept on the AST as a v0.3+ hint for multi-row catalog matches).  v0.1 behaviour where `optimize_for = cost` silently overrode `prefer` is gone — see §6 for the pseudocode + the behaviour-change note.
 
 Anything not described here is out of scope for v0.2.
 
