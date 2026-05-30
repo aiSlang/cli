@@ -16,3 +16,5 @@ router_settings:
   - fast:
     - fast-fb-openai-gpt-4o-mini
     - fast-fb-ollama-llama-3-1-8b
+  - fast-fb-openai-gpt-4o-mini:
+    - fast-fb-ollama-llama-3-1-8b

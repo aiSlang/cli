@@ -2,7 +2,7 @@
 
 > Declarative infrastructure for AI projects. One file describes your agents, models, prompts, MCP servers, evals, budgets, and deployment — `aislang apply` ships it.
 
-**Status:** pre-v0.1 (scaffolding). See [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the roadmap and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
+**Status:** v0.2.0-rc1 (Phase 1 close — internal milestone). See [PLAN-90-days-v0_2.md](PLAN-90-days-v0_2.md) for the v0.2 plan, [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the v0.1 archive, and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
 
 ## Quick taste
 
@@ -11,9 +11,26 @@ project "support-agent" {
   budget {
     hard_cap_per_day = $50
     hard_cap_per_run = $0.50
-    optimize_for     = cost
+    optimize_for     = cost     # v0.2 Tue follow-up: informational hint;
+                                # resolver walks `prefer` in declared order
+                                # — see LANGUAGE-SPEC §6
   }
 
+  # The strategic / orchestration model — declared with `source =
+  # subscription` so its tokens go through the user's Claude Pro or
+  # Cursor Team subscription, NOT the API.  Cost-saving angle of the
+  # v0.2 commercial moat: the expensive top-of-funnel reasoning lives
+  # on a subscription tier; only deployed agents hit the per-token API.
+  model "thinker" {
+    requires    = [chat]
+    context_min = 200k
+    prefer      = [anthropic.claude_sonnet_4_6]
+    source      = subscription          # v0.2 Week 12 Fri
+  }
+
+  # The deployed-agent model — fast + cheap + concrete-tool-using.
+  # `source = api` (default) → routed through LiteLLM, hard budget cap
+  # enforced at runtime via `~/.aislang/spend.json`.
   model "fast" {
     requires    = [chat, tool_use]
     context_min = 32k
@@ -22,10 +39,33 @@ project "support-agent" {
     fallback    = [ollama.llama_3_1_8b]
   }
 
+  # v0.2 Week 12 Fri: `main` block declares the user-facing LLM that
+  # ORCHESTRATES the deployed agents (Claude Desktop / Cursor / etc.).
+  # `pattern = orchestrator` is one of six closed patterns.  `aislang
+  # status --main-spend` (Week 13 Thu) surfaces this entry's spend
+  # alongside the deployed-agent cost.
+  main "support_orchestrator" {
+    model         = model.thinker
+    chat_client   = claude_desktop
+    pattern       = orchestrator
+    system_prompt = prompt.system
+  }
+
   agent "support" {
     model         = model.fast
     system_prompt = prompt.system
     tools         = [mcp_server.docs]
+  }
+
+  # v0.2 Week 13 Tue (Track A2): `expose { web_ui = true }` brings up an
+  # Open WebUI sidecar at http://localhost:3000 wired to the in-stack
+  # LiteLLM — browser chat for users without an MCP-aware client.
+  deploy "local" {
+    target = compose
+    expose {
+      port   = 8080      # informational; future agent-runtime port
+      web_ui = true      # → http://localhost:3000 after `aislang apply`
+    }
   }
 
   # ...
