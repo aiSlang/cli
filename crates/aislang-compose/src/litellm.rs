@@ -172,6 +172,26 @@ pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
         }
 
         if !fallback_aliases.is_empty() {
+            // (c) Primary's fallback chain: walk every alternate in
+            //     declared order.  v0.2 Wed follow-up: ALSO register a
+            //     cascade chain for each fb alias itself, pointing at
+            //     the rest of the tail.  Without this, picking
+            //     `fast-fb-openai-gpt-4o-mini` from Open WebUI's
+            //     dropdown surfaces a raw 401 from OpenAI when the
+            //     key is missing — there's no router-level fallback
+            //     to drop down to the next alternate.  Surfaced by
+            //     live Open WebUI testing.
+            //
+            // The chain is strict tail-of-list: alias[i] falls back
+            // to alias[i+1..].  Last alias gets no entry (no tail to
+            // cascade into).  Output stays diff-stable because the
+            // entries land in `fallback_pairs` keyed by alias name,
+            // and the outer BTreeMap sorts alphabetically.
+            for i in 0..fallback_aliases.len().saturating_sub(1) {
+                let alias_at_i  = fallback_aliases[i].clone();
+                let tail: Vec<String> = fallback_aliases[i + 1 ..].to_vec();
+                fallback_pairs.insert(alias_at_i, tail);
+            }
             fallback_pairs.insert(label.clone(), fallback_aliases);
         }
     }
@@ -826,6 +846,133 @@ mod tests {
                 "primary (haiku via anthropic) must not appear in own \
                  fallback list; got alias `{alias}`");
         }
+    }
+
+    // ── Wed follow-up: per-fb-alias cascade chains ───────────────
+    //
+    // Surfaced by live Open WebUI testing: explicitly picking
+    // `fast-fb-openai-gpt-4o-mini` from the dropdown without an
+    // OPENAI_API_KEY surfaced a raw 401 because LiteLLM had no
+    // fallback chain registered for that alias itself.  Fix: each
+    // fb alias registers the REMAINING TAIL of the chain as its
+    // own fallback, so dropping into a fallback model still
+    // cascades to the next-best on failure.
+
+    #[test] fn each_fb_alias_cascades_to_remaining_tail() {
+        // Demo prefer = [haiku, gpt-4o-mini], fallback = [llama3].
+        // After v0.2 Tue resolver fix, primary = haiku.  fb chain:
+        //   fast → [fast-fb-openai-gpt-4o-mini, fast-fb-ollama-llama-3-1-8b]
+        //   fast-fb-openai-gpt-4o-mini → [fast-fb-ollama-llama-3-1-8b]
+        //   (last alias has no tail → no entry)
+        let (resolved, catalog) = resolve_demo();
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        let router = cfg.router_settings.as_ref()
+            .expect("router_settings must be present for demo");
+
+        // Primary's full chain.
+        let fast_fb = find_fallbacks(router, "fast").unwrap();
+        assert_eq!(fast_fb, &vec![
+            "fast-fb-openai-gpt-4o-mini".to_string(),
+            "fast-fb-ollama-llama-3-1-8b".to_string(),
+        ]);
+
+        // Middle alias's tail (just the last alias).
+        let mid_fb = find_fallbacks(router, "fast-fb-openai-gpt-4o-mini")
+            .expect("middle fb alias must have its own cascade entry");
+        assert_eq!(mid_fb, &vec![
+            "fast-fb-ollama-llama-3-1-8b".to_string(),
+        ]);
+
+        // Last alias has no tail → no entry.
+        assert!(find_fallbacks(router, "fast-fb-ollama-llama-3-1-8b").is_none(),
+            "last fb alias has no tail; must NOT appear as a fallbacks key");
+    }
+
+    #[test] fn three_alternates_emit_three_cascade_entries() {
+        // Synthetic project with 4-deep alternate chain to pin the
+        // per-i loop's correctness:
+        //   prefer   = [A, B, C]
+        //   fallback = [D]
+        // → primary = A (the test catalog ranks A first satisfier)
+        // → fb chain = [B, C, D]
+        // Cascade entries:
+        //   A   → [B, C, D]
+        //   B   → [C, D]      ← per-fb cascade #1
+        //   C   → [D]         ← per-fb cascade #2
+        //   D   → (no entry)
+        use aislang_core::ast::Project;
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_haiku_4_5,
+                               openai.gpt_4o_mini,
+                               anthropic.claude_sonnet_4_6]
+                fallback    = [ollama.llama_3_1_8b]
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
+            .expect("resolve");
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        let router = cfg.router_settings.as_ref().expect("router_settings");
+
+        // primary = haiku (prefer[0]); tail = [gpt-4o-mini, sonnet, llama]
+        let m_chain = find_fallbacks(router, "m").unwrap();
+        assert_eq!(m_chain.len(), 3, "primary cascade should have 3 alternates");
+
+        // First fb alias's cascade should drop the first item.
+        let first_fb_chain = find_fallbacks(router, &m_chain[0])
+            .expect("first fb alias should have a tail cascade");
+        assert_eq!(first_fb_chain, &m_chain[1..].to_vec());
+
+        // Second fb alias.
+        let second_fb_chain = find_fallbacks(router, &m_chain[1])
+            .expect("second fb alias should have a tail cascade");
+        assert_eq!(second_fb_chain, &m_chain[2..].to_vec());
+
+        // Last fb alias → no entry (no tail).
+        assert!(find_fallbacks(router, &m_chain[2]).is_none(),
+            "last fb alias `{}` must NOT have a cascade entry", m_chain[2]);
+
+        // Suppress unused import warning when this file is built
+        // standalone (Project is referenced via the validate() return).
+        let _ = std::any::TypeId::of::<Project>();
+    }
+
+    #[test] fn single_alternate_does_not_emit_self_cascade_entry() {
+        // One-deep alternate chain: prefer = [haiku], fallback = [llama]
+        // → primary = haiku, fb chain = [llama]
+        // Cascade entries:
+        //   primary → [llama]
+        //   llama   → (no entry — only fb alias, no tail)
+        // Pins that the for-loop's `saturating_sub(1)` correctly
+        // handles the boundary (no off-by-one emitting an empty
+        // cascade entry).
+        let src = r#"project "p" {
+            budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+            model "m" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [anthropic.claude_haiku_4_5]
+                fallback    = [ollama.llama_3_1_8b]
+            }
+        }"#;
+        let (project, _) = aislang_core::validate(src).expect("validate");
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = aislang_resolver::resolve(&project, &catalog, &examples_dir())
+            .expect("resolve");
+        let cfg = build_config(&resolved, &catalog).expect("build");
+        let router = cfg.router_settings.as_ref().expect("router_settings");
+
+        let primary_chain = find_fallbacks(router, "m").unwrap();
+        assert_eq!(primary_chain.len(), 1);
+        let only_fb = &primary_chain[0];
+        assert!(find_fallbacks(router, only_fb).is_none(),
+            "single-alternate chain must NOT register a self-cascade \
+             entry for its only fb alias; got fallbacks for `{only_fb}`");
     }
 
     #[test] fn fallback_alias_scheme_format() {
