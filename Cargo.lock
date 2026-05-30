@@ -76,6 +76,7 @@ dependencies = [
  "aislang-resolver",
  "serde",
  "serde_yaml",
+ "sha2",
  "thiserror 1.0.69",
 ]
 

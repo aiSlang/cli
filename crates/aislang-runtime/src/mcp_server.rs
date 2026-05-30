@@ -2819,30 +2819,60 @@ mod tests {
     /// PATH clobber: force `docker_on_path()` to return false.  Used
     /// in tests that exercise the no-docker graceful-degrade paths
     /// without needing a real docker daemon.
-    struct PathGuard(Option<std::ffi::OsString>);
+    ///
+    /// **Serialization** (Phase 2 Week 14 Wed fix-up): `PATH` is a
+    /// process-global env var; cargo runs `#[tokio::test]` tests in
+    /// parallel by default; without a mutex, one test's `Drop`-time
+    /// `set_var("PATH", prev)` could restore `PATH` to a docker-
+    /// containing value WHILE a sibling test's `apply()` call was
+    /// running, letting `docker compose up -d` actually succeed —
+    /// state.json then existed when the no-docker test asserted it
+    /// shouldn't.  Surfaced on GitHub CI as the flaky
+    /// `apply_writes_artifacts_then_graceful_degrade_without_docker`
+    /// failure.  Local runs usually serialized far enough by chance
+    /// to mask the race; the cloud runner's higher contention exposed
+    /// it.
+    ///
+    /// Fix: every `PathGuard::no_docker()` acquires the process-wide
+    /// `PATH_LOCK` Mutex BEFORE mutating PATH and holds it until
+    /// drop.  All PathGuard-using tests serialize against each
+    /// other; tests that don't touch PATH stay parallel.  Mutex
+    /// poisoning is tolerated (.unwrap_or_else(into_inner)) because
+    /// a panicking test still wants the next test to make progress
+    /// with a fresh PATH state.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct PathGuard {
+        // `MutexGuard<'static, ()>` — held until the test function
+        // exits, so the next `PathGuard::no_docker()` blocks until
+        // this one's `Drop::drop` runs the PATH restoration first.
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev:  Option<std::ffi::OsString>,
+    }
     impl PathGuard {
         fn no_docker() -> Self {
+            // Tolerate Mutex poisoning — a panicking test still
+            // wants the next test to make progress with a sensible
+            // PATH state, not deadlock.
+            let lock = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("PATH");
-            // SAFETY: tests run in cargo's default single-thread
-            // ordering per #[tokio::test] only when --test-threads=1;
-            // workspace tests already use the default multi-thread.
-            // We accept the (small) chance of cross-test PATH races
-            // by using a per-test guard that restores on drop —
-            // matches the v0.1 cli_apply_destroy tempdir pattern.
-            // For full isolation, future v0.3 work could pull docker
-            // detection behind a trait + a test seam.
+            // SAFETY: lock acquired; no other PathGuard test can
+            // observe or mutate PATH until our Drop releases it.
             unsafe { std::env::set_var("PATH", "/nonexistent-aislang-mcp-test-path"); }
-            Self(prev)
+            Self { _lock: lock, prev }
         }
     }
     impl Drop for PathGuard {
         fn drop(&mut self) {
+            // SAFETY: lock still held; restore PATH atomically with
+            // respect to other PathGuard-using tests.
             unsafe {
-                match &self.0 {
+                match &self.prev {
                     Some(v) => std::env::set_var("PATH", v),
                     None    => std::env::remove_var("PATH"),
                 }
             }
+            // `_lock` drops after this; the next PathGuard
+            // observer sees PATH in its pre-test state.
         }
     }
 

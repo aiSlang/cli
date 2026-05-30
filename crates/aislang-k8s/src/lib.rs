@@ -121,9 +121,50 @@ pub const CHART_NAME_KEY: &str = "name";
 /// Filenames inside `manifests/` — pinned so downstream tooling
 /// (`aislang destroy`, the Fri k8s-smoke CI job, debugging humans)
 /// can find them by name.
-pub const LITELLM_MANIFEST_FILENAME:        &str = "litellm.yaml";
-pub const JAEGER_MANIFEST_FILENAME:         &str = "jaeger.yaml";
-pub const BUDGET_COUNTER_MANIFEST_FILENAME: &str = "budget-counter.yaml";
+pub const LITELLM_MANIFEST_FILENAME:               &str = "litellm.yaml";
+pub const JAEGER_MANIFEST_FILENAME:                &str = "jaeger.yaml";
+pub const BUDGET_COUNTER_MANIFEST_FILENAME:        &str = "budget-counter.yaml";
+/// Wed (Decision 43.3) — agent-runtime Deployment + Service.
+pub const AGENT_RUNTIME_MANIFEST_FILENAME:         &str = "agent-runtime.yaml";
+/// Wed (Decision 43.4) — `aislang-project` ConfigMap (.ais + lockfile + prompts).
+pub const AISLANG_PROJECT_CM_MANIFEST_FILENAME:    &str = "aislang-project-config.yaml";
+
+// ============================================================================
+// Inputs the emitter needs beyond ResolvedProject + Catalog
+// ============================================================================
+
+/// Bag of source-level inputs that don't live in `ResolvedProject` but
+/// that the K8s emitter needs to bake into ConfigMaps (Decision 43.4,
+/// Phase 2 Week 14 Wed).
+///
+/// **Why a separate struct rather than reaching back to disk inside
+/// `emit()`**: the emitter stays a pure data-transform — no IO, no
+/// surprises in test fixtures, easy mocking from synthetic
+/// `ProjectSources` values in unit tests.  The CLI prepares these
+/// once (it already has the source string in scope from the `validate`
+/// stage, the lockfile body from the `lockfile reconcile` stage,
+/// and trivially-loadable prompt bodies based on
+/// `Project.prompts[i].file`).
+#[derive(Debug, Default, Clone)]
+pub struct ProjectSources {
+    /// Verbatim .ais source text.  Lands in the `aislang-project`
+    /// ConfigMap under key `project.ais`, mounted at
+    /// `/etc/aislang/project.ais` inside the agent-runtime pod.
+    pub ais_source: String,
+
+    /// Lockfile body (`aislang.lock` content).  `None` when the
+    /// project hasn't been planned before OR when the CLI was run
+    /// with `--no-lock`.  Stored as the empty string in the
+    /// ConfigMap in that case so downstream consumers don't have
+    /// to special-case the absence.
+    pub lockfile: Option<String>,
+
+    /// Prompt body bytes keyed by `prompt.label`.  One CM entry +
+    /// one mounted file per entry (at `/etc/aislang/prompts/<label>`).
+    /// Empty map is fine — projects with no prompts skip the
+    /// prompts/ sub-directory entirely.
+    pub prompt_bodies: BTreeMap<String, String>,
+}
 
 // ============================================================================
 // Errors
@@ -152,11 +193,12 @@ pub enum EmitError {
 /// Emit Kubernetes artifacts (raw manifests + Helm chart) for the
 /// resolved project's `deploy { target = kubernetes }` block.
 ///
-/// **Phase 2 Week 14 Tue scope (this commit):** populates
+/// **Phase 2 Week 14 Tue+Wed scope (this commit):** populates
 /// `K8sArtifacts.manifests` with LiteLLM + Jaeger + budget_counter
-/// Deployments/Services/ConfigMaps (Decision 43.2).  `chart_files`
-/// stays empty until Thu (Decision 43.7); `values_yaml` keeps the
-/// Mon placeholder.
+/// + agent-runtime Deployments/Services + the LiteLLM router CM +
+/// the `aislang-project` CM (Decisions 43.2 + 43.3 + 43.4).
+/// `chart_files` stays empty until Thu (Decision 43.7); `values_yaml`
+/// keeps the Mon+Tue placeholder.
 ///
 /// **`deploy` block selection** (Decision 43.1): the emitter picks
 /// the FIRST `deploy` block whose `target == Kubernetes`.  Multiple
@@ -164,9 +206,15 @@ pub enum EmitError {
 /// deploy block + a per-block output sub-directory).  No k8s
 /// `deploy` block at all = the emitter still works but uses
 /// `"default"` as the deploy label so labels stay populated.
+///
+/// **`sources` parameter** (Wed): bag of `.ais source` + lockfile +
+/// per-prompt bodies the agent-runtime pod's ConfigMap needs.  See
+/// [`ProjectSources`] for the rationale of keeping these out of
+/// `ResolvedProject` proper.
 pub fn emit(
     resolved: &ResolvedProject,
     catalog:  &Catalog,
+    sources:  &ProjectSources,
 ) -> Result<K8sArtifacts, EmitError> {
     let deploy_label = pick_k8s_deploy_label(resolved);
 
@@ -208,6 +256,45 @@ pub fn emit(
         BUDGET_COUNTER_MANIFEST_FILENAME.to_string(),
         join_manifests(&[
             ("Deployment", serde_yaml::to_string(&bc_dep)?),
+        ]),
+    );
+
+    // ── agent-runtime: Deployment + Service (Decision 43.3).  Pod
+    //    runs `aislang mcp-serve --http 0.0.0.0:<expose.port>
+    //    /etc/aislang/project.ais`; Service ClusterIP exposes the
+    //    same port.  Per-prompt + project-fingerprint annotations
+    //    on the pod template drive ReplicaSet rollouts on any input
+    //    change (Decision 43.4).
+    let (agent_dep, agent_svc) = services::build_agent_runtime(
+        resolved,
+        &deploy_label,
+        &sources.ais_source,
+        sources.lockfile.as_deref(),
+    );
+    manifests.insert(
+        AGENT_RUNTIME_MANIFEST_FILENAME.to_string(),
+        join_manifests(&[
+            ("Deployment", serde_yaml::to_string(&agent_dep)?),
+            ("Service",    serde_yaml::to_string(&agent_svc)?),
+        ]),
+    );
+
+    // ── aislang-project ConfigMap (Decision 43.4) — `.ais` source +
+    //    lockfile + every prompt body, mounted at /etc/aislang/ on
+    //    the agent-runtime pod.  Separate manifest file so a
+    //    `kubectl apply -f manifests/aislang-project-config.yaml`
+    //    can refresh the project content without touching the
+    //    Deployment YAML.
+    let project_cm = services::build_aislang_project_configmap(
+        &deploy_label,
+        &sources.ais_source,
+        sources.lockfile.as_deref(),
+        &sources.prompt_bodies,
+    );
+    manifests.insert(
+        AISLANG_PROJECT_CM_MANIFEST_FILENAME.to_string(),
+        join_manifests(&[
+            ("ConfigMap", serde_yaml::to_string(&project_cm)?),
         ]),
     );
 
@@ -305,6 +392,15 @@ mod tests {
         }
     }
 
+    /// Empty `ProjectSources` — Tue's tests don't exercise the
+    /// agent-runtime CM content, so a default-empty bag keeps the
+    /// existing emit() calls compiling against the Wed-extended
+    /// signature.  Wed-specific tests below build richer
+    /// `ProjectSources` values to exercise the new code paths.
+    fn empty_sources() -> ProjectSources {
+        ProjectSources::default()
+    }
+
     // ────────────────────────────────────────────────────────────
     // Mon scaffold invariants — still hold post-Tue
     // ────────────────────────────────────────────────────────────
@@ -312,16 +408,17 @@ mod tests {
     #[test] fn emit_returns_skeleton_shape_for_empty_project() {
         let catalog = aislang_catalog::bundled().expect("bundled catalog");
         let resolved = empty_resolved();
-        let artifacts = emit(&resolved, &catalog).expect("emit");
-        // Tue: manifests now populated with the 3 services.  chart_files
-        // + values_yaml stay at the Mon defaults.
-        assert_eq!(artifacts.manifests.len(), 3,
-            "Tue scaffold emits 3 manifest files (litellm/jaeger/budget-counter); \
-             got: {:?}", artifacts.manifests.keys().collect::<Vec<_>>());
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        // Wed: manifests now 5 (Tue's 3 + agent-runtime + project CM).
+        // chart_files + values_yaml stay at the Mon defaults.
+        assert_eq!(artifacts.manifests.len(), 5,
+            "Wed scaffold emits 5 manifest files (litellm/jaeger/budget-counter \
+             + agent-runtime + aislang-project-config); got: {:?}",
+             artifacts.manifests.keys().collect::<Vec<_>>());
         assert!(artifacts.chart_files.is_empty(),
-            "Mon+Tue scaffold emits no chart files yet (Thu populates)");
+            "Mon+Tue+Wed scaffold emits no chart files yet (Thu populates)");
         assert!(artifacts.values_yaml.contains("placeholder"),
-            "Mon+Tue scaffold values.yaml is a placeholder; got:\n{}",
+            "Mon+Tue+Wed scaffold values.yaml is a placeholder; got:\n{}",
             artifacts.values_yaml);
     }
 
@@ -338,13 +435,17 @@ mod tests {
     // Tue — Decision 43.2: LiteLLM/Jaeger/budget_counter manifests
     // ────────────────────────────────────────────────────────────
 
-    #[test] fn emits_all_three_manifest_files() {
+    #[test] fn emits_all_five_manifest_files() {
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         for name in [
+            // Tue (Decision 43.2)
             LITELLM_MANIFEST_FILENAME,
             JAEGER_MANIFEST_FILENAME,
             BUDGET_COUNTER_MANIFEST_FILENAME,
+            // Wed (Decisions 43.3 + 43.4)
+            AGENT_RUNTIME_MANIFEST_FILENAME,
+            AISLANG_PROJECT_CM_MANIFEST_FILENAME,
         ] {
             assert!(artifacts.manifests.contains_key(name),
                 "manifest `{name}` must be present; got: {:?}",
@@ -361,7 +462,7 @@ mod tests {
         // accepts them, `kubectl --dry-run=client apply -f manifests/`
         // will too.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         for name in artifacts.manifests.keys() {
             // all_resources does the parse + panics on failure
             let resources: Vec<_> = all_resources(&artifacts).into_iter()
@@ -396,7 +497,7 @@ mod tests {
 
     #[test] fn litellm_emits_deployment_service_configmap() {
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         let kinds: std::collections::BTreeSet<String> = all_resources(&artifacts).into_iter()
             .filter(|(f, _, _)| f == LITELLM_MANIFEST_FILENAME)
             .map(|(_, k, _)| k)
@@ -412,7 +513,7 @@ mod tests {
 
     #[test] fn jaeger_emits_deployment_and_service_only() {
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         let kinds: std::collections::BTreeSet<String> = all_resources(&artifacts).iter()
             .filter(|(f, _, _)| f == JAEGER_MANIFEST_FILENAME)
             .map(|(_, k, _)| k.clone())
@@ -424,7 +525,7 @@ mod tests {
 
     #[test] fn budget_counter_emits_deployment_only() {
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         let kinds: std::collections::BTreeSet<String> = all_resources(&artifacts).iter()
             .filter(|(f, _, _)| f == BUDGET_COUNTER_MANIFEST_FILENAME)
             .map(|(_, k, _)| k.clone())
@@ -440,7 +541,7 @@ mod tests {
         // `aislang.component=<name>` + `aislang.deploy=<label>`.
         let catalog = aislang_catalog::bundled().expect("bundled");
         let resolved = resolved_with_k8s_deploy("prod");
-        let artifacts = emit(&resolved, &catalog).expect("emit");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
         for (file, kind, v) in all_resources(&artifacts) {
             let labels = &v["metadata"]["labels"];
             assert_eq!(labels["aislang.generated"].as_str(), Some("true"),
@@ -457,7 +558,7 @@ mod tests {
         // emitter still produces manifests but stamps them with the
         // `"default"` label so the label set is well-formed.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         for (_, _, v) in all_resources(&artifacts) {
             assert_eq!(v["metadata"]["labels"]["aislang.deploy"].as_str(),
                 Some("default"),
@@ -472,7 +573,7 @@ mod tests {
         // empty-string creds at runtime = clean-looking pod that
         // fails on first /v1/chat/completions call.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         let litellm_dep = all_resources(&artifacts).into_iter()
             .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "Deployment")
             .expect("litellm Deployment present");
@@ -493,7 +594,7 @@ mod tests {
         // can read the provider Secret" returns the smallest possible
         // set (LiteLLM + Wed's agent-runtime; not Jaeger).
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         let jaeger_dep = all_resources(&artifacts).into_iter()
             .find(|(f, k, _)| f == JAEGER_MANIFEST_FILENAME && k == "Deployment")
             .expect("jaeger Deployment present");
@@ -509,7 +610,7 @@ mod tests {
         // `config.yaml`.  The container mounts it at /app/config.yaml
         // via volumeMounts.subPath.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         let cm = all_resources(&artifacts).into_iter()
             .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "ConfigMap")
             .expect("litellm-config CM present");
@@ -540,7 +641,7 @@ mod tests {
             prompt_hashes:   Btm::new(),
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&resolved, &catalog).expect("emit");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
         let dep = all_resources(&artifacts).into_iter()
             .find(|(f, k, _)| f == BUDGET_COUNTER_MANIFEST_FILENAME && k == "Deployment")
             .expect("budget-counter Deployment present");
@@ -566,7 +667,7 @@ mod tests {
         // ad-hoc label additions don't break pod-to-service
         // matching.  Pin the rule via the selector field shape.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         for (file, kind, v) in all_resources(&artifacts) {
             if kind != "Service" { continue; }
             let selector = v["spec"]["selector"].as_mapping()
@@ -587,7 +688,7 @@ mod tests {
         // sibling Service selects on.  Otherwise the Service has
         // no endpoints and traffic black-holes.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         // Build a (filename, component-label) map from Services.
         let services_by_component: BTreeMap<String, String> =
             all_resources(&artifacts).iter()
@@ -622,7 +723,7 @@ mod tests {
         // Pin the rule so a future "save 4 bytes by dropping the
         // leading ---" attempt fails loudly here.
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
         for (name, body) in &artifacts.manifests {
             assert!(body.starts_with("---\n"),
                 "manifest `{name}` must lead with `---\\n`; got:\n{body}");
@@ -639,7 +740,7 @@ mod tests {
     fn dump_demo_manifests() {
         let resolved = resolved_with_k8s_deploy("prod");
         let catalog = aislang_catalog::bundled().expect("bundled");
-        let artifacts = emit(&resolved, &catalog).expect("emit");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
         for (name, body) in &artifacts.manifests {
             println!("================ {name} ================");
             println!("{body}");
@@ -652,8 +753,8 @@ mod tests {
         // catalog and compare every manifest body byte-for-byte.
         let catalog = aislang_catalog::bundled().expect("bundled");
         let resolved = resolved_with_k8s_deploy("prod");
-        let a = emit(&resolved, &catalog).expect("emit 1");
-        let b = emit(&resolved, &catalog).expect("emit 2");
+        let a = emit(&resolved, &catalog, &empty_sources()).expect("emit 1");
+        let b = emit(&resolved, &catalog, &empty_sources()).expect("emit 2");
         assert_eq!(a.manifests.keys().collect::<Vec<_>>(),
                    b.manifests.keys().collect::<Vec<_>>(),
             "manifest filenames must match across runs");
@@ -663,5 +764,345 @@ mod tests {
                 "manifest `{k}` content must be byte-identical across \
                  runs; left/right diverge");
         }
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Wed — Decision 43.3 + 43.4: agent-runtime + project ConfigMap
+    // ────────────────────────────────────────────────────────────
+
+    /// Synthetic ResolvedProject with a k8s deploy block + a prompt
+    /// hash entry.  Used by Wed tests to exercise the annotation +
+    /// CM-keys + items[] mount paths against a non-trivial input.
+    fn resolved_with_prompt(deploy_label: &str, prompt_label: &str, hash: &str)
+        -> ResolvedProject
+    {
+        use aislang_core::ast::{Expose, Prompt};
+        use aislang_core::types::SemVer;
+        let mut prompt_hashes = Btm::new();
+        prompt_hashes.insert(prompt_label.to_string(), hash.to_string());
+        ResolvedProject {
+            project: Project {
+                name: "x".into(),
+                prompts: vec![Prompt {
+                    label:   prompt_label.into(),
+                    file:    "./prompts/system.md".into(),
+                    version: SemVer::from_literal("1.0.0").expect("semver"),
+                }],
+                deploys: vec![Deploy {
+                    label:  deploy_label.into(),
+                    target: DeployTarget::Kubernetes,
+                    expose: Some(Expose { port: Some(9000), web_ui: false }),
+                }],
+                ..Project::default()
+            },
+            catalog_version: "test".into(),
+            model_bindings:  Btm::new(),
+            prompt_hashes,
+        }
+    }
+
+    fn sources_with(
+        ais_source: &str,
+        lockfile:   Option<&str>,
+        prompts:    &[(&str, &str)],
+    ) -> ProjectSources {
+        let mut bodies = Btm::new();
+        for (label, body) in prompts {
+            bodies.insert(label.to_string(), body.to_string());
+        }
+        ProjectSources {
+            ais_source:    ais_source.to_string(),
+            lockfile:      lockfile.map(String::from),
+            prompt_bodies: bodies,
+        }
+    }
+
+    #[test] fn agent_runtime_deployment_and_service_emit() {
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_prompt("prod", "system", "deadbeef");
+        let sources = sources_with("project \"x\" {}", Some("lock-body"), &[("system", "you are helpful")]);
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let kinds: std::collections::BTreeSet<String> = all_resources(&artifacts).into_iter()
+            .filter(|(f, _, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME)
+            .map(|(_, k, _)| k)
+            .collect();
+        assert_eq!(kinds,
+            std::collections::BTreeSet::from([
+                "Deployment".to_string(),
+                "Service".to_string(),
+            ]),
+            "agent-runtime.yaml must contain Deployment + Service");
+    }
+
+    #[test] fn agent_runtime_pod_uses_expose_port() {
+        // Decision 43.3: `expose.port` becomes the agent-runtime Service
+        // port + the container port + the --http bind address arg.  Pin
+        // all three points so a future refactor that desyncs them fails.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_prompt("prod", "system", "abc");
+        let sources = sources_with("p", None, &[]);
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let resources = all_resources(&artifacts);
+
+        // Service: spec.ports[0].port == 9000
+        let svc = resources.iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Service")
+            .expect("agent-runtime Service");
+        let svc_port = svc.2["spec"]["ports"][0]["port"].as_i64()
+            .expect("Service ports[0].port is int");
+        assert_eq!(svc_port, 9000, "Service port must match expose.port");
+
+        // Deployment: container port + --http arg both 9000.
+        let dep = resources.iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent-runtime Deployment");
+        let container = &dep.2["spec"]["template"]["spec"]["containers"][0];
+        let cport = container["ports"][0]["containerPort"].as_i64()
+            .expect("containerPort is int");
+        assert_eq!(cport, 9000, "containerPort must match expose.port");
+        let args: Vec<&str> = container["args"].as_sequence().expect("args list")
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(args.contains(&"0.0.0.0:9000"),
+            "args must include the --http bind `0.0.0.0:9000`; got: {args:?}");
+        assert!(args.contains(&"mcp-serve"),
+            "args must include the mcp-serve subcommand; got: {args:?}");
+        // The .ais source path positional arg.
+        assert!(args.iter().any(|a| a.ends_with("/project.ais")),
+            "args must include /etc/aislang/project.ais path; got: {args:?}");
+    }
+
+    #[test] fn agent_runtime_defaults_to_port_8080_when_expose_absent() {
+        // No `expose` block → fallback to 8080 (matches aislang-compose's
+        // informational header line for parity).
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("prod"); // expose: None
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent-runtime Deployment");
+        let cport = dep.2["spec"]["template"]["spec"]["containers"][0]
+            ["ports"][0]["containerPort"].as_i64().expect("containerPort int");
+        assert_eq!(cport, services::AGENT_RUNTIME_DEFAULT_PORT as i64,
+            "no expose → fallback to AGENT_RUNTIME_DEFAULT_PORT");
+    }
+
+    #[test] fn agent_runtime_envfroms_aislang_providers_secret() {
+        // Decision 43.5: agent-runtime ALSO needs provider creds (it
+        // dials LiteLLM AND, for some fallback configurations, hits
+        // providers directly).  Same Secret reference as the litellm
+        // pod (single source of truth on the user's side).
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent-runtime Deployment");
+        let env_from = &dep.2["spec"]["template"]["spec"]
+            ["containers"][0]["envFrom"];
+        let seq = env_from.as_sequence().expect("envFrom is list");
+        let names: Vec<&str> = seq.iter()
+            .filter_map(|e| e["secretRef"]["name"].as_str()).collect();
+        assert!(names.contains(&services::PROVIDERS_SECRET_NAME),
+            "agent-runtime must envFrom the providers Secret; got: {names:?}");
+    }
+
+    #[test] fn aislang_project_configmap_contains_source_and_lockfile() {
+        // Decision 43.4: the CM bakes the .ais source + lockfile body
+        // so the pod has everything it needs to run `aislang mcp-serve`
+        // self-contained.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("prod");
+        let sources = sources_with(
+            "project \"my-app\" { }",
+            Some("{\"schema_version\": 1}"),
+            &[],
+        );
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let cm = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AISLANG_PROJECT_CM_MANIFEST_FILENAME && k == "ConfigMap")
+            .expect("aislang-project CM present");
+        assert_eq!(cm.2["metadata"]["name"].as_str(), Some("aislang-project"));
+        let ais_body = cm.2["data"]["project.ais"].as_str()
+            .expect("data[project.ais] is string");
+        assert!(ais_body.contains("my-app"),
+            "CM data[project.ais] must hold the .ais source; got:\n{ais_body}");
+        let lock_body = cm.2["data"]["aislang.lock"].as_str()
+            .expect("data[aislang.lock] is string");
+        assert!(lock_body.contains("schema_version"),
+            "CM data[aislang.lock] must hold the lockfile body; got:\n{lock_body}");
+    }
+
+    #[test] fn aislang_project_cm_has_one_entry_per_prompt() {
+        // Each `prompt` block becomes a CM entry keyed by prompt label;
+        // the body is the bytes provided via ProjectSources.prompt_bodies.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_prompt("prod", "system", "abc123");
+        let sources = sources_with(
+            "p",
+            None,
+            &[
+                ("system",     "you are a helpful assistant"),
+                ("retrieval",  "search the knowledge base"),
+            ],
+        );
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let cm = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AISLANG_PROJECT_CM_MANIFEST_FILENAME && k == "ConfigMap")
+            .expect("CM present");
+        for (label, expected_body) in [
+            ("system",    "you are a helpful assistant"),
+            ("retrieval", "search the knowledge base"),
+        ] {
+            let body = cm.2["data"][label].as_str()
+                .unwrap_or_else(|| panic!("CM missing entry for prompt `{label}`"));
+            assert_eq!(body, expected_body,
+                "CM entry `{label}` must match the provided prompt body");
+        }
+    }
+
+    #[test] fn agent_pod_template_carries_prompt_hash_annotation_per_prompt() {
+        // Decision 43.4: every prompt's SHA-256 hash lands as a
+        // pod-template annotation.  A body change shifts the hash in
+        // `ResolvedProject.prompt_hashes` (resolver) → annotation
+        // shifts → K8s creates a new ReplicaSet → rolling restart.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_prompt("prod", "system", "deadbeefcafebabe");
+        let sources = sources_with("p", None, &[("system", "x")]);
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent Deployment");
+        let ann = &dep.2["spec"]["template"]["metadata"]["annotations"];
+        // Per-prompt: `aislang.prompt-hash/system: deadbeefcafebabe`
+        let expected_key = format!("{}system", services::PROMPT_HASH_ANNOTATION_PREFIX);
+        assert_eq!(ann[expected_key.as_str()].as_str(), Some("deadbeefcafebabe"),
+            "pod-template annotation `{expected_key}` must carry the prompt hash; \
+             got annotations: {ann:?}");
+        // Project-fingerprint annotation: SHA-256 hex, 64 chars
+        let proj_hash = ann[services::PROJECT_HASH_ANNOTATION].as_str()
+            .expect("project-hash annotation present");
+        assert_eq!(proj_hash.len(), 64,
+            "project-hash must be 64-char hex; got `{proj_hash}` ({})",
+            proj_hash.len());
+        assert!(proj_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "project-hash must be all hex; got `{proj_hash}`");
+    }
+
+    #[test] fn project_hash_annotation_shifts_when_source_changes() {
+        // Decision 43.4 invariant: changing the .ais source byte shifts
+        // the `aislang.project-hash` annotation so a `helm upgrade` /
+        // `kubectl apply` triggers a rolling restart.  Compare two
+        // emits with different sources.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("prod");
+        let s1 = sources_with("project \"a\" {}", None, &[]);
+        let s2 = sources_with("project \"b\" {}", None, &[]);
+        let a = emit(&resolved, &catalog, &s1).expect("emit a");
+        let b = emit(&resolved, &catalog, &s2).expect("emit b");
+        let get_proj_hash = |arts: &K8sArtifacts| -> String {
+            all_resources(arts).into_iter()
+                .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+                .map(|(_, _, v)| v["spec"]["template"]["metadata"]
+                    ["annotations"][services::PROJECT_HASH_ANNOTATION]
+                    .as_str().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        assert_ne!(get_proj_hash(&a), get_proj_hash(&b),
+            "different .ais sources must produce different project-hash annotations");
+    }
+
+    #[test] fn project_hash_annotation_shifts_when_lockfile_changes() {
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("prod");
+        let s1 = sources_with("p", Some("lock-v1"), &[]);
+        let s2 = sources_with("p", Some("lock-v2"), &[]);
+        let a = emit(&resolved, &catalog, &s1).expect("emit a");
+        let b = emit(&resolved, &catalog, &s2).expect("emit b");
+        let extract = |arts: &K8sArtifacts| {
+            all_resources(arts).into_iter()
+                .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+                .map(|(_, _, v)| v["spec"]["template"]["metadata"]
+                    ["annotations"][services::PROJECT_HASH_ANNOTATION]
+                    .as_str().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        assert_ne!(extract(&a), extract(&b),
+            "different lockfile bodies must produce different project-hash annotations");
+    }
+
+    #[test] fn agent_pod_mounts_project_configmap_at_etc_aislang() {
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_prompt("prod", "system", "h");
+        let sources = sources_with("p", None, &[("system", "body")]);
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent Deployment");
+
+        // Container's volumeMounts[0] points at /etc/aislang.
+        let mount = &dep.2["spec"]["template"]["spec"]["containers"][0]
+            ["volumeMounts"][0];
+        assert_eq!(mount["mountPath"].as_str(), Some(services::PROJECT_MOUNT_DIR));
+        assert_eq!(mount["readOnly"].as_bool(), Some(true));
+
+        // Pod's volumes[0].configMap references the aislang-project CM.
+        let vol = &dep.2["spec"]["template"]["spec"]["volumes"][0];
+        assert_eq!(vol["configMap"]["name"].as_str(), Some("aislang-project"));
+
+        // items[] maps:
+        //   project.ais  → project.ais
+        //   aislang.lock → aislang.lock
+        //   <prompt-label> → prompts/<prompt-label>
+        let items = vol["configMap"]["items"].as_sequence()
+            .expect("items[] must be present (we set per-key paths)");
+        let paths: Vec<(String, String)> = items.iter()
+            .map(|i| (
+                i["key"].as_str().unwrap_or("").to_string(),
+                i["path"].as_str().unwrap_or("").to_string(),
+            ))
+            .collect();
+        assert!(paths.iter().any(|(k, p)| k == "project.ais"  && p == "project.ais"),
+            "items[] must map project.ais → project.ais; got: {paths:?}");
+        assert!(paths.iter().any(|(k, p)| k == "aislang.lock" && p == "aislang.lock"),
+            "items[] must map aislang.lock → aislang.lock; got: {paths:?}");
+        assert!(paths.iter().any(|(k, p)| k == "system" && p == "prompts/system"),
+            "items[] must map system → prompts/system; got: {paths:?}");
+    }
+
+    #[test] fn agent_runtime_carries_aislang_labels_with_deploy_propagated() {
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("staging");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        for (file, kind, v) in all_resources(&artifacts) {
+            if file != AGENT_RUNTIME_MANIFEST_FILENAME &&
+               file != AISLANG_PROJECT_CM_MANIFEST_FILENAME { continue; }
+            let labels = &v["metadata"]["labels"];
+            assert_eq!(labels["aislang.component"].as_str(), Some("agent_runtime"),
+                "{file}/{kind}: aislang.component must be agent_runtime");
+            assert_eq!(labels["aislang.deploy"].as_str(), Some("staging"),
+                "{file}/{kind}: aislang.deploy must propagate from deploy block label");
+            assert_eq!(labels["aislang.generated"].as_str(), Some("true"));
+        }
+    }
+
+    #[test] fn agent_service_selector_matches_pod_template_labels() {
+        // Round-trip: Service spec.selector targets pods labelled
+        // aislang.component=agent_runtime; agent-runtime Deployment's
+        // pod template MUST carry that label or the Service ends up
+        // with no endpoints + traffic black-holes.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let resources = all_resources(&artifacts);
+        let svc = resources.iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Service")
+            .expect("agent Service");
+        let dep = resources.iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent Deployment");
+        let sel = svc.2["spec"]["selector"]["aislang.component"].as_str();
+        let pod_lbl = dep.2["spec"]["template"]["metadata"]["labels"]
+            ["aislang.component"].as_str();
+        assert_eq!(sel, pod_lbl,
+            "Service selector aislang.component must match pod-template label; \
+             selector={sel:?} pod={pod_lbl:?}");
     }
 }
