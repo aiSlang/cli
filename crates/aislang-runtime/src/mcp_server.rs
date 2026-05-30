@@ -305,7 +305,12 @@ impl AislangServer {
     pub async fn describe(&self,
         Parameters(p): Parameters<SourceOnlyParameters>,
     ) -> Result<CallToolResult, RmcpError> {
-        let (project, _warnings) = aislang_core::validate(&p.source)
+        // SourceOnlyParameters has no `source_dir` field — relative
+        // `source_path` resolves against the MCP server's cwd.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let source = resolve_source(p.source, p.source_path, &cwd)?;
+
+        let (project, _warnings) = aislang_core::validate(&source)
             .map_err(|e| RmcpError::invalid_params(
                 format!("parse error: {e}"), None))?;
 
@@ -339,7 +344,10 @@ impl AislangServer {
     pub async fn validate(&self,
         Parameters(p): Parameters<SourceOnlyParameters>,
     ) -> Result<CallToolResult, RmcpError> {
-        let body = match aislang_core::validate(&p.source) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let source = resolve_source(p.source, p.source_path, &cwd)?;
+
+        let body = match aislang_core::validate(&source) {
             Ok((project, mut warnings)) => {
                 // Run the catalog check too — same as `aislang validate`
                 // in the CLI surface.
@@ -378,7 +386,7 @@ impl AislangServer {
                 }
                 out
             }
-            Err(err) => render_validate_error_to_string(&p.source, &err),
+            Err(err) => render_validate_error_to_string(&source, &err),
         };
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
@@ -413,8 +421,20 @@ impl AislangServer {
     pub async fn plan(&self,
         Parameters(p): Parameters<PlanParameters>,
     ) -> Result<CallToolResult, RmcpError> {
+        // Stage 0 (week 13 Thu): resolve source_dir, then resolve
+        // source content (path > inline > error).  Same order the
+        // stateful-tier tools use — see `resolve_source` for the
+        // Claude-Desktop-preview rationale.
+        let source_dir: PathBuf = match p.source_dir.as_deref() {
+            Some(s) => PathBuf::from(s),
+            None    => std::env::current_dir()
+                .map_err(|e| RmcpError::internal_error(
+                    format!("cwd: {e}"), None))?,
+        };
+        let source = resolve_source(p.source, p.source_path, &source_dir)?;
+
         // Stage 1: parse + typecheck.
-        let (project, _warnings) = aislang_core::validate(&p.source)
+        let (project, _warnings) = aislang_core::validate(&source)
             .map_err(|e| RmcpError::invalid_params(
                 format!("parse error: {e}"), None))?;
 
@@ -423,15 +443,9 @@ impl AislangServer {
             .map_err(|e| RmcpError::invalid_params(
                 format!("catalog error: {e}"), None))?;
 
-        // Stage 3: resolve.  source_dir defaults to the server's CWD,
-        // matching the CLI's `aislang plan` behaviour when called
-        // without --output-dir.
-        let source_dir: PathBuf = match p.source_dir.as_deref() {
-            Some(s) => PathBuf::from(s),
-            None    => std::env::current_dir()
-                .map_err(|e| RmcpError::internal_error(
-                    format!("cwd: {e}"), None))?,
-        };
+        // Stage 3: resolve.  source_dir was bound above so prompt
+        // hash-pinning + mcp_server.mount path resolution work the
+        // same way as the CLI's `aislang plan` without --output-dir.
         let resolved = aislang_resolver::resolve_against_bundled_catalog(
             &project, &source_dir,
         ).map_err(|e| RmcpError::invalid_params(
@@ -533,9 +547,10 @@ impl AislangServer {
     ) -> Result<CallToolResult, RmcpError> {
         let mut out = String::new();
         let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let source     = resolve_source(p.source, p.source_path, &source_dir)?;
 
         // ── Stage 1: full plan pipeline (validate → catalog → resolve → emit)
-        let (project, _warnings) = aislang_core::validate(&p.source)
+        let (project, _warnings) = aislang_core::validate(&source)
             .map_err(|e| RmcpError::invalid_params(
                 format!("parse error: {e}"), None))?;
         aislang_resolver::check_against_bundled_catalog(&project)
@@ -570,7 +585,7 @@ impl AislangServer {
                 format!("write {}: {e}", env_path.display()), None))?;
         // Lockfile via the resolver's helper so format matches v0.1
         // `aislang plan` exactly (byte-stable reproducibility).
-        let lock = aislang_resolver::Lockfile::build(&p.source, &resolved);
+        let lock = aislang_resolver::Lockfile::build(&source, &resolved);
         aislang_resolver::lockfile::write(&lock_path, &lock)
             .map_err(|e| RmcpError::internal_error(
                 format!("write {}: {e}", lock_path.display()), None))?;
@@ -619,7 +634,7 @@ impl AislangServer {
         // not an error: the stack IS up, we just couldn't persist
         // the audit trail.
         let state_path  = crate::state_path_in(&source_dir);
-        let source_hash = crate::hex_sha256(p.source.as_bytes());
+        let source_hash = crate::hex_sha256(source.as_bytes());
         let state = crate::new_applied_state(
             &project.name,
             source_hash,
@@ -786,11 +801,12 @@ impl AislangServer {
         use std::fmt::Write;
         let mut out = String::new();
 
-        let (project, _warnings) = aislang_core::validate(&p.source)
+        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let source     = resolve_source(p.source, p.source_path, &source_dir)?;
+
+        let (project, _warnings) = aislang_core::validate(&source)
             .map_err(|e| RmcpError::invalid_params(
                 format!("parse error: {e}"), None))?;
-
-        let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
         let state_path = crate::state_path_in(&source_dir);
         let stack_path = source_dir.join(aislang_compose::STACK_YAML_FILENAME);
 
@@ -977,6 +993,7 @@ impl AislangServer {
         client: Peer<RoleServer>,
     ) -> Result<CallToolResult, RmcpError> {
         let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
+        let source     = resolve_source(p.source, p.source_path, &source_dir)?;
         let key = SessionKey {
             source_dir:  source_dir.clone(),
             agent_label: p.agent_label.clone(),
@@ -998,7 +1015,7 @@ impl AislangServer {
                     Arc::clone(s)
                 } else {
                     let built = build_session_for_agent(
-                        &p.source, &source_dir, &p.agent_label,
+                        &source, &source_dir, &p.agent_label,
                     ).await
                     .map_err(|e| RmcpError::invalid_params(
                         format!("open session: {e}"), None))?;
@@ -1149,7 +1166,8 @@ impl AislangServer {
         Parameters(p): Parameters<EvalParameters>,
     ) -> Result<CallToolResult, RmcpError> {
         let source_dir = resolve_source_dir(p.source_dir.as_deref())?;
-        let (project, _warnings) = aislang_core::validate(&p.source)
+        let source     = resolve_source(p.source, p.source_path, &source_dir)?;
+        let (project, _warnings) = aislang_core::validate(&source)
             .map_err(|e| RmcpError::invalid_params(
                 format!("parse error: {e}"), None))?;
 
@@ -1235,12 +1253,24 @@ pub struct ExamplesParameters {
 
 /// Single-field shape used by both `describe` and `validate` — both
 /// consume an `.ais` source-text body and nothing else.
+///
+/// Week 13 Thu follow-up: `source` is now optional; `source_path`
+/// is the recommended alternative.  See [`resolve_source`] for the
+/// resolution policy + the Claude-Desktop-preview rationale.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SourceOnlyParameters {
     /// The complete `.ais` source file as a UTF-8 text body.  Must
     /// parse + typecheck for `describe`; can be malformed for
-    /// `validate` (the diagnostic is the point).
-    pub source: String,
+    /// `validate` (the diagnostic is the point).  When `source_path`
+    /// is also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filesystem path to the `.ais` file.  Relative paths resolve
+    /// against the MCP server's current working directory.  Wins over
+    /// inline `source`.  RECOMMENDED for MCP-host integrations
+    /// (Claude Desktop, Cursor) — keeps the confirmation dialog tiny.
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 /// `plan` extends `SourceOnlyParameters` with an optional
@@ -1249,7 +1279,14 @@ pub struct SourceOnlyParameters {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PlanParameters {
     /// The complete `.ais` source file as a UTF-8 text body.
-    pub source: String,
+    /// When `source_path` is also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filesystem path to the `.ais` file.  Relative paths resolve
+    /// against `source_dir` (or cwd if `source_dir` unset).
+    /// RECOMMENDED for MCP-host integrations.
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Absolute filesystem path that `prompt.file` and
     /// `mcp_server.mount` paths in the source are resolved against.
     /// Defaults to the MCP server's current working directory when
@@ -1267,7 +1304,13 @@ pub struct PlanParameters {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ApplyParameters {
     /// The complete `.ais` source file as a UTF-8 text body.
-    pub source: String,
+    /// When `source_path` is also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filesystem path to the `.ais` file.  Relative paths resolve
+    /// against `source_dir`.  RECOMMENDED for MCP-host integrations.
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Filesystem path that will receive the emitted artifacts
     /// (stack.yml, litellm_config.yaml, .env.example, aislang.lock,
     /// .aislang/state.json) and where prompt-file paths in the source
@@ -1304,7 +1347,13 @@ pub struct DestroyParameters {
 pub struct StatusParameters {
     /// The complete `.ais` source file as a UTF-8 text body — used to
     /// resolve the project name (which keys spend.json's tracker).
-    pub source: String,
+    /// When `source_path` is also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filesystem path to the `.ais` file.  Relative paths resolve
+    /// against `source_dir`.  RECOMMENDED for MCP-host integrations.
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Filesystem path containing .aislang/state.json + stack.yml.
     /// Defaults to cwd.
     #[serde(default)]
@@ -1332,7 +1381,15 @@ pub struct ChatTurnParameters {
     /// its model + system_prompt on first call.  Subsequent calls
     /// with the same (source_dir, agent_label) ignore changes here
     /// — the cached Session was built from the initial source.
-    pub source: String,
+    /// When `source_path` is also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filesystem path to the `.ais` file.  Relative paths resolve
+    /// against `source_dir`.  RECOMMENDED for MCP-host integrations
+    /// — keeps the chat-turn confirmation preview tiny + scannable
+    /// instead of dumping the whole .ais source as JSON-escaped text.
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Filesystem path that prompt-file paths in the source resolve
     /// against, and where `aislang.lock` is read for prompt-hash
     /// verification.  Defaults to cwd.
@@ -1353,7 +1410,13 @@ pub struct ChatTurnParameters {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct EvalParameters {
     /// The complete `.ais` source file as a UTF-8 text body.
-    pub source: String,
+    /// When `source_path` is also provided, it wins.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filesystem path to the `.ais` file.  Relative paths resolve
+    /// against `source_dir`.  RECOMMENDED for MCP-host integrations.
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Filesystem path that prompt files + JSONL datasets in the
     /// source resolve against.  Defaults to cwd.
     #[serde(default)]
@@ -1730,6 +1793,67 @@ fn resolve_source_dir(arg: Option<&str>) -> Result<PathBuf, rmcp::ErrorData> {
     };
     std::fs::canonicalize(&raw).map_err(|e| rmcp::ErrorData::invalid_params(
         format!("source_dir `{}` doesn't exist or unreadable: {e}", raw.display()),
+        None))
+}
+
+/// Resolve a tool call's `.ais` source content from either the
+/// inline `source: Option<String>` (legacy, week 12 Tue→Thu) or
+/// the new `source_path: Option<String>` (week 13 Thu follow-up).
+///
+/// **Why the path form was added.** The inline-string form makes
+/// the entire .ais file content land in the JSON envelope of every
+/// MCP request.  Claude Desktop's tool-call preview / confirmation
+/// dialog renders that raw JSON to the user, which turns into a
+/// wall of `\n`-escaped text — ugly, unscannable, hard to verify
+/// before approving.  The path form keeps the .ais on disk and the
+/// envelope tiny:
+///
+/// ```json
+/// { "agent_label": "support",
+///   "user_input":  "How can I contact support?",
+///   "source_path": "/path/to/support-agent.ais" }
+/// ```
+///
+/// **Resolution policy.** If `source_path` is set, it wins.
+/// Relative paths are joined onto the resolved `source_dir` (so the
+/// caller can pass `"./support-agent.ais"` and have it Just Work
+/// for projects laid out alongside their .ais).  Absolute paths are
+/// used as-is.  Missing-file / unreadable → InvalidParams with a
+/// clear message naming the resolved absolute path.
+///
+/// If `source_path` is unset but `source` is, the inline string is
+/// returned verbatim (legacy path, kept for back-compat + the rare
+/// in-memory caller).
+///
+/// If both are unset, returns InvalidParams.  Better than silently
+/// dispatching to a tool that needs source and getting a less-
+/// helpful "parse error: empty input" downstream.
+fn resolve_source(
+    source:      Option<String>,
+    source_path: Option<String>,
+    source_dir:  &Path,
+) -> Result<String, rmcp::ErrorData> {
+    if let Some(path_str) = source_path {
+        let path = std::path::Path::new(&path_str);
+        let abs  = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            source_dir.join(path)
+        };
+        return std::fs::read_to_string(&abs).map_err(|e|
+            rmcp::ErrorData::invalid_params(
+                format!("cannot read source_path `{}`: {e}", abs.display()),
+                None));
+    }
+    if let Some(s) = source {
+        return Ok(s);
+    }
+    Err(rmcp::ErrorData::invalid_params(
+        "one of `source` (inline `.ais` text body) or `source_path` \
+         (filesystem path to an `.ais` file) must be provided.  The path \
+         form is recommended — it keeps the MCP confirmation dialog \
+         tiny + scannable instead of dumping the entire file as JSON-\
+         escaped text.".to_string(),
         None))
 }
 
@@ -2143,7 +2267,8 @@ mod tests {
         const MINIMAL: &str = include_str!("../../../examples/minimal.ais");
         let s = AislangServer::new();
         let result = s.describe(Parameters(SourceOnlyParameters {
-            source: MINIMAL.to_string(),
+            source: Some(MINIMAL.to_string()),
+            source_path: None,
         })).await.expect("describe minimal succeeds");
         let text = body_text(&result);
         // Should be valid JSON.
@@ -2159,7 +2284,8 @@ mod tests {
     async fn describe_parse_error_propagates_as_rmcp_error() {
         let s = AislangServer::new();
         let err = s.describe(Parameters(SourceOnlyParameters {
-            source: "this is not valid aiSlang at all".to_string(),
+            source: Some("this is not valid aiSlang at all".to_string()),
+            source_path: None,
         })).await.expect_err("malformed source must error");
         let msg = err.to_string();
         assert!(msg.contains("parse error") || msg.contains("Parse"),
@@ -2173,7 +2299,8 @@ mod tests {
         const MINIMAL: &str = include_str!("../../../examples/minimal.ais");
         let s = AislangServer::new();
         let result = s.validate(Parameters(SourceOnlyParameters {
-            source: MINIMAL.to_string(),
+            source: Some(MINIMAL.to_string()),
+            source_path: None,
         })).await.expect("validate succeeds at MCP layer");
         let text = body_text(&result);
         assert!(text.starts_with("OK:"),
@@ -2208,7 +2335,8 @@ mod tests {
         // diagnostic text comes back as a successful response body
         // so the LLM can read it without an error-branch context loss.
         let result = s.validate(Parameters(SourceOnlyParameters {
-            source: bad.to_string(),
+            source: Some(bad.to_string()),
+            source_path: None,
         })).await.expect("validate never errors at MCP layer for parse failures");
         let text = body_text(&result);
         assert!(!text.starts_with("OK:"),
@@ -2217,6 +2345,118 @@ mod tests {
         assert!(text.contains("error") || text.contains("Parse")
                 || text.contains("expected") || text.contains("found"),
             "diagnostic should mention an error / expected / found; got: {text:?}");
+    }
+
+    // ── source_path / source resolution policy (week 13 Thu follow-up) ──
+    //
+    // resolve_source is the shared dispatcher every source-taking
+    // tool calls.  These tests pin the four reachable code paths:
+    //   - source_path set → file read from disk
+    //   - source_path absolute vs relative-to-source_dir
+    //   - source set only → returned verbatim (legacy in-memory path)
+    //   - both set → source_path wins (more authoritative)
+    //   - neither set → InvalidParams with migration hint
+    // Plus the unhappy path: source_path points at a missing file →
+    // clean error naming the resolved absolute path.
+
+    #[tokio::test]
+    async fn source_path_absolute_is_read_verbatim() {
+        // Validate via the absolute-path form.  Keeps the test
+        // independent of cwd so it works on macOS / Linux CI / NFS
+        // mounts alike.
+        const MINIMAL: &str = include_str!("../../../examples/minimal.ais");
+        let dir = fresh_tempdir("source-path-abs");
+        let path = dir.join("minimal.ais");
+        std::fs::write(&path, MINIMAL).unwrap();
+
+        let s = AislangServer::new();
+        let result = s.validate(Parameters(SourceOnlyParameters {
+            source:      None,
+            source_path: Some(path.to_string_lossy().to_string()),
+        })).await.expect("validate via source_path succeeds");
+        let text = body_text(&result);
+        assert!(text.starts_with("OK:"),
+            "validate(source_path=absolute) should mirror inline path; got: {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn source_path_relative_resolves_against_source_dir() {
+        // plan with source_path = "./project.ais" + source_dir = dir
+        // should read dir.join("project.ais").  Mirrors how Claude
+        // Desktop / Cursor users will typically configure paths.
+        let dir = fresh_tempdir("source-path-rel");
+        std::fs::write(dir.join("system.md"),
+            "you are a helpful test agent").unwrap();
+        std::fs::write(dir.join("project.ais"), PROJECT_WITH_PROMPT).unwrap();
+
+        let s = AislangServer::new();
+        let result = s.plan(Parameters(PlanParameters {
+            source:      None,
+            source_path: Some("./project.ais".to_string()),
+            source_dir:  Some(dir.to_string_lossy().to_string()),
+        })).await.expect("plan via relative source_path resolves against source_dir");
+        let text = body_text(&result);
+        assert!(text.contains("── docker-compose.yml ──"),
+            "plan via source_path should produce the full plan output");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn source_path_wins_when_both_set() {
+        // resolve_source: source_path is more authoritative because
+        // the user explicitly named a file rather than embedding
+        // content — pin the precedence ordering.  Test by having
+        // source contain garbage AND source_path point at a valid
+        // file; if source were used, validate would surface "error
+        // at line N"; if source_path wins, we get "OK:".
+        const MINIMAL: &str = include_str!("../../../examples/minimal.ais");
+        let dir = fresh_tempdir("source-path-wins");
+        let path = dir.join("minimal.ais");
+        std::fs::write(&path, MINIMAL).unwrap();
+
+        let s = AislangServer::new();
+        let result = s.validate(Parameters(SourceOnlyParameters {
+            source:      Some("@@@ this is garbage @@@".to_string()),
+            source_path: Some(path.to_string_lossy().to_string()),
+        })).await.expect("validate succeeds at the MCP layer");
+        let text = body_text(&result);
+        assert!(text.starts_with("OK:"),
+            "source_path must win over inline source; got: {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn source_path_missing_file_returns_invalid_params() {
+        // Unhappy path: source_path points at a nonexistent file →
+        // InvalidParams naming the resolved absolute path.  Drives
+        // the user to either fix the path or write the file first.
+        let s = AislangServer::new();
+        let err = s.validate(Parameters(SourceOnlyParameters {
+            source:      None,
+            source_path: Some("/tmp/aislang-does-not-exist-7f.ais".to_string()),
+        })).await.expect_err("missing source_path file must error");
+        let msg = err.to_string();
+        assert!(msg.contains("cannot read source_path"),
+            "error should call out the missing file; got: {msg}");
+        assert!(msg.contains("/tmp/aislang-does-not-exist-7f.ais"),
+            "error should name the resolved absolute path; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn neither_source_nor_source_path_returns_invalid_params() {
+        // Empty params → InvalidParams with a migration-hint message
+        // pointing at the recommended source_path form.
+        let s = AislangServer::new();
+        let err = s.validate(Parameters(SourceOnlyParameters {
+            source:      None,
+            source_path: None,
+        })).await.expect_err("neither set must error");
+        let msg = err.to_string();
+        assert!(msg.contains("`source`") && msg.contains("`source_path`"),
+            "error should name both fields; got: {msg}");
+        assert!(msg.contains("recommended"),
+            "error should nudge users toward source_path; got: {msg}");
     }
 
     // ── aislang_plan ──────────────────────────────────────────────
@@ -2274,8 +2514,9 @@ mod tests {
 
         let s = AislangServer::new();
         let result = s.plan(Parameters(PlanParameters {
-            source:     PROJECT_WITH_PROMPT.to_string(),
-            source_dir: Some(dir.to_string_lossy().to_string()),
+            source:      Some(PROJECT_WITH_PROMPT.to_string()),
+            source_path: None,
+            source_dir:  Some(dir.to_string_lossy().to_string()),
         })).await.expect("plan succeeds with materialised prompt");
         let text = body_text(&result);
         assert!(text.contains("── Resolved IR (JSON) ──"),
@@ -2304,8 +2545,9 @@ mod tests {
 
         let s = AislangServer::new();
         let err = s.plan(Parameters(PlanParameters {
-            source:     PROJECT_WITH_PROMPT.to_string(),
-            source_dir: Some(dir.to_string_lossy().to_string()),
+            source:      Some(PROJECT_WITH_PROMPT.to_string()),
+            source_path: None,
+            source_dir:  Some(dir.to_string_lossy().to_string()),
         })).await.expect_err("plan should fail when prompt file missing");
         let msg = err.to_string();
         assert!(msg.contains("resolve") || msg.contains("prompt")
@@ -2318,8 +2560,9 @@ mod tests {
     async fn plan_parse_error_short_circuits_before_resolve() {
         let s = AislangServer::new();
         let err = s.plan(Parameters(PlanParameters {
-            source:     "this is not valid".to_string(),
-            source_dir: None,
+            source:      Some("this is not valid".to_string()),
+            source_path: None,
+            source_dir:  None,
         })).await.expect_err("malformed source must error");
         let msg = err.to_string();
         assert!(msg.contains("parse error"),
@@ -2402,8 +2645,9 @@ mod tests {
 
         let s = AislangServer::new();
         let result = s.apply(Parameters(ApplyParameters {
-            source:     APPLY_TEST_SOURCE.to_string(),
-            source_dir: Some(dir.to_string_lossy().to_string()),
+            source:      Some(APPLY_TEST_SOURCE.to_string()),
+            source_path: None,
+            source_dir:  Some(dir.to_string_lossy().to_string()),
         })).await.expect("apply degrades cleanly without docker");
         let text = body_text(&result);
 
@@ -2436,8 +2680,9 @@ mod tests {
         let dir = fresh_tempdir("apply-bad-source");
         let s = AislangServer::new();
         let err = s.apply(Parameters(ApplyParameters {
-            source:     "this is not aislang".to_string(),
-            source_dir: Some(dir.to_string_lossy().to_string()),
+            source:      Some("this is not aislang".to_string()),
+            source_path: None,
+            source_dir:  Some(dir.to_string_lossy().to_string()),
         })).await.expect_err("malformed source must error");
         assert!(err.to_string().contains("parse error"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2450,8 +2695,9 @@ mod tests {
         // Deliberately DO NOT write system.md.
         let s = AislangServer::new();
         let err = s.apply(Parameters(ApplyParameters {
-            source:     APPLY_TEST_SOURCE.to_string(),
-            source_dir: Some(dir.to_string_lossy().to_string()),
+            source:      Some(APPLY_TEST_SOURCE.to_string()),
+            source_path: None,
+            source_dir:  Some(dir.to_string_lossy().to_string()),
         })).await.expect_err("resolve must fail when prompt missing");
         let msg = err.to_string();
         assert!(msg.contains("resolve") || msg.contains("hash") || msg.contains("system.md"),
@@ -2531,7 +2777,8 @@ mod tests {
         let dir = fresh_tempdir("status-no-state");
         let s = AislangServer::new();
         let result = s.status(Parameters(StatusParameters {
-            source:      APPLY_TEST_SOURCE.to_string(),
+            source:      Some(APPLY_TEST_SOURCE.to_string()),
+            source_path: None,
             source_dir:  Some(dir.to_string_lossy().to_string()),
             spend:       None,
             model_spend: None,
@@ -2561,7 +2808,8 @@ mod tests {
 
         let s = AislangServer::new();
         let result = s.status(Parameters(StatusParameters {
-            source:      APPLY_TEST_SOURCE.to_string(),
+            source:      Some(APPLY_TEST_SOURCE.to_string()),
+            source_path: None,
             source_dir:  Some(dir.to_string_lossy().to_string()),
             spend:       None,
             model_spend: None,
@@ -2578,7 +2826,8 @@ mod tests {
         let dir = fresh_tempdir("status-spend");
         let s = AislangServer::new();
         let result = s.status(Parameters(StatusParameters {
-            source:      APPLY_TEST_SOURCE.to_string(),
+            source:      Some(APPLY_TEST_SOURCE.to_string()),
+            source_path: None,
             source_dir:  Some(dir.to_string_lossy().to_string()),
             spend:       Some(true),
             model_spend: None,
@@ -2597,7 +2846,8 @@ mod tests {
         let _path = PathGuard::no_docker();
         let s = AislangServer::new();
         let err = s.status(Parameters(StatusParameters {
-            source:      "not aislang".to_string(),
+            source:      Some("not aislang".to_string()),
+            source_path: None,
             source_dir:  None,
             spend:       None,
             model_spend: None,
@@ -2611,7 +2861,8 @@ mod tests {
         let dir = fresh_tempdir("status-model-spend-all");
         let s = AislangServer::new();
         let result = s.status(Parameters(StatusParameters {
-            source:      APPLY_TEST_SOURCE.to_string(),
+            source:      Some(APPLY_TEST_SOURCE.to_string()),
+            source_path: None,
             source_dir:  Some(dir.to_string_lossy().to_string()),
             spend:       None,
             // Empty string filter = "all models" (matches CLI --model-spend semantics).
@@ -2778,9 +3029,10 @@ mod tests {
         let _path = PathGuard::no_docker();
         let s = AislangServer::new();
         let err = s.eval(Parameters(EvalParameters {
-            source:     "not aislang".to_string(),
-            source_dir: None,
-            eval_label: None,
+            source:      Some("not aislang".to_string()),
+            source_path: None,
+            source_dir:  None,
+            eval_label:  None,
         })).await.expect_err("parse error must bubble");
         assert!(err.to_string().contains("parse error"));
     }
@@ -2790,9 +3042,10 @@ mod tests {
         let _path = PathGuard::no_docker();
         let s = AislangServer::new();
         let err = s.eval(Parameters(EvalParameters {
-            source:     NO_EVAL_SOURCE.to_string(),
-            source_dir: None,
-            eval_label: None,
+            source:      Some(NO_EVAL_SOURCE.to_string()),
+            source_path: None,
+            source_dir:  None,
+            eval_label:  None,
         })).await.expect_err("no eval blocks → error");
         let msg = err.to_string();
         assert!(msg.contains("no `eval` blocks"),
@@ -2807,9 +3060,10 @@ mod tests {
         const SOURCE: &str = include_str!("../../../examples/support-agent.ais");
         let s = AislangServer::new();
         let err = s.eval(Parameters(EvalParameters {
-            source:     SOURCE.to_string(),
-            source_dir: None,
-            eval_label: Some("does_not_exist".to_string()),
+            source:      Some(SOURCE.to_string()),
+            source_path: None,
+            source_dir:  None,
+            eval_label:  Some("does_not_exist".to_string()),
         })).await.expect_err("unknown eval label must error");
         let msg = err.to_string();
         assert!(msg.contains("no eval named") && msg.contains("does_not_exist"),
