@@ -28,6 +28,7 @@ dependencies = [
  "aislang-catalog",
  "aislang-compose",
  "aislang-core",
+ "aislang-k8s",
  "aislang-resolver",
  "aislang-runtime",
  "anyhow",

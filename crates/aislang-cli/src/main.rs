@@ -598,35 +598,111 @@ fn run_plan(
     };
     let t_lock = t.elapsed();
 
-    // ── Stage 5: emit Compose + LiteLLM config; write the latter ──
+    // ── Stage 5: emit artifacts (Compose OR K8s, decided by deploy target) ──
     let t = std::time::Instant::now();
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
-    let artifacts = aislang_compose::emit(&resolved, &catalog, &output_dir)
-        .map_err(|e| anyhow::anyhow!("compose emit error: {e}"))?;
-    let litellm_config_path = output_dir.join(aislang_compose::LITELLM_CONFIG_FILENAME);
-    std::fs::write(&litellm_config_path, &artifacts.litellm_config)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}",
-            litellm_config_path.display()))?;
-    // .env.example: regenerate freely (it's a template). Distinct from
-    // `.env` (user's secrets) — aislang plan must NEVER touch the
-    // latter; that file is governed by docker compose at runtime.
-    let env_example_path = output_dir.join(aislang_compose::ENV_EXAMPLE_FILENAME);
-    std::fs::write(&env_example_path, &artifacts.env_example)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}",
-            env_example_path.display()))?;
+
+    // Decision 43.1 (locked Phase 2 Sunday): one chart per deploy
+    // block; the FIRST `deploy { target = kubernetes }` block wins.
+    // Mixed-target projects (one compose + one k8s) emit BOTH artifact
+    // sets — useful when transitioning a project from Compose to k8s.
+    let has_k8s_target = resolved.project.deploys.iter()
+        .any(|d| d.target == aislang_core::types::DeployTarget::Kubernetes);
+    let has_compose_target = resolved.project.deploys.iter()
+        .any(|d| d.target == aislang_core::types::DeployTarget::Compose);
+    // Default (no deploy block at all) = Compose, to preserve the v0.1
+    // behaviour where bare projects emit a `stack.yml` for the demo path.
+    let emit_compose = has_compose_target || resolved.project.deploys.is_empty();
+    let emit_k8s     = has_k8s_target;
+
+    // Always-on: Compose path (when selected) writes
+    // litellm_config.yaml + .env.example.
+    let (compose_artifacts, litellm_config_path, env_example_path) = if emit_compose {
+        let artifacts = aislang_compose::emit(&resolved, &catalog, &output_dir)
+            .map_err(|e| anyhow::anyhow!("compose emit error: {e}"))?;
+        let litellm_config_path = output_dir.join(aislang_compose::LITELLM_CONFIG_FILENAME);
+        std::fs::write(&litellm_config_path, &artifacts.litellm_config)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}",
+                litellm_config_path.display()))?;
+        // .env.example: regenerate freely (it's a template). Distinct from
+        // `.env` (user's secrets) — aislang plan must NEVER touch the
+        // latter; that file is governed by docker compose at runtime.
+        let env_example_path = output_dir.join(aislang_compose::ENV_EXAMPLE_FILENAME);
+        std::fs::write(&env_example_path, &artifacts.env_example)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}",
+                env_example_path.display()))?;
+        (Some(artifacts), Some(litellm_config_path), Some(env_example_path))
+    } else {
+        (None, None, None)
+    };
+
+    // K8s emit path (Phase 2 Week 14 Tue, Decision 43.2): write
+    // <output_dir>/manifests/*.yaml — three files: litellm.yaml,
+    // jaeger.yaml, budget-counter.yaml.  Wed adds agent-runtime.yaml +
+    // aislang-project-config.yaml; Thu adds openwebui.yaml (when
+    // `expose.web_ui = true`) and the Helm chart wrapper at
+    // <output_dir>/chart/.
+    let mut k8s_manifest_paths: Vec<PathBuf> = Vec::new();
+    if emit_k8s {
+        let k8s_artifacts = aislang_k8s::emit(&resolved, &catalog)
+            .map_err(|e| anyhow::anyhow!("k8s emit error: {e}"))?;
+        let manifests_dir = output_dir.join(aislang_k8s::MANIFESTS_DIRNAME);
+        std::fs::create_dir_all(&manifests_dir)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}",
+                manifests_dir.display()))?;
+        for (name, body) in &k8s_artifacts.manifests {
+            let path = manifests_dir.join(name);
+            std::fs::write(&path, body)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+            k8s_manifest_paths.push(path);
+        }
+    }
+
     let t_emit = t.elapsed();
 
     let t_total = t_total_start.elapsed();
 
-    // ── Output: Compose YAML on stdout (pipeable into `docker compose -f - up`) ──
-    print!("{}", artifacts.docker_compose);
+    // ── Output: stdout content depends on emit path(s) ──
+    //
+    // Compose-only:  Compose YAML on stdout (pipeable into
+    //                `docker compose -f - up`) — v0.1 contract.
+    // K8s-only:      K8s manifests on stdout, `---`-separated
+    //                (pipeable into `kubectl apply -f -`).
+    // Both targets:  Compose YAML on stdout (v0.1 contract wins);
+    //                k8s manifests on disk only.  Allows mixed-
+    //                target projects without breaking the Compose
+    //                stdout pipeline.
+    if emit_compose {
+        if let Some(artifacts) = &compose_artifacts {
+            print!("{}", artifacts.docker_compose);
+        }
+    } else if emit_k8s {
+        // K8s-only path: stream the manifests/ content as a
+        // concatenated YAML stream so `aislang plan | kubectl
+        // apply -f -` works analogously to the Compose pipeline.
+        // Order matches the BTreeMap (alphabetical filenames).
+        let k8s_artifacts = aislang_k8s::emit(&resolved, &catalog)
+            .map_err(|e| anyhow::anyhow!("k8s emit error: {e}"))?;
+        println!("# Generated by `aislang plan` — target = kubernetes");
+        println!("# Apply: kubectl apply -f - (or use `aislang apply`, Thu)");
+        for (_, body) in &k8s_artifacts.manifests {
+            print!("{body}");
+        }
+    }
 
     // ── Generated-file paths on stderr (so stdout stays pipe-clean) ──
     eprintln!();
     eprintln!("generated:");
-    eprintln!("  litellm config:  {}", litellm_config_path.display());
-    eprintln!("  env example:     {}", env_example_path.display());
+    if let Some(p) = &litellm_config_path {
+        eprintln!("  litellm config:  {}", p.display());
+    }
+    if let Some(p) = &env_example_path {
+        eprintln!("  env example:     {}", p.display());
+    }
+    for p in &k8s_manifest_paths {
+        eprintln!("  k8s manifest:    {}", p.display());
+    }
     if !no_lock {
         eprintln!("  lockfile:        {}", lock_path.display());
     }
@@ -676,6 +752,17 @@ fn run_plan(
         eprintln!();
         eprintln!("smoke test{}:",
             if smoke_test_live { " (live tier)" } else { "" });
+        // Smoke-test path is currently Compose-only (docker compose
+        // config -q + live up/down).  When `target = kubernetes` and
+        // no Compose target alongside it, skip with a notice — kind/
+        // helm-lint based smoke lands Fri (Week 14 close).
+        let Some(artifacts) = &compose_artifacts else {
+            eprintln!("  smoke test for `target = kubernetes` lands Fri \
+                       (kind + helm-lint axis).");
+            eprintln!("  for now, eyeball manifests/ + run `kubectl --dry-run=client \
+                       apply -f manifests/`.");
+            return Ok(());
+        };
         run_smoke_test(
             &artifacts.docker_compose,
             &output_dir,

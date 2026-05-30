@@ -1,0 +1,105 @@
+// examples/support-agent-k8s.ais — Phase 2 Week 14 Tue.
+//
+// Sibling to `support-agent.ais` (the Compose-target canonical demo)
+// flipped to `target = kubernetes` so the v0.2 K8s emitter has its
+// own fixture without having to toggle the Compose-target one back
+// and forth.  Same business logic — support agent over knowledge
+// base — different deploy substrate.
+//
+// Run it:
+//
+//     aislang validate examples/support-agent-k8s.ais
+//     aislang plan      examples/support-agent-k8s.ais
+//
+// `aislang plan` writes:
+//   - examples/manifests/litellm.yaml
+//   - examples/manifests/jaeger.yaml
+//   - examples/manifests/budget-counter.yaml
+//   - examples/litellm_config.yaml  (embedded in the litellm-config
+//                                    ConfigMap; standalone copy for
+//                                    eyeball-debugging)
+//   - examples/aislang.lock         (re-used from support-agent.ais
+//                                    when both have matching content)
+//
+// `aislang plan ... | kubectl apply -f -` will work end-to-end once
+// `aislang apply` lands Thu (shells out to `helm upgrade --install`
+// against the chart wrapper).  For now, do the dry-run:
+//
+//     aislang plan examples/support-agent-k8s.ais > /tmp/stack.yaml
+//     kubectl --dry-run=client apply -f /tmp/stack.yaml
+//
+// Wed adds:
+//   - examples/manifests/agent-runtime.yaml         (mcp-serve pod)
+//   - examples/manifests/aislang-project-config.yaml (.ais + lockfile + prompts CM)
+//
+// Thu adds:
+//   - examples/manifests/openwebui.yaml (when `expose { web_ui = true }`)
+//   - examples/chart/                  (Helm chart wrapper)
+//
+// Fri:
+//   - CI `k8s-smoke` axis runs this exact file against kind, applies
+//     the chart, port-forwards to litellm:4000, hits /health/liveliness.
+
+project "support-agent-k8s" {
+  budget {
+    hard_cap_per_day = $50
+    hard_cap_per_run = $0.50
+    optimize_for     = cost
+  }
+
+  model "fast" {
+    requires    = [chat, tool_use]
+    context_min = 32k
+    cost_max    = $0.001 per 1k_tokens
+    latency_p95 = 2s
+    residency   = [eu, us]
+
+    // Same prefer/fallback semantics as support-agent.ais — walk
+    // prefer in declared order; first satisfying candidate wins.
+    // Default: anthropic.claude_haiku_4_5 (small per-call cost, no
+    // local dependencies).  Swap to ollama.llama_3_1_8b for $0 local
+    // testing once the K8s cluster has Ollama reachable.
+    prefer   = [anthropic.claude_haiku_4_5, openai.gpt_4o_mini]
+    fallback = [ollama.llama_3_1_8b]
+  }
+
+  prompt "system" {
+    file    = "./prompts/system.md"
+    version = "1.0.0"
+  }
+
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "./knowledge/"
+  }
+
+  agent "support" {
+    model         = model.fast
+    system_prompt = prompt.system
+    tools         = [mcp_server.docs]
+  }
+
+  eval "factual_accuracy" {
+    dataset   = "./evals/qa.jsonl"
+    metric    = f1
+    threshold = 50%
+  }
+
+  deploy "prod" {
+    // K8s target — emits Helm chart + raw manifests under
+    // <output_dir>/{manifests,chart}/.  See PLAN-90-days-v0_2.md
+    // §"Phase 2 — Track B foundation" for the resource mapping
+    // (Decisions 43.1-43.8).
+    target = kubernetes
+    expose {
+      // Will become the agent-runtime pod's Service port once Wed
+      // lands `aislang mcp-serve --http <expose.port>` as the
+      // agent runtime under K8s.  Tue: informational only.
+      port = 8080
+      // Thu adds the Open WebUI Deployment + Service + PVC when
+      // this is true.  Set false for headless K8s-only smoke runs;
+      // set true for the browser-UX demo path.
+      web_ui = true
+    }
+  }
+}

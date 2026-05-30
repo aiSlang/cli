@@ -362,7 +362,7 @@ mod tests {
         // will too.
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&empty_resolved(), &catalog).expect("emit");
-        for (name, _) in &artifacts.manifests {
+        for name in artifacts.manifests.keys() {
             // all_resources does the parse + panics on failure
             let resources: Vec<_> = all_resources(&artifacts).into_iter()
                 .filter(|(f, _, _)| f == name)
