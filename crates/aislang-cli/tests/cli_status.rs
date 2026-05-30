@@ -427,3 +427,116 @@ fn tempdir_with_web_ui_project(suffix: &str) -> PathBuf {
     assert!(!stdout.contains("docker logs"),
         "non-web_ui project must NOT include the docker-logs CTA; got:\n{stdout}");
 }
+
+// ---------------------------------------------------------------------------
+// Week 13 Thu: --main-spend (principal-LLM token tracking)
+// ---------------------------------------------------------------------------
+
+/// `.ais` source with a `main` block declared.  `model.source` is
+/// `api` by default; the subscription variant lives in a sibling
+/// helper so individual tests can pick their flavour.
+fn tempdir_with_main_project(suffix: &str, source: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "aislang-status-main-{}-{suffix}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("system.md"), "you orchestrate").expect("write prompt");
+    let src = format!(r#"project "demo" {{
+  budget {{ hard_cap_per_day = $1  hard_cap_per_run = $0.01 }}
+  model "fast" {{
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+{source}
+  }}
+  prompt "system" {{
+    file    = "./system.md"
+    version = "1.0.0"
+  }}
+  agent "support" {{
+    model = model.fast  system_prompt = prompt.system  tools = []
+  }}
+  main "support_orchestrator" {{
+    model         = model.fast
+    chat_client   = claude_desktop
+    pattern       = orchestrator
+    system_prompt = prompt.system
+  }}
+}}
+"#);
+    let ais_path = dir.join("demo.ais");
+    std::fs::write(&ais_path, src).expect("write demo.ais");
+    ais_path
+}
+
+#[test] fn main_spend_empty_state_with_api_source_hints_at_v0_3() {
+    // Project has one `main` block with default `source = api`.
+    // No spend recorded → empty-state line + the "principal-LLM
+    // inference happens inside the host chat app" hint (not the
+    // subscription variant).
+    let ais = tempdir_with_main_project("empty-api", "");   // no source = → defaults to api
+    let dir = ais.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin_isolated(&home)
+        .args(["status", "--main-spend"])
+        .arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("spend by main"),
+        "section header must be present; got:\n{stdout}");
+    assert!(stdout.contains("support_orchestrator")
+        && stdout.contains("(no spend recorded today)"),
+        "per-main empty-state line missing; got:\n{stdout}");
+    assert!(stdout.contains("Principal-LLM inference happens inside the host chat app"),
+        "API-source hint should fire; got:\n{stdout}");
+    assert!(stdout.contains("OpenAI-compatible adapter"),
+        "v0.3 carry-over pointer missing; got:\n{stdout}");
+}
+
+#[test] fn main_spend_with_subscription_source_uses_subscription_variant() {
+    // Project declares `model.source = subscription`.  Empty-state
+    // hint should use the subscription variant ("no API cost — empty
+    // is correct"), not the api variant.
+    let ais = tempdir_with_main_project("empty-sub", "    source = subscription");
+    let dir = ais.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin_isolated(&home)
+        .args(["status", "--main-spend"])
+        .arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Per-main line uses the subscription form, not "(no spend recorded today)".
+    assert!(stdout.contains("subscription (no API charge)"),
+        "subscription-source main should render \"subscription (no API charge)\"; got:\n{stdout}");
+    // Hint mentions subscription explicitly.
+    assert!(stdout.contains("Subscription-source `main` entries"),
+        "subscription hint variant should fire; got:\n{stdout}");
+}
+
+#[test] fn main_spend_on_project_without_main_blocks_explains_state() {
+    // Project has no `main` block at all → section reports it.
+    let ais = tempdir_with_project("no-main");   // base helper, no main
+    let dir = ais.parent().unwrap().to_path_buf();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = bin_isolated(&home)
+        .args(["status", "--main-spend"])
+        .arg(&ais).output()
+        .expect("spawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("spend by main"),
+        "header still present even when no main blocks; got:\n{stdout}");
+    assert!(stdout.contains("(no `main` blocks declared in this project)"),
+        "must surface the explicit no-mains state; got:\n{stdout}");
+    // No v0.3 hint when there's nothing to track.
+    assert!(!stdout.contains("OpenAI-compatible adapter"),
+        "no-main project must NOT emit the v0.3 hint; got:\n{stdout}");
+}
