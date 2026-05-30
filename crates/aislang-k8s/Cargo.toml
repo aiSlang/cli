@@ -1,0 +1,26 @@
+[package]
+name = "aislang-k8s"
+description = "aiSlang Kubernetes emitter (raw manifests + Helm chart)"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+# Phase 2 Week 14 Mon: K8s emitter mirrors aislang-compose's dep
+# surface — same ResolvedProject input, same catalog lookups for
+# LiteLLM image / litellm_name resolution, same serde_yaml for the
+# typed-struct → YAML pipeline.
+aislang-core     = { workspace = true }
+aislang-catalog  = { workspace = true }
+aislang-resolver = { workspace = true }
+# Week-14 Tue (Track B): the K8s emitter re-uses aislang-compose's
+# `litellm::generate_config` to produce the LiteLLM router config
+# that the K8s ConfigMap mounts.  Single source of truth for that
+# generated YAML across both deploy targets.
+aislang-compose  = { workspace = true }
+serde            = { workspace = true }
+serde_yaml       = { workspace = true }
+thiserror        = { workspace = true }
