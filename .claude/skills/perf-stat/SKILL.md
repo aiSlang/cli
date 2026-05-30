@@ -26,6 +26,29 @@ Invoke via the helper script:
 .claude/skills/perf-stat/run.sh report             # show table without re-running git
 ```
 
+### Optional flags (perf-stat-filters follow-up)
+
+Two flags refine the token + LoC attribution; either or both can be combined with any mode:
+
+```bash
+# Restrict token aggregation to one Claude-Code project dir.
+# PATTERN is a case-insensitive SUBSTRING match against subdir
+# names under ~/.claude/projects/.
+.claude/skills/perf-stat/run.sh --project-filter aiSlang
+.claude/skills/perf-stat/run.sh retrofit --project-filter DoorMonitor-Firmware-CubeIDE
+
+# Compute per-LoC ratios for a non-Rust language.  Bypasses the
+# code-stat cache.txt and runs `cloc` inline against the repo
+# root.  Default: read code-stat's cache.txt (which is Rust for
+# aiSlang).
+.claude/skills/perf-stat/run.sh --language Python
+.claude/skills/perf-stat/run.sh --language "C/C++ Header"
+```
+
+**Why `--project-filter`.**  Claude Code records sessions under a dir named after the launching CWD.  Users routinely work on project X from a CWD belonging to project Y; without a filter, perf-stat counts ALL Claude-Code spend on dates that have commits to THIS repo — including side-quests on other repos that happened the same day.  For per-project cost analysis (e.g. "how much did v0.2 actually cost vs. unrelated work on the same days"), `--project-filter aiSlang` narrows to one project subdir.  Wide-net default is kept because sessions can `cd` mid-stream; restricting too aggressively misses spend that genuinely belongs to the project under analysis.
+
+**Why `--language`.**  perf-stat displays tokens-per-LoC and $/LoC as a "how much AI co-development cost per unit of delivered software" baseline.  The legacy path reads `code-stat`'s cache.txt (always Rust for aiSlang).  For non-Rust projects (or to probe Python tooling LoC like the perf-stat skill itself, ~500 lines), `--language Python` re-runs `cloc` inline and picks the matching row.  cloc must be on PATH.
+
 ### Default (`retrofit + report`)
 
 Walks the git log, recomputes the per-week velocity table, atomically rewrites `cache.json`, then prints a human-readable summary on stdout:

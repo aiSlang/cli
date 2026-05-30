@@ -158,17 +158,33 @@ def _find_usage(obj: Any, depth: int = 0) -> dict | None:
     return None
 
 
-def aggregate_tokens_per_date() -> dict[str, dict[str, int]]:
-    """Walk every Claude session JSONL across all project dirs;
-    return {YYYY-MM-DD: {input, output, cache_creation, cache_read, total}}.
+def aggregate_tokens_per_date(
+    project_filter: str | None = None,
+) -> dict[str, dict[str, int]]:
+    """Walk Claude session JSONLs and aggregate token usage by date.
 
-    Why all projects: Claude Code records sessions under a dir named
-    after the CWD where Claude was launched.  Your aiSlang work may
-    live under a non-aiSlang project dir (e.g. you launched Claude
-    from a different repo and then `cd`'d).  Aggregating all dirs
-    captures the full token spend; date-bucketing keeps the per-week
-    rollup honest (only dates with git commits to THIS repo count
-    toward THIS repo's week table — see compute_velocity's loop).
+    Returns {YYYY-MM-DD: {input, output, cache_creation, cache_read,
+    total}} across all matching project dirs.
+
+    `project_filter` (added in the perf-stat-filters follow-up):
+    case-insensitive SUBSTRING match against each project-dir basename.
+    Default behaviour (None / empty) walks every dir under
+    ~/.claude/projects/ — the legacy "all projects" mode.
+
+    **Why filter exists.**  Claude Code records sessions under a dir
+    named after the CWD where Claude was launched.  Users routinely
+    work on project X from a CWD belonging to project Y; perf-stat's
+    "tokens per date" attribution then bundles X's spend into Y's
+    bucket.  For per-project cost analysis (e.g. "how much did the
+    v0.2 aiSlang work actually cost vs. side-quests on other repos")
+    you want to filter to JUST the project dir whose name encodes
+    the relevant CWD prefix.  Pass `--project-filter aiSlang` (or any
+    substring of the encoded dir name) to do so.
+
+    **Why all projects is still the default.**  Sessions can `cd`
+    mid-stream; restricting too aggressively misses spend that
+    belongs to the project under analysis.  The wide-net default
+    over-counts; a substring filter narrows.
 
     Failures swallowed silently: a corrupt jsonl line returns no
     usage; an unparseable file is skipped.  Token metric is
@@ -183,8 +199,11 @@ def aggregate_tokens_per_date() -> dict[str, dict[str, int]]:
     })
     if not CLAUDE_PROJECTS_DIR.exists():
         return {}
+    needle = project_filter.lower() if project_filter else None
     for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
+            continue
+        if needle and needle not in project_dir.name.lower():
             continue
         for jsonl in project_dir.glob("*.jsonl"):
             try:
@@ -358,7 +377,58 @@ def _fmt_usd(d: float) -> str:
     return f"${d/1000:>4.1f}k"
 
 
-def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
+def cloc_loc_for_language(language: str) -> int | None:
+    """Run `cloc --fullpath --not-match-d=target .` from the git
+    repo root and return the LoC count for the row whose Language
+    column matches `language` (case-insensitive).
+
+    Returns None on: cloc not on PATH; no matching language row; any
+    parse failure.  Caller falls back to the code-stat cache.txt.
+
+    Added in the perf-stat-filters follow-up.  Lets users compute
+    tokens-per-LoC and $/LoC for non-Rust languages without first
+    rewriting + re-running the code-stat skill.
+    """
+    try:
+        repo_root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    try:
+        result = subprocess.run(
+            ["cloc", "--fullpath", "--not-match-d=target", "."],
+            check=True, capture_output=True, text=True, cwd=repo_root,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    needle = language.lower()
+    # cloc's output table has rows like:
+    #   Rust            33    2017    5848    16722
+    # We want the rightmost numeric column (the `code` count) of the
+    # row whose first column matches `language`.  Some language names
+    # have spaces (e.g. "C/C++ Header"); use a regex that captures the
+    # whole language portion up to multiple whitespace before digits.
+    line_re = re.compile(r"^([A-Za-z0-9/_+#\.\- ]+?)\s{2,}\d+(?:\s+\d+){2,}\s+(\d+)\s*$")
+    for line in result.stdout.splitlines():
+        m = line_re.match(line)
+        if not m:
+            continue
+        lang_in_line = m.group(1).strip().lower()
+        if lang_in_line == needle:
+            try:
+                return int(m.group(2))
+            except ValueError:
+                return None
+    return None
+
+
+def render_table(
+    rows:     list[dict[str, Any]],
+    s:        dict[str, Any],
+    language: str | None = None,
+) -> str:
     out: list[str] = []
     # Token columns appear only when at least one week has tokens
     # data (i.e. ~/.claude/projects/ existed + had usable JSONLs).
@@ -450,27 +520,40 @@ def render_table(rows: list[dict[str, Any]], s: dict[str, Any]) -> str:
             out.append(
                 f"         $ per SP (mean)             = ${usd_per_sp:,.2f}"
             )
-            # Bottom-line tokens/USD per LoC if code-stat cache exists.
-            code_stat_cache = SCRIPT_DIR.parent / "code-stat" / "cache.txt"
-            if code_stat_cache.exists():
-                try:
-                    loc_now = int(code_stat_cache.read_text().strip().replace(",", ""))
-                    if loc_now > 0:
-                        out.append("")
-                        out.append("         ── per Rust LoC (rough, current LoC not delta) ──")
-                        out.append(
-                            f"         current Rust LoC            = {loc_now:,}"
-                        )
-                        out.append(
-                            f"         tokens / LoC                = "
-                            f"{total_tokens / loc_now:,.0f}"
-                        )
-                        out.append(
-                            f"         $ / LoC                     = "
-                            f"${total_usd / loc_now:.3f}"
-                        )
-                except (ValueError, OSError):
-                    pass
+            # Bottom-line tokens/USD per LoC.  Two sources for the
+            # current LoC, in priority order:
+            #   1. If `language` is set (perf-stat-filters follow-up),
+            #      run `cloc` inline against the repo root and pick
+            #      the row matching that language — bypasses
+            #      code-stat's cache so the user can probe arbitrary
+            #      languages without re-running code-stat each time.
+            #   2. Otherwise fall back to the cached LoC code-stat
+            #      wrote on its last run (the legacy path).
+            loc_now: int | None = None
+            loc_label = language if language else "Rust"
+            if language:
+                loc_now = cloc_loc_for_language(language)
+            if loc_now is None:
+                code_stat_cache = SCRIPT_DIR.parent / "code-stat" / "cache.txt"
+                if code_stat_cache.exists():
+                    try:
+                        loc_now = int(code_stat_cache.read_text().strip().replace(",", ""))
+                    except (ValueError, OSError):
+                        loc_now = None
+            if loc_now is not None and loc_now > 0:
+                out.append("")
+                out.append(f"         ── per {loc_label} LoC (rough, current LoC not delta) ──")
+                out.append(
+                    f"         current {loc_label} LoC            = {loc_now:,}"
+                )
+                out.append(
+                    f"         tokens / LoC                = "
+                    f"{total_tokens / loc_now:,.0f}"
+                )
+                out.append(
+                    f"         $ / LoC                     = "
+                    f"${total_usd / loc_now:.3f}"
+                )
             # Pricing reference footer.
             out.append("")
             out.append(
@@ -533,7 +616,10 @@ def read_cache() -> dict[str, Any] | None:
 
 # ── entrypoints ────────────────────────────────────────────────────
 
-def cmd_retrofit() -> int:
+def cmd_retrofit(
+    project_filter: str | None = None,
+    language:       str | None = None,
+) -> int:
     rows_raw = git_log()
     if not rows_raw:
         print("perf-stat: no git history; run from a checked-out repo.",
@@ -543,24 +629,24 @@ def cmd_retrofit() -> int:
     # v2: token aggregation.  Returns {} on missing / empty
     # ~/.claude/projects/ — table render gracefully degrades to
     # the v1 shape (no token columns) when this is empty.
-    tokens_per_date = aggregate_tokens_per_date()
+    tokens_per_date = aggregate_tokens_per_date(project_filter)
     if not weeks:
         print("perf-stat: no `Week N <Day>:` commits found.", file=sys.stderr)
         return 1
     rows = compute_velocity(weeks, tokens_per_date)
     s = summary(rows, tokens_per_date)
     write_cache(rows, s)
-    print(render_table(rows, s))
+    print(render_table(rows, s, language))
     return 0
 
 
-def cmd_report() -> int:
+def cmd_report(language: str | None = None) -> int:
     cache = read_cache()
     if cache is None:
         print("perf-stat: no cache.json; run `perf-stat retrofit` first.",
               file=sys.stderr)
         return 2
-    print(render_table(cache["weeks"], cache["summary"]))
+    print(render_table(cache["weeks"], cache["summary"], language))
     return 0
 
 
@@ -589,15 +675,56 @@ def usage() -> int:
 
 
 def main(argv: list[str]) -> int:
-    args = argv[1:]
-    if not args or args[0] == "retrofit":
-        return cmd_retrofit()
-    if args[0] == "report":
-        return cmd_report()
-    if args[0] == "estimate":
-        if len(args) != 2:
+    # Two new optional flags (perf-stat-filters follow-up):
+    #   --project-filter PATTERN   substring match against
+    #                              ~/.claude/projects/* basenames
+    #   --language LANG            cloc language row to use for
+    #                              the per-LoC ratios (default: Rust
+    #                              via code-stat's cached LoC)
+    #
+    # Flags can appear anywhere on the line; the remaining positional
+    # arg (or absence) selects the mode (retrofit / report / estimate).
+    # Hand-rolled flag parser to keep "stdlib only" honest and avoid
+    # argparse's help-noise on this tiny surface.
+    raw = list(argv[1:])
+    project_filter: str | None = None
+    language:       str | None = None
+    positional: list[str]      = []
+    i = 0
+    while i < len(raw):
+        tok = raw[i]
+        if tok == "--project-filter":
+            if i + 1 >= len(raw):
+                print("perf-stat: --project-filter needs a PATTERN argument",
+                      file=sys.stderr)
+                return 3
+            project_filter = raw[i + 1]
+            i += 2
+        elif tok.startswith("--project-filter="):
+            project_filter = tok.split("=", 1)[1]
+            i += 1
+        elif tok == "--language":
+            if i + 1 >= len(raw):
+                print("perf-stat: --language needs a LANG argument",
+                      file=sys.stderr)
+                return 3
+            language = raw[i + 1]
+            i += 2
+        elif tok.startswith("--language="):
+            language = tok.split("=", 1)[1]
+            i += 1
+        else:
+            positional.append(tok)
+            i += 1
+
+    if not positional or positional[0] == "retrofit":
+        return cmd_retrofit(project_filter, language)
+    if positional[0] == "report":
+        return cmd_report(language)
+    if positional[0] == "estimate":
+        if len(positional) != 2:
             return usage()
-        return cmd_estimate(args[1])
+        return cmd_estimate(positional[1])
     return usage()
 
 
