@@ -1852,6 +1852,38 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
 /// HTTP failure / etc.) print to stderr but DON'T abort the session,
 /// matching the v0.1 in-process chat behaviour: the user can
 /// continue typing.
+/// rmcp `ClientHandler` impl for `aislang chat` — week 13 Wed.
+///
+/// The only callback we care about is `on_progress`: it fires when
+/// `mcp-serve`'s `aislang_chat_turn` tool sends a `notifications/
+/// progress` message to keep the user informed during a multi-
+/// iteration tool-use turn.  We render each progress message as a
+/// dim-stderr line so the assistant's final reply (which lands on
+/// stdout via the synchronous `call_tool` future) stays the visual
+/// focus.
+///
+/// PII-safe by construction: `mcp_server::chat_turn` builds the
+/// `message` field from `SessionProgress::message()`, which only
+/// contains labels + sizes — never raw arg content or tool-output
+/// bodies (Decision 21 carry-over).
+#[derive(Default, Clone)]
+struct AislangChatClient;
+
+impl rmcp::ClientHandler for AislangChatClient {
+    async fn on_progress(
+        &self,
+        params:   rmcp::model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        // Indent + dim-italic prefix so the progress lines visually
+        // separate from the assistant's eventual reply line (which
+        // is the user's actual data).  ANSI codes are safe on stderr
+        // — even non-TTY pipes (tee'd logs) tolerate them.
+        let msg = params.message.as_deref().unwrap_or("(no message)");
+        eprintln!("\x1b[2;3m  · {msg}\x1b[0m");
+    }
+}
+
 async fn chat_via_mcp_serve(
     source:      String,
     source_dir:  PathBuf,
@@ -1859,7 +1891,8 @@ async fn chat_via_mcp_serve(
     model_label: String,
 ) -> Result<()> {
     use rmcp::{ServiceExt,
-        model::{CallToolRequestParams, RawContent},
+        model::{CallToolRequestParams, NumberOrString, ProgressToken, RawContent,
+                RequestParamsMeta},
         transport::TokioChildProcess};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
@@ -1879,7 +1912,9 @@ async fn chat_via_mcp_serve(
 
     let transport = TokioChildProcess::new(cmd)
         .map_err(|e| anyhow::anyhow!("spawn aislang mcp-serve: {e}"))?;
-    let client = ().serve(transport).await
+    // Use the custom client handler so progress notifications get
+    // rendered as dim-stderr lines via `AislangChatClient::on_progress`.
+    let client = AislangChatClient::default().serve(transport).await
         .map_err(|e| anyhow::anyhow!("MCP handshake failed: {e}"))?;
 
     // ── Banner.  Stderr so stdout stays pipe-clean for assistant
@@ -1895,6 +1930,13 @@ async fn chat_via_mcp_serve(
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
+
+    // Monotonic per-process progress-token sequence.  rmcp uses the
+    // value verbatim to subscribe handlers; making each turn unique
+    // avoids cross-turn confusion if a host ever forks the chat
+    // session across multiple stdin lines (today: doesn't, but the
+    // sequence is cheap insurance).
+    let mut turn_counter: u64 = 0;
 
     let exit_reason = loop {
         eprint!("> ");
@@ -1916,13 +1958,25 @@ async fn chat_via_mcp_serve(
         // ── Dispatch one turn via the MCP tool.  Same Session
         // pool the Claude Desktop / Cursor chat uses (planning-doc
         // Track A architectural decision #3).
-        let params = CallToolRequestParams::new("aislang_chat_turn".to_string())
+        //
+        // Week 13 Wed: include a per-turn `progressToken` in the
+        // request meta so mcp-serve's chat_turn knows to emit
+        // `notifications/progress` updates during the tool-use loop.
+        // Our `AislangChatClient::on_progress` handler renders them
+        // as dim-stderr lines as they arrive.
+        turn_counter += 1;
+        let progress_token = ProgressToken(NumberOrString::Number(turn_counter as i64));
+        let mut params = CallToolRequestParams::new("aislang_chat_turn")
             .with_arguments(serde_json::json!({
                 "source":      source,
                 "source_dir":  source_dir.to_string_lossy(),
                 "agent_label": agent_label,
                 "user_input":  line,
             }).as_object().unwrap().clone());
+        // RequestParamsMeta trait gives us set_progress_token —
+        // populates `params.meta._meta.progressToken` per the MCP
+        // 2025-11-25 spec.
+        params.set_progress_token(progress_token);
         match client.peer().call_tool(params).await {
             Ok(result) => {
                 let reply = result.content.first()
