@@ -1964,13 +1964,21 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         .map_err(|e| anyhow::anyhow!(
             "source dir `{}` not readable: {e}", source_dir.display()))?;
 
+    // Canonical absolute file path so mcp-serve doesn't have to guess
+    // when it later re-reads the .ais via source_path (week 13 Thu
+    // follow-up — keeps each chat_turn MCP request envelope tiny so
+    // Claude Desktop's confirmation preview stays scannable).
+    let source_path = std::fs::canonicalize(&file)
+        .map_err(|e| anyhow::anyhow!(
+            "source file `{}` not readable: {e}", file.display()))?;
+
     // ── 3. spin tokio runtime + drive the MCP-proxied chat loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
     let result = rt.block_on(chat_via_mcp_serve(
-        source, source_dir, agent_label, model_label,
+        source_path, source_dir, agent_label, model_label,
     ));
     drop(rt);
     result
@@ -2019,7 +2027,7 @@ impl rmcp::ClientHandler for AislangChatClient {
 }
 
 async fn chat_via_mcp_serve(
-    source:      String,
+    source_path: PathBuf,
     source_dir:  PathBuf,
     agent_label: String,
     model_label: String,
@@ -2100,9 +2108,14 @@ async fn chat_via_mcp_serve(
         // as dim-stderr lines as they arrive.
         turn_counter += 1;
         let progress_token = ProgressToken(NumberOrString::Number(turn_counter as i64));
+        // Pass `source_path` (file path) instead of `source` (inline
+        // file contents) so the request envelope stays tiny.  Same
+        // resolution policy as Claude Desktop / Cursor / any other
+        // MCP host that drives chat_turn — the path WINS over inline
+        // source if both are set; here we set only the path.
         let mut params = CallToolRequestParams::new("aislang_chat_turn")
             .with_arguments(serde_json::json!({
-                "source":      source,
+                "source_path": source_path.to_string_lossy(),
                 "source_dir":  source_dir.to_string_lossy(),
                 "agent_label": agent_label,
                 "user_input":  line,
