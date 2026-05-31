@@ -1634,6 +1634,20 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
     eprintln!("  lockfile:        {}", lock_path.display());
     eprintln!();
 
+    // ── Stage 7b: preflight — required prerequisites (Decision 43.5). ──
+    //
+    // The chart's pods envFrom `aislang-providers` Secret with
+    // `optional: false` — if the Secret doesn't exist, kubelet
+    // refuses to start the pod (the pod sits Pending with a
+    // `CreateContainerConfigError` event the user only sees
+    // by running `kubectl describe pod`).  Catch this at apply
+    // time so users have a single actionable error instead of
+    // having to dig through pod-event logs.  Non-fatal: print
+    // a loud warning + the create-secret command but let helm
+    // install proceed so the rest of the stack is in place when
+    // the user creates the Secret.
+    preflight_check_providers_secret();
+
     // ── Stage 8: shell to `helm upgrade --install` (or graceful-degrade). ──
     if !helm_on_path() {
         eprintln!("helm not on PATH — wrote artifacts but didn't install chart.");
@@ -1804,6 +1818,68 @@ fn helm_on_path() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Phase 2 Week 14 Thu follow-up — soft preflight check for the
+/// user-created `aislang-providers` Secret (Decision 43.5).  Emits
+/// a loud warning + the create-secret recipe when the Secret is
+/// missing; never blocks the apply.
+///
+/// Why a warning and not a hard fail: the rest of the chart still
+/// needs to be installed (ConfigMaps, Services, Deployments — the
+/// Secret is just one Pod-side dependency).  Stopping the install
+/// would leave the cluster in a worse state ("nothing applied") +
+/// would force users to skip the check with a `--no-preflight`
+/// flag when they're sure the Secret IS there (multi-namespace
+/// installs, externally-managed Secret, etc.).
+///
+/// Quiet when kubectl is absent — the user's already in a degraded
+/// state (we'd never have reached helm-install either); no point
+/// adding noise.  Same posture as `docker_on_path()` / `helm_on_path()`.
+fn preflight_check_providers_secret() {
+    // kubectl may not be on PATH (helm-only environments do exist
+    // — `helm upgrade --install` works against ~/.kube/config without
+    // kubectl).  Skip silently in that case.
+    let kubectl_present = std::process::Command::new("kubectl")
+        .arg("version").arg("--client").arg("--output=yaml")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !kubectl_present { return; }
+
+    // `kubectl get secret aislang-providers -o name --ignore-not-found`
+    // exits 0 in both Found + NotFound cases; empty stdout = NotFound.
+    let out = std::process::Command::new("kubectl")
+        .args(["get", "secret", "aislang-providers",
+               "-o", "name", "--ignore-not-found"])
+        .output();
+    let absent = match out {
+        Ok(o) if o.status.success() => o.stdout.is_empty(),
+        // Any error from kubectl (RBAC denial, cluster unreachable,
+        // namespace permission issue) → skip the check rather than
+        // false-positive.  Apply continues; if there's a real
+        // cluster issue, helm will fail loudly enough.
+        _ => return,
+    };
+    if !absent { return; }
+
+    // Loud warning block — easy to spot in scroll-back.
+    eprintln!();
+    eprintln!("⚠  preflight WARNING: required Secret `aislang-providers` not found");
+    eprintln!("   (Decision 43.5 — provider creds Secret is user-created)");
+    eprintln!();
+    eprintln!("   The chart's litellm + agent-runtime pods envFrom this Secret;");
+    eprintln!("   without it the pods will install but stay Pending with a");
+    eprintln!("   `CreateContainerConfigError` event.  Create the Secret then");
+    eprintln!("   the pods will progress automatically on the next kubelet sync:");
+    eprintln!();
+    eprintln!("     kubectl create secret generic aislang-providers \\");
+    eprintln!("       --from-literal=ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" \\");
+    eprintln!("       --from-literal=OPENAI_API_KEY=\"$OPENAI_API_KEY\" \\");
+    eprintln!("       --from-literal=OLLAMA_API_BASE=\"$OLLAMA_API_BASE\"");
+    eprintln!();
+    eprintln!("   Helm install will proceed; create the Secret afterwards.");
+    eprintln!();
 }
 
 /// Phase 2 Week 14 Thu — peek the deploy target without doing the

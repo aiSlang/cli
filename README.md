@@ -215,6 +215,8 @@ helm upgrade --install prod ./chart \
 
 See `examples/support-agent-k8s.ais` for the canonical K8s demo and PLAN-90-days-v0_2.md §"Phase 2 — Track B foundation" for the eight locked architectural decisions (43.1–43.8) that drive the resource shapes.
 
+> **Heads-up on the agent-runtime image (pre-v0.2.0-rc2)**: the `agent-runtime` Deployment references `ghcr.io/aislang/aislang:latest`, which is published by the release workflow's `image` job (Mon's Phase 2 Week 14 commit).  Until v0.2.0-rc2 is tagged (Fri's Phase 2 Week 14 close), that image **doesn't exist in ghcr.io** — the agent-runtime pod will sit in `ImagePullBackOff`.  The rest of the stack (LiteLLM + Jaeger + budget-counter + Open WebUI) uses upstream public images and runs fine.  For early testing on a pre-rc2 build: either (a) chat through Open WebUI in the browser (it dials LiteLLM directly, no agent-runtime needed); (b) build + push `aislang:dev` to a registry you control and override with `helm install --set image.repository=… --set image.tag=dev`; or (c) `kind load docker-image aislang:dev` to side-load a locally-built image into kind without pushing.
+
 ### MCP integration — drive aiSlang from Claude Desktop / Cursor (v0.2 Thu, Track A)
 
 `aislang mcp-serve` exposes the whole CLI surface as an MCP server, so MCP-aware LLM hosts can author, deploy, and chat with .ais agents without you touching a terminal.
