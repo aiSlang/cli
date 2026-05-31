@@ -653,8 +653,11 @@ This keeps the v0.1 language small and stable while leaving room for the long ta
 | Provider credentials | User-created Secret `aislang-providers`; `envFrom: secretRef` on LiteLLM + agent-runtime |
 | `expose.web_ui = true` | Open WebUI Deployment + Service + PersistentVolumeClaim |
 | `expose.ingress = "<host>"` (+ `web_ui = true`) | `networking.k8s.io/v1` Ingress routing `/` Prefix to the openwebui Service |
+| OpenTelemetry traces (Week 15 Tue) | LiteLLM + agent-runtime pods carry `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` + `OTEL_SERVICE_NAME=aislang.<component>.<deploy-label>` env vars; Jaeger pod is the receiver |
 
 CLI behaviour: `aislang apply` shells to `helm upgrade --install <deploy-label> chart/`; `aislang destroy` shells to `helm uninstall <deploy-label>`.  Both graceful-degrade when `helm` isn't on PATH (apply writes artifacts + prints manual command; destroy hard-fails with a `kubectl delete -f manifests/` fallback hint).
+
+**OTLP endpoint override** (Week 15 Tue): the chart's `values.yaml` exposes `observability.otlp_endpoint` so users running an external collector (Honeycomb, Tempo, Datadog, NewRelic, OTel Collector) can redirect spans without re-running `aislang plan` — `helm install --set observability.otlp_endpoint=https://otlp.honeycomb.io:443`.
 
 ### 7.4 Binary IR / wire format — not in v0.1
 

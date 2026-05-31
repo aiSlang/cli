@@ -264,6 +264,54 @@ aislang eval examples/support-agent.ais | jq -r '.trace_url, .cases[].trace_url'
 
 Override the Jaeger UI URL with `AISLANG_JAEGER_UI` (e.g. for a shared collector) or the OTLP endpoint with the standard `OTEL_EXPORTER_OTLP_ENDPOINT` env var. v0.1 uses 100 % head sampling — eval volumes are small enough that the debuggability win pays for itself.
 
+#### Observability under K8s (Phase 2 Week 15 Tue)
+
+The same OTel-GenAI spans flow into the in-cluster Jaeger pod automatically — no manual env config required.  Both the LiteLLM router pod and the `aislang mcp-serve` agent-runtime pod ship spans to `http://jaeger:4318` (K8s DNS — same posture LiteLLM uses to expose its own router endpoint).  Per-pod `OTEL_SERVICE_NAME` follows the pattern `aislang.<component>.<deploy-label>`:
+
+| Component | `service.name` (example for `deploy "prod"`) |
+|---|---|
+| LiteLLM router | `aislang.litellm.prod` |
+| Agent runtime  | `aislang.agent_runtime.prod` |
+| Jaeger         | (receiver — doesn't produce its own spans in our topology) |
+
+The `<deploy-label>` suffix lets a single Jaeger instance serve multi-tenant clusters cleanly — `aislang.litellm.tenant-a` and `aislang.litellm.tenant-b` show up as distinct rows in the Jaeger UI's service dropdown.
+
+To view traces from a kind cluster, port-forward Jaeger's UI:
+
+```sh
+kubectl port-forward svc/jaeger 16686:16686
+# Then browse http://localhost:16686.
+```
+
+After running `aislang chat support examples/support-agent-k8s.ais` against the cluster, the Jaeger UI's "Service" dropdown should show:
+
+| `service.name`              | Produced by                                  |
+|-----------------------------|----------------------------------------------|
+| `aislang`                   | The **local** `aislang chat` process (laptop) |
+| `aislang.litellm.prod`      | The **in-cluster** LiteLLM router pod         |
+| `aislang.agent_runtime.<deploy>` | The **in-cluster** mcp-serve pod         |
+| `jaeger-all-in-one`         | Jaeger's own self-instrumentation             |
+
+If you only see `jaeger-all-in-one` after a successful chat turn, two common gaps:
+
+1. **No `kubectl port-forward svc/jaeger 4318:4318`** — local `aislang chat` ships spans to `http://localhost:4318/v1/traces` by default; under Compose that lands in the bundled jaeger sidecar, under K8s nothing's listening on host port 4318 unless you forward it.  Add a second port-forward alongside the `svc/litellm 4000:4000` one chat already needs:
+   ```sh
+   kubectl port-forward svc/jaeger  4318:4318  &   # for local chat spans
+   kubectl port-forward svc/jaeger 16686:16686 &   # for UI
+   kubectl port-forward svc/litellm 4000:4000 &   # for chat itself
+   ```
+   Then re-run the chat — `service.name = aislang` should appear within seconds (simple-exporter ships per-span synchronously).
+2. **agent-runtime pod stuck in `ImagePullBackOff`** — see the "Heads-up on the agent-runtime image" callout above.  When the pod can't pull its image, it never produces spans.  Override `image.repository` to your fork's published image (e.g. `--set image.repository=ghcr.io/<your-org>/aislang --set image.tag=v0.2.0-rc2`) or side-load via `kind load docker-image aislang:dev`.
+
+**Use an external collector** (Honeycomb, Grafana Tempo, Datadog, NewRelic, OTel Collector) instead of the bundled in-cluster Jaeger:
+
+```sh
+helm upgrade --install prod ./chart \
+  --set observability.otlp_endpoint=https://api.honeycomb.io:443
+```
+
+The override flows into both LiteLLM + agent-runtime pods via the chart's `observability.otlp_endpoint` value (5th templating point — see `chart/values.yaml`).  Cross-cluster TLS / auth headers (`OTEL_EXPORTER_OTLP_HEADERS=…`) aren't covered by the chart in v0.2 — patch the Deployments with a kustomize overlay if you need them; v0.3 may surface them as another values.yaml field.
+
 ## Commands
 
 `aislang` exposes eight subcommands. Four are read-only / offline (`validate`, `plan`, `cost`, `status`); four shell out to `docker compose` and the running LiteLLM router (`apply`, `destroy`, `chat`, `eval`). Run `aislang <cmd> --help` for the full flag list — the table is a quick reference, the flowcharts below show each command's decision tree.

@@ -1383,4 +1383,145 @@ mod tests {
         assert!(!artifacts.chart_files.contains_key(&ing_template),
             "no ingress → no templates/ingress.yaml");
     }
+
+    // ────────────────────────────────────────────────────────────
+    // Phase 2 Week 15 Tue — OpenTelemetry pod-wiring
+    // ────────────────────────────────────────────────────────────
+
+    /// Extract a pod's env-var list (name → value map) from a
+    /// Deployment resource value.  Used by the OTEL tests to assert
+    /// per-pod env vars without re-walking the same path in each test.
+    fn container_env(deployment_resource: &serde_yaml::Value)
+        -> std::collections::BTreeMap<String, String>
+    {
+        deployment_resource["spec"]["template"]["spec"]
+            ["containers"][0]["env"]
+            .as_sequence()
+            .map(|seq| seq.iter()
+                .filter_map(|e| {
+                    let n = e["name"].as_str()?.to_string();
+                    let v = e["value"].as_str()?.to_string();
+                    Some((n, v))
+                })
+                .collect())
+            .unwrap_or_default()
+    }
+
+    #[test] fn litellm_pod_carries_otel_env_vars() {
+        // Decision: every component participating in the OTel trace
+        // topology gets OTLP endpoint + protocol + service name as
+        // env vars.  Jaeger doesn't (it's the receiver, not a
+        // span producer).  LiteLLM dials its OTel-GenAI spans into
+        // the in-cluster Jaeger pod by default.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("prod");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "Deployment")
+            .expect("litellm Deployment");
+        let env = container_env(&dep.2);
+        assert_eq!(env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some(services::OTEL_ENDPOINT_DEFAULT));
+        assert_eq!(env.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            Some(services::OTEL_PROTOCOL));
+        // Service name format: <prefix>.<component>.<deploy-label>
+        assert_eq!(env.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some("aislang.litellm.prod"));
+        // The existing AISLANG_CATALOG_VERSION env var is still
+        // present — OTEL was appended, not overwritten.
+        assert!(env.contains_key("AISLANG_CATALOG_VERSION"),
+            "AISLANG_CATALOG_VERSION must still be present alongside OTEL vars");
+    }
+
+    #[test] fn agent_runtime_pod_carries_otel_env_vars() {
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("staging");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent-runtime Deployment");
+        let env = container_env(&dep.2);
+        assert_eq!(env.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some(services::OTEL_ENDPOINT_DEFAULT));
+        assert_eq!(env.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            Some(services::OTEL_PROTOCOL));
+        // Service name uses the agent_runtime component + the deploy
+        // label.  Pinned both so a refactor that drops the deploy
+        // suffix (which would break multi-tenant Jaeger views) is
+        // caught here.
+        assert_eq!(env.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some("aislang.agent_runtime.staging"));
+    }
+
+    #[test] fn jaeger_pod_does_not_carry_otel_env_vars() {
+        // Jaeger is the OTLP RECEIVER, not a span producer.
+        // OTEL_EXPORTER_OTLP_ENDPOINT on Jaeger would tell it to
+        // SHIP its own internal spans somewhere — which we don't
+        // want (Jaeger's metrics are noise in the aislang
+        // service.name view).
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == JAEGER_MANIFEST_FILENAME && k == "Deployment")
+            .expect("jaeger Deployment");
+        let env = container_env(&dep.2);
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            "jaeger receives spans; must not also export them");
+        assert!(!env.contains_key("OTEL_SERVICE_NAME"),
+            "jaeger doesn't produce its own service.name spans in our topology");
+        // BUT jaeger MUST keep COLLECTOR_OTLP_ENABLED=true (Tue
+        // Week 14) so its 4318 receiver is active for LiteLLM +
+        // agent-runtime to dial.
+        assert_eq!(env.get("COLLECTOR_OTLP_ENABLED").map(String::as_str),
+            Some("true"),
+            "jaeger must keep its OTLP receiver enabled");
+    }
+
+    #[test] fn otel_service_name_includes_deploy_label() {
+        // Multi-tenant cluster: a single Jaeger sees traces from
+        // multiple aislang stacks.  The deploy label in the
+        // service.name lets Jaeger UI group them
+        // (`aislang.litellm.tenant-a` vs. `aislang.litellm.tenant-b`).
+        // Pin the suffix shape across litellm + agent-runtime.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_k8s_deploy("tenant-a");
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        for (file, target_component) in [
+            (LITELLM_MANIFEST_FILENAME,        "litellm"),
+            (AGENT_RUNTIME_MANIFEST_FILENAME,  "agent_runtime"),
+        ] {
+            let dep = all_resources(&artifacts).into_iter()
+                .find(|(f, k, _)| f == file && k == "Deployment")
+                .unwrap_or_else(|| panic!("Deployment missing for {file}"));
+            let env = container_env(&dep.2);
+            let svc_name = env.get("OTEL_SERVICE_NAME")
+                .unwrap_or_else(|| panic!("{file}: missing OTEL_SERVICE_NAME"));
+            assert_eq!(svc_name, &format!("aislang.{target_component}.tenant-a"),
+                "{file}: service name must be aislang.<component>.<deploy-label>");
+        }
+    }
+
+    #[test] fn chart_template_substitutes_otlp_endpoint() {
+        // Phase 2 Week 15 Tue: helm_templatize swaps the raw
+        // `http://jaeger:4318` default for the chart's
+        // `{{ .Values.observability.otlp_endpoint }}` so chart
+        // users can override at install time without re-running
+        // `aislang plan`.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        for manifest_name in [LITELLM_MANIFEST_FILENAME, AGENT_RUNTIME_MANIFEST_FILENAME] {
+            let path = PathBuf::from("templates").join(manifest_name);
+            let templated = &artifacts.chart_files[&path];
+            assert!(templated.contains(chart::OTLP_ENDPOINT_TEMPLATE_REPLACEMENT),
+                "templates/{manifest_name}: OTLP endpoint must be templated; got:\n{templated}");
+            assert!(!templated.contains(services::OTEL_ENDPOINT_DEFAULT),
+                "templates/{manifest_name}: raw OTLP URL must be gone after templatize; got:\n{templated}");
+        }
+        // Confirm values.yaml exposes the new field with the
+        // in-cluster Jaeger default.
+        assert!(artifacts.values_yaml.contains(&format!(
+            "otlp_endpoint: \"{}\"", services::OTEL_ENDPOINT_DEFAULT)),
+            "values.yaml must surface observability.otlp_endpoint default; got:\n{}",
+            artifacts.values_yaml);
+    }
 }
