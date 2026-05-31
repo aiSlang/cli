@@ -271,3 +271,198 @@ fn tempdir_with_k8s_project(suffix: &str) -> (PathBuf, PathBuf) {
     assert!(!manifests_exists,
         "Compose-only project must NOT have a manifests/ directory");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 Week 15 Mon — lockfile + K8s-artifact stability regression tests
+// ---------------------------------------------------------------------------
+//
+// Three invariants pinned end-to-end through the CLI plan path (the
+// emitter-side `emit_is_deterministic_across_runs` unit test in
+// `aislang-k8s/src/lib.rs` covers determinism at the data-transform
+// layer; these tests cover the disk-IO + lockfile-reconcile layers
+// the CLI adds on top):
+//
+//   1. Re-running `aislang plan` against unchanged inputs produces
+//      byte-identical manifests/ + chart/ + aislang.lock.
+//   2. The `aislang.lock` on disk under `<output_dir>/` equals the
+//      `data."aislang.lock"` value inside `manifests/aislang-project-
+//      config.yaml` byte-for-byte.  Wed Decision 43.4: the embedded
+//      ConfigMap copy stays in lockstep with the canonical lockfile.
+//   3. Editing the .ais source triggers BOTH lockfile rewrite
+//      (Stale → Fresh — source_hash shifts) AND a corresponding
+//      shift in `data."project.ais"` inside the project CM (which
+//      in turn shifts the agent pod's `aislang.project-hash`
+//      annotation — covered by `aislang-k8s` unit tests).
+
+/// Walk every entry under `dir` recursively, returning a sorted
+/// `Vec<(relative_path, bytes)>`.  Used by the byte-stability test
+/// to diff two on-disk artifact sets without depending on filesystem
+/// iteration order (which is filesystem-dependent on Linux —
+/// reproducible on tmpfs but not necessarily on the NFS volume the
+/// dev environment uses).
+fn collect_dir_contents(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    fn walk(base: &std::path::Path, rel: &std::path::Path,
+            out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let abs = base.join(rel);
+        let entries = std::fs::read_dir(&abs).unwrap_or_else(|e|
+            panic!("read_dir {}: {e}", abs.display()));
+        for entry in entries {
+            let entry = entry.expect("entry");
+            let name  = entry.file_name();
+            let child = rel.join(&name);
+            let ft    = entry.file_type().expect("file_type");
+            if ft.is_dir() {
+                walk(base, &child, out);
+            } else if ft.is_file() {
+                let bytes = std::fs::read(entry.path()).expect("read file");
+                out.push((child, bytes));
+            }
+            // Symlinks intentionally skipped — emitter never produces them.
+        }
+    }
+    walk(dir, std::path::Path::new(""), &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[test] fn plan_k8s_emits_byte_stable_artifacts_across_runs() {
+    // Decision 43 determinism contract, end-to-end through the CLI:
+    // running plan twice against unchanged inputs (same .ais, same
+    // prompts/, same .env) produces byte-identical manifests/ +
+    // chart/ + aislang.lock.  Surfaces any source-of-nondeterminism
+    // that crept in between the emitter's typed-struct output and
+    // disk: BTreeMap iteration order, file-write order, even
+    // accidental SystemTime::now() calls in any layer.
+    let (ais, dir1) = tempdir_with_k8s_project("stability-run1");
+    // Second tempdir — separate from dir1 so neither plan run sees
+    // the other's outputs (lockfile reconcile would otherwise
+    // observe a "Match" on the second run; we want both runs to
+    // emit from scratch + then compare the FULL artifact set).
+    let dir2 = std::env::temp_dir().join(format!(
+        "aislang-plan-k8s-{}-stability-run2", std::process::id()));
+    std::fs::create_dir_all(&dir2).expect("mkdir dir2");
+    // Copy the .ais source + system.md into dir2 so they resolve
+    // relative to the second output dir the same way they do in
+    // dir1 — otherwise the prompt path would be on the wrong
+    // filesystem branch + hash differently.
+    std::fs::copy(&ais, dir2.join("demo.ais")).expect("copy ais");
+    std::fs::copy(ais.parent().unwrap().join("system.md"),
+                  dir2.join("system.md")).expect("copy prompt");
+    let ais2 = dir2.join("demo.ais");
+
+    let out1 = bin().args(["plan"]).arg(&ais)
+        .args(["--output-dir"]).arg(&dir1)
+        .output().expect("spawn plan run 1");
+    let out2 = bin().args(["plan"]).arg(&ais2)
+        .args(["--output-dir"]).arg(&dir2)
+        .output().expect("spawn plan run 2");
+
+    // Snapshot every artifact-produced file under each output dir.
+    let contents1 = collect_dir_contents(&dir1);
+    let contents2 = collect_dir_contents(&dir2);
+    let _ = std::fs::remove_dir_all(&dir1);
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    assert!(out1.status.success() && out2.status.success(),
+        "both plan runs must succeed");
+    // Same file set?
+    let files1: Vec<&PathBuf> = contents1.iter().map(|(p, _)| p).collect();
+    let files2: Vec<&PathBuf> = contents2.iter().map(|(p, _)| p).collect();
+    assert_eq!(files1, files2,
+        "back-to-back plan runs must produce the same file set; \
+         run1: {files1:?}\nrun2: {files2:?}");
+    // Same bytes for every file?
+    for ((p1, b1), (p2, b2)) in contents1.iter().zip(contents2.iter()) {
+        assert_eq!(p1, p2, "iteration order should match");
+        assert_eq!(b1, b2,
+            "file `{}` differs across plan runs (Decision 43 determinism contract violated)",
+            p1.display());
+    }
+}
+
+#[test] fn plan_k8s_aislang_lock_matches_embedded_in_project_cm() {
+    // Decision 43.4 invariant: the `aislang-project` ConfigMap bakes
+    // a copy of the lockfile under `data."aislang.lock"`.  Wed's
+    // emitter sources both from the same `ProjectSources.lockfile`
+    // string — so they MUST be byte-identical on disk.  Drift here
+    // would mean the agent pod boots with a lockfile that doesn't
+    // match what `aislang plan` would re-resolve to (stale-but-
+    // unflagged scenario).
+    let (ais, dir) = tempdir_with_k8s_project("lock-embed");
+    let out = bin().args(["plan"]).arg(&ais)
+        .args(["--output-dir"]).arg(&dir)
+        .output().expect("spawn aislang");
+    assert!(out.status.success(), "plan must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr));
+
+    let on_disk = std::fs::read_to_string(dir.join("aislang.lock"))
+        .expect("read on-disk lockfile");
+
+    // Parse the project CM YAML and extract data["aislang.lock"].
+    let cm_yaml = std::fs::read_to_string(
+        dir.join("manifests").join("aislang-project-config.yaml"))
+        .expect("read project CM");
+    // The file contains 1 doc with a leading `---`; serde_yaml
+    // accepts that shape directly.
+    let cm: serde_yaml::Value = serde_yaml::from_str(&cm_yaml)
+        .expect("CM parses");
+    let embedded = cm["data"]["aislang.lock"].as_str()
+        .expect("aislang.lock key present in CM data");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(embedded, on_disk,
+        "embedded lockfile in project CM must byte-match the on-disk \
+         aislang.lock — emitter sources both from the same ProjectSources \
+         field, so any drift is a real bug");
+}
+
+#[test] fn plan_k8s_source_change_propagates_to_lockfile_and_project_cm() {
+    // End-to-end rollout-trigger chain (Wed Decision 43.4):
+    //   .ais source edit → resolver computes new source_hash →
+    //   lockfile reconcile flips Match → Stale → rewrite →
+    //   `data."project.ais"` in CM shifts → agent pod's
+    //   `aislang.project-hash` annotation shifts (unit-tested
+    //   in aislang-k8s) → ReplicaSet rolls out.
+    //
+    // This test pins links 1-4; the annotation→rollout link is
+    // K8s controller behaviour (out of scope for an integration
+    // test that doesn't have a cluster).
+    let (ais, dir) = tempdir_with_k8s_project("source-change");
+
+    let out1 = bin().args(["plan"]).arg(&ais)
+        .args(["--output-dir"]).arg(&dir)
+        .output().expect("plan 1");
+    assert!(out1.status.success());
+    let lock_v1 = std::fs::read_to_string(dir.join("aislang.lock"))
+        .expect("lock v1");
+    let cm_v1 = std::fs::read_to_string(
+        dir.join("manifests").join("aislang-project-config.yaml"))
+        .expect("cm v1");
+
+    // Touch the .ais source by appending a no-op comment — same
+    // semantic project but the source bytes change → source_hash
+    // shifts → reconcile flips to Stale.
+    let mut src = std::fs::read_to_string(&ais).expect("read ais");
+    src.push_str("\n// Phase 2 Week 15 Mon: stability test source-edit marker\n");
+    std::fs::write(&ais, src).expect("rewrite ais");
+
+    let out2 = bin().args(["plan"]).arg(&ais)
+        .args(["--output-dir"]).arg(&dir)
+        .output().expect("plan 2");
+    assert!(out2.status.success());
+    let lock_v2 = std::fs::read_to_string(dir.join("aislang.lock"))
+        .expect("lock v2");
+    let cm_v2 = std::fs::read_to_string(
+        dir.join("manifests").join("aislang-project-config.yaml"))
+        .expect("cm v2");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_ne!(lock_v1, lock_v2,
+        "source change must trigger lockfile rewrite (source_hash field shifts)");
+    assert_ne!(cm_v1, cm_v2,
+        "source change must propagate into the project CM's \
+         data.\"project.ais\" key — Decision 43.4 invariant");
+}
