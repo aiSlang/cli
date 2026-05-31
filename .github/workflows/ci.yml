@@ -206,56 +206,65 @@ jobs:
           }
 
   # ──────────────────────────────────────────────────────────────
-  # K8s smoke — Phase 2 Week 14 Fri (Track B close).
+  # K8s smoke — Phase 2 Week 14 Fri (Track B close), Week 15 Wed
+  # added the k3s matrix axis.
   #
-  # End-to-end gate for the `target = kubernetes` path:
-  #   1. Stand up a kind cluster (single-node, ephemeral).
+  # End-to-end gate for the `target = kubernetes` path, run
+  # against TWO cluster implementations:
+  #
+  #   - **kind** (default GitHub-Actions-friendly K8s-in-Docker).
+  #     Ships `standard` StorageClass + no default IngressClass.
+  #   - **k3s** (via `k3d` — k3s-in-Docker, same posture as kind
+  #     but Rancher's lighter-weight K8s distro).  Ships
+  #     `local-path` StorageClass + traefik IngressController by
+  #     default.
+  #
+  # Catching kind-only assumptions early — the openwebui PVC's
+  # missing `storageClassName` field works on both (cluster
+  # picks its own default), but a regression that hardcodes
+  # `standard` would silently break k3s.  Same risk for
+  # IngressClass + DNS plugin defaults.
+  #
+  # Pipeline steps (per axis):
+  #   1. Stand up the cluster (kind OR k3s via k3d).
   #   2. Build the aislang binary + a local `aislang:ci` image
   #      (the published `ghcr.io/aislang/aislang:latest` may not
   #      exist on every commit — pre-release branches especially).
-  #   3. `kind load docker-image` to side-load the freshly-built
-  #      image into the kind node — no registry push needed.
+  #   3. Side-load the image (cluster-specific: `kind load
+  #      docker-image` vs. `k3d image import`).
   #   4. Create the fake `aislang-providers` Secret so the
-  #      preflight check passes (values don't need to be real keys
-  #      because we don't make any actual provider calls in smoke).
-  #   5. `aislang apply examples/support-agent-k8s.ais
-  #      --output-dir <tmp>` → helm upgrade --install + the chart.
+  #      preflight check passes (dummy values — no provider
+  #      calls happen in smoke).
+  #   5. `aislang plan` → `helm upgrade --install` + chart.
   #   6. Wait for every aislang-labelled Deployment to be Ready
-  #      (kubectl rollout status, 5-min timeout per pod).
-  #   7. `helm lint` the emitted chart (catches chart-shape
-  #      regressions the unit tests don't cover).
-  #   8. `aislang destroy` → helm uninstall; assert exit 0.
-  #   9. kind delete cluster (cleanup runs `if: always()`).
+  #      (kubectl rollout status, 2-min per-Deployment timeout).
+  #   7. `helm lint` the emitted chart.
+  #   8. `helm uninstall prod`; assert exit 0 + no aislang
+  #      resources remain.
+  #   9. Diagnostic dump on failure (cluster-independent).
   #
-  # Why a separate job (not part of `test`): kind brings ~90s of
-  # cluster-creation latency that's wasted on PRs that don't
-  # touch k8s code.  This job gates pushes to main + can be
-  # manually triggered.  v0.3 may add a `paths-filter` to skip
-  # the job on docs-only PRs.
-  #
-  # Time budget revised (Week 15 Mon, after first live run): the
-  # original 10-min ceiling was set from the local dev-box estimate
-  # (kind ~30s + image build ~30s + apply ~30s + pod-ready ~30s
-  # + cleanup ~10s ≈ 2 min).  GitHub-hosted runners are slower
-  # on every axis — pulling the LiteLLM + Open WebUI base images
-  # (each ~300-600 MB) into the kind node alone takes 3-5 min on
-  # a cold runner.  Bumped to 20 min ceiling pending a per-step
-  # timing breakdown from the live run; Week 15 Wed (k3s axis
-  # addition) is the natural point to revisit + drop back down
-  # if the actual wall time stays well under 20.
+  # Time budget per axis: 20 min ceiling (was 10 min Mon, revised
+  # after first live-run image-pull cost).  Both axes run in
+  # parallel — total wall time = max(kind, k3s), not sum.
+  # Free-tier cost = 2 × ~10-15 Linux-min per main-push run.
   # ──────────────────────────────────────────────────────────────
   k8s-smoke:
-    name: k8s-smoke (kind + helm)
+    name: k8s-smoke (${{ matrix.cluster }} + helm)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: build
-    # Up to 20 Linux-min per run — the single most expensive job in
-    # the workflow.  Gate to main-push + workflow_dispatch only;
-    # PRs that touch k8s code can be smoke-tested by triggering
+    # Up to 20 Linux-min per run × 2 cluster axes — Gate to main-
+    # push + workflow_dispatch only (PRs that touch k8s code can
     # `workflow_dispatch` from the Actions tab against the PR
-    # branch.  Week 16+ may add a `paths-filter` to auto-trigger
-    # this job when crates/aislang-k8s/** changes on a PR.
+    # branch).  Week 16+ may add `paths-filter` to auto-trigger.
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      # Both axes run independently — a kind-only regression
+      # surfaces on the kind axis without blocking the k3s
+      # signal (and vice versa).
+      fail-fast: false
+      matrix:
+        cluster: [kind, k3s]
     steps:
       - uses: actions/checkout@v4
 
@@ -265,17 +274,22 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ env.CACHE_VERSION }}-k8s-smoke
+          # Per-axis cache keys: both axes run cargo build with
+          # the same workspace state, but split caches avoid the
+          # last-writer-wins race when both finish around the
+          # same time.
+          key: ${{ env.CACHE_VERSION }}-k8s-smoke-${{ matrix.cluster }}
 
-      # Build aislang binary first — the kind image build needs it
+      # Build aislang binary first — the cluster image build needs it
       # and we want compile errors to surface here, not deep inside
       # the docker build context.
-      - name: Build aislang (release profile for the kind image)
+      - name: Build aislang (release profile for the cluster image)
         run: cargo build --release --bin aislang --locked
 
-      # Set up kind + kubectl + helm.  kind action also installs
-      # kubectl as a side-effect; we install helm separately.
+      # ──── Cluster setup (kind OR k3s/k3d, conditional) ────
+
       - name: Set up kind
+        if: matrix.cluster == 'kind'
         uses: helm/kind-action@v1
         with:
           cluster_name: aislang-smoke
@@ -285,6 +299,25 @@ jobs:
           node_image: kindest/node:v1.31.0
           wait: 90s        # node-Ready timeout
 
+      - name: Set up k3s (via k3d)
+        if: matrix.cluster == 'k3s'
+        uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: aislang-smoke
+          # --agents 0 → single-server cluster (k3d's equivalent
+          # of kind's single-node default; matches resource
+          # footprint).
+          # --no-lb → skip k3d's klipper-LB (we use ClusterIP
+          # services + kubectl port-forward for verification;
+          # an LB pod would just consume more memory).
+          # --image rancher/k3s:v1.31.0-k3s1 → pin K8s 1.31
+          # so both axes test the same K8s API surface.
+          args: >-
+            --agents 0
+            --no-lb
+            --image rancher/k3s:v1.31.0-k3s1
+            --wait
+
       - name: Install Helm 3
         uses: azure/setup-helm@v4
         with:
@@ -293,7 +326,7 @@ jobs:
       # Build a minimal Docker image around the freshly-built
       # binary — same distroless base as the release.yml image
       # job, but skips the multi-arch buildx + GHCR push (we just
-      # need amd64 locally for kind to load).
+      # need amd64 locally for the cluster to load).
       - name: Build local aislang:ci image
         run: |
           set -euo pipefail
@@ -308,8 +341,17 @@ jobs:
           DOCKERFILE
           docker build -t aislang:ci docker-ci/
 
+      # ──── Image side-load (cluster-specific) ────
+
       - name: Side-load image into kind
+        if: matrix.cluster == 'kind'
         run: kind load docker-image aislang:ci --name aislang-smoke
+
+      - name: Side-load image into k3s (via k3d)
+        if: matrix.cluster == 'k3s'
+        run: k3d image import aislang:ci --cluster aislang-smoke
+
+      # ──── Cluster-agnostic steps ────
 
       # The preflight check (Thu) wants the Secret present.  Real
       # keys would never make it into a CI run anyway; dummy
@@ -332,22 +374,22 @@ jobs:
           # `helm upgrade --install --set image.…` after the
           # chart is rendered + written; aislang apply doesn't
           # itself take `--set` flags (yet — v0.3 carry-over).
-          KIND_OUTPUT_DIR: /tmp/aislang-k8s-smoke
+          OUTPUT_DIR: /tmp/aislang-k8s-smoke
         run: |
           set -euo pipefail
-          mkdir -p "$KIND_OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
           # First: render manifests + chart to disk via
           # `aislang plan` (apply would also do this but plan
           # gives us inspectability for failures).
           ./target/release/aislang plan examples/support-agent-k8s.ais \
-            --output-dir "$KIND_OUTPUT_DIR" >/dev/null
-          ls -la "$KIND_OUTPUT_DIR/manifests" "$KIND_OUTPUT_DIR/chart"
-          # Helm install with image override so kind uses our
-          # local aislang:ci.  `aislang apply` would run
+            --output-dir "$OUTPUT_DIR" >/dev/null
+          ls -la "$OUTPUT_DIR/manifests" "$OUTPUT_DIR/chart"
+          # Helm install with image override so the cluster uses
+          # our local aislang:ci.  `aislang apply` would run
           # `helm upgrade --install <release> chart/` without
           # the image override; we replicate that command + add
           # `--set image.{repository,tag}`.
-          helm upgrade --install prod "$KIND_OUTPUT_DIR/chart" \
+          helm upgrade --install prod "$OUTPUT_DIR/chart" \
             --set image.repository=aislang \
             --set image.tag=ci \
             --wait --timeout 5m
@@ -365,6 +407,17 @@ jobs:
           for dep in litellm jaeger budget-counter agent-runtime openwebui; do
             kubectl rollout status deploy/$dep --timeout=2m
           done
+
+      - name: Verify openwebui PVC bound (StorageClass parity)
+        run: |
+          # k3s ships `local-path` as default; kind ships `standard`.
+          # Our PVC leaves storageClassName UNSET (defers to cluster
+          # default).  Pin that it actually binds on both — catches
+          # a regression where the emitter hardcodes the kind name.
+          kubectl wait --for=jsonpath='{.status.phase}'=Bound \
+            pvc/openwebui-data --timeout=60s
+          kubectl get pvc openwebui-data \
+            -o jsonpath='{"PVC StorageClass: "}{.spec.storageClassName}{"\n"}'
 
       - name: Destroy the chart
         run: |
@@ -388,8 +441,17 @@ jobs:
       - name: Diagnostic dump on failure
         if: failure()
         run: |
+          echo "=== cluster ==="
+          echo "axis: ${{ matrix.cluster }}"
+          kubectl version --output=yaml || true
+          echo "=== nodes ==="
+          kubectl get nodes -o wide || true
           echo "=== pods ==="
           kubectl get pods -A -o wide || true
+          echo "=== PVCs ==="
+          kubectl get pvc -A -o wide || true
+          echo "=== StorageClasses ==="
+          kubectl get storageclass || true
           echo "=== aislang-labelled events ==="
           kubectl get events --sort-by=.lastTimestamp -A | tail -50 || true
           echo "=== describe litellm ==="
