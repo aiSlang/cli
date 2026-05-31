@@ -685,6 +685,22 @@ fn run_plan(
                 .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
             k8s_manifest_paths.push(path);
         }
+        // Thu (Decision 43.7): also write the Helm chart tree so
+        // `aislang plan` materializes EVERY artifact `aislang apply`
+        // would install.  Recreate chart/ from scratch on every
+        // plan run so stale templates from a previous emit don't
+        // leak through.
+        let chart_dir = output_dir.join(aislang_k8s::CHART_DIRNAME);
+        let _ = std::fs::remove_dir_all(&chart_dir);
+        for (rel_path, body) in &k8s_artifacts.chart_files {
+            let abs = chart_dir.join(rel_path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).map_err(|e|
+                    anyhow::anyhow!("create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&abs, body).map_err(|e|
+                anyhow::anyhow!("write {}: {e}", abs.display()))?;
+        }
         // Hand the artifacts off to the stdout-streaming branch
         // below so we don't pay for a second `emit()` call.
         k8s_artifacts_for_stdout = Some(k8s_artifacts);
@@ -734,6 +750,10 @@ fn run_plan(
     }
     for p in &k8s_manifest_paths {
         eprintln!("  k8s manifest:    {}", p.display());
+    }
+    if emit_k8s {
+        eprintln!("  helm chart:      {}",
+            output_dir.join(aislang_k8s::CHART_DIRNAME).display());
     }
     if !no_lock {
         eprintln!("  lockfile:        {}", lock_path.display());
@@ -1294,6 +1314,18 @@ fn prepare_stack(
 
 /// `aislang apply <file>` — plan, then `docker compose up -d`.
 fn run_apply(file: PathBuf) -> Result<()> {
+    // Phase 2 Week 14 Thu — dispatch on the declared deploy target.
+    // `target = kubernetes` deploys go through the helm path; v0.1
+    // Compose path (the rest of this function) is unchanged.
+    match peek_deploy_target(&file)? {
+        aislang_core::types::DeployTarget::Kubernetes => {
+            return run_apply_k8s(file);
+        }
+        aislang_core::types::DeployTarget::Compose => {
+            // Fall through to the existing Compose flow.
+        }
+    }
+
     let prep = prepare_stack(&file, None, false, 0)?;
 
     // Write stack.yml so `docker compose -f stack.yml` (and the
@@ -1372,6 +1404,18 @@ fn run_apply(file: PathBuf) -> Result<()> {
 /// clean exit 0. `--force` bypasses state-file existence checks and
 /// runs the compose down anyway (when stack.yml exists).
 fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
+    // Phase 2 Week 14 Thu — dispatch on the declared deploy target.
+    // `target = kubernetes` deploys go through `helm uninstall`; v0.1
+    // Compose path (the rest of this function) is unchanged.
+    match peek_deploy_target(&file)? {
+        aislang_core::types::DeployTarget::Kubernetes => {
+            return run_destroy_k8s(file, force);
+        }
+        aislang_core::types::DeployTarget::Compose => {
+            // Fall through to the existing Compose flow.
+        }
+    }
+
     let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
         anyhow::anyhow!("source directory `{}` not readable: {e}",
@@ -1460,6 +1504,297 @@ fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// `aislang apply` / `aislang destroy` — K8s target (Phase 2 Week 14 Thu)
+// ============================================================================
+
+/// Apply path for `target = kubernetes` deploys (Decision 43.7 +
+/// 43.8).  Mirrors `run_apply`'s shape but emits the K8s artifact
+/// set + shells out to `helm upgrade --install` instead of `docker
+/// compose up -d`.
+///
+/// Steps:
+///   1. validate + resolve + lockfile (same as Compose path)
+///   2. Build `ProjectSources` from .ais source + lockfile body +
+///      per-prompt file bodies (Wed wiring re-used)
+///   3. `aislang_k8s::emit` → manifests/ + chart/
+///   4. Write manifests/*.yaml + chart/Chart.yaml + chart/values.yaml +
+///      chart/templates/*.yaml under `<output_dir>/`
+///   5. If `helm` on PATH: `helm upgrade --install <deploy-label>
+///      <output_dir>/chart/`; else graceful-degrade with the manual
+///      command printed
+///   6. Write `.aislang/state.json` (chart dir recorded in
+///      `stack_yaml_path` — repurposed for k8s; v0.3 may add a
+///      proper target field)
+fn run_apply_k8s(file: PathBuf) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
+        anyhow::anyhow!("source directory `{}` not readable: {e}",
+            source_dir.display())
+    })?;
+
+    // ── Stage 1: validate. ──
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    // ── Stage 2: catalog ID check. ──
+    aislang_resolver::check_against_bundled_catalog(&project)
+        .map_err(|e| anyhow::anyhow!("catalog error: {e}"))?;
+    // ── Stage 3: resolve. ──
+    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
+        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+    // ── Stage 4: lockfile (always reconciled in apply path —
+    //    same posture as v0.1 Compose apply). ──
+    let lock_path = output_dir.join("aislang.lock");
+    {
+        let existing = aislang_resolver::lockfile::read(&lock_path)
+            .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
+        let diff = aislang_resolver::lockfile::reconcile(
+            &source, existing.as_ref(),
+            &resolved.catalog_version, &resolved.prompt_hashes,
+        );
+        match diff {
+            aislang_resolver::LockfileDiff::Match => {}
+            aislang_resolver::LockfileDiff::Fresh
+            | aislang_resolver::LockfileDiff::Stale { .. } => {
+                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                aislang_resolver::lockfile::write(&lock_path, &new_lock)
+                    .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
+            }
+        }
+    }
+
+    // ── Stage 5: load prompt bodies for the ProjectSources bag. ──
+    let lockfile_body = std::fs::read_to_string(&lock_path).ok();
+    let mut prompt_bodies: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for prompt in &project.prompts {
+        let abs = if prompt.file.is_absolute() {
+            prompt.file.clone()
+        } else {
+            source_dir.join(&prompt.file)
+        };
+        let body = std::fs::read_to_string(&abs)
+            .map_err(|e| anyhow::anyhow!(
+                "read prompt `{}` from {}: {e}",
+                prompt.label, abs.display()))?;
+        prompt_bodies.insert(prompt.label.clone(), body);
+    }
+    let sources = aislang_k8s::ProjectSources {
+        ais_source:    source.clone(),
+        lockfile:      lockfile_body,
+        prompt_bodies,
+    };
+
+    // ── Stage 6: emit. ──
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
+    let artifacts = aislang_k8s::emit(&resolved, &catalog, &sources)
+        .map_err(|e| anyhow::anyhow!("k8s emit error: {e}"))?;
+
+    // ── Stage 7: write manifests/ + chart/ to disk. ──
+    let manifests_dir = output_dir.join(aislang_k8s::MANIFESTS_DIRNAME);
+    std::fs::create_dir_all(&manifests_dir).map_err(|e|
+        anyhow::anyhow!("create {}: {e}", manifests_dir.display()))?;
+    for (name, body) in &artifacts.manifests {
+        let p = manifests_dir.join(name);
+        std::fs::write(&p, body).map_err(|e|
+            anyhow::anyhow!("write {}: {e}", p.display()))?;
+    }
+    let chart_dir = output_dir.join(aislang_k8s::CHART_DIRNAME);
+    // Recreate chart/ from scratch on every apply so stale
+    // templates from a previous emit don't leak through (the chart
+    // is a derived artifact + helm doesn't care if we re-overwrite).
+    let _ = std::fs::remove_dir_all(&chart_dir);
+    for (rel_path, body) in &artifacts.chart_files {
+        let abs = chart_dir.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e|
+                anyhow::anyhow!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&abs, body).map_err(|e|
+            anyhow::anyhow!("write {}: {e}", abs.display()))?;
+    }
+
+    // Pick the deploy label (== Helm release name per Decision 43.1).
+    let release_name = resolved.project.deploys.iter()
+        .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+        .map(|d| d.label.clone())
+        .unwrap_or_else(|| "aislang".to_string());
+
+    eprintln!("generated:");
+    eprintln!("  manifests dir:   {}", manifests_dir.display());
+    eprintln!("  chart dir:       {}", chart_dir.display());
+    eprintln!("  lockfile:        {}", lock_path.display());
+    eprintln!();
+
+    // ── Stage 7b: preflight — required prerequisites (Decision 43.5). ──
+    //
+    // The chart's pods envFrom `aislang-providers` Secret with
+    // `optional: false` — if the Secret doesn't exist, kubelet
+    // refuses to start the pod (the pod sits Pending with a
+    // `CreateContainerConfigError` event the user only sees
+    // by running `kubectl describe pod`).  ALSO checks that each
+    // referenced env var has a non-empty value (catches the
+    // `--from-literal=KEY="$UNSET_VAR"` foot-gun where the user's
+    // shell didn't have the env var set when they ran kubectl
+    // create secret).  Both warnings are non-fatal: helm install
+    // proceeds so the rest of the stack is in place when the user
+    // fixes the Secret afterwards.
+    let referenced_vars =
+        aislang_compose::litellm::referenced_env_vars(&resolved);
+    preflight_check_providers_secret(&referenced_vars);
+
+    // ── Stage 8: shell to `helm upgrade --install` (or graceful-degrade). ──
+    if !helm_on_path() {
+        eprintln!("helm not on PATH — wrote artifacts but didn't install chart.");
+        eprintln!("install Helm 3 (https://helm.sh) and run:");
+        eprintln!("  helm upgrade --install {release_name} {}", chart_dir.display());
+        eprintln!("  # … or apply the raw manifests:");
+        eprintln!("  kubectl apply -f {}", manifests_dir.display());
+        return Ok(());
+    }
+    eprintln!("installing chart: helm upgrade --install {release_name} {}",
+        chart_dir.display());
+    let status = std::process::Command::new("helm")
+        .args(["upgrade", "--install", &release_name])
+        .arg(&chart_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoke helm: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "helm upgrade --install exited {:?}", status.code()));
+    }
+
+    // ── Stage 9: write state.json (Decision 26 reuse).  For the k8s
+    //    target the `stack_yaml_path` field holds the chart directory
+    //    (where destroy can find the release name + manifests for the
+    //    rare `helm uninstall` fallback to kubectl).
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+    let source_hash = aislang_runtime::hex_sha256(source.as_bytes());
+    let state = aislang_runtime::new_applied_state(
+        &project.name,
+        source_hash,
+        &resolved.catalog_version,
+        chart_dir.clone(),
+    );
+    match aislang_runtime::write_state_atomic(&state_path, &state) {
+        Ok(())  => eprintln!("  state:           {}", state_path.display()),
+        Err(e)  => eprintln!("warning: chart is installed but failed to write {}: {e}",
+                             state_path.display()),
+    }
+
+    eprintln!();
+    eprintln!("chart installed.  next steps:");
+    eprintln!("  status:           kubectl get all -l aislang.deploy={release_name}");
+    eprintln!("  open webui:       kubectl port-forward svc/openwebui 3000:8080 \
+                                    (then http://localhost:3000)");
+    // `aislang chat` always dials LiteLLM at 127.0.0.1:4000 — the
+    // local-Compose convention.  Under K8s, LiteLLM is a ClusterIP
+    // service inside the cluster; without a port-forward the chat
+    // attempt fails with "error sending request" against the local
+    // address.  Surface the port-forward command so users have a
+    // one-step "make chat work" recipe.  v0.3 carry-over: make
+    // chat topology-aware so this hand-step goes away.
+    if let Some(agent) = first_agent_label_in_file(&file) {
+        eprintln!("  chat (k8s mode):");
+        eprintln!("    1. kubectl port-forward svc/litellm 4000:4000   \
+                       # in another terminal; leave running");
+        eprintln!("    2. aislang chat {agent} {}", file.display());
+    }
+    eprintln!("  teardown:         aislang destroy {}", file.display());
+    Ok(())
+}
+
+/// Destroy path for `target = kubernetes` deploys.  Mirrors
+/// `run_destroy`'s shape but uses `helm uninstall <release>` instead
+/// of `docker compose down -v`.
+fn run_destroy_k8s(file: PathBuf, force: bool) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let (project, _) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
+        anyhow::anyhow!("source directory `{}` not readable: {e}",
+            source_dir.display())
+    })?;
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+    let chart_dir  = output_dir.join(aislang_k8s::CHART_DIRNAME);
+    let release_name = project.deploys.iter()
+        .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+        .map(|d| d.label.clone())
+        .unwrap_or_else(|| "aislang".to_string());
+
+    // ── Idempotency check (mirrors v0.1 Compose destroy). ──
+    if !force {
+        match aislang_runtime::read_state(&state_path) {
+            Ok(Some(state)) if state.applied_at.is_none() => {
+                eprintln!("nothing to destroy: state file at `{}` shows the \
+                           chart was already uninstalled.", state_path.display());
+                eprintln!("(pass --force to run `helm uninstall {release_name}` anyway.)");
+                return Ok(());
+            }
+            Ok(None) if !chart_dir.exists() => {
+                eprintln!("nothing to destroy: neither `{}` nor `{}` exists.",
+                    state_path.display(), chart_dir.display());
+                eprintln!("(if the chart IS installed but state was lost, pass \
+                           --force to attempt `helm uninstall {release_name}` directly.)");
+                return Ok(());
+            }
+            Ok(_)  => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "read state file `{}`: {e}\n\
+                     (pass --force to ignore the state file)",
+                    state_path.display()));
+            }
+        }
+    }
+
+    if !helm_on_path() {
+        return Err(anyhow::anyhow!(
+            "helm not on PATH; cannot uninstall release `{release_name}`.  \
+             Install Helm 3 (https://helm.sh) or use `kubectl delete -f {}` \
+             to manually remove the resources.",
+            output_dir.join(aislang_k8s::MANIFESTS_DIRNAME).display()));
+    }
+    eprintln!("uninstalling chart: helm uninstall {release_name}");
+    let status = std::process::Command::new("helm")
+        .args(["uninstall", &release_name])
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoke helm: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "helm uninstall exited {:?}", status.code()));
+    }
+
+    if let Err(e) = aislang_runtime::mark_state_torn_down(&state_path) {
+        eprintln!("warning: chart uninstalled but failed to update state \
+                   file `{}`: {e}", state_path.display());
+    }
+
+    eprintln!();
+    eprintln!("chart uninstalled — release `{release_name}` removed.");
+    eprintln!("manifests/ + chart/ files preserved for reference; remove them \
+               manually if desired:");
+    eprintln!("  rm -rf {} {}",
+        output_dir.join(aislang_k8s::MANIFESTS_DIRNAME).display(),
+        chart_dir.display());
+    Ok(())
+}
+
 /// Check whether `docker` is callable. Used by apply (graceful
 /// degrade — write artifacts then tell the user how to bring them
 /// up manually) and destroy (hard fail — there's nothing useful to
@@ -1470,6 +1805,299 @@ fn docker_on_path() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Phase 2 Week 14 Thu — `helm` CLI presence check, mirror of
+/// `docker_on_path` for the K8s deploy target.  Used by the
+/// `target = kubernetes` paths of `run_apply` / `run_destroy`:
+/// apply graceful-degrades (writes manifests/ + chart/ and prints
+/// the manual `helm upgrade --install …` command), destroy hard-
+/// fails (without helm there's no way to release-uninstall, and
+/// `kubectl delete -f manifests/` doesn't track Helm release state).
+fn helm_on_path() -> bool {
+    std::process::Command::new("helm")
+        .arg("version")
+        .arg("--short")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Phase 2 Week 14 Thu follow-up — soft preflight check for the
+/// user-created `aislang-providers` Secret (Decision 43.5).  Emits
+/// loud warnings + actionable recipes when:
+///   1. the Secret doesn't exist; OR
+///   2. the Secret exists but a referenced env var's value is empty
+///      (catches the `--from-literal=ANTHROPIC_API_KEY="$EMPTY_VAR"`
+///      foot-gun where the user's shell didn't have the env var set
+///      when they ran kubectl create secret).
+///
+/// Never blocks the apply: helm install proceeds, the user fixes
+/// the Secret afterwards, kubelet picks up the change on the next
+/// pod restart.
+///
+/// Why a warning and not a hard fail: the rest of the chart still
+/// needs to be installed (ConfigMaps, Services, Deployments — the
+/// Secret is just one Pod-side dependency).  Stopping the install
+/// would leave the cluster in a worse state ("nothing applied") +
+/// would force users to skip the check with a `--no-preflight`
+/// flag when they're sure the Secret IS there (multi-namespace
+/// installs, externally-managed Secret, etc.).
+///
+/// Quiet when kubectl is absent — the user's already in a degraded
+/// state (we'd never have reached helm-install either); no point
+/// adding noise.  Same posture as `docker_on_path()` / `helm_on_path()`.
+///
+/// `referenced_vars` comes from `aislang_compose::litellm::
+/// referenced_env_vars(resolved)` — the same set the .env.example
+/// template + Compose container env-forwarding consume, so the
+/// three checks stay in lockstep.
+fn preflight_check_providers_secret(referenced_vars: &std::collections::BTreeSet<String>) {
+    // kubectl may not be on PATH (helm-only environments do exist
+    // — `helm upgrade --install` works against ~/.kube/config without
+    // kubectl).  Skip silently in that case.
+    let kubectl_present = std::process::Command::new("kubectl")
+        .arg("version").arg("--client").arg("--output=yaml")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !kubectl_present { return; }
+
+    // ── Check #1: does the Secret exist? ──
+    let out = std::process::Command::new("kubectl")
+        .args(["get", "secret", "aislang-providers",
+               "-o", "name", "--ignore-not-found"])
+        .output();
+    let absent = match out {
+        Ok(o) if o.status.success() => o.stdout.is_empty(),
+        // Any error from kubectl (RBAC denial, cluster unreachable,
+        // namespace permission issue) → skip the check rather than
+        // false-positive.  Apply continues; if there's a real
+        // cluster issue, helm will fail loudly enough.
+        _ => return,
+    };
+    if absent {
+        preflight_warn_missing_secret(referenced_vars);
+        return;
+    }
+
+    // ── Check #2 + #3: per-var value sanity ──
+    //
+    // `kubectl get secret aislang-providers -o jsonpath='{.data.<VAR>}'`
+    // returns the base64-encoded value (or empty string if the key
+    // is absent OR present but empty).  We base64-decode the
+    // non-empty values to check for non-ASCII bytes (typically
+    // signals a placeholder was pasted including unicode `…`
+    // ellipsis or smart-quotes — Anthropic's SDK ASCII-encodes the
+    // key for the x-api-key header and explodes with
+    // `'ascii' codec can't encode character '\u2026'`).
+    //
+    // Foot-guns caught:
+    //   - empty value:  shell didn't have $VAR set when user ran
+    //                   `kubectl create secret … --from-literal=
+    //                   <VAR>="$<VAR>"`  → LiteLLM forwards empty
+    //                   header → 401.
+    //   - non-ASCII:    user pasted a placeholder containing `…`
+    //                   ellipsis or smart-quotes (e.g.
+    //                   `sk-ant-…YOUR-KEY…`) → Anthropic SDK
+    //                   ASCII-encode fails → HTTP 500.
+    let mut empty_vars:     Vec<String> = Vec::new();
+    let mut non_ascii_vars: Vec<String> = Vec::new();
+    for var in referenced_vars {
+        let v = std::process::Command::new("kubectl")
+            .args(["get", "secret", "aislang-providers",
+                   "-o", &format!("jsonpath={{.data.{var}}}")])
+            .output();
+        let Ok(o) = v else { continue };
+        if !o.status.success() { continue; }
+        if o.stdout.is_empty() {
+            empty_vars.push(var.clone());
+            continue;
+        }
+        // Decode the base64 to inspect the actual bytes.  kubectl
+        // returns standard base64 with no whitespace; a hand-rolled
+        // decoder keeps us from pulling in the `base64` crate.
+        let b64_str = String::from_utf8_lossy(&o.stdout).into_owned();
+        let decoded = decode_base64(b64_str.trim());
+        if let Some(bytes) = decoded {
+            if bytes.iter().any(|&b| b > 0x7f) {
+                non_ascii_vars.push(var.clone());
+            }
+        }
+        // Decode failure → can't tell; skip silently (kubectl
+        // output may have changed, or the data was binary).
+    }
+    if !empty_vars.is_empty() {
+        preflight_warn_empty_secret_values(&empty_vars);
+    }
+    if !non_ascii_vars.is_empty() {
+        preflight_warn_non_ascii_secret_values(&non_ascii_vars);
+    }
+}
+
+/// Minimal base64 decoder — kubectl returns standard alphabet (`+/=`)
+/// with no whitespace.  Returns `None` on invalid input (treated as
+/// "can't sanity-check; skip the non-ASCII probe for this var").
+/// Hand-rolled to avoid pulling in the `base64` crate for one call
+/// site.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    fn idx(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+'        => Some(62),
+            b'/'        => Some(63),
+            _           => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 { return None; }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let pad = (bytes[i+2] == b'=') as usize + (bytes[i+3] == b'=') as usize;
+        let a = idx(bytes[i])?  as u32;
+        let b = idx(bytes[i+1])? as u32;
+        let c = if bytes[i+2] == b'=' { 0 } else { idx(bytes[i+2])? as u32 };
+        let d = if bytes[i+3] == b'=' { 0 } else { idx(bytes[i+3])? as u32 };
+        let chunk = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push(((chunk >> 16) & 0xff) as u8);
+        if pad < 2 { out.push(((chunk >> 8) & 0xff) as u8); }
+        if pad < 1 { out.push((chunk        & 0xff) as u8); }
+        i += 4;
+    }
+    Some(out)
+}
+
+/// Print the "Secret doesn't exist" warning + the create-secret
+/// recipe customised to the project's referenced env vars.
+fn preflight_warn_missing_secret(referenced_vars: &std::collections::BTreeSet<String>) {
+    eprintln!();
+    eprintln!("!  preflight WARNING: required Secret `aislang-providers` not found");
+    eprintln!("   (Decision 43.5 — provider creds Secret is user-created)");
+    eprintln!();
+    eprintln!("   The chart's litellm + agent-runtime pods envFrom this Secret;");
+    eprintln!("   without it the pods will install but stay Pending with a");
+    eprintln!("   `CreateContainerConfigError` event.  Create the Secret then");
+    eprintln!("   the pods will progress automatically on the next kubelet sync:");
+    eprintln!();
+    eprintln!("     kubectl create secret generic aislang-providers \\");
+    for (i, var) in referenced_vars.iter().enumerate() {
+        let last = i == referenced_vars.len() - 1;
+        let backslash = if last { "" } else { " \\" };
+        eprintln!("       --from-literal={var}=\"${var}\"{backslash}");
+    }
+    eprintln!();
+    eprintln!("   !  Make sure those env vars are actually exported in your shell");
+    eprintln!("      first — empty `$ANTHROPIC_API_KEY` → empty key in the Secret");
+    eprintln!("      → LiteLLM 401s on every request.");
+    eprintln!();
+    eprintln!("   Helm install will proceed; create the Secret afterwards.");
+    eprintln!();
+}
+
+/// Print the "Secret exists but some values are empty" warning +
+/// the patch-secret recipe.
+fn preflight_warn_empty_secret_values(empty_vars: &[String]) {
+    eprintln!();
+    eprintln!("!  preflight WARNING: Secret `aislang-providers` has EMPTY values");
+    eprintln!("   for: {}", empty_vars.join(", "));
+    eprintln!();
+    eprintln!("   These keys are referenced by the resolved model bindings;");
+    eprintln!("   LiteLLM will forward empty headers/credentials and providers");
+    eprintln!("   will reject the calls (typically HTTP 401).");
+    eprintln!();
+    eprintln!("   Patch the Secret with the real values:");
+    eprintln!();
+    eprintln!("     kubectl create secret generic aislang-providers \\");
+    for (i, var) in empty_vars.iter().enumerate() {
+        let last = i == empty_vars.len() - 1;
+        let backslash = if last { "" } else { " \\" };
+        // ASCII-only placeholder (no unicode `…` — that triggers
+        // the very bug we're trying to prevent if the user pastes
+        // it literally).  Uppercase + obvious "PASTE" verb makes
+        // it impossible to mistake for a real value.
+        eprintln!("       --from-literal={var}='PASTE_{var}_VALUE_HERE'{backslash}");
+    }
+    eprintln!("       --dry-run=client -o yaml | kubectl apply -f -");
+    eprintln!();
+    eprintln!("   Then restart the pods so envFrom re-reads the Secret:");
+    eprintln!();
+    eprintln!("     kubectl rollout restart deploy/litellm");
+    eprintln!("     kubectl rollout restart deploy/agent-runtime");
+    eprintln!();
+    eprintln!("   Helm install will proceed; fix the Secret afterwards.");
+    eprintln!();
+}
+
+/// Print the "Secret exists but some values contain non-ASCII bytes"
+/// warning + the patch recipe.  Almost always caused by the user
+/// pasting a placeholder containing unicode ellipsis (`...`) or smart
+/// quotes — the Anthropic SDK ASCII-encodes the key for the
+/// `x-api-key` header and explodes with
+/// `'ascii' codec can't encode character '\u2026'`.  Other providers
+/// have similar (less helpful) failure modes.
+fn preflight_warn_non_ascii_secret_values(non_ascii_vars: &[String]) {
+    eprintln!();
+    eprintln!("!  preflight WARNING: Secret `aislang-providers` contains NON-ASCII");
+    eprintln!("   bytes in: {}", non_ascii_vars.join(", "));
+    eprintln!();
+    eprintln!("   Provider API keys are ASCII-only — typically `sk-…` prefix +");
+    eprintln!("   base64-alphabet body.  Non-ASCII bytes almost always mean a");
+    eprintln!("   placeholder was pasted literally, e.g.");
+    eprintln!("       sk-ant-{}YOUR-REAL-KEY{}", '\u{2026}', '\u{2026}');
+    eprintln!("   …where `{}` (U+2026) crashes the Anthropic SDK with",       '\u{2026}');
+    eprintln!("       'ascii' codec can't encode character '\\u2026'");
+    eprintln!("   …surfacing as HTTP 500 from LiteLLM with that message in");
+    eprintln!("   the body.  Smart quotes (curly `'`, `\"`) hit the same trap.");
+    eprintln!();
+    eprintln!("   Get a real API key from the provider's console and patch:");
+    eprintln!();
+    eprintln!("     kubectl create secret generic aislang-providers \\");
+    for (i, var) in non_ascii_vars.iter().enumerate() {
+        let last = i == non_ascii_vars.len() - 1;
+        let backslash = if last { "" } else { " \\" };
+        eprintln!("       --from-literal={var}='PASTE_REAL_{var}_HERE'{backslash}");
+    }
+    eprintln!("       --dry-run=client -o yaml | kubectl apply -f -");
+    eprintln!();
+    eprintln!("     kubectl rollout restart deploy/litellm");
+    eprintln!("     kubectl rollout restart deploy/agent-runtime");
+    eprintln!();
+    eprintln!("   Helm install will proceed; fix the Secret afterwards.");
+    eprintln!();
+}
+
+/// Phase 2 Week 14 Thu — peek the deploy target without doing the
+/// full validate+resolve+lockfile dance.  Used at the top of
+/// `run_apply` / `run_destroy` to dispatch between the v0.1 Compose
+/// path (unchanged) and the new k8s path.
+///
+/// **Why not factor `prepare_stack` instead**: the Compose pipeline
+/// has deeper assumptions baked in (Compose emit unconditionally,
+/// state file shape pins stack.yml path).  A surface-level dispatch
+/// at the very top keeps the two paths cleanly separable + lets
+/// the v0.1 Compose flow stay byte-stable.  Double-validates the
+/// source as a result; the second validate is cheap (parser is fast)
+/// and `aislang validate` happens often anyway.
+fn peek_deploy_target(file: &Path) -> Result<aislang_core::types::DeployTarget> {
+    // Mirror the existing destroy-path wording ("source ... not
+    // readable") so error-message tests don't fragment by code path.
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("source file `{}` not readable: {e}",
+            file.display()))?;
+    let (project, _) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    Ok(project.deploys.iter()
+        .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+        .map(|_| aislang_core::types::DeployTarget::Kubernetes)
+        .unwrap_or(aislang_core::types::DeployTarget::Compose))
 }
 
 /// Diagnostic helper for the apply success line. Re-parses the
@@ -3077,5 +3705,80 @@ mod tests {
                                        Path::new("/tmp")).err().unwrap();
         assert!(err.to_string().contains("phantom"),
             "error must name the missing secret; got: {err}");
+    }
+
+    // ── base64 decoder used by preflight non-ASCII probe (Thu) ──
+
+    #[test] fn decode_base64_round_trips_ascii() {
+        // "sk-test-key" — what a real API key body looks like.
+        let s = "c2stdGVzdC1rZXk=";
+        let decoded = decode_base64(s).expect("valid base64");
+        assert_eq!(String::from_utf8_lossy(&decoded), "sk-test-key");
+        assert!(decoded.iter().all(|&b| b <= 0x7f),
+            "ASCII-only input must decode to all-ASCII bytes");
+    }
+
+    #[test] fn decode_base64_round_trips_non_ascii() {
+        // Decodes "sk-ant-\u2026YOUR-KEY\u2026" — the bug-reproducing
+        // case the preflight catches.  base64 of those 18 bytes:
+        let raw = format!("sk-ant-{}YOUR-KEY{}", '\u{2026}', '\u{2026}');
+        // Hand-roll base64 encode for the test (we only have decode).
+        let encoded = simple_b64_encode(raw.as_bytes());
+        let decoded = decode_base64(&encoded).expect("round-trip");
+        assert_eq!(decoded, raw.as_bytes());
+        assert!(decoded.iter().any(|&b| b > 0x7f),
+            "non-ASCII unicode (`\u{2026}` = 3 bytes UTF-8) must surface as >0x7f bytes — \
+             that's what triggers the preflight non-ASCII warning");
+    }
+
+    #[test] fn decode_base64_rejects_invalid_input() {
+        assert!(decode_base64("not!valid").is_none(),
+            "invalid base64 → None (preflight skips the non-ASCII probe rather \
+             than false-positive)");
+        assert!(decode_base64("abc").is_none(),
+            "non-multiple-of-4 length → None");
+    }
+
+    #[test] fn decode_base64_handles_padding() {
+        // "ab" = 2 bytes → base64 "YWI=" (1 pad)
+        assert_eq!(decode_base64("YWI=").unwrap(), b"ab");
+        // "a"  = 1 byte  → base64 "YQ==" (2 pad)
+        assert_eq!(decode_base64("YQ==").unwrap(), b"a");
+    }
+
+    /// Tiny base64 encoder for the round-trip test above; not used
+    /// in the production path (decode_base64 is the one in main.rs).
+    fn simple_b64_encode(bytes: &[u8]) -> String {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut i = 0;
+        while i + 3 <= bytes.len() {
+            let n = ((bytes[i]   as u32) << 16)
+                  | ((bytes[i+1] as u32) << 8)
+                  | (bytes[i+2]  as u32);
+            for shift in [18, 12, 6, 0] {
+                out.push(ALPHA[((n >> shift) & 0x3f) as usize] as char);
+            }
+            i += 3;
+        }
+        match bytes.len() - i {
+            1 => {
+                let n = (bytes[i] as u32) << 16;
+                out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+                out.push('=');
+                out.push('=');
+            }
+            2 => {
+                let n = ((bytes[i] as u32) << 16) | ((bytes[i+1] as u32) << 8);
+                out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+                out.push(ALPHA[((n >>  6) & 0x3f) as usize] as char);
+                out.push('=');
+            }
+            _ => {}
+        }
+        out
     }
 }

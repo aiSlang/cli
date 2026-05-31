@@ -901,34 +901,53 @@ fn to_deploy(raw: RawBlock) -> Result<Deploy, String> {
     })
 }
 
-/// Parse the inner body of `expose { … }` — v0.2 Tue (Track A2).
+/// Parse the inner body of `expose { … }` — v0.2 Tue (Track A2) +
+/// Thu (Track B Decision 43.6).
 ///
-/// Both `port` and `web_ui` are optional; an empty `expose {}` is
-/// allowed and emits the same `Expose::default()` (no web UI, no
-/// informational port).  Unknown attribute names are an error so
-/// typos surface immediately.
+/// All three fields are optional; an empty `expose {}` is allowed
+/// and emits the same `Expose::default()` (no web UI, no
+/// informational port, no Ingress).  Unknown attribute names are
+/// an error so typos surface immediately.
 fn to_expose(raw: RawBlock) -> Result<Expose, String> {
     if !raw.labels.is_empty() {
         return Err(format!(
             "`expose` block takes no label; got {} label(s)", raw.labels.len()
         ));
     }
-    let mut port:   Option<u16> = None;
-    let mut web_ui: bool        = false;
+    let mut port:    Option<u16>    = None;
+    let mut web_ui:  bool           = false;
+    let mut ingress: Option<String> = None;
 
     for item in raw.body {
         let attr = expect_attr_only("expose", item)?;
         match attr.name.as_str() {
-            "port"   => port   = Some(expect_port_u16(&attr.name, attr.value)?),
-            "web_ui" => web_ui = expect_bool(&attr.name, attr.value)?,
+            "port"    => port    = Some(expect_port_u16(&attr.name, attr.value)?),
+            "web_ui"  => web_ui  = expect_bool(&attr.name, attr.value)?,
+            // Thu (Decision 43.6): hostname string for the optional
+            // K8s Ingress that fronts the Open WebUI Service.  Empty
+            // string is rejected at the typed-value level
+            // (`expect_string` accepts any String, but a hostname-less
+            // Ingress isn't useful — we'd rather catch the typo than
+            // silently emit a broken Ingress).
+            "ingress" => {
+                let host = expect_string(&attr.name, attr.value)?;
+                if host.trim().is_empty() {
+                    return Err(format!(
+                        "`ingress` host must be non-empty; got an empty string. \
+                         Drop the attribute entirely if you don't need an \
+                         Ingress (Decision 43.6 — Ingress is opt-in)."
+                    ));
+                }
+                ingress = Some(host);
+            }
             other => return Err(format!(
                 "unknown attribute `{other}` in expose block; \
-                 allowed: port, web_ui"
+                 allowed: port, web_ui, ingress"
             )),
         }
     }
 
-    Ok(Expose { port, web_ui })
+    Ok(Expose { port, web_ui, ingress })
 }
 
 /// Single-port extractor used by `to_expose`.  Reuses the same
@@ -2302,6 +2321,7 @@ mod project_tests {
         let expose = p.deploys[0].expose.as_ref().unwrap();
         assert_eq!(expose.port, None);
         assert!(!expose.web_ui);
+        assert_eq!(expose.ingress, None);
     }
 
     #[test] fn deploy_port_out_of_range_fails() {
@@ -2338,6 +2358,60 @@ mod project_tests {
         let src = project_with(
             r#"deploy "local" { target = compose  expose { web_ui = "yes" } }"#);
         assert_parse_err_contains(&src, "`true` or `false`");
+    }
+
+    // ── expose.ingress (Phase 2 Week 14 Thu — Decision 43.6) ──
+
+    #[test] fn deploy_expose_with_ingress_host_parses() {
+        // Happy path: `ingress = "example.com"` lands as
+        // `Some("example.com")` in the AST.
+        let src = project_with(
+            r#"deploy "prod" {
+                 target = kubernetes
+                 expose { web_ui = true  ingress = "support.example.com" }
+               }"#);
+        let p = assert_parse_ok(&src);
+        let expose = p.deploys[0].expose.as_ref().unwrap();
+        assert_eq!(expose.ingress.as_deref(), Some("support.example.com"));
+        assert!(expose.web_ui);
+    }
+
+    #[test] fn deploy_expose_ingress_without_web_ui_parses_warns_at_emit() {
+        // Grammar-level: ingress without web_ui IS parseable (no
+        // cross-field validation at the parser layer).  The K8s
+        // emitter ignores it with a warning (tracked in the emitter
+        // tests).  Keeps the parser's job to "shape only" + reserves
+        // semantic complaints to the emit-side.
+        let src = project_with(
+            r#"deploy "prod" {
+                 target = kubernetes
+                 expose { ingress = "ui.example.com" }
+               }"#);
+        let p = assert_parse_ok(&src);
+        let expose = p.deploys[0].expose.as_ref().unwrap();
+        assert_eq!(expose.ingress.as_deref(), Some("ui.example.com"));
+        assert!(!expose.web_ui);
+    }
+
+    #[test] fn deploy_expose_empty_ingress_string_fails() {
+        // Empty string is rejected — the user almost certainly meant
+        // to drop the attribute rather than emit a broken Ingress
+        // with an empty `spec.rules[0].host`.
+        let src = project_with(
+            r#"deploy "prod" {
+                 target = kubernetes
+                 expose { ingress = "" }
+               }"#);
+        assert_parse_err_contains(&src, "non-empty");
+    }
+
+    #[test] fn deploy_expose_ingress_non_string_fails() {
+        let src = project_with(
+            r#"deploy "prod" {
+                 target = kubernetes
+                 expose { ingress = true }
+               }"#);
+        assert_parse_err_contains(&src, "ingress");
     }
 
     #[test] fn deploy_unknown_target_fails() {

@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test] fn web_ui_true_emits_openwebui_service() {
         let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
-            port: None, web_ui: true,
+            port: None, web_ui: true, ingress: None,
         }));
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
@@ -1049,7 +1049,7 @@ mod tests {
         // expose { web_ui = false } → no sidecar.  Same posture as
         // an absent expose block (covered by the next test).
         let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
-            port: Some(8080), web_ui: false,
+            port: Some(8080), web_ui: false, ingress: None,
         }));
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
@@ -1087,7 +1087,7 @@ mod tests {
         // `port` (informational, header-only) AND `web_ui = true`
         // (functional, emits sidecar) co-exist cleanly.
         let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
-            port: Some(8080), web_ui: true,
+            port: Some(8080), web_ui: true, ingress: None,
         }));
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
@@ -1118,7 +1118,7 @@ mod tests {
         // tooling treats openwebui as part of the aislang-generated
         // stack.
         let resolved = resolved_with_expose(Some(aislang_core::ast::Expose {
-            port: None, web_ui: true,
+            port: None, web_ui: true, ingress: None,
         }));
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
