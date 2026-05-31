@@ -22,10 +22,17 @@
 #               (PLAN §Week 11 Thu) uses this. When BASE_URL is set,
 #               VERSION must be a concrete tag (no "latest" resolve).
 #
+# Flags:
+#   --check-deps   — skip install, just probe runtime prerequisites
+#                    (docker / docker compose / helm / kubectl / kind)
+#                    and print a tailored install-hints block.
+#                    Same probe runs at the end of a normal install.
+#
 # Usage:
 #   curl -sSfL https://github.com/aislang/aislang/releases/latest/download/install.sh | sh
 #   PREFIX=/usr/local/bin sudo sh install.sh
 #   VERSION=v0.1.0 sh install.sh
+#   sh install.sh --check-deps        # probe-only, no install
 #
 # Strategic note (Decision 34): through v0.1 and v0.2 this script
 # is intentionally distributed via authenticated `gh release
@@ -236,11 +243,223 @@ print_success() {
 
   printf '\n'
   info "next steps:  https://github.com/$REPO#quick-taste"
-  info "prereq:      Docker is required for \`aislang apply\` / \`destroy\`."
+}
+
+# ── Runtime-dependency probe (Phase 2 Week 14 Thu) ──────────────
+#
+# aiSlang itself is one static binary, but `aislang apply`/`destroy`
+# shell out to docker (target = compose) or helm + kubectl (target =
+# kubernetes).  Auto-installing these would mean choosing a distro-
+# specific package manager and asking for sudo — too invasive for a
+# `curl | sh` flow.  We DETECT instead: print what's present + what's
+# missing + per-distro install hints, then exit 0.  Users who want to
+# proceed without the missing tool can; users who don't can run the
+# printed commands.
+#
+# Exits 0 always — never blocks the install on missing runtime deps.
+check_runtime_deps() {
+  printf '\n'
+  info "runtime prerequisites probe (informational — never blocks install)"
+  printf '\n'
+
+  # ── docker (target = compose; also required by kind) ───────────
+  if command -v docker >/dev/null 2>&1; then
+    docker_ver="$(docker --version 2>/dev/null | head -n1)"
+    printf '  \033[1;32m✓\033[0m docker         %s\n' "$docker_ver"
+  else
+    printf '  \033[1;31m✗\033[0m docker         (not found — required for target = compose AND kind)\n'
+    DEP_MISSING_DOCKER=1
+  fi
+
+  # ── docker compose plugin (Compose v2 is a `docker compose` subcommand) ──
+  if docker compose version >/dev/null 2>&1; then
+    compose_ver="$(docker compose version --short 2>/dev/null || echo '?')"
+    printf '  \033[1;32m✓\033[0m docker compose v%s\n' "$compose_ver"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    printf '  \033[1;33m~\033[0m docker-compose (legacy v1 — works but consider upgrading to Docker Compose v2)\n'
+  elif [ -z "${DEP_MISSING_DOCKER:-}" ]; then
+    # docker present but compose subcommand missing — usually the
+    # case on stripped Docker installs (no compose plugin).
+    printf '  \033[1;31m✗\033[0m docker compose (plugin missing — required for target = compose)\n'
+    DEP_MISSING_COMPOSE=1
+  fi
+
+  # ── helm (target = kubernetes) ─────────────────────────────────
+  if command -v helm >/dev/null 2>&1; then
+    helm_ver="$(helm version --short 2>/dev/null || echo '?')"
+    printf '  \033[1;32m✓\033[0m helm           %s\n' "$helm_ver"
+  else
+    printf '  \033[1;31m✗\033[0m helm           (not found — required for target = kubernetes)\n'
+    DEP_MISSING_HELM=1
+  fi
+
+  # ── kubectl (target = kubernetes) ──────────────────────────────
+  if command -v kubectl >/dev/null 2>&1; then
+    kubectl_ver="$(kubectl version --client -o json 2>/dev/null \
+      | awk -F'"' '/gitVersion/ {print $4; exit}' || echo '?')"
+    printf '  \033[1;32m✓\033[0m kubectl        %s\n' "${kubectl_ver:-?}"
+  else
+    printf '  \033[1;31m✗\033[0m kubectl        (not found — required for target = kubernetes)\n'
+    DEP_MISSING_KUBECTL=1
+  fi
+
+  # ── kind (recommended local K8s for testing) ───────────────────
+  if command -v kind >/dev/null 2>&1; then
+    kind_ver="$(kind --version 2>/dev/null | head -n1)"
+    printf '  \033[1;32m✓\033[0m kind           %s\n' "$kind_ver"
+  else
+    printf '  \033[1;33m~\033[0m kind           (not found — optional; recommended for local K8s testing)\n'
+    DEP_MISSING_KIND=1
+  fi
+
+  # ── Optional but commonly needed ───────────────────────────────
+  if command -v ollama >/dev/null 2>&1; then
+    printf '  \033[1;32m✓\033[0m ollama         (local-model option for $0 dev runs)\n'
+  fi
+
+  # If anything's missing, print install hints scoped to the
+  # detected OS.  Each block is a small recipe the user can copy-
+  # paste; auto-running them would require sudo + assumption of
+  # the package manager, both of which we deliberately avoid.
+  if [ -n "${DEP_MISSING_DOCKER:-}${DEP_MISSING_COMPOSE:-}${DEP_MISSING_HELM:-}${DEP_MISSING_KUBECTL:-}${DEP_MISSING_KIND:-}" ]; then
+    print_dep_install_hints
+  else
+    printf '\n'
+    info "all runtime dependencies present — ready for both target = compose AND target = kubernetes."
+  fi
+}
+
+# Print install hints for missing runtime deps, scoped to host OS.
+# Called only when at least one DEP_MISSING_* flag is set.
+print_dep_install_hints() {
+  os="$(uname -s)"
+  printf '\n'
+  info "install hints for missing prerequisites:"
+  printf '\n'
+
+  case "$os" in
+    Linux)
+      # Detect distro family for better hints.  /etc/os-release is
+      # POSIX-standard on Debian/Ubuntu/RHEL/Arch/etc.
+      distro_id=''
+      if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        distro_id="$(. /etc/os-release; echo "${ID_LIKE:-$ID}" | awk '{print $1}')"
+      fi
+      case "$distro_id" in
+        debian|ubuntu)
+          [ -n "${DEP_MISSING_DOCKER:-}" ] && cat >&2 <<'EOF'
+  ── docker (Ubuntu/Debian) ────────────────────────────────────
+    sudo apt update && sudo apt install -y docker.io docker-compose-v2
+    sudo usermod -aG docker $USER && newgrp docker
+
+EOF
+          [ -n "${DEP_MISSING_COMPOSE:-}" ] && [ -z "${DEP_MISSING_DOCKER:-}" ] && cat >&2 <<'EOF'
+  ── docker compose plugin (Ubuntu/Debian) ─────────────────────
+    sudo apt install -y docker-compose-v2
+
+EOF
+          [ -n "${DEP_MISSING_KUBECTL:-}" ] && cat >&2 <<'EOF'
+  ── kubectl ───────────────────────────────────────────────────
+    curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+EOF
+          [ -n "${DEP_MISSING_HELM:-}" ] && cat >&2 <<'EOF'
+  ── helm 3 ────────────────────────────────────────────────────
+    curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+EOF
+          [ -n "${DEP_MISSING_KIND:-}" ] && cat >&2 <<'EOF'
+  ── kind (local K8s in Docker — for testing target = kubernetes) ─
+    curl -sSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+    sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+    kind create cluster        # spins up a working cluster in ~30s
+
+EOF
+          ;;
+        rhel|fedora|centos|rocky|almalinux)
+          [ -n "${DEP_MISSING_DOCKER:-}" ] && cat >&2 <<'EOF'
+  ── docker (RHEL/Fedora) ──────────────────────────────────────
+    sudo dnf install -y docker docker-compose-plugin
+    sudo systemctl enable --now docker
+    sudo usermod -aG docker $USER && newgrp docker
+
+EOF
+          [ -n "${DEP_MISSING_KUBECTL:-}" ] && cat >&2 <<'EOF'
+  ── kubectl (RHEL/Fedora) ─────────────────────────────────────
+    sudo dnf install -y kubectl
+
+EOF
+          [ -n "${DEP_MISSING_HELM:-}" ] && cat >&2 <<'EOF'
+  ── helm 3 ────────────────────────────────────────────────────
+    curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+EOF
+          [ -n "${DEP_MISSING_KIND:-}" ] && cat >&2 <<'EOF'
+  ── kind ──────────────────────────────────────────────────────
+    curl -sSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+    sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+
+EOF
+          ;;
+        arch|manjaro)
+          [ -n "${DEP_MISSING_DOCKER:-}" ] && cat >&2 <<'EOF'
+  ── docker (Arch) ─────────────────────────────────────────────
+    sudo pacman -S --needed docker docker-compose
+    sudo systemctl enable --now docker
+    sudo usermod -aG docker $USER && newgrp docker
+
+EOF
+          [ -n "${DEP_MISSING_KUBECTL:-}" ] && cat >&2 <<'EOF'
+  ── kubectl + helm + kind (Arch) ──────────────────────────────
+    sudo pacman -S --needed kubectl helm kind
+
+EOF
+          ;;
+        *)
+          warn "(unknown Linux distro: '$distro_id' — falling back to generic hints)"
+          [ -n "${DEP_MISSING_DOCKER:-}" ] && warn "install docker:  https://docs.docker.com/engine/install/"
+          [ -n "${DEP_MISSING_KUBECTL:-}" ] && warn "install kubectl: https://kubernetes.io/docs/tasks/tools/#kubectl"
+          [ -n "${DEP_MISSING_HELM:-}" ] && warn "install helm:    https://helm.sh/docs/intro/install/"
+          [ -n "${DEP_MISSING_KIND:-}" ] && warn "install kind:    https://kind.sigs.k8s.io/docs/user/quick-start/#installation"
+          ;;
+      esac
+      ;;
+    Darwin)
+      # macOS via Homebrew — single-line install for all four
+      # missing tools.  Docker Desktop is the easy GUI route; the
+      # CLI-only `docker` formula works too if the user prefers no
+      # GUI overhead.
+      cat >&2 <<'EOF'
+  ── macOS (Homebrew) ──────────────────────────────────────────
+    brew install docker docker-compose helm kubectl kind
+    # Or Docker Desktop (GUI): https://docs.docker.com/desktop/install/mac-install/
+    open -a Docker         # if Docker Desktop installed
+
+EOF
+      ;;
+    *)
+      warn "(unknown OS: '$os' — see vendor pages for install instructions)"
+      ;;
+  esac
+
+  printf '\n'
+  info "after installing, re-run with --check-deps to verify:  sh install.sh --check-deps"
 }
 
 # ── main ────────────────────────────────────────────────────────
 main() {
+  # --check-deps flag short-circuits to the probe + install hints
+  # without doing the binary install.  Useful for the cold-start
+  # workflow: "I already have aislang; what runtime deps do I need
+  # for `target = kubernetes`?"
+  if [ "${1:-}" = "--check-deps" ]; then
+    info "aiSlang runtime-dependency probe (--check-deps)"
+    check_runtime_deps
+    exit 0
+  fi
+
   info "aiSlang installer"
   ensure_deps
   detect_target
@@ -249,6 +468,7 @@ main() {
   verify_checksum
   install_binary
   print_success
+  check_runtime_deps
 }
 
 main "$@"

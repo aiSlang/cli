@@ -2,7 +2,7 @@
 
 > Declarative infrastructure for AI projects. One file describes your agents, models, prompts, MCP servers, evals, budgets, and deployment — `aislang apply` ships it.
 
-**Status:** v0.2.0-rc1 (Phase 1 close — internal milestone). See [PLAN-90-days-v0_2.md](PLAN-90-days-v0_2.md) for the v0.2 plan, [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the v0.1 archive, and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
+**Status:** v0.2.0-rc1 + Phase 2 Week 14 in flight (Track B — `target = kubernetes` + Helm chart + Open WebUI + Ingress all landed; CI smoke + v0.2.0-rc2 tag at Fri close).  See [PLAN-90-days-v0_2.md](PLAN-90-days-v0_2.md) for the v0.2 plan, [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the v0.1 archive, and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
 
 ## Quick taste
 
@@ -110,6 +110,102 @@ After `aislang apply`, browse to **http://localhost:3000**, sign up (local SQLit
 
 `aislang destroy` runs `docker compose down -v` which wipes the `openwebui-data` named volume; chat history + local accounts go away alongside the rest of the stack.
 
+### Deploy to Kubernetes (Helm) — v0.2 Phase 2 Week 14 (Track B)
+
+Flip `target = compose` to `target = kubernetes` and `aislang apply` packages the same stack as a Helm chart and installs it via `helm upgrade --install`.  All five always-on infrastructure pods (LiteLLM router + Jaeger tracing + budget counter + `aislang mcp-serve` agent runtime + the `aislang-project` ConfigMap holding your .ais source + lockfile + prompts) plus the opt-in Open WebUI Deployment+Service+PVC.  Same labels (`aislang.generated=true` + `aislang.component=<name>` + `aislang.deploy=<label>`) so `kubectl get all -l aislang.generated=true` is the K8s analogue of `docker compose ls --filter "label=aislang.generated"`.
+
+```hcl
+deploy "prod" {
+  target = kubernetes
+  expose {
+    port    = 8080                       # agent-runtime mcp-serve --http port
+    web_ui  = true                       # → Open WebUI Deployment+Service+PVC
+    ingress = "support.example.com"      # opt-in Ingress (omit for kubectl port-forward)
+  }
+}
+```
+
+#### `kind` quick-start on Ubuntu
+
+For local testing, **[kind](https://kind.sigs.k8s.io/)** (Kubernetes in Docker) gives you a working cluster in ~30 seconds.  It needs Docker (already required by `target = compose`) plus the `kind` + `kubectl` + `helm` CLIs:
+
+```sh
+# 1. Docker — required prerequisite (same as target = compose)
+sudo apt update && sudo apt install -y docker.io
+sudo usermod -aG docker $USER && newgrp docker
+
+# 2. kubectl — the K8s CLI
+curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+# 3. helm — chart installer
+curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# 4. kind — local cluster
+curl -sSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+
+# 5. Spin up a cluster (takes ~30s; default name `kind`)
+kind create cluster
+
+# 6. Sanity-check that kubectl talks to it
+kubectl get nodes
+# NAME                 STATUS   ROLES           AGE   VERSION
+# kind-control-plane   Ready    control-plane   30s   v1.31.0
+```
+
+On macOS, swap `apt install` for `brew install docker kubectl helm kind` and ensure Docker Desktop is running.  See `install.sh --check-deps` (added Thu) for an automated probe of your local toolchain.
+
+#### Apply, port-forward, destroy
+
+```sh
+# 1. Create the provider-creds Secret (Decision 43.5).  aislang doesn't
+#    auto-create this — Secret bodies should never land in the chart
+#    values.yaml.  Populate from your .env or paste keys directly.
+kubectl create secret generic aislang-providers \
+  --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+  --from-literal=OLLAMA_API_BASE="$OLLAMA_API_BASE"
+
+# 2. Plan — writes manifests/ + chart/ but doesn't install yet.
+aislang plan examples/support-agent-k8s.ais
+
+# 3. Apply — `helm upgrade --install <deploy-label> chart/`.
+aislang apply examples/support-agent-k8s.ais
+
+# 4. Open WebUI is on a ClusterIP Service by default.  Either:
+#    - port-forward (works on every cluster, no Ingress controller needed):
+kubectl port-forward svc/openwebui 3000:8080
+#    - or set `ingress = "<host>"` in your .ais (Decision 43.6) and point
+#      DNS at your cluster's Ingress controller LB.
+
+# 5. Tear it down — `helm uninstall <deploy-label>`.
+aislang destroy examples/support-agent-k8s.ais
+```
+
+The chart's `values.yaml` exposes exactly four overrides (Decision 43.7 — minimal templating).  Override at install time without re-running `aislang plan`:
+
+```sh
+helm upgrade --install prod ./chart \
+  --set image.tag=v0.2.0-rc2 \
+  --set litellm.replicas=3 \
+  --set openwebui.persistence.size=5Gi \
+  --set ingress.host=support.example.com
+```
+
+#### What's pinned, what's user-controlled
+
+| Concern | aiSlang emits | User overrides |
+|---|---|---|
+| Container images | `ghcr.io/aislang/aislang`, `ghcr.io/berriai/litellm:main-stable`, `jaegertracing/all-in-one:latest`, `ghcr.io/open-webui/open-webui:main` | `image.tag` (agent-runtime only via chart `values.yaml`) |
+| Provider credentials | `envFrom: secretRef: aislang-providers` (Decision 43.5) | `kubectl create secret generic aislang-providers --from-literal=…` |
+| Storage | `PersistentVolumeClaim` for Open WebUI (1Gi default, cluster default StorageClass) | `openwebui.persistence.size` |
+| Ingress | Optional `Ingress` routing `/` to openwebui (no TLS in v0.2) | `expose.ingress = "<host>"` in .ais; `ingress.host` in chart values |
+| Replicas | LiteLLM = 1 (templated), others fixed at 1 (stateful) | `litellm.replicas` |
+| Namespace | None pinned — uses Helm's `--namespace` flag or default | `helm install --namespace <ns>` |
+
+See `examples/support-agent-k8s.ais` for the canonical K8s demo and PLAN-90-days-v0_2.md §"Phase 2 — Track B foundation" for the eight locked architectural decisions (43.1–43.8) that drive the resource shapes.
+
 ### MCP integration — drive aiSlang from Claude Desktop / Cursor (v0.2 Thu, Track A)
 
 `aislang mcp-serve` exposes the whole CLI surface as an MCP server, so MCP-aware LLM hosts can author, deploy, and chat with .ais agents without you touching a terminal.
@@ -162,9 +258,9 @@ Override the Jaeger UI URL with `AISLANG_JAEGER_UI` (e.g. for a shared collector
 | Command | Synopsis | What it does |
 |---|---|---|
 | `validate` | `aislang validate [-v…] <file>` | Parse, type-check, and catalog-id-check the .ais source. No network, no writes. |
-| `plan`     | `aislang plan [-v…] [--no-lock] [-o DIR] [--smoke-test] [--smoke-test-live] <file>` | Resolve models, reconcile `aislang.lock`, emit Compose YAML to stdout + `litellm_config.yaml` + `.env.example` to disk. Optional tiered smoke test. |
-| `apply`    | `aislang apply <file>` | Run `plan` internals, write `stack.yml`, then `docker compose up -d` and record `.aislang/state.json`. |
-| `destroy`  | `aislang destroy [--force] <file>` | `docker compose down -v` against the recorded stack. Idempotent — re-runs on a torn-down stack exit 0. |
+| `plan`     | `aislang plan [-v…] [--no-lock] [-o DIR] [--smoke-test] [--smoke-test-live] <file>` | Resolve models, reconcile `aislang.lock`, emit artifacts.  `target = compose`: Compose YAML on stdout + `litellm_config.yaml` + `.env.example`.  `target = kubernetes` (Phase 2): K8s manifests on stdout + `manifests/*.yaml` + Helm `chart/` on disk. |
+| `apply`    | `aislang apply <file>` | Compose: write `stack.yml`, then `docker compose up -d` + record `.aislang/state.json`.  Kubernetes: write `manifests/` + `chart/`, then `helm upgrade --install <deploy-label> chart/`.  Both paths graceful-degrade when their backend CLI is missing. |
+| `destroy`  | `aislang destroy [--force] <file>` | Compose: `docker compose down -v`.  Kubernetes: `helm uninstall <deploy-label>`.  Both idempotent — re-runs on a torn-down stack exit 0. |
 | `chat`     | `aislang chat <agent> <file>` | Open an interactive REPL against the deployed LiteLLM, spawning declared MCP servers as stdio children for the session. Tool-use loop hard-capped at 8 iterations. |
 | `eval`     | `aislang eval [-e <label>] <file>` | Run every `eval` block (or one named via `-e`) against the deployed agent. JSON `EvalReport` on stdout; per-case `trace_url`s deep-link into Jaeger. Exit 1 if any eval fails threshold. |
 | `cost`     | `aislang cost <file>` | Print today's UTC spend (total + per-model) from `~/.aislang/spend.json` against the budget caps in the source. Read-only. |
