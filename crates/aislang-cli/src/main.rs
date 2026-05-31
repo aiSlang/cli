@@ -685,6 +685,22 @@ fn run_plan(
                 .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
             k8s_manifest_paths.push(path);
         }
+        // Thu (Decision 43.7): also write the Helm chart tree so
+        // `aislang plan` materializes EVERY artifact `aislang apply`
+        // would install.  Recreate chart/ from scratch on every
+        // plan run so stale templates from a previous emit don't
+        // leak through.
+        let chart_dir = output_dir.join(aislang_k8s::CHART_DIRNAME);
+        let _ = std::fs::remove_dir_all(&chart_dir);
+        for (rel_path, body) in &k8s_artifacts.chart_files {
+            let abs = chart_dir.join(rel_path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).map_err(|e|
+                    anyhow::anyhow!("create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&abs, body).map_err(|e|
+                anyhow::anyhow!("write {}: {e}", abs.display()))?;
+        }
         // Hand the artifacts off to the stdout-streaming branch
         // below so we don't pay for a second `emit()` call.
         k8s_artifacts_for_stdout = Some(k8s_artifacts);
@@ -734,6 +750,10 @@ fn run_plan(
     }
     for p in &k8s_manifest_paths {
         eprintln!("  k8s manifest:    {}", p.display());
+    }
+    if emit_k8s {
+        eprintln!("  helm chart:      {}",
+            output_dir.join(aislang_k8s::CHART_DIRNAME).display());
     }
     if !no_lock {
         eprintln!("  lockfile:        {}", lock_path.display());
@@ -1294,6 +1314,18 @@ fn prepare_stack(
 
 /// `aislang apply <file>` — plan, then `docker compose up -d`.
 fn run_apply(file: PathBuf) -> Result<()> {
+    // Phase 2 Week 14 Thu — dispatch on the declared deploy target.
+    // `target = kubernetes` deploys go through the helm path; v0.1
+    // Compose path (the rest of this function) is unchanged.
+    match peek_deploy_target(&file)? {
+        aislang_core::types::DeployTarget::Kubernetes => {
+            return run_apply_k8s(file);
+        }
+        aislang_core::types::DeployTarget::Compose => {
+            // Fall through to the existing Compose flow.
+        }
+    }
+
     let prep = prepare_stack(&file, None, false, 0)?;
 
     // Write stack.yml so `docker compose -f stack.yml` (and the
@@ -1372,6 +1404,18 @@ fn run_apply(file: PathBuf) -> Result<()> {
 /// clean exit 0. `--force` bypasses state-file existence checks and
 /// runs the compose down anyway (when stack.yml exists).
 fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
+    // Phase 2 Week 14 Thu — dispatch on the declared deploy target.
+    // `target = kubernetes` deploys go through `helm uninstall`; v0.1
+    // Compose path (the rest of this function) is unchanged.
+    match peek_deploy_target(&file)? {
+        aislang_core::types::DeployTarget::Kubernetes => {
+            return run_destroy_k8s(file, force);
+        }
+        aislang_core::types::DeployTarget::Compose => {
+            // Fall through to the existing Compose flow.
+        }
+    }
+
     let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
     let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
         anyhow::anyhow!("source directory `{}` not readable: {e}",
@@ -1460,6 +1504,266 @@ fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// `aislang apply` / `aislang destroy` — K8s target (Phase 2 Week 14 Thu)
+// ============================================================================
+
+/// Apply path for `target = kubernetes` deploys (Decision 43.7 +
+/// 43.8).  Mirrors `run_apply`'s shape but emits the K8s artifact
+/// set + shells out to `helm upgrade --install` instead of `docker
+/// compose up -d`.
+///
+/// Steps:
+///   1. validate + resolve + lockfile (same as Compose path)
+///   2. Build `ProjectSources` from .ais source + lockfile body +
+///      per-prompt file bodies (Wed wiring re-used)
+///   3. `aislang_k8s::emit` → manifests/ + chart/
+///   4. Write manifests/*.yaml + chart/Chart.yaml + chart/values.yaml +
+///      chart/templates/*.yaml under `<output_dir>/`
+///   5. If `helm` on PATH: `helm upgrade --install <deploy-label>
+///      <output_dir>/chart/`; else graceful-degrade with the manual
+///      command printed
+///   6. Write `.aislang/state.json` (chart dir recorded in
+///      `stack_yaml_path` — repurposed for k8s; v0.3 may add a
+///      proper target field)
+fn run_apply_k8s(file: PathBuf) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
+        anyhow::anyhow!("source directory `{}` not readable: {e}",
+            source_dir.display())
+    })?;
+
+    // ── Stage 1: validate. ──
+    let (project, _warnings) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    // ── Stage 2: catalog ID check. ──
+    aislang_resolver::check_against_bundled_catalog(&project)
+        .map_err(|e| anyhow::anyhow!("catalog error: {e}"))?;
+    // ── Stage 3: resolve. ──
+    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
+        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+    // ── Stage 4: lockfile (always reconciled in apply path —
+    //    same posture as v0.1 Compose apply). ──
+    let lock_path = output_dir.join("aislang.lock");
+    {
+        let existing = aislang_resolver::lockfile::read(&lock_path)
+            .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
+        let diff = aislang_resolver::lockfile::reconcile(
+            &source, existing.as_ref(),
+            &resolved.catalog_version, &resolved.prompt_hashes,
+        );
+        match diff {
+            aislang_resolver::LockfileDiff::Match => {}
+            aislang_resolver::LockfileDiff::Fresh
+            | aislang_resolver::LockfileDiff::Stale { .. } => {
+                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                aislang_resolver::lockfile::write(&lock_path, &new_lock)
+                    .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
+            }
+        }
+    }
+
+    // ── Stage 5: load prompt bodies for the ProjectSources bag. ──
+    let lockfile_body = std::fs::read_to_string(&lock_path).ok();
+    let mut prompt_bodies: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for prompt in &project.prompts {
+        let abs = if prompt.file.is_absolute() {
+            prompt.file.clone()
+        } else {
+            source_dir.join(&prompt.file)
+        };
+        let body = std::fs::read_to_string(&abs)
+            .map_err(|e| anyhow::anyhow!(
+                "read prompt `{}` from {}: {e}",
+                prompt.label, abs.display()))?;
+        prompt_bodies.insert(prompt.label.clone(), body);
+    }
+    let sources = aislang_k8s::ProjectSources {
+        ais_source:    source.clone(),
+        lockfile:      lockfile_body,
+        prompt_bodies,
+    };
+
+    // ── Stage 6: emit. ──
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
+    let artifacts = aislang_k8s::emit(&resolved, &catalog, &sources)
+        .map_err(|e| anyhow::anyhow!("k8s emit error: {e}"))?;
+
+    // ── Stage 7: write manifests/ + chart/ to disk. ──
+    let manifests_dir = output_dir.join(aislang_k8s::MANIFESTS_DIRNAME);
+    std::fs::create_dir_all(&manifests_dir).map_err(|e|
+        anyhow::anyhow!("create {}: {e}", manifests_dir.display()))?;
+    for (name, body) in &artifacts.manifests {
+        let p = manifests_dir.join(name);
+        std::fs::write(&p, body).map_err(|e|
+            anyhow::anyhow!("write {}: {e}", p.display()))?;
+    }
+    let chart_dir = output_dir.join(aislang_k8s::CHART_DIRNAME);
+    // Recreate chart/ from scratch on every apply so stale
+    // templates from a previous emit don't leak through (the chart
+    // is a derived artifact + helm doesn't care if we re-overwrite).
+    let _ = std::fs::remove_dir_all(&chart_dir);
+    for (rel_path, body) in &artifacts.chart_files {
+        let abs = chart_dir.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e|
+                anyhow::anyhow!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&abs, body).map_err(|e|
+            anyhow::anyhow!("write {}: {e}", abs.display()))?;
+    }
+
+    // Pick the deploy label (== Helm release name per Decision 43.1).
+    let release_name = resolved.project.deploys.iter()
+        .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+        .map(|d| d.label.clone())
+        .unwrap_or_else(|| "aislang".to_string());
+
+    eprintln!("generated:");
+    eprintln!("  manifests dir:   {}", manifests_dir.display());
+    eprintln!("  chart dir:       {}", chart_dir.display());
+    eprintln!("  lockfile:        {}", lock_path.display());
+    eprintln!();
+
+    // ── Stage 8: shell to `helm upgrade --install` (or graceful-degrade). ──
+    if !helm_on_path() {
+        eprintln!("helm not on PATH — wrote artifacts but didn't install chart.");
+        eprintln!("install Helm 3 (https://helm.sh) and run:");
+        eprintln!("  helm upgrade --install {release_name} {}", chart_dir.display());
+        eprintln!("  # … or apply the raw manifests:");
+        eprintln!("  kubectl apply -f {}", manifests_dir.display());
+        return Ok(());
+    }
+    eprintln!("installing chart: helm upgrade --install {release_name} {}",
+        chart_dir.display());
+    let status = std::process::Command::new("helm")
+        .args(["upgrade", "--install", &release_name])
+        .arg(&chart_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoke helm: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "helm upgrade --install exited {:?}", status.code()));
+    }
+
+    // ── Stage 9: write state.json (Decision 26 reuse).  For the k8s
+    //    target the `stack_yaml_path` field holds the chart directory
+    //    (where destroy can find the release name + manifests for the
+    //    rare `helm uninstall` fallback to kubectl).
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+    let source_hash = aislang_runtime::hex_sha256(source.as_bytes());
+    let state = aislang_runtime::new_applied_state(
+        &project.name,
+        source_hash,
+        &resolved.catalog_version,
+        chart_dir.clone(),
+    );
+    match aislang_runtime::write_state_atomic(&state_path, &state) {
+        Ok(())  => eprintln!("  state:           {}", state_path.display()),
+        Err(e)  => eprintln!("warning: chart is installed but failed to write {}: {e}",
+                             state_path.display()),
+    }
+
+    eprintln!();
+    eprintln!("chart installed.  next steps:");
+    eprintln!("  status:    kubectl get all -l aislang.deploy={release_name}");
+    eprintln!("  port-fwd:  kubectl port-forward svc/openwebui 3000:8080");
+    eprintln!("  teardown:  aislang destroy {}", file.display());
+    Ok(())
+}
+
+/// Destroy path for `target = kubernetes` deploys.  Mirrors
+/// `run_destroy`'s shape but uses `helm uninstall <release>` instead
+/// of `docker compose down -v`.
+fn run_destroy_k8s(file: PathBuf, force: bool) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    let (project, _) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
+        anyhow::anyhow!("source directory `{}` not readable: {e}",
+            source_dir.display())
+    })?;
+    let state_path = aislang_runtime::state_path_in(&output_dir);
+    let chart_dir  = output_dir.join(aislang_k8s::CHART_DIRNAME);
+    let release_name = project.deploys.iter()
+        .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+        .map(|d| d.label.clone())
+        .unwrap_or_else(|| "aislang".to_string());
+
+    // ── Idempotency check (mirrors v0.1 Compose destroy). ──
+    if !force {
+        match aislang_runtime::read_state(&state_path) {
+            Ok(Some(state)) if state.applied_at.is_none() => {
+                eprintln!("nothing to destroy: state file at `{}` shows the \
+                           chart was already uninstalled.", state_path.display());
+                eprintln!("(pass --force to run `helm uninstall {release_name}` anyway.)");
+                return Ok(());
+            }
+            Ok(None) if !chart_dir.exists() => {
+                eprintln!("nothing to destroy: neither `{}` nor `{}` exists.",
+                    state_path.display(), chart_dir.display());
+                eprintln!("(if the chart IS installed but state was lost, pass \
+                           --force to attempt `helm uninstall {release_name}` directly.)");
+                return Ok(());
+            }
+            Ok(_)  => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "read state file `{}`: {e}\n\
+                     (pass --force to ignore the state file)",
+                    state_path.display()));
+            }
+        }
+    }
+
+    if !helm_on_path() {
+        return Err(anyhow::anyhow!(
+            "helm not on PATH; cannot uninstall release `{release_name}`.  \
+             Install Helm 3 (https://helm.sh) or use `kubectl delete -f {}` \
+             to manually remove the resources.",
+            output_dir.join(aislang_k8s::MANIFESTS_DIRNAME).display()));
+    }
+    eprintln!("uninstalling chart: helm uninstall {release_name}");
+    let status = std::process::Command::new("helm")
+        .args(["uninstall", &release_name])
+        .status()
+        .map_err(|e| anyhow::anyhow!("invoke helm: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "helm uninstall exited {:?}", status.code()));
+    }
+
+    if let Err(e) = aislang_runtime::mark_state_torn_down(&state_path) {
+        eprintln!("warning: chart uninstalled but failed to update state \
+                   file `{}`: {e}", state_path.display());
+    }
+
+    eprintln!();
+    eprintln!("chart uninstalled — release `{release_name}` removed.");
+    eprintln!("manifests/ + chart/ files preserved for reference; remove them \
+               manually if desired:");
+    eprintln!("  rm -rf {} {}",
+        output_dir.join(aislang_k8s::MANIFESTS_DIRNAME).display(),
+        chart_dir.display());
+    Ok(())
+}
+
 /// Check whether `docker` is callable. Used by apply (graceful
 /// degrade — write artifacts then tell the user how to bring them
 /// up manually) and destroy (hard fail — there's nothing useful to
@@ -1470,6 +1774,53 @@ fn docker_on_path() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Phase 2 Week 14 Thu — `helm` CLI presence check, mirror of
+/// `docker_on_path` for the K8s deploy target.  Used by the
+/// `target = kubernetes` paths of `run_apply` / `run_destroy`:
+/// apply graceful-degrades (writes manifests/ + chart/ and prints
+/// the manual `helm upgrade --install …` command), destroy hard-
+/// fails (without helm there's no way to release-uninstall, and
+/// `kubectl delete -f manifests/` doesn't track Helm release state).
+fn helm_on_path() -> bool {
+    std::process::Command::new("helm")
+        .arg("version")
+        .arg("--short")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Phase 2 Week 14 Thu — peek the deploy target without doing the
+/// full validate+resolve+lockfile dance.  Used at the top of
+/// `run_apply` / `run_destroy` to dispatch between the v0.1 Compose
+/// path (unchanged) and the new k8s path.
+///
+/// **Why not factor `prepare_stack` instead**: the Compose pipeline
+/// has deeper assumptions baked in (Compose emit unconditionally,
+/// state file shape pins stack.yml path).  A surface-level dispatch
+/// at the very top keeps the two paths cleanly separable + lets
+/// the v0.1 Compose flow stay byte-stable.  Double-validates the
+/// source as a result; the second validate is cheap (parser is fast)
+/// and `aislang validate` happens often anyway.
+fn peek_deploy_target(file: &Path) -> Result<aislang_core::types::DeployTarget> {
+    // Mirror the existing destroy-path wording ("source ... not
+    // readable") so error-message tests don't fragment by code path.
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("source file `{}` not readable: {e}",
+            file.display()))?;
+    let (project, _) = match aislang_core::validate(&source) {
+        Ok(v) => v,
+        Err(err) => {
+            render_validate_error(&source, &err);
+            return Err(anyhow::anyhow!("(see error above)"));
+        }
+    };
+    Ok(project.deploys.iter()
+        .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+        .map(|_| aislang_core::types::DeployTarget::Kubernetes)
+        .unwrap_or(aislang_core::types::DeployTarget::Compose))
 }
 
 /// Diagnostic helper for the apply success line. Re-parses the

@@ -32,6 +32,7 @@
 //! DoDs + the 8 architectural decisions (Decision 43.1–43.8) that
 //! shape the resource mapping.
 
+pub mod chart;
 pub mod k8s_types;
 pub mod labels;
 pub mod services;
@@ -128,6 +129,13 @@ pub const BUDGET_COUNTER_MANIFEST_FILENAME:        &str = "budget-counter.yaml";
 pub const AGENT_RUNTIME_MANIFEST_FILENAME:         &str = "agent-runtime.yaml";
 /// Wed (Decision 43.4) — `aislang-project` ConfigMap (.ais + lockfile + prompts).
 pub const AISLANG_PROJECT_CM_MANIFEST_FILENAME:    &str = "aislang-project-config.yaml";
+/// Thu (Decision 43.6) — Open WebUI Deployment + Service + PVC; only
+/// emitted when `expose.web_ui = true`.
+pub const OPENWEBUI_MANIFEST_FILENAME:             &str = "openwebui.yaml";
+/// Thu (Decision 43.6) — Optional Ingress fronting the Open WebUI
+/// Service; only emitted when `expose.ingress = Some("<host>")` AND
+/// `expose.web_ui = true`.
+pub const INGRESS_MANIFEST_FILENAME:               &str = "ingress.yaml";
 
 // ============================================================================
 // Inputs the emitter needs beyond ResolvedProject + Catalog
@@ -298,18 +306,81 @@ pub fn emit(
         ]),
     );
 
-    // Placeholder values.yaml — Thu rewrites with real schema.
-    let values_yaml = "\
-# values.yaml — placeholder for Phase 2 Week 14 Mon+Tue scaffold.
-# Real schema (image.tag, ingress.enabled, openwebui.persistence,
-# litellm.replicas, …) lands Thu — see crate-level doc.
-".to_string();
+    // ── Open WebUI (Decision 43.6) — emitted ONLY when the selected
+    //    deploy block carries `expose.web_ui = true`.  Bundle:
+    //    Deployment + Service + PVC.  Decision 43.7: chart wrapper
+    //    leaves these manifests unconditional inside chart/templates/
+    //    only if we WRITE the file; we decide here.
+    let expose = pick_expose(resolved, &deploy_label);
+    let web_ui_requested = expose.as_ref().is_some_and(|e| e.web_ui);
+    let ingress_host = expose.as_ref()
+        .and_then(|e| e.ingress.as_deref())
+        .filter(|_| web_ui_requested);   // Ingress alone (no web_ui)
+                                         // is a no-op — silently
+                                         // drop here; the parser
+                                         // accepts it (separation of
+                                         // grammar shape vs.
+                                         // emit-time semantic check).
+
+    if web_ui_requested {
+        let (owu_dep, owu_svc, owu_pvc) =
+            services::build_openwebui(&deploy_label, services::OPENWEBUI_DEFAULT_PVC_SIZE);
+        manifests.insert(
+            OPENWEBUI_MANIFEST_FILENAME.to_string(),
+            join_manifests(&[
+                ("Deployment",            serde_yaml::to_string(&owu_dep)?),
+                ("Service",               serde_yaml::to_string(&owu_svc)?),
+                ("PersistentVolumeClaim", serde_yaml::to_string(&owu_pvc)?),
+            ]),
+        );
+    }
+
+    if let Some(host) = ingress_host {
+        let ing = services::build_openwebui_ingress(&deploy_label, host);
+        manifests.insert(
+            INGRESS_MANIFEST_FILENAME.to_string(),
+            join_manifests(&[
+                ("Ingress", serde_yaml::to_string(&ing)?),
+            ]),
+        );
+    }
+
+    // ── Helm chart wrapper (Decision 43.7).  Builds Chart.yaml +
+    //    values.yaml + templates/<each-manifest>.yaml from the
+    //    manifests map above, with helm-templatize() substituting
+    //    the four templating points (image.tag / replicas / pvc
+    //    size / ingress.host).
+    let chart_files = chart::build_chart(
+        &deploy_label,
+        &resolved.catalog_version,
+        &manifests,
+        ingress_host,
+    );
+    // Surface the chart's values.yaml separately for callers that
+    // want to compute `--set` overrides without re-reading
+    // chart_files.
+    let values_yaml = chart_files
+        .get(&PathBuf::from(chart::VALUES_FILENAME))
+        .cloned()
+        .unwrap_or_default();
 
     Ok(K8sArtifacts {
         manifests,
-        chart_files: BTreeMap::new(),
+        chart_files,
         values_yaml,
     })
+}
+
+/// Find the `Expose` block belonging to the selected deploy label.
+/// `None` when the deploy block has no `expose { … }` OR when no
+/// matching block exists.  Pulled out for re-use by both the
+/// `web_ui_requested` and `ingress_host` checks in `emit`.
+fn pick_expose<'a>(resolved: &'a ResolvedProject, deploy_label: &str)
+    -> Option<&'a aislang_core::ast::Expose>
+{
+    resolved.project.deploys.iter()
+        .find(|d| d.label == deploy_label)
+        .and_then(|d| d.expose.as_ref())
 }
 
 // ============================================================================
@@ -409,16 +480,16 @@ mod tests {
         let catalog = aislang_catalog::bundled().expect("bundled catalog");
         let resolved = empty_resolved();
         let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
-        // Wed: manifests now 5 (Tue's 3 + agent-runtime + project CM).
-        // chart_files + values_yaml stay at the Mon defaults.
+        // Thu: manifests stays at 5 for empty projects (no expose →
+        // no openwebui or ingress); chart_files now populated.
         assert_eq!(artifacts.manifests.len(), 5,
-            "Wed scaffold emits 5 manifest files (litellm/jaeger/budget-counter \
-             + agent-runtime + aislang-project-config); got: {:?}",
+            "empty-project scaffold emits 5 manifest files (litellm/jaeger/\
+             budget-counter + agent-runtime + aislang-project-config); got: {:?}",
              artifacts.manifests.keys().collect::<Vec<_>>());
-        assert!(artifacts.chart_files.is_empty(),
-            "Mon+Tue+Wed scaffold emits no chart files yet (Thu populates)");
-        assert!(artifacts.values_yaml.contains("placeholder"),
-            "Mon+Tue+Wed scaffold values.yaml is a placeholder; got:\n{}",
+        assert!(!artifacts.chart_files.is_empty(),
+            "Thu scaffold emits a non-empty Helm chart (Chart.yaml + values.yaml + templates/*)");
+        assert!(artifacts.values_yaml.contains("image:"),
+            "Thu scaffold values.yaml has the real schema with image: section; got:\n{}",
             artifacts.values_yaml);
     }
 
@@ -791,7 +862,7 @@ mod tests {
                 deploys: vec![Deploy {
                     label:  deploy_label.into(),
                     target: DeployTarget::Kubernetes,
-                    expose: Some(Expose { port: Some(9000), web_ui: false }),
+                    expose: Some(Expose { port: Some(9000), web_ui: false, ingress: None }),
                 }],
                 ..Project::default()
             },
@@ -1104,5 +1175,212 @@ mod tests {
         assert_eq!(sel, pod_lbl,
             "Service selector aislang.component must match pod-template label; \
              selector={sel:?} pod={pod_lbl:?}");
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Thu — Decisions 43.6 + 43.7: Open WebUI + Ingress + Helm chart
+    // ────────────────────────────────────────────────────────────
+
+    fn resolved_with_expose(deploy_label: &str, expose: aislang_core::ast::Expose)
+        -> ResolvedProject
+    {
+        ResolvedProject {
+            project: Project {
+                name: "x".into(),
+                deploys: vec![Deploy {
+                    label:  deploy_label.into(),
+                    target: DeployTarget::Kubernetes,
+                    expose: Some(expose),
+                }],
+                ..Project::default()
+            },
+            catalog_version: "test".into(),
+            model_bindings:  Btm::new(),
+            prompt_hashes:   Btm::new(),
+        }
+    }
+
+    #[test] fn web_ui_true_emits_openwebui_manifest_with_deployment_service_pvc() {
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod",
+            Expose { port: None, web_ui: true, ingress: None });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+
+        assert!(artifacts.manifests.contains_key(OPENWEBUI_MANIFEST_FILENAME),
+            "openwebui.yaml must be emitted when expose.web_ui = true");
+        let kinds: std::collections::BTreeSet<String> = all_resources(&artifacts).into_iter()
+            .filter(|(f, _, _)| f == OPENWEBUI_MANIFEST_FILENAME)
+            .map(|(_, k, _)| k)
+            .collect();
+        assert_eq!(kinds,
+            std::collections::BTreeSet::from([
+                "Deployment".to_string(),
+                "Service".to_string(),
+                "PersistentVolumeClaim".to_string(),
+            ]),
+            "openwebui.yaml must contain Deployment + Service + PVC");
+    }
+
+    #[test] fn web_ui_false_omits_openwebui_manifest() {
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod",
+            Expose { port: Some(8080), web_ui: false, ingress: None });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        assert!(!artifacts.manifests.contains_key(OPENWEBUI_MANIFEST_FILENAME),
+            "openwebui.yaml must NOT be emitted when web_ui = false");
+        assert!(!artifacts.manifests.contains_key(INGRESS_MANIFEST_FILENAME),
+            "ingress.yaml must NOT be emitted when web_ui = false");
+    }
+
+    #[test] fn no_expose_block_omits_openwebui_and_ingress() {
+        // Same shape as v0.1-style deploys without `expose { … }`.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        assert!(!artifacts.manifests.contains_key(OPENWEBUI_MANIFEST_FILENAME));
+        assert!(!artifacts.manifests.contains_key(INGRESS_MANIFEST_FILENAME));
+    }
+
+    #[test] fn openwebui_pvc_carries_default_size_storage_request() {
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod",
+            Expose { port: None, web_ui: true, ingress: None });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        let pvc = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == OPENWEBUI_MANIFEST_FILENAME && k == "PersistentVolumeClaim")
+            .expect("openwebui PVC present");
+        let storage = pvc.2["spec"]["resources"]["requests"]["storage"]
+            .as_str().expect("storage is a string");
+        assert_eq!(storage, services::OPENWEBUI_DEFAULT_PVC_SIZE,
+            "PVC raw manifest carries the compile-time default size; \
+             chart users override via values.yaml::openwebui.persistence.size");
+    }
+
+    #[test] fn ingress_emitted_when_web_ui_and_ingress_both_set() {
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod", Expose {
+            port: None, web_ui: true,
+            ingress: Some("ui.example.com".to_string()),
+        });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        assert!(artifacts.manifests.contains_key(INGRESS_MANIFEST_FILENAME),
+            "ingress.yaml must be emitted when web_ui=true + ingress=Some(host)");
+        let ing = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == INGRESS_MANIFEST_FILENAME && k == "Ingress")
+            .expect("Ingress resource present");
+        assert_eq!(ing.2["spec"]["rules"][0]["host"].as_str(),
+            Some("ui.example.com"));
+        // Points at the openwebui Service on the named `http` port.
+        let backend = &ing.2["spec"]["rules"][0]["http"]["paths"][0]["backend"];
+        assert_eq!(backend["service"]["name"].as_str(), Some("openwebui"));
+        assert_eq!(backend["service"]["port"]["name"].as_str(), Some("http"));
+    }
+
+    #[test] fn ingress_omitted_when_set_but_web_ui_false() {
+        // Edge case: user wrote `ingress = "h"` but `web_ui = false`
+        // (or unset).  Without an openwebui Service to route to, the
+        // Ingress would dangle — silently drop here.  Parser accepts
+        // the shape; emitter degrades gracefully.
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod", Expose {
+            port: None, web_ui: false,
+            ingress: Some("ui.example.com".to_string()),
+        });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        assert!(!artifacts.manifests.contains_key(OPENWEBUI_MANIFEST_FILENAME),
+            "openwebui not requested → no openwebui manifest");
+        assert!(!artifacts.manifests.contains_key(INGRESS_MANIFEST_FILENAME),
+            "ingress requested but no upstream Service → Ingress dropped");
+    }
+
+    #[test] fn ingress_omitted_when_web_ui_true_but_ingress_none() {
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod",
+            Expose { port: None, web_ui: true, ingress: None });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        assert!(artifacts.manifests.contains_key(OPENWEBUI_MANIFEST_FILENAME),
+            "web_ui=true → openwebui present");
+        assert!(!artifacts.manifests.contains_key(INGRESS_MANIFEST_FILENAME),
+            "ingress=None → no ingress.yaml even with web_ui=true");
+    }
+
+    #[test] fn chart_files_include_chart_yaml_and_values_yaml() {
+        // Decision 43.7: chart wrapper is non-empty by Thu.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        assert!(artifacts.chart_files.contains_key(&PathBuf::from("Chart.yaml")),
+            "chart_files must include Chart.yaml");
+        assert!(artifacts.chart_files.contains_key(&PathBuf::from("values.yaml")),
+            "chart_files must include values.yaml");
+        // values_yaml convenience field matches the in-map entry.
+        let in_map = &artifacts.chart_files[&PathBuf::from("values.yaml")];
+        assert_eq!(in_map, &artifacts.values_yaml,
+            "K8sArtifacts.values_yaml must mirror chart_files[\"values.yaml\"]");
+    }
+
+    #[test] fn chart_templates_mirror_manifest_filenames() {
+        // Every emitted manifest gets a sibling under chart/templates/.
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod", Expose {
+            port: Some(8080), web_ui: true,
+            ingress: Some("h.example.com".to_string()),
+        });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        for manifest_name in artifacts.manifests.keys() {
+            let template_path = PathBuf::from("templates").join(manifest_name);
+            assert!(artifacts.chart_files.contains_key(&template_path),
+                "manifest `{manifest_name}` must have a sibling at chart/templates/{manifest_name}; \
+                 got chart_files: {:?}",
+                artifacts.chart_files.keys().collect::<Vec<_>>());
+        }
+    }
+
+    #[test] fn chart_agent_runtime_template_substitutes_image() {
+        // Decision 43.7: chart/templates/agent-runtime.yaml has the
+        // raw image literal replaced with `{{ .Values.image.repository }}
+        // :{{ .Values.image.tag }}`.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let templated = &artifacts.chart_files[
+            &PathBuf::from("templates").join(AGENT_RUNTIME_MANIFEST_FILENAME)
+        ];
+        assert!(templated.contains(chart::IMAGE_TEMPLATE_REPLACEMENT),
+            "templated agent-runtime.yaml must contain {{ .Values.image.* }}; got:\n{templated}");
+        assert!(!templated.contains(services::AGENT_RUNTIME_IMAGE),
+            "raw image literal must be replaced; got:\n{templated}");
+    }
+
+    #[test] fn chart_values_yaml_carries_ingress_host_when_set() {
+        use aislang_core::ast::Expose;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let resolved = resolved_with_expose("prod", Expose {
+            port: None, web_ui: true,
+            ingress: Some("ui.example.com".to_string()),
+        });
+        let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
+        assert!(artifacts.values_yaml.contains("host: \"ui.example.com\""),
+            "values.yaml must carry the declared ingress host; got:\n{}",
+            artifacts.values_yaml);
+    }
+
+    #[test] fn empty_project_chart_omits_openwebui_and_ingress_templates() {
+        // No expose block → no openwebui or ingress in manifests/ →
+        // no templates/openwebui.yaml or templates/ingress.yaml in
+        // chart/.  Decision 43.7 "minimal templating": absent files
+        // beat `{{ if }}` ladders.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let owu_template = PathBuf::from("templates").join(OPENWEBUI_MANIFEST_FILENAME);
+        let ing_template = PathBuf::from("templates").join(INGRESS_MANIFEST_FILENAME);
+        assert!(!artifacts.chart_files.contains_key(&owu_template),
+            "no web_ui → no templates/openwebui.yaml");
+        assert!(!artifacts.chart_files.contains_key(&ing_template),
+            "no ingress → no templates/ingress.yaml");
     }
 }

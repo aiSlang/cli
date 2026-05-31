@@ -125,8 +125,12 @@ fn expected_support_agent() -> Project {
         // web_ui).  support-agent.ais demos both: informational
         // port AND Open WebUI sidecar opt-in.
         expose: Some(Expose {
-            port:   Some(8080),
-            web_ui: true,
+            port:    Some(8080),
+            web_ui:  true,
+            ingress: None,    // Phase 2 Week 14 Thu: support-agent.ais
+                              // doesn't declare Ingress; field defaults
+                              // to None.  Forward-compat: existing
+                              // fixture round-trips byte-stably.
         }),
     };
 

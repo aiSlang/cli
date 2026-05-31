@@ -219,4 +219,24 @@ pub struct Expose {
     /// `destroy` applies").  Default false → no sidecar emitted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub web_ui: bool,
+    /// Optional ingress host (Phase 2 Week 14 Thu — Decision 43.6).
+    /// When set, the K8s emitter emits an `Ingress` resource pointing
+    /// at the Open WebUI Service so the browser UI is reachable at
+    /// `http://<ingress>` (or `https://` if TLS terminator is wired
+    /// upstream of the cluster — v0.2 doesn't emit TLS configuration
+    /// for the Ingress).
+    ///
+    /// **Two conditions for the Ingress to be emitted**:
+    ///   - `web_ui = true` (the Ingress points at the openwebui
+    ///     Service, so without an Open WebUI pod there's nothing
+    ///     to route to)
+    ///   - `ingress` is `Some("<host>")`
+    ///
+    /// Ignored by the Compose target — Compose's `3000:8080` host
+    /// port mapping covers the same browser-access need without
+    /// needing an Ingress controller in front.  Forward-compat: v0.1
+    /// .ais files (no `expose` block at all) round-trip cleanly
+    /// because the field is `Option<String>` skipped when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<String>,
 }

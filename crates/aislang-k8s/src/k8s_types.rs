@@ -367,6 +367,156 @@ pub struct ServicePort {
 }
 
 // ============================================================================
+// PersistentVolumeClaim — Phase 2 Week 14 Thu (Decision 43.6 Open WebUI)
+// ============================================================================
+
+/// `PersistentVolumeClaim` resource for the Open WebUI Deployment's
+/// `/app/backend/data` mount (SQLite + chat history + uploads).
+/// Sized from `values.yaml::openwebui.persistence.size` at Helm
+/// render time (Thu's chart wrapper substitutes the size string).
+///
+/// **Why the bare manifest carries a concrete size** (vs. just a
+/// templated `{{ .Values.… }}` placeholder): the `manifests/` view
+/// of the artifact set is intended to be `kubectl apply -f`-able
+/// without Helm.  Raw-manifest users get the emitter's compile-time
+/// default (1Gi); chart users override via `helm install --set
+/// openwebui.persistence.size=…`.  Decision 43.7 in one struct.
+#[derive(Serialize)]
+pub struct PersistentVolumeClaim {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind:        String,
+    pub metadata:    ObjectMeta,
+    pub spec:        PersistentVolumeClaimSpec,
+}
+
+impl PersistentVolumeClaim {
+    pub fn new(metadata: ObjectMeta, spec: PersistentVolumeClaimSpec) -> Self {
+        Self {
+            api_version: "v1".to_string(),
+            kind:        "PersistentVolumeClaim".to_string(),
+            metadata,
+            spec,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaimSpec {
+    /// Most clusters default to `ReadWriteOnce` (single-node read+write).
+    /// Open WebUI is a single-pod Deployment so RWO is sufficient.
+    /// Emitted explicitly rather than relying on cluster default to
+    /// keep the manifest self-describing.
+    pub access_modes: Vec<String>,
+    pub resources:    PersistentVolumeClaimResources,
+
+    /// `None` → cluster default StorageClass.  We don't pin one
+    /// because StorageClass names vary across clusters (kind, GKE,
+    /// EKS, k3s all use different defaults).  Users can override
+    /// via `helm install --set openwebui.persistence.storageClass=…`
+    /// once Thu's chart adds that field.  v0.2 emits with default
+    /// (sufficient for kind + EKS gp2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PersistentVolumeClaimResources {
+    /// K8s-formatted resource quantities — for storage typically
+    /// `"1Gi"`, `"500Mi"`, etc.  Plain string preserves the unit
+    /// suffix instead of forcing all sizes into a single int unit.
+    pub requests: BTreeMap<String, String>,
+}
+
+// ============================================================================
+// Ingress — Phase 2 Week 14 Thu (Decision 43.6 — opt-in via expose.ingress)
+// ============================================================================
+
+/// `networking.k8s.io/v1` Ingress resource.  Emitted ONLY when both
+/// `expose.web_ui = true` AND `expose.ingress = "<host>"` are set;
+/// routes the named host to the openwebui Service on port 8080.
+///
+/// **What's NOT in the v0.2 surface**:
+///   - TLS — users wire cert-manager + an `IngressTLS` block via
+///     `kubectl annotate` post-apply, or front the Ingress with an
+///     external load balancer that terminates TLS upstream.  v0.3+
+///     adds an `expose.tls = "<secret-name>"` grammar field if the
+///     demand surfaces.
+///   - IngressClassName — relies on the cluster's default
+///     IngressClass (nginx on most installs).  v0.3+ adds an
+///     `expose.ingress_class` grammar field.
+///
+/// Keeping the v0.2 Ingress minimal matches Decision 43.7
+/// ("no `{{ if }}` gymnastics, minimal templating points").
+#[derive(Serialize)]
+pub struct Ingress {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind:        String,
+    pub metadata:    ObjectMeta,
+    pub spec:        IngressSpec,
+}
+
+impl Ingress {
+    pub fn new(metadata: ObjectMeta, spec: IngressSpec) -> Self {
+        Self {
+            api_version: "networking.k8s.io/v1".to_string(),
+            kind:        "Ingress".to_string(),
+            metadata,
+            spec,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngressSpec {
+    pub rules: Vec<IngressRule>,
+}
+
+#[derive(Serialize)]
+pub struct IngressRule {
+    pub host: String,
+    pub http: IngressRuleHttp,
+}
+
+#[derive(Serialize)]
+pub struct IngressRuleHttp {
+    pub paths: Vec<HttpIngressPath>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpIngressPath {
+    /// `"/"` for the Open WebUI root.  `path_type: Prefix` matches
+    /// every URL the UI ever uses (root + /api/* + /static/*).
+    pub path:      String,
+    pub path_type: String,
+    pub backend:   IngressBackend,
+}
+
+#[derive(Serialize)]
+pub struct IngressBackend {
+    pub service: IngressServiceBackend,
+}
+
+#[derive(Serialize)]
+pub struct IngressServiceBackend {
+    pub name: String,
+    pub port: IngressBackendServicePort,
+}
+
+#[derive(Serialize)]
+pub struct IngressBackendServicePort {
+    /// Use the named port on the Service (`http` for openwebui)
+    /// instead of the number — same posture as the rest of our
+    /// Service/Container ports (resilient to port-number changes
+    /// inside the upstream image).
+    pub name: String,
+}
+
+// ============================================================================
 // ConfigMap
 // ============================================================================
 

@@ -689,3 +689,199 @@ fn sha256_hex_of_source_and_lockfile(ais_source: &str, lockfile: Option<&str>) -
     }
     out
 }
+
+// ============================================================================
+// Open WebUI — Deployment + Service + PVC (Decision 43.6, Phase 2 Week 14 Thu)
+// ============================================================================
+
+/// Pinned image for the Open WebUI sidecar.  Same `:main` pin
+/// `aislang-compose` uses — single source of truth across deploy
+/// targets.  Open WebUI's docs recommend `:main` for self-hosted
+/// installs (they cut versioned tags far less frequently than
+/// upstream commits).
+pub const OPENWEBUI_IMAGE: &str = "ghcr.io/open-webui/open-webui:main";
+
+/// Open WebUI listens on 8080 inside the container.  Same number
+/// `aislang-compose` exposes (it remaps to host 3000 via `3000:8080`).
+/// Under K8s, the Service exposes 8080 directly; users either
+/// `kubectl port-forward svc/openwebui 3000:8080` to mimic the
+/// Compose URL, or hit the Ingress when one is emitted
+/// (`expose.ingress = "<host>"`).
+pub const OPENWEBUI_CONTAINER_PORT: u16 = 8080;
+
+/// PVC default size — Open WebUI's SQLite + uploads grow slowly for
+/// the demo path; 1Gi covers a few hundred conversation turns + a
+/// dozen uploaded files.  Overridable at chart-render time via
+/// `helm install --set openwebui.persistence.size=…`.  Bumped to
+/// 5Gi+ by users running real workloads.
+pub const OPENWEBUI_DEFAULT_PVC_SIZE: &str = "1Gi";
+
+/// PVC name — pinned constant so the Deployment's volume reference
+/// + the PVC's metadata.name + the chart's values-yaml override
+/// path all line up without string-format drift.
+pub const OPENWEBUI_PVC_NAME: &str = "openwebui-data";
+
+/// Build the Open WebUI Deployment + Service + PVC bundle.
+///
+/// Env-var contract (mirrors `aislang-compose::build_openwebui_service`):
+///   - `OPENAI_API_BASE_URL=http://litellm:4000/v1` — dials the
+///     in-cluster LiteLLM via K8s DNS (no host-side port-forward
+///     needed because pod-to-pod traffic resolves the litellm
+///     Service name natively).
+///   - `OPENAI_API_KEY=sk-aislang-litellm-internal` — any non-
+///     empty string satisfies Open WebUI's client-side requirement;
+///     LiteLLM accepts everything at the master-key layer (v0.2
+///     doesn't enable LiteLLM master-key auth).
+///   - `WEBUI_AUTH=true` (Open WebUI default) — keeps the local
+///     sign-up flow; persisted under /app/backend/data on the PVC.
+///
+/// Service: ClusterIP-only.  External access is via Ingress
+/// (emitted separately by `build_openwebui_ingress` when
+/// `expose.ingress = "<host>"`) OR `kubectl port-forward`.  Not
+/// emitting a NodePort because it's noisy on shared clusters +
+/// would conflict between deploys in multi-tenant kind setups.
+pub fn build_openwebui(deploy_label: &str, pvc_size: &str)
+    -> (Deployment, Service, PersistentVolumeClaim)
+{
+    let labels   = aislang_labels("openwebui", deploy_label);
+    let selector = component_selector("openwebui");
+
+    // ── PVC: /app/backend/data persistent storage.
+    let mut requests = BTreeMap::new();
+    requests.insert("storage".to_string(), pvc_size.to_string());
+    let pvc = PersistentVolumeClaim::new(
+        ObjectMeta::new(OPENWEBUI_PVC_NAME, labels.clone()),
+        PersistentVolumeClaimSpec {
+            access_modes:      vec!["ReadWriteOnce".to_string()],
+            resources:         PersistentVolumeClaimResources { requests },
+            storage_class_name: None,  // = cluster default
+        },
+    );
+
+    // ── Container.
+    let mut env = Vec::new();
+    env.push(EnvVar {
+        name:  "OPENAI_API_BASE_URL".to_string(),
+        // Same in-cluster LiteLLM target the Compose openwebui uses,
+        // resolved via K8s service DNS (`litellm.<namespace>.svc
+        // .cluster.local`, but the unqualified `litellm` name works
+        // when both pods land in the same namespace — chart users
+        // running `helm install -n <ns>` get this for free).
+        value: "http://litellm:4000/v1".to_string(),
+    });
+    env.push(EnvVar {
+        name:  "OPENAI_API_KEY".to_string(),
+        value: "sk-aislang-litellm-internal".to_string(),
+    });
+
+    let container = Container {
+        name:  "openwebui".to_string(),
+        image: OPENWEBUI_IMAGE.to_string(),
+        ports: Some(vec![ContainerPort {
+            container_port: OPENWEBUI_CONTAINER_PORT,
+            name:           "http".to_string(),
+            protocol:       None,
+        }]),
+        env:      Some(env),
+        // No envFrom — Open WebUI dials the in-cluster LiteLLM, not
+        // providers directly, so the providers Secret isn't needed
+        // on this pod.  Cleaner permissions surface (only LiteLLM +
+        // agent-runtime can read the providers Secret).
+        env_from: None,
+        command:  None,
+        args:     None,
+        volume_mounts: Some(vec![VolumeMount {
+            name:       "data".to_string(),
+            mount_path: "/app/backend/data".to_string(),
+            read_only:  None,         // = false (rw — SQLite needs write)
+            sub_path:   None,
+        }]),
+    };
+
+    let pod_template = PodTemplate {
+        metadata: ObjectMeta {
+            name:        String::new(),
+            namespace:   None,
+            labels:      labels.clone(),
+            annotations: BTreeMap::new(),
+        },
+        spec: PodSpec {
+            containers: vec![container],
+            volumes:    Some(vec![Volume {
+                name:                    "data".to_string(),
+                config_map:              None,
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: OPENWEBUI_PVC_NAME.to_string(),
+                }),
+            }]),
+            init_containers: None,
+        },
+    };
+
+    let deployment = Deployment::new(
+        ObjectMeta::new("openwebui", labels.clone()),
+        DeploymentSpec {
+            replicas: 1,
+            selector: LabelSelector { match_labels: selector.clone() },
+            template: pod_template,
+        },
+    );
+
+    let service = Service::new(
+        ObjectMeta::new("openwebui", labels),
+        ServiceSpec {
+            selector,
+            ports: vec![ServicePort {
+                port:        OPENWEBUI_CONTAINER_PORT,
+                target_port: "http".to_string(),
+                name:        "http".to_string(),
+                protocol:    None,
+            }],
+            type_: None,                                  // = ClusterIP
+        },
+    );
+
+    (deployment, service, pvc)
+}
+
+// ============================================================================
+// Ingress — opt-in (Decision 43.6, Phase 2 Week 14 Thu)
+// ============================================================================
+
+/// Build the optional Ingress fronting the openwebui Service.
+/// Returns `Some` only when both:
+///   - the deploy block's `expose.web_ui = true` (so an openwebui
+///     Service exists for the Ingress to route to), AND
+///   - `expose.ingress = Some("<host>")` is set.
+///
+/// `None` in every other shape — including the cases where
+/// `expose.ingress` is set but `web_ui = false` (which makes no
+/// sense and is reported as a warning by the emitter's caller in
+/// `lib.rs::emit`).
+pub fn build_openwebui_ingress(deploy_label: &str, host: &str) -> Ingress {
+    let labels = aislang_labels("openwebui", deploy_label);
+    Ingress::new(
+        ObjectMeta::new("openwebui", labels),
+        IngressSpec {
+            rules: vec![IngressRule {
+                host: host.to_string(),
+                http: IngressRuleHttp {
+                    paths: vec![HttpIngressPath {
+                        path:      "/".to_string(),
+                        // `Prefix` matches every URL Open WebUI ever uses
+                        // (root + /api/* + /static/* + websocket /ws/*).
+                        path_type: "Prefix".to_string(),
+                        backend: IngressBackend {
+                            service: IngressServiceBackend {
+                                name: "openwebui".to_string(),
+                                port: IngressBackendServicePort {
+                                    name: "http".to_string(),
+                                },
+                            },
+                        },
+                    }],
+                },
+            }],
+        },
+    )
+}

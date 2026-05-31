@@ -100,6 +100,13 @@ project "support-agent-k8s" {
       // this is true.  Set false for headless K8s-only smoke runs;
       // set true for the browser-UX demo path.
       web_ui = true
+      // Phase 2 Week 14 Thu (Decision 43.6): when set, the K8s
+      // emitter emits an Ingress fronting the Open WebUI Service
+      // at the given host.  Drop this line for kubectl-port-forward-
+      // only access (the canonical kind-cluster demo path); keep it
+      // for clusters with an Ingress controller + a wildcard cert.
+      // Comment out for now — uncomment after setting up cluster DNS:
+      //   ingress = "support.example.com"
     }
   }
 }
