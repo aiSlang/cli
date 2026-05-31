@@ -280,9 +280,28 @@ To view traces from a kind cluster, port-forward Jaeger's UI:
 
 ```sh
 kubectl port-forward svc/jaeger 16686:16686
-# Then browse http://localhost:16686, pick aislang.agent_runtime.prod
-# from the Service dropdown.
+# Then browse http://localhost:16686.
 ```
+
+After running `aislang chat support examples/support-agent-k8s.ais` against the cluster, the Jaeger UI's "Service" dropdown should show:
+
+| `service.name`              | Produced by                                  |
+|-----------------------------|----------------------------------------------|
+| `aislang`                   | The **local** `aislang chat` process (laptop) |
+| `aislang.litellm.prod`      | The **in-cluster** LiteLLM router pod         |
+| `aislang.agent_runtime.<deploy>` | The **in-cluster** mcp-serve pod         |
+| `jaeger-all-in-one`         | Jaeger's own self-instrumentation             |
+
+If you only see `jaeger-all-in-one` after a successful chat turn, two common gaps:
+
+1. **No `kubectl port-forward svc/jaeger 4318:4318`** — local `aislang chat` ships spans to `http://localhost:4318/v1/traces` by default; under Compose that lands in the bundled jaeger sidecar, under K8s nothing's listening on host port 4318 unless you forward it.  Add a second port-forward alongside the `svc/litellm 4000:4000` one chat already needs:
+   ```sh
+   kubectl port-forward svc/jaeger  4318:4318  &   # for local chat spans
+   kubectl port-forward svc/jaeger 16686:16686 &   # for UI
+   kubectl port-forward svc/litellm 4000:4000 &   # for chat itself
+   ```
+   Then re-run the chat — `service.name = aislang` should appear within seconds (simple-exporter ships per-span synchronously).
+2. **agent-runtime pod stuck in `ImagePullBackOff`** — see the "Heads-up on the agent-runtime image" callout above.  When the pod can't pull its image, it never produces spans.  Override `image.repository` to your fork's published image (e.g. `--set image.repository=ghcr.io/<your-org>/aislang --set image.tag=v0.2.0-rc2`) or side-load via `kind load docker-image aislang:dev`.
 
 **Use an external collector** (Honeycomb, Grafana Tempo, Datadog, NewRelic, OTel Collector) instead of the bundled in-cluster Jaeger:
 

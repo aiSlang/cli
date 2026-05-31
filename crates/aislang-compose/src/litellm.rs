@@ -32,6 +32,30 @@ pub struct LiteLlmConfig {
     /// fallback was declared on any model block (clean YAML output).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub router_settings: Option<RouterSettings>,
+
+    /// Phase 2 Week 15 Tue follow-up — `litellm_settings.callbacks`
+    /// is LiteLLM's opt-in switch for built-in integrations.
+    /// `["otel"]` activates the OpenTelemetry emitter (LiteLLM
+    /// reads OTEL_EXPORTER_OTLP_ENDPOINT + protocol + service_name
+    /// at startup but doesn't ship spans unless this callback is
+    /// present in its config — having the env vars without the
+    /// callback was the gap that made Tue's pod-wiring invisible
+    /// in Jaeger).  Same value lands in both Compose-target +
+    /// k8s-target litellm_config.yaml since the generator is one
+    /// source of truth across deploy targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub litellm_settings: Option<LiteLlmSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiteLlmSettings {
+    /// LiteLLM callbacks list — `["otel"]` for OTel-GenAI span
+    /// emission to the resolved `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    /// Other callbacks LiteLLM ships (langfuse, helicone, datadog,
+    /// braintrust, …) are user-add via `helm upgrade --set` post-
+    /// Phase 2; v0.2 emits the OTel one by default since it's
+    /// what the bundled Jaeger pod consumes.
+    pub callbacks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -217,7 +241,18 @@ pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
         Some(RouterSettings { fallbacks })
     };
 
-    Ok(LiteLlmConfig { model_list, router_settings })
+    // Phase 2 Week 15 Tue follow-up: opt LiteLLM into the OTel
+    // emitter unconditionally.  Required even when the proxy is
+    // running with OTEL_EXPORTER_OTLP_ENDPOINT set — LiteLLM
+    // doesn't auto-emit spans from env vars alone; the callbacks
+    // list is the explicit switch.  Same generated YAML lands in
+    // both Compose-target + k8s-target deployments since this
+    // generator is the single source of truth across emitters.
+    let litellm_settings = Some(LiteLlmSettings {
+        callbacks: vec!["otel".to_string()],
+    });
+
+    Ok(LiteLlmConfig { model_list, router_settings, litellm_settings })
 }
 
 /// Build a single `ModelEntry` from a catalog lookup + provider creds.
@@ -1209,6 +1244,44 @@ mod tests {
         let router_pos = yaml.find("router_settings:").expect("router_settings");
         assert!(ml_pos < router_pos,
             "model_list must precede router_settings; got model_list@{ml_pos}, router_settings@{router_pos}");
+    }
+
+    // ── Phase 2 Week 15 Tue follow-up — LiteLLM OTel callback ──
+
+    #[test] fn litellm_settings_enables_otel_callback() {
+        // Just setting OTEL_EXPORTER_OTLP_ENDPOINT on the LiteLLM
+        // container env (Tue's pod-wiring) is necessary BUT NOT
+        // SUFFICIENT to make LiteLLM emit spans — the proxy needs
+        // `litellm_settings.callbacks` to include "otel".  Without
+        // it LiteLLM reads the env vars + silently does nothing
+        // with them.  Pin via the generated YAML body.
+        let (resolved, catalog) = resolve_demo();
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        assert!(yaml.contains("litellm_settings:"),
+            "litellm_config.yaml must include a litellm_settings: section; got:\n{yaml}");
+        // Sequence shape (not a mapping) — LiteLLM expects callbacks
+        // as a list of strings.
+        assert!(yaml.contains("callbacks:"),
+            "litellm_settings must declare callbacks: …; got:\n{yaml}");
+        assert!(yaml.contains("- otel"),
+            "callbacks list must include `otel` for OTel emission; got:\n{yaml}");
+    }
+
+    #[test] fn litellm_settings_yaml_section_present_for_minimal_project() {
+        // The OTel callback opt-in fires for EVERY project, not just
+        // ones declaring fancy models — a minimal config still wants
+        // spans landing in Jaeger if the operator wires the endpoint.
+        use aislang_core::ast::Project;
+        let resolved = ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+        };
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let yaml = generate_config(&resolved, &catalog).expect("generate");
+        assert!(yaml.contains("litellm_settings:") && yaml.contains("- otel"),
+            "OTel callback must be unconditional (every project gets it); got:\n{yaml}");
     }
 
     #[test] fn yaml_fallbacks_is_a_sequence_of_dicts_not_a_map() {
