@@ -1,12 +1,16 @@
 # aiSlang Language Specification — v0 (v0.1 baseline + v0.2 additions)
 
-Status: **Authoritative for v0.2.0-rc1** (Phase 1 close — Week 13 Fri).  The v0.1 baseline is frozen; v0.2 additions are forward-compatible at the AST level (any valid v0.1 file produces an AST that v0.2 deserialises identically — see §7) and mostly purely-additive at the source level.  One controlled grammar break in v0.2 Tue: see §4.9.
+Status: **Authoritative for v0.2.0-rc2** (Phase 2 Week 14 close — Track B foundation).  The v0.1 baseline is frozen; Phase 1 (Week 12-13) additions are forward-compatible at the AST level; Phase 2 Week 14 (Track B) additions are likewise purely-additive (any valid v0.1 file produces an AST that v0.2-rc2 deserialises identically — see §7).  One controlled grammar break in v0.2 Tue: see §4.9.
 
-This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run, **plus** the v0.2 grammar additions that landed in Phase 1:
+This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run, **plus** the v0.2 grammar additions that landed in Phase 1 + Phase 2 Week 14:
 
 - **Week 12 Fri.**  New `main { … }` block — declares the user-facing LLM as first-class topology (planning-doc Track A architectural decision #7).  New `model.source = subscription | api` enum — opt-in declaration that a model's inference path lives in the host chat app's subscription tier (not LiteLLM).  Three new closed enums in §3.4: `Pattern` (6 variants), `ChatClient` (5 variants), `ModelSource` (2 variants).
 - **Week 13 Tue (Track A2).**  `deploy.expose` promoted from attribute (`expose = { port = N }`, v0.1) to nested block (`expose { port = N  web_ui = true }`, v0.2) — see §4.9.  New `web_ui: Bool?` field opt-ins an Open WebUI Compose sidecar.  Grammar break against v0.1; parser surfaces a migration hint for the legacy form.  Phase-1-pre-public-launch break per Decision 34 — no v0.1 users to migrate.
 - **Week 13 Tue follow-up.**  `prefer / fallback` resolver semantics changed to match LANGUAGE-SPEC §6 prose exactly: `prefer` is now an ORDERED preference list (walked in declared order; first satisfier wins).  `fallback` only used when no `prefer` candidate satisfies constraints.  `optimize_for = cost | latency` no longer re-orders the walk — became informational at the resolver layer (kept on the AST as a v0.3+ hint for multi-row catalog matches).  v0.1 behaviour where `optimize_for = cost` silently overrode `prefer` is gone — see §6 for the pseudocode + the behaviour-change note.
+- **Phase 2 Week 14 (Track B).**  Two grammar additions:
+  - **Mon**: `target = kubernetes` joins `target = compose` as an accepted `DeployTarget` enum variant on `deploy` blocks (see §4.9 + §7.3 for the resource-mapping table).
+  - **Thu**: `expose { … }` block gains an optional `ingress : String?` field — when set together with `web_ui = true`, the K8s emitter emits an `Ingress` resource fronting the Open WebUI Service at the named host.  Ignored under `target = compose` (Compose's `3000:8080` host-port mapping covers the same browser-access need without needing an Ingress controller).  Forward-compat: v0.1 / v0.2-pre-Thu files round-trip byte-stably because the field is `Option<String>` (`skip_serializing_if = "Option::is_none"`).
+  - **Locked architectural decisions** for the K8s emitter are recorded as Decisions 43.1-43.8 in PLAN-90-days-v0_2.md §"Phase 2 — Track B foundation"; this spec stays grammar-only and points at the PLAN for the resource-mapping rationale.
 
 Anything not described here is out of scope for v0.2.
 
@@ -245,26 +249,37 @@ Secrets are written into the container's environment only for the listed resourc
 
 ```
 deploy "<identifier>" {
-  target : DeployTarget              # v0.1: must be `compose`
+  target : DeployTarget              # v0.1: `compose`; v0.2 Phase 2: also `kubernetes`
   expose { ... }?                    # v0.2 Tue: nested block, see below
 }
 ```
 
-**`expose { ... }` block** (v0.2 Tue, Track A2 — replaces the v0.1 `expose : Map<String, Int>` attribute):
+**`DeployTarget` enum** (closed set):
+
+| Variant | Since | Emitter | Apply path |
+|---|---|---|---|
+| `compose` | v0.1 | `aislang-compose` → `stack.yml` + `litellm_config.yaml` + `.env.example` | `docker compose up -d` |
+| `kubernetes` | v0.2 Phase 2 Week 14 Mon | `aislang-k8s` → `manifests/*.yaml` (raw K8s) + `chart/` (Helm wrapper) | `helm upgrade --install <deploy-label> chart/` |
+
+Other targets (ecs, nomad, databricks, vertex_ai, …) are v0.3+ — see §7.3 for the additive-emitter strategy that keeps them out of the language core.
+
+**`expose { ... }` block** (v0.2 Tue, Track A2 — replaces the v0.1 `expose : Map<String, Int>` attribute; v0.2 Phase 2 Week 14 Thu adds the `ingress` field):
 
 ```
 expose {
-  port   : Int?            # informational; future agent-runtime port
-  web_ui : Bool?           # default false; true → Open WebUI sidecar
+  port    : Int?           # informational under compose; functional under kubernetes
+  web_ui  : Bool?          # default false; true → Open WebUI sidecar
+  ingress : String?        # v0.2 Phase 2 Thu — only meaningful under target = kubernetes
 }
 ```
 
 Field semantics:
 
-- **`port`** — informational only.  Surfaces as a comment in the emitted `stack.yml` header but no v0.2 service binds it.  The v0.2+ containerized agent runtime (via `aislang mcp-serve --http`) will consume it.
-- **`web_ui = true`** — instructs the Compose emitter to add an Open WebUI sidecar (`ghcr.io/open-webui/open-webui:main`) mapped `3000:8080`, pre-pointed at the in-stack LiteLLM via `OPENAI_API_BASE_URL=http://litellm:4000/v1`.  Persisted to a named volume (`openwebui-data`) that `aislang destroy` wipes (`docker compose down -v`).
+- **`port`** — under `target = compose`: informational only, surfaces as a comment in the emitted `stack.yml` header (no v0.1/v0.2 Compose service binds it).  Under `target = kubernetes` (Phase 2 Week 14 Wed): functional — becomes the agent-runtime `aislang mcp-serve --http 0.0.0.0:<port>` bind address + the Service `port` + container `containerPort`, all in lockstep.  Defaults to `8080` when absent (parity with the Compose informational header).
+- **`web_ui = true`** — under `target = compose`: instructs the emitter to add an Open WebUI sidecar (`ghcr.io/open-webui/open-webui:main`) mapped `3000:8080`, pre-pointed at the in-stack LiteLLM via `OPENAI_API_BASE_URL=http://litellm:4000/v1`.  Persisted to a named volume (`openwebui-data`) that `aislang destroy` wipes (`docker compose down -v`).  Under `target = kubernetes` (Phase 2 Week 14 Thu): emits an Open WebUI Deployment + Service + PersistentVolumeClaim bundle into `manifests/openwebui.yaml`; PVC defaults to 1Gi (overridable via the chart's `values.yaml::openwebui.persistence.size`).
+- **`ingress = "<host>"`** — v0.2 Phase 2 Week 14 Thu addition (Decision 43.6).  Only meaningful under `target = kubernetes`; ignored by the Compose emitter (Compose's `3000:8080` host-port mapping serves the same browser-access purpose).  When set together with `web_ui = true`, the K8s emitter writes a `networking.k8s.io/v1` Ingress to `manifests/ingress.yaml` routing `/` Prefix at the named host to the openwebui Service's named `http` port.  TLS not in v0.2's Ingress surface — wire cert-manager externally or terminate TLS upstream.  Empty-string value rejected at parse time (typo guard).  Setting `ingress` without `web_ui = true` is parseable but emit-silent (no upstream Service to route to).
 
-**Grammar break vs. v0.1.** The v0.1 attribute form `expose = { port = 8080 }` (a `Map<String, Int>` value) is no longer accepted.  Parser rejects with a migration hint; replace with `expose { port = 8080 }` and optionally add `web_ui = true` inside.  Phase-1-pre-public-launch break per Decision 34 (no v0.1 users to migrate); v0.2+ files only.
+**Grammar break vs. v0.1.** The v0.1 attribute form `expose = { port = 8080 }` (a `Map<String, Int>` value) is no longer accepted.  Parser rejects with a migration hint; replace with `expose { port = 8080 }` and optionally add `web_ui = true` / `ingress = "<host>"` inside.  Phase-1-pre-public-launch break per Decision 34 (no v0.1 users to migrate); v0.2+ files only.
 
 ### 4.10 `main` (v0.2, Week 12 Fri)
 
@@ -614,14 +629,32 @@ Reserved keywords for all three are already claimed in §2.
 
 ### 7.3 Multi-platform deploy targets — emitter-first, additive resources later
 
-v0.1 supports `target = compose` only. Future targets fall into two categories with different cost profiles:
+v0.1 supports `target = compose` only. v0.2 Phase 2 Week 14 lands `target = kubernetes` (`aislang-k8s` crate — see PLAN-90-days-v0_2.md §"Phase 2 — Track B foundation" for the 8 locked architectural decisions 43.1-43.8).  Future targets fall into two categories with different cost profiles:
 
-| Target | Conceptual match to v0.1 resources | Strategy |
-|---|---|---|
-| Kubernetes, Helm, ECS, Nomad | Direct — containers, services, ports, volumes | **New emitter only; zero spec change.** Add `k8s`, `helm`, `ecs`, `nomad` to the `DeployTarget` enum and write the emitter. |
-| Databricks, MS Fabric, Spark, Vertex AI, Bedrock Agents | Conceptual mismatch — endpoints, MLflow artifacts, lakehouse-native primitives | **New emitter + additive resource types.** Most v0.1 resources map with caveats; some platform-native concepts (Unity Catalog, MLflow registry, Databricks Functions) need new resource types like `databricks.endpoint`, `unity_catalog`, `mlflow_artifact`. These are introduced via the v0.3 modules/packages mechanism (§7.2) — `databricks.*` lives in an importable module, not in the language core. |
+| Target | Status | Conceptual match to v0.1 resources | Strategy |
+|---|---|---|---|
+| `compose` | v0.1 baseline | Direct — Docker Compose services + volumes | `aislang-compose` crate |
+| `kubernetes` | v0.2 Phase 2 Week 14 Mon-Thu | Direct — Deployment / Service / ConfigMap / PVC / Ingress | `aislang-k8s` crate; Helm chart wrapper (Decision 43.7) over raw manifests (Decision 43.8) |
+| ECS, Nomad | v0.3+ | Direct — task definitions, services, target groups | New emitter only; zero spec change |
+| Databricks, MS Fabric, Spark, Vertex AI, Bedrock Agents | v0.3+ | Conceptual mismatch — endpoints, MLflow artifacts, lakehouse-native primitives | **New emitter + additive resource types.** Most v0.1 resources map with caveats; some platform-native concepts (Unity Catalog, MLflow registry, Databricks Functions) need new resource types like `databricks.endpoint`, `unity_catalog`, `mlflow_artifact`. These are introduced via the v0.3 modules/packages mechanism (§7.2) — `databricks.*` lives in an importable module, not in the language core. |
 
-This keeps the v0.1 language small and stable while leaving room for the long tail of platforms. The `expose { ... }` block on `deploy` blocks (v0.2 Tue, replaces the v0.1 `Map<String, Int>` attribute) carries platform-agnostic fields (`port`, `web_ui`) by design — platform-specific emitters add their own fields under the same block as they grow (e.g. on Databricks, `expose { endpoint_name = "..." }` registers a model-serving endpoint; on k8s, `expose { ingress_host = "..." }` produces an Ingress resource).
+This keeps the v0.1 language small and stable while leaving room for the long tail of platforms. The `expose { ... }` block on `deploy` blocks (v0.2 Tue, replaces the v0.1 `Map<String, Int>` attribute) carries platform-agnostic fields (`port`, `web_ui`, `ingress`) by design — platform-specific emitters add their own fields under the same block as they grow (e.g. on Databricks, `expose { endpoint_name = "..." }` registers a model-serving endpoint).  Phase 2 Week 14 Thu's `ingress: String?` field follows the same additive-extension pattern; the Compose emitter silently ignores it.
+
+**K8s resource mapping** (Decisions 43.1-43.8 in PLAN-90-days-v0_2.md):
+
+| .ais source concept | K8s shape |
+|---|---|
+| `deploy "<label>" { target = kubernetes }` | One Helm chart named `<label>`; one `aislang.deploy=<label>` label on every emitted resource |
+| Implicit LiteLLM router | Deployment + Service + ConfigMap (router YAML → CM) |
+| Implicit Jaeger tracing | Deployment + Service (no CM — bundled defaults) |
+| Implicit budget counter | Deployment only (no incoming traffic) |
+| `agent "<label>" { … }` | Deployment + Service running `aislang mcp-serve --http 0.0.0.0:<expose.port>` |
+| `.ais` source + `aislang.lock` + every `prompt` body | One `aislang-project` ConfigMap mounted at `/etc/aislang/` |
+| Provider credentials | User-created Secret `aislang-providers`; `envFrom: secretRef` on LiteLLM + agent-runtime |
+| `expose.web_ui = true` | Open WebUI Deployment + Service + PersistentVolumeClaim |
+| `expose.ingress = "<host>"` (+ `web_ui = true`) | `networking.k8s.io/v1` Ingress routing `/` Prefix to the openwebui Service |
+
+CLI behaviour: `aislang apply` shells to `helm upgrade --install <deploy-label> chart/`; `aislang destroy` shells to `helm uninstall <deploy-label>`.  Both graceful-degrade when `helm` isn't on PATH (apply writes artifacts + prints manual command; destroy hard-fails with a `kubectl delete -f manifests/` fallback hint).
 
 ### 7.4 Binary IR / wire format — not in v0.1
 
