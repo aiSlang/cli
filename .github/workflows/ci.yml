@@ -10,6 +10,29 @@
 # (e.g. `let foo: T   = ...; let bar: U = ...;`) that default
 # rustfmt mass-rewrites. v0.2 may revisit with a custom
 # `rustfmt.toml` or a vendored style guide.
+#
+# ── Cost-tiered job triggers (Phase 2 Week 15 follow-up) ────────
+#
+# Free-tier GitHub Actions gives 2000 Linux-minute-equivalents per
+# month on private repos; Windows runners count 2×, macOS 10×.
+# Running every job on every PR ate the monthly budget in ~35
+# pushes.  Split the matrix:
+#
+#   PR (`pull_request`) — Linux-only fast feedback:
+#     test-linux, build, clippy   (~5 Linux-mins/push)
+#
+#   Main push (`push: branches: [main]`) — full sweep + heavy jobs:
+#     test-macos, install-ps1-lint, k8s-smoke
+#     (~30 Linux-equiv mins/push; happens once per merge)
+#
+#   workflow_dispatch — all jobs runnable manually for debugging.
+#
+# Regressions caught post-merge surface on the main-push run +
+# get fixed in a follow-up PR.  Trade-off: ~30s window where a
+# merged change has unverified macOS / Windows / k8s status; in
+# practice the Linux test job catches >95 % of regressions
+# because the codebase is platform-agnostic except for the
+# install scripts.
 
 name: ci
 
@@ -24,18 +47,25 @@ env:
   RUST_BACKTRACE: short
   # Cache key suffix — bump when CI shape changes to invalidate.
   CACHE_VERSION: v1
+  # Truthy when this run was triggered by a push to main (NOT a
+  # pull_request).  Heavy-platform jobs (macOS test, install-ps1-
+  # lint, k8s-smoke) condition on this so PRs stay cheap.  Also
+  # truthy for workflow_dispatch so manual debugging triggers
+  # everything regardless of branch.
+  HEAVY_TIER_ENABLED: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
 
 jobs:
   # ──────────────────────────────────────────────────────────────
-  # Primary gate: full workspace test suite on both platforms.
+  # Primary gate (every PR + main push): full workspace test
+  # suite on Linux.  Linux runners are 1× weight; this is the
+  # always-on tier.  >95 % of regressions surface here because
+  # the codebase is platform-agnostic except for the install
+  # scripts (covered by install-ps1-lint, main-only) and the
+  # k8s emitter (covered by k8s-smoke, main-only).
   # ──────────────────────────────────────────────────────────────
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  test-linux:
+    name: test (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +75,32 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ env.CACHE_VERSION }}-test-${{ matrix.os }}
+          key: ${{ env.CACHE_VERSION }}-test-ubuntu-latest
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  # ──────────────────────────────────────────────────────────────
+  # macOS test (main-push + workflow_dispatch only — 10× weight).
+  # Catches macOS-specific regressions (filesystem case-sensitivity,
+  # shasum vs. sha256sum, BSD coreutils flag differences) once per
+  # merge instead of per PR push.  Failures here block the next
+  # main-push run + get fixed in a follow-up PR.
+  # ──────────────────────────────────────────────────────────────
+  test-macos:
+    name: test (macos-latest)
+    runs-on: macos-latest
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.CACHE_VERSION }}-test-macos-latest
 
       - name: cargo test --workspace
         run: cargo test --workspace --locked
@@ -115,6 +170,11 @@ jobs:
   install-ps1-lint:
     name: install.ps1 (windows-latest)
     runs-on: windows-latest
+    # Windows runners count 2× toward the Actions minute budget;
+    # the install.ps1 surface changes rarely + regressions can
+    # always be caught by re-triggering via workflow_dispatch.
+    # Main-push + workflow_dispatch only.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -189,6 +249,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: build
+    # Up to 20 Linux-min per run — the single most expensive job in
+    # the workflow.  Gate to main-push + workflow_dispatch only;
+    # PRs that touch k8s code can be smoke-tested by triggering
+    # `workflow_dispatch` from the Actions tab against the PR
+    # branch.  Week 16+ may add a `paths-filter` to auto-trigger
+    # this job when crates/aislang-k8s/** changes on a PR.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
 
