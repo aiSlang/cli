@@ -2,7 +2,7 @@
 
 > Declarative infrastructure for AI projects. One file describes your agents, models, prompts, MCP servers, evals, budgets, and deployment — `aislang apply` ships it.
 
-**Status:** v0.2.0-rc1 + Phase 2 Week 14 in flight (Track B — `target = kubernetes` + Helm chart + Open WebUI + Ingress all landed; CI smoke + v0.2.0-rc2 tag at Fri close).  See [PLAN-90-days-v0_2.md](PLAN-90-days-v0_2.md) for the v0.2 plan, [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the v0.1 archive, and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
+**Status:** **v0.2.0-rc2** (Phase 2 close — Track B foundation shipped: K8s emitter + Helm chart wrapper + Open WebUI + Ingress + OTel pod-wiring + kind/k3s CI smoke + GKE rehearsal procedure).  v0.2.0 final tag is **DoD-blocked** on the Phase 1 leftover (centralized `~/.aislang/store.json` — gates source-conditional budget enforcement) — scheduled for Phase 3 Week 16 Mon; until then the latest released tag stays v0.2.0-rc2.  See [PLAN-90-days-v0_2.md](PLAN-90-days-v0_2.md) for the v0.2 plan + Phase 2 close totals + Phase 3 Week 16 day-by-day, [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the v0.1 archive, and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
 
 ## Quick taste
 
