@@ -1640,13 +1640,16 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
     // `optional: false` — if the Secret doesn't exist, kubelet
     // refuses to start the pod (the pod sits Pending with a
     // `CreateContainerConfigError` event the user only sees
-    // by running `kubectl describe pod`).  Catch this at apply
-    // time so users have a single actionable error instead of
-    // having to dig through pod-event logs.  Non-fatal: print
-    // a loud warning + the create-secret command but let helm
-    // install proceed so the rest of the stack is in place when
-    // the user creates the Secret.
-    preflight_check_providers_secret();
+    // by running `kubectl describe pod`).  ALSO checks that each
+    // referenced env var has a non-empty value (catches the
+    // `--from-literal=KEY="$UNSET_VAR"` foot-gun where the user's
+    // shell didn't have the env var set when they ran kubectl
+    // create secret).  Both warnings are non-fatal: helm install
+    // proceeds so the rest of the stack is in place when the user
+    // fixes the Secret afterwards.
+    let referenced_vars =
+        aislang_compose::litellm::referenced_env_vars(&resolved);
+    preflight_check_providers_secret(&referenced_vars);
 
     // ── Stage 8: shell to `helm upgrade --install` (or graceful-degrade). ──
     if !helm_on_path() {
@@ -1822,8 +1825,16 @@ fn helm_on_path() -> bool {
 
 /// Phase 2 Week 14 Thu follow-up — soft preflight check for the
 /// user-created `aislang-providers` Secret (Decision 43.5).  Emits
-/// a loud warning + the create-secret recipe when the Secret is
-/// missing; never blocks the apply.
+/// loud warnings + actionable recipes when:
+///   1. the Secret doesn't exist; OR
+///   2. the Secret exists but a referenced env var's value is empty
+///      (catches the `--from-literal=ANTHROPIC_API_KEY="$EMPTY_VAR"`
+///      foot-gun where the user's shell didn't have the env var set
+///      when they ran kubectl create secret).
+///
+/// Never blocks the apply: helm install proceeds, the user fixes
+/// the Secret afterwards, kubelet picks up the change on the next
+/// pod restart.
 ///
 /// Why a warning and not a hard fail: the rest of the chart still
 /// needs to be installed (ConfigMaps, Services, Deployments — the
@@ -1836,7 +1847,12 @@ fn helm_on_path() -> bool {
 /// Quiet when kubectl is absent — the user's already in a degraded
 /// state (we'd never have reached helm-install either); no point
 /// adding noise.  Same posture as `docker_on_path()` / `helm_on_path()`.
-fn preflight_check_providers_secret() {
+///
+/// `referenced_vars` comes from `aislang_compose::litellm::
+/// referenced_env_vars(resolved)` — the same set the .env.example
+/// template + Compose container env-forwarding consume, so the
+/// three checks stay in lockstep.
+fn preflight_check_providers_secret(referenced_vars: &std::collections::BTreeSet<String>) {
     // kubectl may not be on PATH (helm-only environments do exist
     // — `helm upgrade --install` works against ~/.kube/config without
     // kubectl).  Skip silently in that case.
@@ -1847,8 +1863,7 @@ fn preflight_check_providers_secret() {
         .unwrap_or(false);
     if !kubectl_present { return; }
 
-    // `kubectl get secret aislang-providers -o name --ignore-not-found`
-    // exits 0 in both Found + NotFound cases; empty stdout = NotFound.
+    // ── Check #1: does the Secret exist? ──
     let out = std::process::Command::new("kubectl")
         .args(["get", "secret", "aislang-providers",
                "-o", "name", "--ignore-not-found"])
@@ -1861,9 +1876,44 @@ fn preflight_check_providers_secret() {
         // cluster issue, helm will fail loudly enough.
         _ => return,
     };
-    if !absent { return; }
+    if absent {
+        preflight_warn_missing_secret(referenced_vars);
+        return;
+    }
 
-    // Loud warning block — easy to spot in scroll-back.
+    // ── Check #2: does each referenced env var have a non-empty
+    //    value inside the Secret?
+    //
+    // `kubectl get secret aislang-providers -o jsonpath='{.data.<VAR>}'`
+    // returns the base64-encoded value (or empty string if the key
+    // is absent OR present but empty).  We don't need to base64-
+    // decode for the empty-vs-non-empty check; empty string in =
+    // empty value out.  Foot-gun this catches: the user's shell
+    // didn't have $ANTHROPIC_API_KEY set when they ran
+    // `kubectl create secret … --from-literal=ANTHROPIC_API_KEY=
+    // "$ANTHROPIC_API_KEY"`, so the Secret stored an empty value
+    // — LiteLLM then forwards a literal empty x-api-key header
+    // to Anthropic which 401s.
+    let mut empty_vars: Vec<String> = Vec::new();
+    for var in referenced_vars {
+        let v = std::process::Command::new("kubectl")
+            .args(["get", "secret", "aislang-providers",
+                   "-o", &format!("jsonpath={{.data.{var}}}")])
+            .output();
+        if let Ok(o) = v {
+            if o.status.success() && o.stdout.is_empty() {
+                empty_vars.push(var.clone());
+            }
+        }
+    }
+    if !empty_vars.is_empty() {
+        preflight_warn_empty_secret_values(&empty_vars);
+    }
+}
+
+/// Print the "Secret doesn't exist" warning + the create-secret
+/// recipe customised to the project's referenced env vars.
+fn preflight_warn_missing_secret(referenced_vars: &std::collections::BTreeSet<String>) {
     eprintln!();
     eprintln!("⚠  preflight WARNING: required Secret `aislang-providers` not found");
     eprintln!("   (Decision 43.5 — provider creds Secret is user-created)");
@@ -1874,11 +1924,47 @@ fn preflight_check_providers_secret() {
     eprintln!("   the pods will progress automatically on the next kubelet sync:");
     eprintln!();
     eprintln!("     kubectl create secret generic aislang-providers \\");
-    eprintln!("       --from-literal=ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" \\");
-    eprintln!("       --from-literal=OPENAI_API_KEY=\"$OPENAI_API_KEY\" \\");
-    eprintln!("       --from-literal=OLLAMA_API_BASE=\"$OLLAMA_API_BASE\"");
+    for (i, var) in referenced_vars.iter().enumerate() {
+        let last = i == referenced_vars.len() - 1;
+        let backslash = if last { "" } else { " \\" };
+        eprintln!("       --from-literal={var}=\"${var}\"{backslash}");
+    }
+    eprintln!();
+    eprintln!("   ⚠  Make sure those env vars are actually exported in your shell");
+    eprintln!("      first — empty `$ANTHROPIC_API_KEY` → empty key in the Secret");
+    eprintln!("      → LiteLLM 401s on every request.");
     eprintln!();
     eprintln!("   Helm install will proceed; create the Secret afterwards.");
+    eprintln!();
+}
+
+/// Print the "Secret exists but some values are empty" warning +
+/// the patch-secret recipe.
+fn preflight_warn_empty_secret_values(empty_vars: &[String]) {
+    eprintln!();
+    eprintln!("⚠  preflight WARNING: Secret `aislang-providers` has EMPTY values");
+    eprintln!("   for: {}", empty_vars.join(", "));
+    eprintln!();
+    eprintln!("   These keys are referenced by the resolved model bindings;");
+    eprintln!("   LiteLLM will forward empty headers/credentials and providers");
+    eprintln!("   will reject the calls (typically HTTP 401).");
+    eprintln!();
+    eprintln!("   Patch the Secret with the real values:");
+    eprintln!();
+    eprintln!("     kubectl create secret generic aislang-providers \\");
+    for (i, var) in empty_vars.iter().enumerate() {
+        let last = i == empty_vars.len() - 1;
+        let backslash = if last { "" } else { " \\" };
+        eprintln!("       --from-literal={var}='<real-value-here>'{backslash}");
+    }
+    eprintln!("       --dry-run=client -o yaml | kubectl apply -f -");
+    eprintln!();
+    eprintln!("   Then restart the pods so envFrom re-reads the Secret:");
+    eprintln!();
+    eprintln!("     kubectl rollout restart deploy/litellm");
+    eprintln!("     kubectl rollout restart deploy/agent-runtime");
+    eprintln!();
+    eprintln!("   Helm install will proceed; fix the Secret afterwards.");
     eprintln!();
 }
 
