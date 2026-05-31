@@ -1675,9 +1675,23 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
 
     eprintln!();
     eprintln!("chart installed.  next steps:");
-    eprintln!("  status:    kubectl get all -l aislang.deploy={release_name}");
-    eprintln!("  port-fwd:  kubectl port-forward svc/openwebui 3000:8080");
-    eprintln!("  teardown:  aislang destroy {}", file.display());
+    eprintln!("  status:           kubectl get all -l aislang.deploy={release_name}");
+    eprintln!("  open webui:       kubectl port-forward svc/openwebui 3000:8080 \
+                                    (then http://localhost:3000)");
+    // `aislang chat` always dials LiteLLM at 127.0.0.1:4000 — the
+    // local-Compose convention.  Under K8s, LiteLLM is a ClusterIP
+    // service inside the cluster; without a port-forward the chat
+    // attempt fails with "error sending request" against the local
+    // address.  Surface the port-forward command so users have a
+    // one-step "make chat work" recipe.  v0.3 carry-over: make
+    // chat topology-aware so this hand-step goes away.
+    if let Some(agent) = first_agent_label_in_file(&file) {
+        eprintln!("  chat (k8s mode):");
+        eprintln!("    1. kubectl port-forward svc/litellm 4000:4000   \
+                       # in another terminal; leave running");
+        eprintln!("    2. aislang chat {agent} {}", file.display());
+    }
+    eprintln!("  teardown:         aislang destroy {}", file.display());
     Ok(())
 }
 

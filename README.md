@@ -179,9 +179,18 @@ kubectl port-forward svc/openwebui 3000:8080
 #    - or set `ingress = "<host>"` in your .ais (Decision 43.6) and point
 #      DNS at your cluster's Ingress controller LB.
 
-# 5. Tear it down — `helm uninstall <deploy-label>`.
+# 5. `aislang chat` from your laptop — needs LiteLLM reachable on
+#    localhost:4000 (the CLI dials a fixed address; v0.3 makes it
+#    topology-aware).  Port-forward LiteLLM in a second terminal:
+kubectl port-forward svc/litellm 4000:4000
+#    Then chat as normal:
+aislang chat support examples/support-agent-k8s.ais
+
+# 6. Tear it down — `helm uninstall <deploy-label>`.
 aislang destroy examples/support-agent-k8s.ais
 ```
+
+> **Why the port-forward**: under `target = compose`, LiteLLM publishes `4000:4000` to the host, so `aislang chat`'s local mcp-serve dials `http://127.0.0.1:4000` and it just works.  Under `target = kubernetes`, LiteLLM is a `ClusterIP` Service — reachable only from inside the cluster.  Until v0.3 teaches `aislang chat` to discover the K8s Service (via the lockfile or a topology field), the workaround is the one-line `kubectl port-forward svc/litellm 4000:4000`.  Open WebUI chat (browser via the port-forwarded Service or the Ingress) is unaffected — it dials LiteLLM by K8s DNS name from inside the cluster.
 
 The chart's `values.yaml` exposes exactly four overrides (Decision 43.7 — minimal templating).  Override at install time without re-running `aislang plan`:
 
