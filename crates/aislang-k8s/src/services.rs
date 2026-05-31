@@ -88,6 +88,78 @@ pub const AGENT_RUNTIME_DEFAULT_PORT: u16 = 8080;
 pub const PROVIDERS_SECRET_NAME: &str = "aislang-providers";
 
 // ============================================================================
+// OpenTelemetry pod-wiring (Phase 2 Week 15 Tue)
+// ============================================================================
+
+/// Default OTLP/HTTP endpoint pods dial to ship spans into the
+/// in-cluster Jaeger pod's OTLP receiver.  `jaeger` resolves via
+/// K8s DNS (same posture LiteLLM uses to expose its router on
+/// `litellm:4000` to pod siblings).  Port 4318 is the OTLP/HTTP
+/// receiver; Jaeger already exposes it as a named container port
+/// (`otlp-http`) since Tue Week 14.
+///
+/// Chart users can override at install time:
+///   `helm install --set observability.otlp_endpoint=https://<ext>`
+/// — useful when they're running an external collector (Honeycomb,
+/// Tempo, NewRelic) instead of the bundled Jaeger.  helm_templatize
+/// substitutes this string with the Helm-templated `{{ .Values
+/// .observability.otlp_endpoint }}` for the chart variant.
+pub const OTEL_ENDPOINT_DEFAULT: &str = "http://jaeger:4318";
+
+/// Default service-name prefix for the OpenTelemetry resource
+/// attribute `service.name`.  Each pod's `OTEL_SERVICE_NAME` env
+/// var becomes `<prefix>.<component>.<deploy-label>` —
+/// e.g. `aislang.litellm.prod`, `aislang.agent_runtime.prod`.
+///
+/// Why prefix-then-component-then-deploy:
+///   - Prefix groups all aislang-emitted services together in
+///     Jaeger UI's service dropdown (a single `aislang.*` filter
+///     surfaces everything).
+///   - Component disambiguates within an aislang stack.
+///   - Deploy label disambiguates across deploys when a single
+///     Jaeger instance serves multi-tenant clusters (per-tenant
+///     `helm install` with the chart per Decision 43.1).
+pub const OTEL_SERVICE_NAME_PREFIX_DEFAULT: &str = "aislang";
+
+/// OTLP protocol — `http/protobuf` is the v1 OTel standard
+/// receiver Jaeger ships by default on 4318.  Pinned here so the
+/// LiteLLM + agent-runtime pods agree with each other + with
+/// Jaeger's enabled receivers (`COLLECTOR_OTLP_ENABLED=true`,
+/// Tue Week 14).  Alternative is `grpc` on port 4317 — declined
+/// because LiteLLM's Python SDK ships HTTP-only by default,
+/// and gRPC adds a TLS-flag surface we don't need at v0.2.
+pub const OTEL_PROTOCOL: &str = "http/protobuf";
+
+/// Build the standard OTLP env-var block for a pod participating
+/// in the aislang trace topology.  Three vars:
+///
+///   - `OTEL_EXPORTER_OTLP_ENDPOINT` — where to ship spans
+///   - `OTEL_EXPORTER_OTLP_PROTOCOL` — wire format (http/protobuf)
+///   - `OTEL_SERVICE_NAME`           — span `service.name` attribute
+///
+/// Service name pattern: `<prefix>.<component>.<deploy-label>`
+/// (e.g. `aislang.litellm.prod`).  Used by `build_litellm` +
+/// `build_agent_runtime`.  Jaeger itself is the receiver, NOT a
+/// span producer, so it doesn't get an OTEL_SERVICE_NAME.
+pub fn otel_env_vars(component: &str, deploy_label: &str) -> Vec<EnvVar> {
+    vec![
+        EnvVar {
+            name:  "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            value: OTEL_ENDPOINT_DEFAULT.to_string(),
+        },
+        EnvVar {
+            name:  "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+            value: OTEL_PROTOCOL.to_string(),
+        },
+        EnvVar {
+            name:  "OTEL_SERVICE_NAME".to_string(),
+            value: format!(
+                "{OTEL_SERVICE_NAME_PREFIX_DEFAULT}.{component}.{deploy_label}"),
+        },
+    ]
+}
+
+// ============================================================================
 // LiteLLM — Deployment + Service + ConfigMap
 // ============================================================================
 
@@ -135,11 +207,18 @@ pub fn build_litellm(
         }]),
         // AISLANG_CATALOG_VERSION pinned for traceability — same
         // role it plays in the Compose env (debug "which catalog
-        // was this stack resolved against?").
-        env: Some(vec![EnvVar {
-            name:  "AISLANG_CATALOG_VERSION".to_string(),
-            value: resolved.catalog_version.clone(),
-        }]),
+        // was this stack resolved against?").  Phase 2 Week 15
+        // Tue: OTEL env vars appended so LiteLLM ships its
+        // request-/response- spans into the in-cluster Jaeger
+        // pod automatically — no manual env override required.
+        env: Some({
+            let mut env = vec![EnvVar {
+                name:  "AISLANG_CATALOG_VERSION".to_string(),
+                value: resolved.catalog_version.clone(),
+            }];
+            env.extend(otel_env_vars("litellm", deploy_label));
+            env
+        }),
         // Provider creds via envFrom (Decision 43.5).
         env_from: Some(vec![EnvFromSource {
             secret_ref:     Some(SecretEnvSource {
@@ -591,9 +670,15 @@ pub fn build_agent_runtime(
             }),
             config_map_ref: None,
         }]),
-        // Optional env tweaks — none needed Wed; Thu may add
-        // OTEL_EXPORTER_OTLP_ENDPOINT when wiring jaeger.
-        env: None,
+        // Phase 2 Week 15 Tue: OTEL env vars so the agent-runtime
+        // pod's `aislang mcp-serve --http` spans (Decision 18 /
+        // Week 9 v0.1 work — OTel-GenAI semantic conventions on
+        // chat_turn / eval / tool_use_iteration) flow into the
+        // in-cluster Jaeger pod automatically.  Service name
+        // pattern is `aislang.agent_runtime.<deploy-label>` —
+        // distinguishes deploys when a single Jaeger sees traces
+        // from multiple aislang stacks (multi-tenant clusters).
+        env: Some(otel_env_vars("agent_runtime", deploy_label)),
         // Default image entrypoint is `aislang`; pass the mcp-serve
         // subcommand + flags as args.  `--http 0.0.0.0:<port>` binds
         // on every pod interface so the Service can reach it; the

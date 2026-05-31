@@ -49,6 +49,7 @@
 use crate::services::{
     AGENT_RUNTIME_IMAGE,
     OPENWEBUI_DEFAULT_PVC_SIZE,
+    OTEL_ENDPOINT_DEFAULT,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -89,6 +90,18 @@ pub const PVC_SIZE_TEMPLATE_REPLACEMENT: &str =
 pub const LITELLM_REPLICAS_TEMPLATE_REPLACEMENT: &str =
     "replicas: {{ .Values.litellm.replicas }}";
 
+/// Phase 2 Week 15 Tue — raw `http://jaeger:4318` literal in the
+/// LiteLLM + agent-runtime pod env, replaced with
+/// `{{ .Values.observability.otlp_endpoint }}` under chart/templates/.
+/// Lets `helm install --set observability.otlp_endpoint=https://
+/// otlp.honeycomb.io:443` swap the trace sink for users running an
+/// external collector (Honeycomb, Tempo, Datadog, NewRelic, OTel
+/// Collector) instead of the bundled in-cluster Jaeger pod.  Both
+/// pods get the same substitution from this single literal — they
+/// were emitted by `services::otel_env_vars` from the same constant.
+pub const OTLP_ENDPOINT_TEMPLATE_REPLACEMENT: &str =
+    "{{ .Values.observability.otlp_endpoint }}";
+
 // ============================================================================
 // Chart.yaml + values.yaml builders
 // ============================================================================
@@ -122,12 +135,14 @@ pub fn build_chart_yaml(deploy_label: &str, catalog_version: &str) -> String {
 
 /// Build the chart `values.yaml` body.
 ///
-/// Four templating points (Decision 43.7):
+/// Five templating points (Decision 43.7 + Phase 2 Week 15 Tue):
 ///
-///   1. `image.repository` + `image.tag`     — agent-runtime image
-///   2. `openwebui.persistence.size`         — PVC size
-///   3. `litellm.replicas`                   — LiteLLM scale-up
-///   4. `ingress.host`                       — Ingress hostname
+///   1. `image.repository` + `image.tag`        — agent-runtime image
+///   2. `openwebui.persistence.size`             — PVC size
+///   3. `litellm.replicas`                       — LiteLLM scale-up
+///   4. `ingress.host`                           — Ingress hostname
+///   5. `observability.otlp_endpoint`            — OTLP collector URL
+///                                                 (Week 15 Tue addition)
 ///
 /// Fields the chart needs at render time but that users RARELY
 /// override stay as constants in the templates rather than
@@ -136,7 +151,11 @@ pub fn build_chart_yaml(deploy_label: &str, catalog_version: &str) -> String {
 /// `ingress.host` defaults to empty string; the Ingress template
 /// is only emitted when the .ais source set `expose.ingress = "…"`,
 /// so an empty default is fine (no rendering happens for an
-/// unrequested Ingress).
+/// unrequested Ingress).  `observability.otlp_endpoint` defaults
+/// to the in-cluster Jaeger pod (`http://jaeger:4318`); override
+/// to an external collector (Honeycomb / Tempo / Datadog / NewRelic
+/// / OTel Collector) when you'd rather aggregate spans outside the
+/// cluster.
 pub fn build_values_yaml(ingress_host: Option<&str>) -> String {
     // Helm parses YAML; explicit quoting around string values
     // avoids any auto-typing surprises (`latest` and version
@@ -150,7 +169,7 @@ pub fn build_values_yaml(ingress_host: Option<&str>) -> String {
         .rsplit_once(':')
         .unwrap_or((AGENT_RUNTIME_IMAGE, "latest"));
     format!(
-        "# values.yaml — Phase 2 Week 14 Thu (Decision 43.7)\n\
+        "# values.yaml — Phase 2 Week 14 Thu + Week 15 Tue (Decision 43.7)\n\
          # Override at install time with: helm install --set <key>=<value>\n\
          \n\
          image:\n  \
@@ -172,7 +191,14 @@ pub fn build_values_yaml(ingress_host: Option<&str>) -> String {
              size: \"{OPENWEBUI_DEFAULT_PVC_SIZE}\"\n\
          \n\
          ingress:\n\
-         {host_field}"
+         {host_field}\
+         \n\
+         observability:\n  \
+           # OTLP/HTTP endpoint LiteLLM + agent-runtime ship spans to.\n  \
+           # Default: in-cluster Jaeger pod (the chart's own jaeger Deployment).\n  \
+           # Override to an external collector when aggregating spans outside\n  \
+           # the cluster:  --set observability.otlp_endpoint=https://otlp.honeycomb.io:443\n  \
+           otlp_endpoint: \"{OTEL_ENDPOINT_DEFAULT}\"\n"
     )
 }
 
@@ -198,6 +224,13 @@ pub fn helm_templatize(manifest_body: &str) -> String {
         .replace(AGENT_RUNTIME_IMAGE,                    IMAGE_TEMPLATE_REPLACEMENT)
         .replace(&format!("storage: {OPENWEBUI_DEFAULT_PVC_SIZE}"),
                  &format!("storage: {PVC_SIZE_TEMPLATE_REPLACEMENT}"))
+        // Phase 2 Week 15 Tue — OTLP endpoint override.  Pin: every
+        // `OTEL_EXPORTER_OTLP_ENDPOINT` env var in any manifest body
+        // gets the chart variable swapped in.  Targets both LiteLLM
+        // + agent-runtime pods (both emitted by `otel_env_vars` from
+        // the same `OTEL_ENDPOINT_DEFAULT` constant).
+        .replace(&format!("value: {OTEL_ENDPOINT_DEFAULT}"),
+                 &format!("value: {OTLP_ENDPOINT_TEMPLATE_REPLACEMENT}"))
         // LiteLLM replicas template: matches the exact `replicas: 1`
         // line on the LiteLLM Deployment.  Jaeger / budget-counter /
         // agent-runtime / openwebui ALSO have `replicas: 1` lines
@@ -286,14 +319,34 @@ mod tests {
             "appVersion tracks catalog_version; got:\n{chart}");
     }
 
-    #[test] fn values_yaml_has_four_templating_points() {
+    #[test] fn values_yaml_has_five_templating_points() {
         let v = build_values_yaml(Some("ui.example.com"));
-        // Decision 43.7 — exactly four user-overridable points.
+        // Decision 43.7 + Phase 2 Week 15 Tue — five user-
+        // overridable points.
         assert!(v.contains("repository:"),    "image.repository point");
         assert!(v.contains("tag:"),            "image.tag point");
         assert!(v.contains("replicas:"),       "litellm.replicas point");
         assert!(v.contains("size:"),           "openwebui.persistence.size point");
         assert!(v.contains("host: \"ui.example.com\""), "ingress.host point");
+        assert!(v.contains("otlp_endpoint:"),  "observability.otlp_endpoint point (Week 15 Tue)");
+    }
+
+    #[test] fn values_yaml_observability_defaults_to_in_cluster_jaeger() {
+        let v = build_values_yaml(None);
+        assert!(v.contains(&format!("otlp_endpoint: \"{OTEL_ENDPOINT_DEFAULT}\"")),
+            "OTLP endpoint defaults to in-cluster jaeger; got:\n{v}");
+    }
+
+    #[test] fn helm_templatize_substitutes_otlp_endpoint() {
+        // Both LiteLLM + agent-runtime envs render
+        // `value: http://jaeger:4318` from the same constant;
+        // helm_templatize swaps that for the chart variable.
+        let body = format!("- name: OTEL_EXPORTER_OTLP_ENDPOINT\n  value: {OTEL_ENDPOINT_DEFAULT}\n");
+        let templated = helm_templatize(&body);
+        assert!(templated.contains(OTLP_ENDPOINT_TEMPLATE_REPLACEMENT),
+            "templated body must contain {{{{ .Values.observability.otlp_endpoint }}}}; got:\n{templated}");
+        assert!(!templated.contains(OTEL_ENDPOINT_DEFAULT),
+            "raw default URL must be gone after templatize; got:\n{templated}");
     }
 
     #[test] fn values_yaml_handles_no_ingress() {
