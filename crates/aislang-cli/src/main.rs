@@ -1881,41 +1881,100 @@ fn preflight_check_providers_secret(referenced_vars: &std::collections::BTreeSet
         return;
     }
 
-    // ── Check #2: does each referenced env var have a non-empty
-    //    value inside the Secret?
+    // ── Check #2 + #3: per-var value sanity ──
     //
     // `kubectl get secret aislang-providers -o jsonpath='{.data.<VAR>}'`
     // returns the base64-encoded value (or empty string if the key
-    // is absent OR present but empty).  We don't need to base64-
-    // decode for the empty-vs-non-empty check; empty string in =
-    // empty value out.  Foot-gun this catches: the user's shell
-    // didn't have $ANTHROPIC_API_KEY set when they ran
-    // `kubectl create secret … --from-literal=ANTHROPIC_API_KEY=
-    // "$ANTHROPIC_API_KEY"`, so the Secret stored an empty value
-    // — LiteLLM then forwards a literal empty x-api-key header
-    // to Anthropic which 401s.
-    let mut empty_vars: Vec<String> = Vec::new();
+    // is absent OR present but empty).  We base64-decode the
+    // non-empty values to check for non-ASCII bytes (typically
+    // signals a placeholder was pasted including unicode `…`
+    // ellipsis or smart-quotes — Anthropic's SDK ASCII-encodes the
+    // key for the x-api-key header and explodes with
+    // `'ascii' codec can't encode character '\u2026'`).
+    //
+    // Foot-guns caught:
+    //   - empty value:  shell didn't have $VAR set when user ran
+    //                   `kubectl create secret … --from-literal=
+    //                   <VAR>="$<VAR>"`  → LiteLLM forwards empty
+    //                   header → 401.
+    //   - non-ASCII:    user pasted a placeholder containing `…`
+    //                   ellipsis or smart-quotes (e.g.
+    //                   `sk-ant-…YOUR-KEY…`) → Anthropic SDK
+    //                   ASCII-encode fails → HTTP 500.
+    let mut empty_vars:     Vec<String> = Vec::new();
+    let mut non_ascii_vars: Vec<String> = Vec::new();
     for var in referenced_vars {
         let v = std::process::Command::new("kubectl")
             .args(["get", "secret", "aislang-providers",
                    "-o", &format!("jsonpath={{.data.{var}}}")])
             .output();
-        if let Ok(o) = v {
-            if o.status.success() && o.stdout.is_empty() {
-                empty_vars.push(var.clone());
+        let Ok(o) = v else { continue };
+        if !o.status.success() { continue; }
+        if o.stdout.is_empty() {
+            empty_vars.push(var.clone());
+            continue;
+        }
+        // Decode the base64 to inspect the actual bytes.  kubectl
+        // returns standard base64 with no whitespace; a hand-rolled
+        // decoder keeps us from pulling in the `base64` crate.
+        let b64_str = String::from_utf8_lossy(&o.stdout).into_owned();
+        let decoded = decode_base64(b64_str.trim());
+        if let Some(bytes) = decoded {
+            if bytes.iter().any(|&b| b > 0x7f) {
+                non_ascii_vars.push(var.clone());
             }
         }
+        // Decode failure → can't tell; skip silently (kubectl
+        // output may have changed, or the data was binary).
     }
     if !empty_vars.is_empty() {
         preflight_warn_empty_secret_values(&empty_vars);
     }
+    if !non_ascii_vars.is_empty() {
+        preflight_warn_non_ascii_secret_values(&non_ascii_vars);
+    }
+}
+
+/// Minimal base64 decoder — kubectl returns standard alphabet (`+/=`)
+/// with no whitespace.  Returns `None` on invalid input (treated as
+/// "can't sanity-check; skip the non-ASCII probe for this var").
+/// Hand-rolled to avoid pulling in the `base64` crate for one call
+/// site.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    fn idx(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+'        => Some(62),
+            b'/'        => Some(63),
+            _           => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 { return None; }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let pad = (bytes[i+2] == b'=') as usize + (bytes[i+3] == b'=') as usize;
+        let a = idx(bytes[i])?  as u32;
+        let b = idx(bytes[i+1])? as u32;
+        let c = if bytes[i+2] == b'=' { 0 } else { idx(bytes[i+2])? as u32 };
+        let d = if bytes[i+3] == b'=' { 0 } else { idx(bytes[i+3])? as u32 };
+        let chunk = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push(((chunk >> 16) & 0xff) as u8);
+        if pad < 2 { out.push(((chunk >> 8) & 0xff) as u8); }
+        if pad < 1 { out.push((chunk        & 0xff) as u8); }
+        i += 4;
+    }
+    Some(out)
 }
 
 /// Print the "Secret doesn't exist" warning + the create-secret
 /// recipe customised to the project's referenced env vars.
 fn preflight_warn_missing_secret(referenced_vars: &std::collections::BTreeSet<String>) {
     eprintln!();
-    eprintln!("⚠  preflight WARNING: required Secret `aislang-providers` not found");
+    eprintln!("!  preflight WARNING: required Secret `aislang-providers` not found");
     eprintln!("   (Decision 43.5 — provider creds Secret is user-created)");
     eprintln!();
     eprintln!("   The chart's litellm + agent-runtime pods envFrom this Secret;");
@@ -1930,7 +1989,7 @@ fn preflight_warn_missing_secret(referenced_vars: &std::collections::BTreeSet<St
         eprintln!("       --from-literal={var}=\"${var}\"{backslash}");
     }
     eprintln!();
-    eprintln!("   ⚠  Make sure those env vars are actually exported in your shell");
+    eprintln!("   !  Make sure those env vars are actually exported in your shell");
     eprintln!("      first — empty `$ANTHROPIC_API_KEY` → empty key in the Secret");
     eprintln!("      → LiteLLM 401s on every request.");
     eprintln!();
@@ -1942,7 +2001,7 @@ fn preflight_warn_missing_secret(referenced_vars: &std::collections::BTreeSet<St
 /// the patch-secret recipe.
 fn preflight_warn_empty_secret_values(empty_vars: &[String]) {
     eprintln!();
-    eprintln!("⚠  preflight WARNING: Secret `aislang-providers` has EMPTY values");
+    eprintln!("!  preflight WARNING: Secret `aislang-providers` has EMPTY values");
     eprintln!("   for: {}", empty_vars.join(", "));
     eprintln!();
     eprintln!("   These keys are referenced by the resolved model bindings;");
@@ -1955,11 +2014,53 @@ fn preflight_warn_empty_secret_values(empty_vars: &[String]) {
     for (i, var) in empty_vars.iter().enumerate() {
         let last = i == empty_vars.len() - 1;
         let backslash = if last { "" } else { " \\" };
-        eprintln!("       --from-literal={var}='<real-value-here>'{backslash}");
+        // ASCII-only placeholder (no unicode `…` — that triggers
+        // the very bug we're trying to prevent if the user pastes
+        // it literally).  Uppercase + obvious "PASTE" verb makes
+        // it impossible to mistake for a real value.
+        eprintln!("       --from-literal={var}='PASTE_{var}_VALUE_HERE'{backslash}");
     }
     eprintln!("       --dry-run=client -o yaml | kubectl apply -f -");
     eprintln!();
     eprintln!("   Then restart the pods so envFrom re-reads the Secret:");
+    eprintln!();
+    eprintln!("     kubectl rollout restart deploy/litellm");
+    eprintln!("     kubectl rollout restart deploy/agent-runtime");
+    eprintln!();
+    eprintln!("   Helm install will proceed; fix the Secret afterwards.");
+    eprintln!();
+}
+
+/// Print the "Secret exists but some values contain non-ASCII bytes"
+/// warning + the patch recipe.  Almost always caused by the user
+/// pasting a placeholder containing unicode ellipsis (`...`) or smart
+/// quotes — the Anthropic SDK ASCII-encodes the key for the
+/// `x-api-key` header and explodes with
+/// `'ascii' codec can't encode character '\u2026'`.  Other providers
+/// have similar (less helpful) failure modes.
+fn preflight_warn_non_ascii_secret_values(non_ascii_vars: &[String]) {
+    eprintln!();
+    eprintln!("!  preflight WARNING: Secret `aislang-providers` contains NON-ASCII");
+    eprintln!("   bytes in: {}", non_ascii_vars.join(", "));
+    eprintln!();
+    eprintln!("   Provider API keys are ASCII-only — typically `sk-…` prefix +");
+    eprintln!("   base64-alphabet body.  Non-ASCII bytes almost always mean a");
+    eprintln!("   placeholder was pasted literally, e.g.");
+    eprintln!("       sk-ant-{}YOUR-REAL-KEY{}", '\u{2026}', '\u{2026}');
+    eprintln!("   …where `{}` (U+2026) crashes the Anthropic SDK with",       '\u{2026}');
+    eprintln!("       'ascii' codec can't encode character '\\u2026'");
+    eprintln!("   …surfacing as HTTP 500 from LiteLLM with that message in");
+    eprintln!("   the body.  Smart quotes (curly `'`, `\"`) hit the same trap.");
+    eprintln!();
+    eprintln!("   Get a real API key from the provider's console and patch:");
+    eprintln!();
+    eprintln!("     kubectl create secret generic aislang-providers \\");
+    for (i, var) in non_ascii_vars.iter().enumerate() {
+        let last = i == non_ascii_vars.len() - 1;
+        let backslash = if last { "" } else { " \\" };
+        eprintln!("       --from-literal={var}='PASTE_REAL_{var}_HERE'{backslash}");
+    }
+    eprintln!("       --dry-run=client -o yaml | kubectl apply -f -");
     eprintln!();
     eprintln!("     kubectl rollout restart deploy/litellm");
     eprintln!("     kubectl rollout restart deploy/agent-runtime");
@@ -3604,5 +3705,80 @@ mod tests {
                                        Path::new("/tmp")).err().unwrap();
         assert!(err.to_string().contains("phantom"),
             "error must name the missing secret; got: {err}");
+    }
+
+    // ── base64 decoder used by preflight non-ASCII probe (Thu) ──
+
+    #[test] fn decode_base64_round_trips_ascii() {
+        // "sk-test-key" — what a real API key body looks like.
+        let s = "c2stdGVzdC1rZXk=";
+        let decoded = decode_base64(s).expect("valid base64");
+        assert_eq!(String::from_utf8_lossy(&decoded), "sk-test-key");
+        assert!(decoded.iter().all(|&b| b <= 0x7f),
+            "ASCII-only input must decode to all-ASCII bytes");
+    }
+
+    #[test] fn decode_base64_round_trips_non_ascii() {
+        // Decodes "sk-ant-\u2026YOUR-KEY\u2026" — the bug-reproducing
+        // case the preflight catches.  base64 of those 18 bytes:
+        let raw = format!("sk-ant-{}YOUR-KEY{}", '\u{2026}', '\u{2026}');
+        // Hand-roll base64 encode for the test (we only have decode).
+        let encoded = simple_b64_encode(raw.as_bytes());
+        let decoded = decode_base64(&encoded).expect("round-trip");
+        assert_eq!(decoded, raw.as_bytes());
+        assert!(decoded.iter().any(|&b| b > 0x7f),
+            "non-ASCII unicode (`\u{2026}` = 3 bytes UTF-8) must surface as >0x7f bytes — \
+             that's what triggers the preflight non-ASCII warning");
+    }
+
+    #[test] fn decode_base64_rejects_invalid_input() {
+        assert!(decode_base64("not!valid").is_none(),
+            "invalid base64 → None (preflight skips the non-ASCII probe rather \
+             than false-positive)");
+        assert!(decode_base64("abc").is_none(),
+            "non-multiple-of-4 length → None");
+    }
+
+    #[test] fn decode_base64_handles_padding() {
+        // "ab" = 2 bytes → base64 "YWI=" (1 pad)
+        assert_eq!(decode_base64("YWI=").unwrap(), b"ab");
+        // "a"  = 1 byte  → base64 "YQ==" (2 pad)
+        assert_eq!(decode_base64("YQ==").unwrap(), b"a");
+    }
+
+    /// Tiny base64 encoder for the round-trip test above; not used
+    /// in the production path (decode_base64 is the one in main.rs).
+    fn simple_b64_encode(bytes: &[u8]) -> String {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut i = 0;
+        while i + 3 <= bytes.len() {
+            let n = ((bytes[i]   as u32) << 16)
+                  | ((bytes[i+1] as u32) << 8)
+                  | (bytes[i+2]  as u32);
+            for shift in [18, 12, 6, 0] {
+                out.push(ALPHA[((n >> shift) & 0x3f) as usize] as char);
+            }
+            i += 3;
+        }
+        match bytes.len() - i {
+            1 => {
+                let n = (bytes[i] as u32) << 16;
+                out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+                out.push('=');
+                out.push('=');
+            }
+            2 => {
+                let n = ((bytes[i] as u32) << 16) | ((bytes[i+1] as u32) << 8);
+                out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
+                out.push(ALPHA[((n >>  6) & 0x3f) as usize] as char);
+                out.push('=');
+            }
+            _ => {}
+        }
+        out
     }
 }
