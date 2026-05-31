@@ -50,4 +50,9 @@ tokio-util       = { workspace = true }
 # exercise it via rmcp's client side (TokioChildProcess transport).
 # rmcp itself is now a main dep (week-12 Fri chat refactor); tokio
 # stays here for the test crate's scope.
-tokio = { workspace = true }
+tokio      = { workspace = true }
+# Phase 2 Week 15 Mon: `cli_plan_k8s::*_stability_*` tests inspect
+# the emitted manifests/aislang-project-config.yaml by deserialising
+# it back into a generic `serde_yaml::Value` — the same posture
+# `aislang-k8s`'s emitter-side tests use.  Test-only dep.
+serde_yaml = { workspace = true }
