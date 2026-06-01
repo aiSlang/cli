@@ -301,9 +301,22 @@ jobs:
 
       - name: Set up k3s (via k3d)
         if: matrix.cluster == 'k3s'
-        uses: AbsaOSS/k3d-action@v2
-        with:
-          cluster-name: aislang-smoke
+        # v0.3 Week 16: replaced `AbsaOSS/k3d-action@v2` with a manual
+        # k3d install.  The action hardcodes k3d v5.4.6 (released
+        # July 2022, two years before k3s v1.31) — the version skew
+        # caused the k3s server to enter a restart loop before the
+        # `k3s is up and running` log line, so cluster creation
+        # always failed: "node ... is running=true in status=
+        # restarting".  k3d v5.7+ supports k3s 1.31; we pin v5.7.5
+        # explicitly so a future k3d release can't surprise CI.
+        env:
+          K3D_VERSION: v5.7.5
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh" \
+            | TAG="$K3D_VERSION" bash
+          k3d version
           # --agents 0 → single-server cluster (k3d's equivalent
           # of kind's single-node default; matches resource
           # footprint).
@@ -312,10 +325,10 @@ jobs:
           # an LB pod would just consume more memory).
           # --image rancher/k3s:v1.31.0-k3s1 → pin K8s 1.31
           # so both axes test the same K8s API surface.
-          args: >-
-            --agents 0
-            --no-lb
-            --image rancher/k3s:v1.31.0-k3s1
+          k3d cluster create aislang-smoke \
+            --agents 0 \
+            --no-lb \
+            --image rancher/k3s:v1.31.0-k3s1 \
             --wait
 
       - name: Install Helm 3
