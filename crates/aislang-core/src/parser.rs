@@ -661,11 +661,16 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
             // topology.  Multiple `main` blocks are allowed per project
             // (different chat_clients → different entry points).
             "main"       => project.mains.push(to_main(block)?),
+            // v0.3 Week 17 Mon (Decision 44.5): `pipeline` composition
+            // primitive.  Sequential agent composition with one Vec<Ref>
+            // step list + optional input/output descriptors.  Tue extends
+            // to `loop` + `branch`; Wed-Fri wires the runtime dispatch.
+            "pipeline"   => project.pipelines.push(to_pipeline(block)?),
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
-                     v0.2 supports: budget, model, prompt, mcp_server, \
-                     agent, eval, secret, deploy, main"
+                     v0.3 supports: budget, model, prompt, mcp_server, \
+                     agent, eval, secret, deploy, main, pipeline"
                 ));
             }
         }
@@ -1237,6 +1242,48 @@ fn to_main(raw: RawBlock) -> Result<Main, String> {
              (one of: orchestrator, supervisor, router, reflector, \
              planner_executor, coordinator)".to_string())?,
     })
+}
+
+// ============================================================================
+// `pipeline` block converter — v0.3 Week 17 Mon (Decision 44.5)
+// ============================================================================
+//
+// Sequential composition primitive.  steps[] is a Vec<Ref> with
+// RefKind::Agent — same Ref shape as agent.tools but constrained
+// to agents (not mcp_servers).  input + output are descriptive
+// String metadata in v0.3; structured types are v0.5+.
+
+fn to_pipeline(raw: RawBlock) -> Result<Pipeline, String> {
+    let label = require_single_label("pipeline", raw.labels)?;
+    let mut steps:  Option<Vec<Ref>> = None;
+    let mut input:  Option<String>   = None;
+    let mut output: Option<String>   = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("pipeline", item)?;
+        match attr.name.as_str() {
+            "steps"  => steps  = Some(expect_list_of_refs(
+                &attr.name, RefKind::Agent, attr.value)?),
+            "input"  => input  = Some(expect_string(&attr.name, attr.value)?),
+            "output" => output = Some(expect_string(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in pipeline block; \
+                 allowed: steps, input, output"
+            )),
+        }
+    }
+
+    let steps = steps.ok_or_else(||
+        "pipeline block missing required attribute `steps` \
+         (a non-empty list of agent references, e.g. \
+         `steps = [agent.architect, agent.coder]`)".to_string())?;
+    if steps.is_empty() {
+        return Err(
+            "pipeline `steps` must contain at least one agent reference; \
+             got an empty list".to_string());
+    }
+
+    Ok(Pipeline { label, steps, input, output })
 }
 
 // ============================================================================
@@ -3272,5 +3319,151 @@ mod project_tests {
         }"#;
         let p_kind = parse_first_agent(src_prompt).system_prompt.kind;
         assert_eq!(p_kind, RefKind::Prompt);
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 17 Mon — `pipeline { … }` composition block.
+    // ---------------------------------------------------------------- //
+
+    /// Helper: parse a project containing one or more agents + a
+    /// pipeline that chains them.  Returns the parsed Project.
+    fn project_with_pipeline(pipeline_body: &str) -> Project {
+        let src = format!(r#"project "p" {{
+          budget {{ hard_cap_per_day = $1  hard_cap_per_run = $0.01 }}
+          model "m" {{
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }}
+          prompt "sys" {{ file = "./s.md"  version = "1.0.0" }}
+          agent "a" {{
+            model         = model.m
+            system_prompt = prompt.sys
+            tools         = []
+          }}
+          agent "b" {{
+            model         = model.m
+            system_prompt = prompt.sys
+            tools         = []
+          }}
+          {pipeline_body}
+        }}"#);
+        assert_parse_ok(&src)
+    }
+
+    #[test] fn pipeline_block_parses_with_required_steps_only() {
+        let p = project_with_pipeline(r#"
+          pipeline "two_step" {
+            steps = [agent.a, agent.b]
+          }
+        "#);
+        assert_eq!(p.pipelines.len(), 1);
+        let pl = &p.pipelines[0];
+        assert_eq!(pl.label, "two_step");
+        assert_eq!(pl.steps.len(), 2);
+        assert_eq!(pl.steps[0].kind,  RefKind::Agent);
+        assert_eq!(pl.steps[0].label, "a");
+        assert_eq!(pl.steps[1].label, "b");
+        assert_eq!(pl.input,  None);
+        assert_eq!(pl.output, None);
+    }
+
+    #[test] fn pipeline_block_parses_with_optional_input_output_descriptors() {
+        let p = project_with_pipeline(r#"
+          pipeline "annotated" {
+            steps  = [agent.a]
+            input  = "user request"
+            output = "final reply"
+          }
+        "#);
+        let pl = &p.pipelines[0];
+        assert_eq!(pl.input,  Some("user request".to_string()));
+        assert_eq!(pl.output, Some("final reply".to_string()));
+    }
+
+    #[test] fn pipeline_block_rejects_empty_steps_list() {
+        // PLAN requires the pipeline body to actually compose
+        // SOMETHING — an empty steps[] is a user mistake we catch at
+        // parse time so the runtime never has to.
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              pipeline "empty" {
+                steps = []
+              }
+            }"#,
+            "at least one agent reference",
+        );
+    }
+
+    #[test] fn pipeline_block_rejects_missing_steps() {
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              pipeline "no_steps" {
+                input = "x"
+              }
+            }"#,
+            "missing required attribute `steps`",
+        );
+    }
+
+    #[test] fn pipeline_block_rejects_non_agent_refs_in_steps() {
+        // steps[] MUST hold agent.* refs only.  A `prompt.sys` ref in
+        // steps[] is a category error at parse time (kind mismatch
+        // from `expect_list_of_refs`).
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              prompt "sys" { file = "./s.md"  version = "1.0.0" }
+              pipeline "bad" {
+                steps = [prompt.sys]
+              }
+            }"#,
+            "expects a `agent` reference",
+        );
+    }
+
+    #[test] fn pipeline_block_rejects_unknown_attribute() {
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              pipeline "weird" {
+                steps        = [agent.a]
+                made_up_attr = "x"
+              }
+            }"#,
+            "unknown attribute `made_up_attr`",
+        );
+    }
+
+    #[test] fn pipeline_block_accepts_cross_module_step_refs() {
+        // The `use <module>.<label>` form (v0.3 Tue Week 16) inside
+        // steps[] parses to a Ref with module=Some.  Resolution
+        // against the multi-module symbol table is the checker's
+        // job; the parser just shapes the AST.
+        let p = project_with_pipeline(r#"
+          pipeline "x_module" {
+            steps = [agent.a, use coder.advanced]
+          }
+        "#);
+        let pl = &p.pipelines[0];
+        assert_eq!(pl.steps.len(), 2);
+        assert_eq!(pl.steps[0].module, None);
+        assert_eq!(pl.steps[1].module, Some("coder".to_string()));
+        assert_eq!(pl.steps[1].label,  "advanced");
+        assert_eq!(pl.steps[1].kind,   RefKind::Agent);
+    }
+
+    #[test] fn pipelines_field_omitted_from_json_when_empty() {
+        // Forward-compat pin: a Project with no pipelines must
+        // serialize WITHOUT the `pipelines` field — same discipline
+        // as `mains` (v0.2 Fri).  Keeps v0.2 expected-AST JSON
+        // fixtures byte-stable.
+        let p: Project = Project::default();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("\"pipelines\""),
+            "empty pipelines must NOT serialize; got: {json}");
     }
 }
