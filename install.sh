@@ -13,14 +13,23 @@
 # `sha256sum` (Linux) or `shasum` (macOS).  No bash, no jq.
 #
 # Environment-variable overrides:
-#   REPO      — github "<owner>/<repo>"  (default: aislang/aislang)
-#   VERSION   — tag to install           (default: latest)
-#   PREFIX    — install dir              (default: $HOME/.local/bin)
-#   BASE_URL  — release-asset base URL   (default: https://github.com/$REPO/releases/download)
-#               Useful for rehearsing the installer against a local
-#               HTTP mirror before tagging — the cold-VM rehearsal
-#               (PLAN §Week 11 Thu) uses this. When BASE_URL is set,
-#               VERSION must be a concrete tag (no "latest" resolve).
+#   REPO         — github "<owner>/<repo>"  (default: aislang/aislang)
+#   VERSION      — tag to install           (default: latest)
+#   PREFIX       — install dir              (default: $HOME/.local/bin)
+#   BASE_URL     — release-asset base URL   (default: https://github.com/$REPO/releases/download)
+#                  Useful for rehearsing the installer against a local
+#                  HTTP mirror before tagging — the cold-VM rehearsal
+#                  (PLAN §Week 11 Thu) uses this. When BASE_URL is set,
+#                  VERSION must be a concrete tag (no "latest" resolve).
+#   GITHUB_TOKEN — Personal Access Token (Classic with `repo` scope,
+#     or GH_TOKEN    or fine-grained with read-access to the repo).
+#                  REQUIRED for private repos; ignored for public ones.
+#                  Phase 2 Week 15 Fri (post-Phase-2-close) addition —
+#                  unblocks cold-VM rehearsal against private forks
+#                  before the v0.4 public-launch flip.  When set, the
+#                  installer passes `Authorization: Bearer $TOKEN` on
+#                  every curl call (latest-tag resolve + tarball
+#                  fetch + checksums fetch).
 #
 # Flags:
 #   --check-deps   — skip install, just probe runtime prerequisites
@@ -29,16 +38,30 @@
 #                    Same probe runs at the end of a normal install.
 #
 # Usage:
+#   # public repo (no token):
 #   curl -sSfL https://github.com/aislang/aislang/releases/latest/download/install.sh | sh
 #   PREFIX=/usr/local/bin sudo sh install.sh
 #   VERSION=v0.1.0 sh install.sh
 #   sh install.sh --check-deps        # probe-only, no install
 #
+#   # private repo / fork (token required for assets, NOT for the
+#   # script itself if you've already cloned it — the bootstrap
+#   # one-liner below uses the token for both):
+#   GITHUB_TOKEN=ghp_XXXX REPO=aiSlang/cli \
+#     curl -sSfL -H "Authorization: Bearer $GITHUB_TOKEN" \
+#       "https://raw.githubusercontent.com/${REPO}/main/install.sh" \
+#     | GITHUB_TOKEN=$GITHUB_TOKEN REPO=$REPO sh
+#
 # Strategic note (Decision 34): through v0.1 and v0.2 this script
 # is intentionally distributed via authenticated `gh release
 # download` rather than a public curl one-liner — the script
 # exists and the workflow attaches it to releases, but the
-# public install URL only goes live with v0.3.
+# public install URL only goes live with v0.3.  v0.2 Phase 2
+# close adds GITHUB_TOKEN support so authenticated cold-VM
+# rehearsal works against private forks in the meantime
+# (PLAN §"Three Phase-2-Week-14 lessons" #3 — procedure-only
+# deliverables become live-execution-ready once cred-bearing
+# users actually test).
 
 set -eu
 
@@ -49,10 +72,46 @@ PREFIX="${PREFIX:-$HOME/.local/bin}"
 BASE_URL="${BASE_URL:-}"   # empty → derived from REPO in fetch_assets
 BIN="aislang"
 
+# Either `GH_TOKEN` or `GITHUB_TOKEN` (former wins when both set,
+# matching the `gh` CLI convention).  Empty when neither is set —
+# triggers the public-repo curl path with no Authorization header.
+TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+
 # ── tiny logging helpers ────────────────────────────────────────
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ── authenticated curl wrapper ──────────────────────────────────
+#
+# Drop-in replacement for `curl …` that:
+#   1. Adds `Authorization: Bearer $TOKEN` when TOKEN is non-empty.
+#   2. Uses `--location-trusted` instead of plain `-L` so the
+#      Authorization header survives the cross-origin redirect from
+#      `github.com/…/releases/download/…` to the temporary signed
+#      URL on `objects.githubusercontent.com`.  curl 7.86+ strips
+#      auth on cross-origin redirects by default — the GitHub
+#      releases CDN crosses origins, so without `--location-trusted`
+#      private-repo asset downloads 404 even with a valid token.
+#
+# Cross-origin trust caveat: `--location-trusted` passes the auth
+# header to ANY redirect target.  In practice GitHub redirects only
+# between its own hostnames, so the leak surface is bounded — but
+# users worried about token exposure should use a fine-grained PAT
+# scoped to read-access on the single repo + an expiration date.
+#
+# Callers pass curl args after the function name; the wrapper
+# prepends the auth + redirect flags.  `set --` re-builds positional
+# args so the inner `curl "$@"` invocation passes everything through.
+auth_curl() {
+  if [ -n "$TOKEN" ]; then
+    curl --location-trusted \
+         -H "Authorization: Bearer $TOKEN" \
+         "$@"
+  else
+    curl -L "$@"
+  fi
+}
 
 # ── ensure required tools are on PATH ───────────────────────────
 ensure_deps() {
@@ -149,8 +208,10 @@ resolve_version() {
       die "VERSION=latest is not supported with BASE_URL override; pass a concrete tag."
     fi
     info "resolving latest release tag from github.com/$REPO …"
-    # Follow redirects (-L), print final URL (-w), no body (-o /dev/null).
-    final="$(curl -sSL -o /dev/null -w '%{url_effective}' \
+    # Follow redirects (auth_curl does -L/--location-trusted), print
+    # final URL (-w), no body (-o /dev/null).  Token-aware so private
+    # repos can resolve the latest tag via the same redirect chain.
+    final="$(auth_curl -sS -o /dev/null -w '%{url_effective}' \
       "https://github.com/$REPO/releases/latest")" \
       || die "failed to resolve latest release URL"
     # Final URL shape: .../releases/tag/v0.1.0
@@ -174,12 +235,14 @@ fetch_assets() {
   base="${BASE_URL:-https://github.com/$REPO/releases/download}/${VERSION}"
 
   info "downloading ${base}/${TARBALL}"
-  curl -sSfL -o "$TMPDIR/$TARBALL" "$base/$TARBALL" \
-    || die "failed to download tarball: $base/$TARBALL"
+  auth_curl -sSf -o "$TMPDIR/$TARBALL" "$base/$TARBALL" \
+    || die "failed to download tarball: $base/$TARBALL
+       (private repo? set GITHUB_TOKEN / GH_TOKEN — see header comment)"
 
   info "downloading ${base}/checksums.txt"
-  curl -sSfL -o "$TMPDIR/checksums.txt" "$base/checksums.txt" \
-    || die "failed to download checksums.txt"
+  auth_curl -sSf -o "$TMPDIR/checksums.txt" "$base/checksums.txt" \
+    || die "failed to download checksums.txt
+       (private repo? set GITHUB_TOKEN / GH_TOKEN — see header comment)"
 }
 
 # ── verify sha256 against the published checksums file ──────────
@@ -461,6 +524,13 @@ main() {
   fi
 
   info "aiSlang installer"
+  if [ -n "$TOKEN" ]; then
+    # Print just the first 8 chars so a screen-share / log paste
+    # doesn't leak the full token.  `cut` is POSIX, available
+    # everywhere `sh` runs.
+    token_prefix="$(printf '%s' "$TOKEN" | cut -c1-8)"
+    info "GITHUB_TOKEN / GH_TOKEN detected (${token_prefix}…) — using authenticated download"
+  fi
   ensure_deps
   detect_target
   resolve_version
