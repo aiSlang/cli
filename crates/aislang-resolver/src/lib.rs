@@ -20,7 +20,9 @@ pub mod lockfile;
 pub use lockfile::{Lockfile, LockfileDiff, LockfileError};
 
 use aislang_catalog::{Catalog, CatalogModel};
-use aislang_core::ast::{Model, ModelId, Project};
+use aislang_core::ast::{
+    Agent, Deploy, Eval, Main, McpServer, Model, ModelId, Project, Prompt, Secret,
+};
 use aislang_core::types::OptimizeFor;
 use aislang_core::Warning;
 use serde::Serialize;
@@ -107,18 +109,48 @@ fn check_one_model_id(
 /// block catalog-entry choices plus per-`prompt`-block content hashes
 /// (Tuesday). Week 4 Wed adds oci_digests; week 4 Thu's Compose emitter
 /// consumes the whole struct.
-#[derive(Debug, Clone, Serialize)]
+///
+/// v0.3 Week 16 Wed: multi-module projects (Decision 44.1) produce a
+/// `ResolvedProject` of the same shape but with module-qualified keys
+/// — `model_bindings["<module>.<label>"]` instead of bare `<label>`,
+/// same for `prompt_hashes`.  The merged `project` field concatenates
+/// every module's resource vectors with labels rewritten to
+/// `<module>.<original_label>` so the flat shape preserves uniqueness.
+/// `module_source_hashes` carries per-module SHA-256 of the raw source
+/// bytes — empty for single-file projects (v0.2 baseline);
+/// non-empty for multi-module.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ResolvedProject {
     pub project:         Project,
     pub catalog_version: String,
     /// Map from `model.label` → catalog model ID chosen by the resolver.
     /// `BTreeMap` for deterministic JSON ordering (lockfile reproducibility).
+    ///
+    /// v0.3 multi-module: keys are `<module>.<label>` for resources
+    /// owned by a module; v0.2 single-file: keys are bare `<label>`.
     pub model_bindings:  BTreeMap<String, ModelId>,
     /// Map from `prompt.label` → SHA-256 hex digest of the file content
     /// at resolution time. Used by the lockfile (Wed) to detect prompt-
     /// file edits between runs and by the Compose emitter (Thu) to
     /// embed the hash as a config value for downstream cache-busting.
+    ///
+    /// v0.3 multi-module: keys are `<module>.<label>` (mirrors
+    /// `model_bindings`).
     pub prompt_hashes:   BTreeMap<String, String>,
+
+    /// v0.3 Week 16 Wed — multi-module source-tracking.  Maps each
+    /// declared module (per the project's `aislang.toml`) to the
+    /// SHA-256 hex of the raw `.ais` source bytes at resolve time.
+    /// Empty for single-file projects (v0.2 baseline path); populated
+    /// by [`resolve_multi`].  Drives the lockfile's `modules` field —
+    /// reconciler invalidates ALL modules when any one's hash changes
+    /// (over-broad but safe for v0.3; per-module incremental is a
+    /// v0.5+ carry-over per PLAN-v0_3.md Week 16 Wed row).
+    ///
+    /// `skip_serializing_if = BTreeMap::is_empty` keeps v0.2 fixtures
+    /// + downstream artifacts byte-stable when no manifest is in play.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub module_source_hashes: BTreeMap<String, String>,
     // Wed: pub oci_digests:   BTreeMap<String, String>,
 }
 
@@ -180,7 +212,157 @@ pub fn resolve(project: &Project, catalog: &Catalog, source_dir: &Path)
         catalog_version: catalog.version.clone(),
         model_bindings,
         prompt_hashes,
+        // Single-file projects have no aislang.toml; multi-module
+        // source hashes belong to [`resolve_multi`] (Wed Week 16).
+        module_source_hashes: BTreeMap::new(),
     })
+}
+
+// ============================================================================
+// Multi-module resolver — v0.3 Week 16 Wed
+// ============================================================================
+
+/// Input to [`resolve_multi`] — one entry per module declared in the
+/// project's `aislang.toml`.
+///
+/// `source` is the raw `.ais` bytes (used for the module's SHA-256
+/// source hash in the lockfile).  `source_dir` is the directory the
+/// module's `.ais` lives in — used to resolve relative `prompt.file`
+/// paths inside that module (matching [`resolve`]'s single-file
+/// semantics; each module's prompts resolve against ITS own directory,
+/// not the project root).
+#[derive(Debug, Clone)]
+pub struct ModuleInput {
+    pub project:    Project,
+    pub source:     String,
+    pub source_dir: PathBuf,
+}
+
+/// v0.3 Week 16 Wed — multi-module resolution.
+///
+/// Walks every module in turn, runs the same model + prompt resolution
+/// algorithm as [`resolve`], then merges the outputs into a SINGLE
+/// `ResolvedProject` with module-qualified keys:
+///
+/// - `model_bindings["<module>.<label>"]` for every resolved model
+/// - `prompt_hashes["<module>.<label>"]` for every resolved prompt
+/// - `module_source_hashes["<module>"]` for every module's source
+///   file (drives the lockfile's `modules` section)
+/// - `project` is a merged Project whose resource vectors are the
+///   concatenation of every module's vectors with each resource's
+///   label rewritten to `<module>.<original_label>`.  This preserves
+///   label uniqueness across modules at the AST level (so downstream
+///   duplicate-label checks don't trip on legitimate cross-module
+///   homonyms like two `model "fast"` blocks in different modules).
+///   Note: refs inside the merged project are NOT rewritten on Wed —
+///   Thursday's multi-module emitter handles the ref-resolution mapping
+///   between (containing module, ref) → qualified label.
+///
+/// Modules iterate in `BTreeMap` order for deterministic output
+/// (lockfile reproducibility — same input → byte-identical output).
+pub fn resolve_multi(
+    modules: &BTreeMap<String, ModuleInput>,
+    catalog: &Catalog,
+) -> Result<ResolvedProject, ResolveError> {
+    let mut merged_project = Project::default();
+    // Project name: pinned to "<multi-module>" — Thu Week 16 reads the
+    // actual project name from `aislang.toml` and overrides this.
+    merged_project.name = "<multi-module>".to_string();
+
+    let mut model_bindings        = BTreeMap::new();
+    let mut prompt_hashes         = BTreeMap::new();
+    let mut module_source_hashes  = BTreeMap::new();
+
+    for (mod_name, input) in modules {
+        // Per-module source hash drives lockfile reconciliation.
+        module_source_hashes.insert(
+            mod_name.clone(),
+            sha256_hex_of_bytes(input.source.as_bytes()),
+        );
+
+        // Reuse the single-file resolver for this module's resources.
+        // Then qualify every label with `<module>.` before merging.
+        let module_resolved = resolve(&input.project, catalog, &input.source_dir)?;
+
+        for (label, model_id) in module_resolved.model_bindings {
+            let qualified = format!("{mod_name}.{label}");
+            model_bindings.insert(qualified, model_id);
+        }
+        for (label, hash) in module_resolved.prompt_hashes {
+            let qualified = format!("{mod_name}.{label}");
+            prompt_hashes.insert(qualified, hash);
+        }
+
+        // Merge resource vectors with module-qualified labels.  Refs
+        // inside the resource blocks stay as the parser produced them
+        // (the multi-module emitter on Thu walks them with module
+        // context to resolve cross-module qualifiers).
+        merged_project.models.extend(
+            input.project.models.iter().cloned().map(|m| Model {
+                label: format!("{mod_name}.{}", m.label),
+                ..m
+            }));
+        merged_project.prompts.extend(
+            input.project.prompts.iter().cloned().map(|p| Prompt {
+                label: format!("{mod_name}.{}", p.label),
+                ..p
+            }));
+        merged_project.mcp_servers.extend(
+            input.project.mcp_servers.iter().cloned().map(|s| McpServer {
+                label: format!("{mod_name}.{}", s.label),
+                ..s
+            }));
+        merged_project.agents.extend(
+            input.project.agents.iter().cloned().map(|a| Agent {
+                label: format!("{mod_name}.{}", a.label),
+                ..a
+            }));
+        merged_project.evals.extend(
+            input.project.evals.iter().cloned().map(|e| Eval {
+                label: format!("{mod_name}.{}", e.label),
+                ..e
+            }));
+        merged_project.secrets.extend(
+            input.project.secrets.iter().cloned().map(|s| Secret {
+                label: format!("{mod_name}.{}", s.label),
+                ..s
+            }));
+        merged_project.deploys.extend(
+            input.project.deploys.iter().cloned().map(|d| Deploy {
+                label: format!("{mod_name}.{}", d.label),
+                ..d
+            }));
+        merged_project.mains.extend(
+            input.project.mains.iter().cloned().map(|m| Main {
+                label: format!("{mod_name}.{}", m.label),
+                ..m
+            }));
+
+        // Budget: first module's budget wins (matches `aislang.toml`'s
+        // role as the project root).  Thursday's CLI integration may
+        // pull the budget from a top-level manifest field instead.
+        if merged_project.budget.is_none() {
+            merged_project.budget = input.project.budget.clone();
+        }
+    }
+
+    Ok(ResolvedProject {
+        project: merged_project,
+        catalog_version: catalog.version.clone(),
+        model_bindings,
+        prompt_hashes,
+        module_source_hashes,
+    })
+}
+
+/// SHA-256 of a byte slice as a lowercase hex string.  Mirrors the
+/// helper in `lockfile.rs` so the multi-module resolver doesn't need
+/// to depend on that module.
+fn sha256_hex_of_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }
 
 /// Convenience: resolve against the bundled catalog.
@@ -1132,5 +1314,173 @@ mod tests {
         let json = serde_json::to_string_pretty(&resolved).expect("serialize");
         assert!(json.contains("\"prompt_hashes\""));
         assert!(json.contains("\"system\""));
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 16 Wed — multi-module resolver tests
+    // ---------------------------------------------------------------- //
+
+    /// Helper: parse a labelled `.ais` source string into a Project.
+    /// Used to compose the multi-module fixtures below.
+    fn parse_module_source(label: &str, src: &str) -> aislang_core::ast::Project {
+        aislang_core::validate(src)
+            .unwrap_or_else(|e| panic!(
+                "module `{label}` source failed to validate: {e}"))
+            .0
+    }
+
+    /// Helper: build a two-module ModuleInput map with one model per
+    /// module + a shared system prompt.  Used by the resolve_multi
+    /// happy-path tests.
+    fn two_module_inputs(tmp: &std::path::Path)
+        -> BTreeMap<String, ModuleInput>
+    {
+        std::fs::write(tmp.join("shared_prompt.md"), b"sys prompt body")
+            .expect("write prompt file");
+
+        let shared_src = r#"project "shared" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "thinker" {
+            requires    = [chat]
+            context_min = 200k
+            prefer      = [anthropic.claude_haiku_4_5]
+            pin         = anthropic.claude_haiku_4_5
+          }
+          prompt "sys" { file = "./shared_prompt.md"  version = "1.0.0" }
+        }"#;
+        let app_src = r#"project "app" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "fast" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [anthropic.claude_haiku_4_5]
+            pin         = anthropic.claude_haiku_4_5
+          }
+        }"#;
+
+        let mut modules = BTreeMap::new();
+        modules.insert("shared".to_string(), ModuleInput {
+            project:    parse_module_source("shared", shared_src),
+            source:     shared_src.to_string(),
+            source_dir: tmp.to_path_buf(),
+        });
+        modules.insert("app".to_string(), ModuleInput {
+            project:    parse_module_source("app", app_src),
+            source:     app_src.to_string(),
+            source_dir: tmp.to_path_buf(),
+        });
+        modules
+    }
+
+    #[test] fn resolve_multi_qualifies_model_binding_keys_with_module_name() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aislang-resolve-multi-models-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let modules = two_module_inputs(&tmp);
+        let cat = aislang_catalog::bundled().expect("catalog");
+        let r   = resolve_multi(&modules, &cat).expect("resolve");
+        let _   = std::fs::remove_dir_all(&tmp);
+
+        // Each module's `model.<label>` becomes `<module>.<label>`.
+        // Pins absence of bare keys (which would collide if a future
+        // multi-module project had homonyms).
+        assert!(r.model_bindings.contains_key("shared.thinker"),
+            "expected `shared.thinker` in bindings; got: {:?}",
+            r.model_bindings.keys().collect::<Vec<_>>());
+        assert!(r.model_bindings.contains_key("app.fast"),
+            "expected `app.fast` in bindings; got: {:?}",
+            r.model_bindings.keys().collect::<Vec<_>>());
+        assert!(!r.model_bindings.contains_key("thinker"),
+            "bare `thinker` key must not appear (module qualifier required)");
+        assert!(!r.model_bindings.contains_key("fast"),
+            "bare `fast` key must not appear (module qualifier required)");
+    }
+
+    #[test] fn resolve_multi_records_per_module_source_hashes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aislang-resolve-multi-hashes-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let modules = two_module_inputs(&tmp);
+        let cat = aislang_catalog::bundled().expect("catalog");
+        let r   = resolve_multi(&modules, &cat).expect("resolve");
+        let _   = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(r.module_source_hashes.len(), 2);
+        assert!(r.module_source_hashes.contains_key("shared"));
+        assert!(r.module_source_hashes.contains_key("app"));
+        // Hashes are 64-char hex strings (SHA-256).
+        for (m, h) in &r.module_source_hashes {
+            assert_eq!(h.len(), 64,
+                "module `{m}` hash must be 64 hex chars (SHA-256); got: {h}");
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()),
+                "module `{m}` hash must be hex; got: {h}");
+        }
+        // The two modules have different sources → different hashes.
+        assert_ne!(r.module_source_hashes["shared"],
+                   r.module_source_hashes["app"]);
+    }
+
+    #[test] fn resolve_multi_qualifies_prompt_hash_keys() {
+        // Single prompt in `shared` → key in prompt_hashes should be
+        // `shared.sys` (qualified), NOT bare `sys`.
+        let tmp = std::env::temp_dir().join(format!(
+            "aislang-resolve-multi-prompts-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let modules = two_module_inputs(&tmp);
+        let cat = aislang_catalog::bundled().expect("catalog");
+        let r   = resolve_multi(&modules, &cat).expect("resolve");
+        let _   = std::fs::remove_dir_all(&tmp);
+
+        assert!(r.prompt_hashes.contains_key("shared.sys"),
+            "expected qualified `shared.sys` prompt hash; got keys: {:?}",
+            r.prompt_hashes.keys().collect::<Vec<_>>());
+        assert!(!r.prompt_hashes.contains_key("sys"),
+            "bare `sys` key must not appear");
+    }
+
+    #[test] fn resolve_multi_merged_project_carries_module_qualified_labels() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aislang-resolve-multi-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let modules = two_module_inputs(&tmp);
+        let cat = aislang_catalog::bundled().expect("catalog");
+        let r   = resolve_multi(&modules, &cat).expect("resolve");
+        let _   = std::fs::remove_dir_all(&tmp);
+
+        // Merged project carries every module's resources, qualified.
+        let model_labels: Vec<&str> = r.project.models.iter()
+            .map(|m| m.label.as_str()).collect();
+        assert!(model_labels.contains(&"shared.thinker"),
+            "merged project must carry shared.thinker; got: {model_labels:?}");
+        assert!(model_labels.contains(&"app.fast"),
+            "merged project must carry app.fast; got: {model_labels:?}");
+
+        // First-module's budget wins (BTreeMap ordering: `app` < `shared`).
+        assert!(r.project.budget.is_some(),
+            "merged project must carry a budget from the first module");
+    }
+
+    #[test] fn resolve_multi_iterates_deterministic_module_order() {
+        // BTreeMap ordering pins iteration order — ensures lockfile
+        // reproducibility (same input → byte-identical artifacts).
+        let tmp = std::env::temp_dir().join(format!(
+            "aislang-resolve-multi-order-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let modules = two_module_inputs(&tmp);
+        let cat = aislang_catalog::bundled().expect("catalog");
+        let r1 = resolve_multi(&modules, &cat).expect("first");
+        let r2 = resolve_multi(&modules, &cat).expect("second");
+        let _  = std::fs::remove_dir_all(&tmp);
+
+        // Same inputs → identical model_bindings (key order pinned
+        // by BTreeMap).
+        let k1: Vec<&String> = r1.model_bindings.keys().collect();
+        let k2: Vec<&String> = r2.model_bindings.keys().collect();
+        assert_eq!(k1, k2,
+            "model_bindings key order must be deterministic");
+        let h1: Vec<&String> = r1.module_source_hashes.keys().collect();
+        let h2: Vec<&String> = r2.module_source_hashes.keys().collect();
+        assert_eq!(h1, h2,
+            "module_source_hashes key order must be deterministic");
     }
 }

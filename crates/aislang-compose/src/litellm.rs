@@ -609,6 +609,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         (resolved, catalog)
@@ -645,6 +646,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
 
@@ -665,6 +667,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let cfg = build_config(&resolved, &catalog).expect("build");
@@ -712,6 +715,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let cfg = build_config(&resolved, &catalog).expect("build");
@@ -808,6 +812,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let env = generate_env_example(&resolved);
         assert!(!env.contains("Ollama-on-host hint"),
@@ -839,6 +844,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let env = generate_env_example(&resolved);
         assert!(env.contains("(no provider credentials needed for this resolution)"));
@@ -1114,6 +1120,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let env = generate_env_example(&resolved);
         // Count occurrences — must be exactly one ANTHROPIC_API_KEY line.
@@ -1216,6 +1223,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let cfg = build_config(&resolved, &catalog).expect("build");
@@ -1277,6 +1285,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let yaml = generate_config(&resolved, &catalog).expect("generate");
@@ -1359,6 +1368,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         }
     }
 

@@ -46,6 +46,25 @@ pub struct Lockfile {
     pub model_bindings:  BTreeMap<String, ModelId>,
     pub prompt_hashes:   BTreeMap<String, String>,
     pub oci_digests:     BTreeMap<String, String>,
+
+    /// v0.3 Week 16 Wed — per-module source hashes for multi-module
+    /// projects (Decision 44.1).  Empty for single-file projects
+    /// (`source_hash` above is authoritative); populated by
+    /// [`Lockfile::build`] when the resolved project carries a
+    /// non-empty `module_source_hashes` map.
+    ///
+    /// Reconciliation (see [`reconcile`]): when this map is non-empty,
+    /// EACH module's hash must match the current source; ANY mismatch
+    /// (add / remove / change) triggers `Stale`.  Over-broad invalidation
+    /// is deliberate per PLAN-v0_3.md Week 16 Wed row — per-module
+    /// incremental is a v0.5+ carry-over.
+    ///
+    /// `#[serde(default, skip_serializing_if = BTreeMap::is_empty)]`
+    /// keeps v0.2 lockfiles byte-stable (no `modules` field appears
+    /// when the project is single-file) and lets v0.2 lockfiles
+    /// deserialize cleanly on v0.3 (treated as single-file).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modules: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Error)]
@@ -103,6 +122,39 @@ impl Lockfile {
             model_bindings:  resolved.model_bindings.clone(),
             prompt_hashes:   resolved.prompt_hashes.clone(),
             oci_digests,
+            // v0.3 Week 16 Wed: empty for single-file projects (the
+            // `source_hash` field above is authoritative there);
+            // populated by [`Lockfile::build_multi`] for multi-module.
+            modules: BTreeMap::new(),
+        }
+    }
+
+    /// v0.3 Week 16 Wed — build a lockfile from a multi-module
+    /// [`ResolvedProject`].  Differences from [`Lockfile::build`]:
+    ///
+    /// - `source_hash` is set to the empty string — multi-module
+    ///   projects have no single canonical source.  `modules` is the
+    ///   source-of-truth.
+    /// - `modules` is populated from `resolved.module_source_hashes`.
+    ///
+    /// Callers determine which builder to call based on whether the
+    /// resolved project came from [`crate::resolve`] (single-file)
+    /// or [`crate::resolve_multi`] (multi-module).
+    pub fn build_multi(resolved: &ResolvedProject) -> Self {
+        let oci_digests = resolved
+            .project
+            .mcp_servers
+            .iter()
+            .map(|m| (m.label.clone(), m.image.digest.clone().unwrap_or_default()))
+            .collect();
+        Self {
+            schema_version:  SCHEMA_VERSION,
+            catalog_version: resolved.catalog_version.clone(),
+            source_hash:     String::new(),
+            model_bindings:  resolved.model_bindings.clone(),
+            prompt_hashes:   resolved.prompt_hashes.clone(),
+            oci_digests,
+            modules:         resolved.module_source_hashes.clone(),
         }
     }
 }
@@ -174,8 +226,14 @@ pub fn reconcile(
         ));
     }
 
+    // v0.3 Week 16 Wed: skip the single-file source-hash check when
+    // the lockfile carries a `modules` table — that lockfile was
+    // written by a multi-module project and `source_hash` is empty
+    // (sentinel; see `Lockfile::build_multi`).  Callers reconcile
+    // multi-module lockfiles via [`reconcile_multi`] instead, which
+    // checks the per-module hashes against the current sources.
     let current_source_hash = sha256_hex(source.as_bytes());
-    if lock.source_hash != current_source_hash {
+    if lock.modules.is_empty() && lock.source_hash != current_source_hash {
         reasons.push(format!(
             "source file changed (lockfile hash starts {}, current starts {})",
             short(&lock.source_hash),
@@ -196,6 +254,117 @@ pub fn reconcile(
     // We check both directions: every current entry must match
     // the lockfile, AND the lockfile must not carry stale entries
     // for prompts the user removed from the source.
+    for (label, current_hash) in current_prompt_hashes {
+        match lock.prompt_hashes.get(label) {
+            Some(lock_hash) if lock_hash == current_hash => {}
+            Some(lock_hash) => {
+                reasons.push(format!(
+                    "prompt `{label}` content changed (lockfile hash \
+                     starts {}, current starts {})",
+                    short(lock_hash),
+                    short(current_hash),
+                ));
+            }
+            None => {
+                reasons.push(format!(
+                    "prompt `{label}` added in source (not in lockfile)"));
+            }
+        }
+    }
+    for label in lock.prompt_hashes.keys() {
+        if !current_prompt_hashes.contains_key(label) {
+            reasons.push(format!(
+                "prompt `{label}` removed from source (present in lockfile)"));
+        }
+    }
+
+    if reasons.is_empty() {
+        LockfileDiff::Match
+    } else {
+        LockfileDiff::Stale { reasons }
+    }
+}
+
+/// v0.3 Week 16 Wed — reconcile a multi-module lockfile against the
+/// current per-module source hashes.  Mirrors [`reconcile`] but
+/// substitutes the single-file `source_hash` check with a per-module
+/// hash diff.
+///
+/// `current_module_source_hashes` is keyed by module name; values
+/// are SHA-256 hex of the raw source bytes (matching
+/// [`crate::resolve_multi`]'s output).  Any module added, removed,
+/// or changed since the lockfile was written triggers `Stale` with
+/// per-module reasons — matching the prompt-hash diff style.
+///
+/// Per PLAN-v0_3.md Week 16 Wed: over-broad invalidation by design
+/// (one module changes → re-resolve all modules).  Per-module
+/// incremental rebuilds are v0.5+.
+pub fn reconcile_multi(
+    existing:                     Option<&Lockfile>,
+    current_catalog_version:      &str,
+    current_module_source_hashes: &BTreeMap<String, String>,
+    current_prompt_hashes:        &BTreeMap<String, String>,
+) -> LockfileDiff {
+    let lock = match existing {
+        None    => return LockfileDiff::Fresh,
+        Some(l) => l,
+    };
+
+    let mut reasons = Vec::new();
+
+    if lock.schema_version != SCHEMA_VERSION {
+        reasons.push(format!(
+            "lockfile schema version {} not supported by this aislang \
+             (current: {})",
+            lock.schema_version, SCHEMA_VERSION,
+        ));
+    }
+
+    if lock.catalog_version != current_catalog_version {
+        reasons.push(format!(
+            "catalog version changed: lockfile {}, current {}",
+            lock.catalog_version, current_catalog_version,
+        ));
+    }
+
+    // Per-module source-hash diff.  Mirrors the prompt-hash diff
+    // style (existing v0.2 code below) — three failure modes:
+    //   1. Module modified  → hash differs
+    //   2. Module added     → key in current, missing in lockfile
+    //   3. Module removed   → key in lockfile, missing in current
+    // Every difference is added as its own reason so the user sees
+    // the exact module(s) involved rather than "something changed".
+    for (mod_name, current_hash) in current_module_source_hashes {
+        match lock.modules.get(mod_name) {
+            Some(lock_hash) if lock_hash == current_hash => {}
+            Some(lock_hash) => {
+                reasons.push(format!(
+                    "module `{mod_name}` source changed (lockfile hash \
+                     starts {}, current starts {})",
+                    short(lock_hash),
+                    short(current_hash),
+                ));
+            }
+            None => {
+                reasons.push(format!(
+                    "module `{mod_name}` added to manifest \
+                     (not in lockfile)"));
+            }
+        }
+    }
+    for mod_name in lock.modules.keys() {
+        if !current_module_source_hashes.contains_key(mod_name) {
+            reasons.push(format!(
+                "module `{mod_name}` removed from manifest \
+                 (present in lockfile)"));
+        }
+    }
+
+    // Prompt-hash diff — identical to single-file [`reconcile`]'s
+    // logic.  Multi-module prompts use `<module>.<label>` keys, so
+    // adding/removing a module is also reflected here as prompt-hash
+    // key adds/removes; that's redundant with the module-hash diff
+    // above but cheap and adds detail to the diagnostic.
     for (label, current_hash) in current_prompt_hashes {
         match lock.prompt_hashes.get(label) {
             Some(lock_hash) if lock_hash == current_hash => {}
@@ -269,6 +438,10 @@ mod tests {
             model_bindings:  bindings,
             prompt_hashes:   prompts,
             oci_digests:     digests,
+            // v0.3 Week 16 Wed: single-file synthetic lockfile, so
+            // modules stays empty (drives the "no `modules` field in
+            // JSON" forward-compat test below).
+            modules:         BTreeMap::new(),
         }
     }
 
@@ -512,6 +685,7 @@ mod tests {
             catalog_version: "v-test".to_string(),
             model_bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let source = "project \"demo\" { }";
         let lock = Lockfile::build(source, &resolved);
@@ -544,8 +718,187 @@ mod tests {
             catalog_version: "v-test".to_string(),
             model_bindings: BTreeMap::new(),
             prompt_hashes:  BTreeMap::new(),
+            ..Default::default()
         };
         let lock = Lockfile::build("src", &resolved);
         assert_eq!(lock.oci_digests.get("docs").unwrap(), "");
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 16 Wed — Lockfile multi-module fields + reconcile_multi
+    // ---------------------------------------------------------------- //
+
+    /// Helper: build a synthetic multi-module ResolvedProject for the
+    /// build_multi + reconcile_multi tests.  Two modules `m1` and `m2`
+    /// with distinct source hashes; one prompt per module.
+    fn synthetic_multi_resolved() -> ResolvedProject {
+        let mut hashes = BTreeMap::new();
+        hashes.insert("m1".to_string(), "a".repeat(64));
+        hashes.insert("m2".to_string(), "b".repeat(64));
+        let mut prompts = BTreeMap::new();
+        prompts.insert("m1.sys".to_string(), "1".repeat(64));
+        prompts.insert("m2.sys".to_string(), "2".repeat(64));
+        ResolvedProject {
+            catalog_version: "test-cat-1".to_string(),
+            module_source_hashes: hashes,
+            prompt_hashes: prompts,
+            ..Default::default()
+        }
+    }
+
+    #[test] fn build_multi_clears_source_hash_and_populates_modules() {
+        let resolved = synthetic_multi_resolved();
+        let lock = Lockfile::build_multi(&resolved);
+        // source_hash is the sentinel-empty value — modules is auth.
+        assert_eq!(lock.source_hash, "",
+            "build_multi must NOT populate source_hash (modules drives it)");
+        assert_eq!(lock.modules.len(), 2);
+        assert!(lock.modules.contains_key("m1"));
+        assert!(lock.modules.contains_key("m2"));
+        assert_eq!(lock.modules["m1"], resolved.module_source_hashes["m1"]);
+    }
+
+    #[test] fn modules_field_omitted_from_json_when_empty() {
+        // Forward-compat: single-file lockfiles must serialize WITHOUT
+        // the `modules` field so v0.2 lockfile fixtures (if any) stay
+        // byte-stable + the typical single-file lockfile stays
+        // visually clean.
+        let lock = synthetic_lockfile(); // single-file (modules empty)
+        let json = serde_json::to_string(&lock).expect("serialize");
+        assert!(!json.contains("\"modules\""),
+            "single-file lockfile must NOT carry a `modules` field; \
+             got: {json}");
+    }
+
+    #[test] fn modules_field_round_trips_through_json_when_populated() {
+        let resolved = synthetic_multi_resolved();
+        let lock = Lockfile::build_multi(&resolved);
+        let json = serde_json::to_string(&lock).expect("serialize");
+        assert!(json.contains("\"modules\""),
+            "multi-module lockfile must serialize `modules` field; got: {json}");
+        let back: Lockfile = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.modules, lock.modules);
+    }
+
+    #[test] fn v02_lockfile_without_modules_field_deserializes_cleanly() {
+        // Pin forward-compat: a JSON shape with no `modules` key
+        // (v0.2 on-disk format) must deserialize on v0.3 with
+        // modules = empty BTreeMap.  This protects users who upgrade
+        // mid-project from spurious schema-mismatch errors.
+        let v02_json = r#"{
+            "schema_version":   1,
+            "catalog_version":  "x",
+            "source_hash":      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "model_bindings":   {},
+            "prompt_hashes":    {},
+            "oci_digests":      {}
+        }"#;
+        let lock: Lockfile = serde_json::from_str(v02_json).expect("parse v0.2");
+        assert!(lock.modules.is_empty(),
+            "missing `modules` field must default to empty");
+    }
+
+    #[test] fn reconcile_multi_matches_when_hashes_align() {
+        let resolved = synthetic_multi_resolved();
+        let lock = Lockfile::build_multi(&resolved);
+        let diff = reconcile_multi(
+            Some(&lock),
+            &resolved.catalog_version,
+            &resolved.module_source_hashes,
+            &resolved.prompt_hashes,
+        );
+        assert_eq!(diff, LockfileDiff::Match,
+            "all hashes identical → reconcile_multi must report Match");
+    }
+
+    #[test] fn reconcile_multi_stale_when_one_module_changed() {
+        let resolved = synthetic_multi_resolved();
+        let lock = Lockfile::build_multi(&resolved);
+        let mut current = resolved.module_source_hashes.clone();
+        // Mutate m1's source hash — simulate user editing m1.ais.
+        current.insert("m1".to_string(), "c".repeat(64));
+        let diff = reconcile_multi(
+            Some(&lock),
+            &resolved.catalog_version,
+            &current,
+            &resolved.prompt_hashes,
+        );
+        match diff {
+            LockfileDiff::Stale { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("module `m1`")),
+                    "reasons must name the changed module; got: {reasons:?}");
+                assert!(reasons.iter().any(|r| r.contains("source changed")),
+                    "reasons must explain what changed; got: {reasons:?}");
+            }
+            other => panic!("expected Stale; got {other:?}"),
+        }
+    }
+
+    #[test] fn reconcile_multi_stale_when_module_added_to_manifest() {
+        let resolved = synthetic_multi_resolved();
+        let lock = Lockfile::build_multi(&resolved);
+        let mut current = resolved.module_source_hashes.clone();
+        current.insert("m3".to_string(), "d".repeat(64));
+        let diff = reconcile_multi(
+            Some(&lock),
+            &resolved.catalog_version,
+            &current,
+            &resolved.prompt_hashes,
+        );
+        match diff {
+            LockfileDiff::Stale { reasons } => {
+                assert!(reasons.iter().any(|r|
+                    r.contains("module `m3`") && r.contains("added")),
+                    "reasons must name the newly-added module; got: {reasons:?}");
+            }
+            other => panic!("expected Stale; got {other:?}"),
+        }
+    }
+
+    #[test] fn reconcile_multi_stale_when_module_removed_from_manifest() {
+        let resolved = synthetic_multi_resolved();
+        let lock = Lockfile::build_multi(&resolved);
+        let mut current = resolved.module_source_hashes.clone();
+        current.remove("m2");
+        let diff = reconcile_multi(
+            Some(&lock),
+            &resolved.catalog_version,
+            &current,
+            &resolved.prompt_hashes,
+        );
+        match diff {
+            LockfileDiff::Stale { reasons } => {
+                assert!(reasons.iter().any(|r|
+                    r.contains("module `m2`") && r.contains("removed")),
+                    "reasons must name the removed module; got: {reasons:?}");
+            }
+            other => panic!("expected Stale; got {other:?}"),
+        }
+    }
+
+    #[test] fn reconcile_multi_fresh_when_no_lockfile() {
+        let resolved = synthetic_multi_resolved();
+        let diff = reconcile_multi(
+            None,
+            &resolved.catalog_version,
+            &resolved.module_source_hashes,
+            &resolved.prompt_hashes,
+        );
+        assert_eq!(diff, LockfileDiff::Fresh,
+            "no on-disk lockfile → Fresh, same as the single-file case");
+    }
+
+    #[test] fn reconcile_single_file_ignores_modules_field_when_empty() {
+        // Pin that a single-file Lockfile (modules empty) still
+        // reconciles via the legacy source_hash check unchanged.
+        // This is the regression-guard for v0.2 lockfiles after the
+        // Wed schema extension.
+        let mut lock = synthetic_lockfile();   // modules: empty
+        let source = "project \"demo\" { }";
+        lock.source_hash = sha256_hex(source.as_bytes());
+        // Reuse the legacy reconcile() — must still report Match.
+        let diff = reconcile(
+            source, Some(&lock), &lock.catalog_version, &lock.prompt_hashes);
+        assert_eq!(diff, LockfileDiff::Match);
     }
 }

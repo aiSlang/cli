@@ -443,6 +443,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  Btm::new(),
             prompt_hashes:   Btm::new(),
+            ..Default::default()
         }
     }
 
@@ -460,6 +461,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  Btm::new(),
             prompt_hashes:   Btm::new(),
+            ..Default::default()
         }
     }
 
@@ -710,6 +712,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  Btm::new(),
             prompt_hashes:   Btm::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, &empty_sources()).expect("emit");
@@ -869,6 +872,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  Btm::new(),
             prompt_hashes,
+            ..Default::default()
         }
     }
 
@@ -1197,6 +1201,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  Btm::new(),
             prompt_hashes:   Btm::new(),
+            ..Default::default()
         }
     }
 

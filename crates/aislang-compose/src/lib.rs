@@ -715,6 +715,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  bindings,
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
@@ -746,6 +747,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
@@ -958,6 +960,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         };
         let catalog = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, std::path::Path::new("/tmp"))
@@ -1000,6 +1003,7 @@ mod tests {
             catalog_version: "test".into(),
             model_bindings:  BTreeMap::new(),
             prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
         }
     }
 
