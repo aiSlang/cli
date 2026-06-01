@@ -4,6 +4,27 @@
 
 **Status:** **v0.2.0-rc2** (Phase 2 close — Track B foundation shipped: K8s emitter + Helm chart wrapper + Open WebUI + Ingress + OTel pod-wiring + kind/k3s CI smoke + GKE rehearsal procedure).  v0.2.0 final tag is **DoD-blocked** on the Phase 1 leftover (centralized `~/.aislang/store.json` — gates source-conditional budget enforcement) — scheduled for Phase 3 Week 16 Mon; until then the latest released tag stays v0.2.0-rc2.  See [PLAN-90-days-v0_2.md](PLAN-90-days-v0_2.md) for the v0.2 plan + Phase 2 close totals + Phase 3 Week 16 day-by-day, [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md) for the v0.1 archive, and [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md) for the language reference.
 
+## Install
+
+```sh
+# Public repo (post-v0.4 launch).  Detects OS+arch, fetches the
+# matching tarball from GitHub Releases, verifies sha256, installs
+# the `aislang` binary into $HOME/.local/bin.
+curl -sSfL https://github.com/aislang/aislang/releases/latest/download/install.sh | sh
+```
+
+```sh
+# Private repo / fork (current v0.2/v0.3 state — repo not yet public).
+# Create a Classic PAT with `repo` scope OR a fine-grained PAT with
+# read-access to the single repo: https://github.com/settings/tokens
+GITHUB_TOKEN=ghp_XXXX REPO=aiSlang/cli \
+  curl -sSfL -H "Authorization: Bearer $GITHUB_TOKEN" \
+    "https://raw.githubusercontent.com/${REPO}/main/install.sh" \
+  | GITHUB_TOKEN=$GITHUB_TOKEN REPO=$REPO sh
+```
+
+`GITHUB_TOKEN` (or `GH_TOKEN`) is honoured for all release-asset downloads.  `sh install.sh --check-deps` probes for runtime prerequisites (docker / docker compose / helm / kubectl / kind) and prints per-distro install hints without running the binary install.  Full install.sh option surface: see the script header.
+
 ## Quick taste
 
 ```hcl
