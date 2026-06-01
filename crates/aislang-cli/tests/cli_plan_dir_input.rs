@@ -90,19 +90,28 @@ fn bin() -> Command { Command::new(env!("CARGO_BIN_EXE_aislang")) }
         "stdout must report the module count; got:\n{stdout}");
 }
 
-#[test] fn apply_dir_input_errors_with_workaround_hint() {
+#[test] fn apply_dir_input_proceeds_past_planning_phase() {
+    // v0.3 Week 16 follow-up (post-Fri close): `aislang apply <dir>`
+    // is now wired through load_project_input + prepare_stack +
+    // the multi-module-aware K8s emit / Compose emit branches.  The
+    // old workaround-hint guard is gone.  In CI Docker isn't
+    // available, so apply hits the graceful-degrade branch +
+    // exits 0 with the artifacts written to disk.  We pin only
+    // the user-visible contract change: the OLD guard message is
+    // never produced.
     let dir = examples_dir().join("multi-module-demo");
     let out = bin().args(["apply"]).arg(&dir)
         .output().expect("spawn aislang");
-    assert!(!out.status.success(),
-        "apply on dir must NOT silently succeed pre-Fri");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not yet accept a directory"),
-        "error must explain the limitation; got:\n{stderr}");
-    assert!(stderr.contains("aislang plan"),
-        "error must point at the workaround; got:\n{stderr}");
-    assert!(stderr.contains("docker compose") || stderr.contains("helm upgrade"),
-        "workaround must show the next command; got:\n{stderr}");
+    assert!(!stderr.contains("does not yet accept a directory"),
+        "the v0.3 Thu workaround-hint guard must be removed; got:\n{stderr}");
+    // Cleanup any artifacts the apply may have written into the
+    // fixture dir so the test is re-runnable.
+    for f in [
+        "stack.yml", "litellm_config.yaml", ".env.example", "aislang.lock",
+    ] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
 }
 
 #[test] fn plan_single_file_input_still_works() {

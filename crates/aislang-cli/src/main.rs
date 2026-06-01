@@ -575,6 +575,42 @@ struct LoadedProject {
     /// per-module hashes in `resolved.module_source_hashes` drive
     /// reconciliation via `reconcile_multi`).
     single_file_source: String,
+    /// Project name used by state.json + display banners.  Single-
+    /// file: the `project "<name>" { … }` block's label.  Multi-
+    /// module: `aislang.toml`'s `[project] name` field.
+    project_name: String,
+}
+
+impl LoadedProject {
+    /// Deterministic content hash used by state.json + diff messages.
+    /// Single-file: SHA-256 of the `.ais` source bytes (matches v0.2
+    /// `Lockfile::source_hash`).  Multi-module: SHA-256 of a stable
+    /// concatenation of every module's name + body bytes (matches
+    /// the K8s pod-template `aislang.project-hash` annotation shape
+    /// from `services::sha256_hex_of_multi_module`, minus the
+    /// manifest/lockfile parts since state.json wants a hash of
+    /// the SOURCE INPUTS only — manifest changes implicitly through
+    /// module list changes, lockfile is derived).
+    fn effective_source_hash(&self) -> String {
+        if self.is_multi_module {
+            // Concatenate every module's name + body bytes with the
+            // same `module:` / `||` separator pattern the K8s emitter
+            // uses for the pod-template `aislang.project-hash`
+            // annotation (see `services::sha256_hex_of_multi_module`)
+            // — minus manifest + lockfile which are derived inputs.
+            let mut combined = Vec::with_capacity(2048);
+            for (name, body) in &self.sources.modules {
+                combined.extend_from_slice(b"module:");
+                combined.extend_from_slice(name.as_bytes());
+                combined.extend_from_slice(b"||");
+                combined.extend_from_slice(body.as_bytes());
+                combined.extend_from_slice(b"||");
+            }
+            aislang_runtime::hex_sha256(&combined)
+        } else {
+            aislang_runtime::hex_sha256(self.single_file_source.as_bytes())
+        }
+    }
 }
 
 /// Load a project from a CLI positional path argument.  If the path
@@ -642,6 +678,7 @@ fn load_single_file_project(file: &Path) -> Result<LoadedProject> {
         ..Default::default()
     };
 
+    let project_name = resolved.project.name.clone();
     Ok(LoadedProject {
         resolved,
         warnings,
@@ -649,6 +686,7 @@ fn load_single_file_project(file: &Path) -> Result<LoadedProject> {
         sources,
         project_root: source_dir.to_path_buf(),
         single_file_source: source,
+        project_name,
     })
 }
 
@@ -757,6 +795,7 @@ fn load_multi_module_project(dir: &Path) -> Result<LoadedProject> {
         sources,
         project_root: dir.to_path_buf(),
         single_file_source: String::new(),
+        project_name: manifest.project.name.clone(),
     })
 }
 
@@ -1454,11 +1493,15 @@ struct PreparedStack {
     /// Apply doesn't expose `--no-lock` in v0.1 — it always reconciles.
     lock_path:           Option<PathBuf>,
     /// Week 10 Tue: `aislang apply` reads these to populate the
-    /// state file (`.aislang/state.json`). `source` is held verbatim
-    /// rather than hashed eagerly so apply can compute `source_hash`
-    /// with the same sha256 helper the runtime uses for prompt
-    /// hashing — keeps "source identity" one consistent thing.
-    source:              String,
+    /// state file (`.aislang/state.json`).
+    ///
+    /// v0.3 Week 17 (post Week 16): `source_hash` is now the
+    /// already-computed effective hash (single-file: SHA-256 of
+    /// `.ais` bytes; multi-module: SHA-256 of stable concatenation
+    /// of every module's name + body bytes — see
+    /// [`LoadedProject::effective_source_hash`]).  Apply writes
+    /// this directly to state.json; no second hashing pass.
+    source_hash:         String,
     project_name:        String,
     catalog_version:     String,
 }
@@ -1477,61 +1520,64 @@ fn prepare_stack(
     no_lock:    bool,
     verbose:    u8,
 ) -> Result<PreparedStack> {
-    let source = std::fs::read_to_string(file)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    // v0.3 Week 17 (follow-up to Week 16 Fri close): route through
+    // load_project_input so multi-module dirs work end-to-end.  The
+    // load_*_project helpers already handle parse + check_multi +
+    // catalog-check + resolve for both single-file and multi-module
+    // inputs, returning a uniform LoadedProject.
+    let loaded = load_project_input(file)?;
 
     let output_dir_buf: PathBuf = match output_dir {
         Some(p) => p.to_path_buf(),
-        None    => source_dir.to_path_buf(),
+        None    => loaded.project_root.clone(),
     };
     let output_dir = std::fs::canonicalize(&output_dir_buf).map_err(|e| {
         anyhow::anyhow!("output dir `{}` doesn't exist or unreadable: {e}",
             output_dir_buf.display())
     })?;
 
-    // Stage 1: validate.
-    let (project, mut warnings) = match aislang_core::validate(&source) {
-        Ok(v) => v,
-        Err(err) => {
-            render_validate_error(&source, &err);
-            return Err(anyhow::anyhow!("(see error above)"));
-        }
-    };
-    // Stage 2: catalog ID validation.
-    match aislang_resolver::check_against_bundled_catalog(&project) {
-        Ok(cat_warnings) => warnings.extend(cat_warnings),
-        Err(e) => return Err(anyhow::anyhow!("catalog error: {e}")),
-    }
-    // Stage 3: resolve.
-    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
-        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
-    // Stage 4: lockfile.
+    // Lockfile reconciliation — multi-module branches to reconcile_
+    // multi (per-module hash diff); single-file keeps the v0.2 path.
     let lock_path = output_dir.join("aislang.lock");
     let lock_path_out: Option<PathBuf> = if no_lock {
         None
     } else {
         let existing = aislang_resolver::lockfile::read(&lock_path)
             .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
-        let diff = aislang_resolver::lockfile::reconcile(
-            &source, existing.as_ref(), &resolved.catalog_version,
-            &resolved.prompt_hashes,
-        );
+        let diff = if loaded.is_multi_module {
+            aislang_resolver::lockfile::reconcile_multi(
+                existing.as_ref(),
+                &loaded.resolved.catalog_version,
+                &loaded.resolved.module_source_hashes,
+                &loaded.resolved.prompt_hashes,
+            )
+        } else {
+            aislang_resolver::lockfile::reconcile(
+                &loaded.single_file_source, existing.as_ref(),
+                &loaded.resolved.catalog_version,
+                &loaded.resolved.prompt_hashes,
+            )
+        };
         match diff {
             aislang_resolver::LockfileDiff::Match => {}
             aislang_resolver::LockfileDiff::Fresh
             | aislang_resolver::LockfileDiff::Stale { .. } => {
-                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                let new_lock = if loaded.is_multi_module {
+                    aislang_resolver::Lockfile::build_multi(&loaded.resolved)
+                } else {
+                    aislang_resolver::Lockfile::build(
+                        &loaded.single_file_source, &loaded.resolved)
+                };
                 aislang_resolver::lockfile::write(&lock_path, &new_lock)
                     .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
             }
         }
         Some(lock_path)
     };
-    // Stage 5: emit + write supporting files.
+    // Emit + write supporting files.
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
-    let artifacts = aislang_compose::emit(&resolved, &catalog, &output_dir)
+    let artifacts = aislang_compose::emit(&loaded.resolved, &catalog, &output_dir)
         .map_err(|e| anyhow::anyhow!("compose emit error: {e}"))?;
     let litellm_config_path = output_dir.join(aislang_compose::LITELLM_CONFIG_FILENAME);
     std::fs::write(&litellm_config_path, &artifacts.litellm_config)
@@ -1540,9 +1586,9 @@ fn prepare_stack(
     std::fs::write(&env_example_path, &artifacts.env_example)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", env_example_path.display()))?;
 
-    if verbose >= 1 && !warnings.is_empty() {
+    if verbose >= 1 && !loaded.warnings.is_empty() {
         eprintln!("warnings:");
-        for w in &warnings {
+        for w in &loaded.warnings {
             eprintln!("  - {}", w.message);
         }
     }
@@ -1553,36 +1599,19 @@ fn prepare_stack(
         litellm_config_path,
         env_example_path,
         lock_path: lock_path_out,
-        source,
-        project_name:    project.name.clone(),
-        catalog_version: resolved.catalog_version.clone(),
+        source_hash:     loaded.effective_source_hash(),
+        project_name:    loaded.project_name.clone(),
+        catalog_version: loaded.resolved.catalog_version.clone(),
     })
 }
 
 /// `aislang apply <file>` — plan, then `docker compose up -d`.
 fn run_apply(file: PathBuf) -> Result<()> {
-    // v0.3 Week 16 Thu: directory input not yet wired through the
-    // apply path (state writing + Compose stack-up touch many
-    // single-file assumptions).  For Thu, give a clear error that
-    // points at the workaround: run `aislang plan <dir>` then bring
-    // the stack up via the generated artifacts directly.  Full dir-
-    // input apply lands as a v0.3 carry-over (Week 17 / Fri close).
-    if file.is_dir() {
-        return Err(anyhow::anyhow!(
-            "`aislang apply` does not yet accept a directory input \
-             (multi-module projects).  Workaround: run\n\
-             \n  \
-             aislang plan {} && \\\n    \
-             docker compose -f {}/stack.yml up -d   # Compose target\n    \
-             helm upgrade --install <release> {}/chart  # Kubernetes target\n\
-             \nDirectory-input apply lands in Week 16 Fri close \
-             (v0.3 carry-over).",
-            file.display(), file.display(), file.display(),
-        ));
-    }
     // Phase 2 Week 14 Thu — dispatch on the declared deploy target.
     // `target = kubernetes` deploys go through the helm path; v0.1
-    // Compose path (the rest of this function) is unchanged.
+    // Compose path (the rest of this function) is unchanged.  v0.3
+    // Week 16 follow-up: `peek_deploy_target` now accepts dir-input
+    // too (multi-module manifest path).
     match peek_deploy_target(&file)? {
         aislang_core::types::DeployTarget::Kubernetes => {
             return run_apply_k8s(file);
@@ -1636,10 +1665,9 @@ fn run_apply(file: PathBuf) -> Result<()> {
     // persist the audit-trail record. Users can re-run apply or
     // file the missing state manually.
     let state_path = aislang_runtime::state_path_in(&prep.output_dir);
-    let source_hash = aislang_runtime::hex_sha256(prep.source.as_bytes());
     let state = aislang_runtime::new_applied_state(
         &prep.project_name,
-        source_hash,
+        prep.source_hash.clone(),
         &prep.catalog_version,
         stack_path.clone(),
     );
@@ -1682,8 +1710,20 @@ fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
         }
     }
 
-    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
+    // v0.3 Week 16 follow-up: dir input → output_dir IS the project
+    // dir (where aislang.toml + emitted artifacts live).  File input
+    // → parent dir, matching v0.2.  `Path::parent` returns Some("")
+    // for single-component relative paths like `foo.ais`, so the
+    // empty-string guard mirrors `load_single_file_project`.
+    let source_dir: PathBuf = if file.is_dir() {
+        file.clone()
+    } else {
+        match file.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    };
+    let output_dir = std::fs::canonicalize(&source_dir).map_err(|e| {
         anyhow::anyhow!("source directory `{}` not readable: {e}",
             source_dir.display())
     })?;
@@ -1793,76 +1833,65 @@ fn run_destroy(file: PathBuf, force: bool) -> Result<()> {
 ///      `stack_yaml_path` — repurposed for k8s; v0.3 may add a
 ///      proper target field)
 fn run_apply_k8s(file: PathBuf) -> Result<()> {
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let output_dir = std::fs::canonicalize(source_dir).map_err(|e| {
-        anyhow::anyhow!("source directory `{}` not readable: {e}",
-            source_dir.display())
-    })?;
+    // v0.3 Week 16 follow-up: load_project_input handles single-file
+    // (file arg) OR multi-module (dir arg).  The K8s emit then reads
+    // `sources.is_multi_module()` and routes to the per-module CM
+    // shape Thu wired in.
+    let loaded = load_project_input(&file)?;
+    let output_dir = std::fs::canonicalize(&loaded.project_root)
+        .map_err(|e| anyhow::anyhow!(
+            "project dir `{}` not readable: {e}",
+            loaded.project_root.display()))?;
 
-    // ── Stage 1: validate. ──
-    let (project, _warnings) = match aislang_core::validate(&source) {
-        Ok(v) => v,
-        Err(err) => {
-            render_validate_error(&source, &err);
-            return Err(anyhow::anyhow!("(see error above)"));
-        }
-    };
-    // ── Stage 2: catalog ID check. ──
-    aislang_resolver::check_against_bundled_catalog(&project)
-        .map_err(|e| anyhow::anyhow!("catalog error: {e}"))?;
-    // ── Stage 3: resolve. ──
-    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
-        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
-    // ── Stage 4: lockfile (always reconciled in apply path —
-    //    same posture as v0.1 Compose apply). ──
+    // ── Lockfile (always reconciled in apply path — same posture
+    //    as v0.1 Compose apply).  Multi-module branches to
+    //    reconcile_multi + build_multi. ──
     let lock_path = output_dir.join("aislang.lock");
     {
         let existing = aislang_resolver::lockfile::read(&lock_path)
             .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
-        let diff = aislang_resolver::lockfile::reconcile(
-            &source, existing.as_ref(),
-            &resolved.catalog_version, &resolved.prompt_hashes,
-        );
+        let diff = if loaded.is_multi_module {
+            aislang_resolver::lockfile::reconcile_multi(
+                existing.as_ref(),
+                &loaded.resolved.catalog_version,
+                &loaded.resolved.module_source_hashes,
+                &loaded.resolved.prompt_hashes,
+            )
+        } else {
+            aislang_resolver::lockfile::reconcile(
+                &loaded.single_file_source, existing.as_ref(),
+                &loaded.resolved.catalog_version,
+                &loaded.resolved.prompt_hashes,
+            )
+        };
         match diff {
             aislang_resolver::LockfileDiff::Match => {}
             aislang_resolver::LockfileDiff::Fresh
             | aislang_resolver::LockfileDiff::Stale { .. } => {
-                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                let new_lock = if loaded.is_multi_module {
+                    aislang_resolver::Lockfile::build_multi(&loaded.resolved)
+                } else {
+                    aislang_resolver::Lockfile::build(
+                        &loaded.single_file_source, &loaded.resolved)
+                };
                 aislang_resolver::lockfile::write(&lock_path, &new_lock)
                     .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
             }
         }
     }
 
-    // ── Stage 5: load prompt bodies for the ProjectSources bag. ──
+    // ── ProjectSources for the emitter — load_project_input already
+    //    populated `ais_source` (single-file) or `modules` + `manifest`
+    //    (multi-module) + prompt_bodies; we just attach the lockfile
+    //    body that we may have just written. ──
     let lockfile_body = std::fs::read_to_string(&lock_path).ok();
-    let mut prompt_bodies: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for prompt in &project.prompts {
-        let abs = if prompt.file.is_absolute() {
-            prompt.file.clone()
-        } else {
-            source_dir.join(&prompt.file)
-        };
-        let body = std::fs::read_to_string(&abs)
-            .map_err(|e| anyhow::anyhow!(
-                "read prompt `{}` from {}: {e}",
-                prompt.label, abs.display()))?;
-        prompt_bodies.insert(prompt.label.clone(), body);
-    }
-    let sources = aislang_k8s::ProjectSources {
-        ais_source:    source.clone(),
-        lockfile:      lockfile_body,
-        prompt_bodies,
-        ..Default::default()
-    };
+    let mut sources = loaded.sources.clone();
+    sources.lockfile = lockfile_body;
 
-    // ── Stage 6: emit. ──
+    // ── Emit. ──
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("catalog load error: {e}"))?;
-    let artifacts = aislang_k8s::emit(&resolved, &catalog, &sources)
+    let artifacts = aislang_k8s::emit(&loaded.resolved, &catalog, &sources)
         .map_err(|e| anyhow::anyhow!("k8s emit error: {e}"))?;
 
     // ── Stage 7: write manifests/ + chart/ to disk. ──
@@ -1890,7 +1919,7 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
     }
 
     // Pick the deploy label (== Helm release name per Decision 43.1).
-    let release_name = resolved.project.deploys.iter()
+    let release_name = loaded.resolved.project.deploys.iter()
         .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
         .map(|d| d.label.clone())
         .unwrap_or_else(|| "aislang".to_string());
@@ -1915,7 +1944,7 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
     // proceeds so the rest of the stack is in place when the user
     // fixes the Secret afterwards.
     let referenced_vars =
-        aislang_compose::litellm::referenced_env_vars(&resolved);
+        aislang_compose::litellm::referenced_env_vars(&loaded.resolved);
     preflight_check_providers_secret(&referenced_vars);
 
     // ── Stage 8: shell to `helm upgrade --install` (or graceful-degrade). ──
@@ -1944,11 +1973,10 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
     //    (where destroy can find the release name + manifests for the
     //    rare `helm uninstall` fallback to kubectl).
     let state_path = aislang_runtime::state_path_in(&output_dir);
-    let source_hash = aislang_runtime::hex_sha256(source.as_bytes());
     let state = aislang_runtime::new_applied_state(
-        &project.name,
-        source_hash,
-        &resolved.catalog_version,
+        &loaded.project_name,
+        loaded.effective_source_hash(),
+        &loaded.resolved.catalog_version,
         chart_dir.clone(),
     );
     match aislang_runtime::write_state_atomic(&state_path, &state) {
@@ -2349,8 +2377,18 @@ fn preflight_warn_non_ascii_secret_values(non_ascii_vars: &[String]) {
 /// source as a result; the second validate is cheap (parser is fast)
 /// and `aislang validate` happens often anyway.
 fn peek_deploy_target(file: &Path) -> Result<aislang_core::types::DeployTarget> {
-    // Mirror the existing destroy-path wording ("source ... not
-    // readable") so error-message tests don't fragment by code path.
+    // v0.3 Week 16 follow-up: dir input goes through load_project_
+    // input which scans the merged ResolvedProject's deploys; file
+    // input keeps the v0.2 lightweight parser-only path so the
+    // existing "source ... not readable" diagnostic shape stays
+    // stable for error-message tests.
+    if file.is_dir() {
+        let loaded = load_project_input(file)?;
+        return Ok(loaded.resolved.project.deploys.iter()
+            .find(|d| d.target == aislang_core::types::DeployTarget::Kubernetes)
+            .map(|_| aislang_core::types::DeployTarget::Kubernetes)
+            .unwrap_or(aislang_core::types::DeployTarget::Compose));
+    }
     let source = std::fs::read_to_string(file)
         .map_err(|e| anyhow::anyhow!("source file `{}` not readable: {e}",
             file.display()))?;

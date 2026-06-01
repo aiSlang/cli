@@ -158,6 +158,110 @@ def _find_usage(obj: Any, depth: int = 0) -> dict | None:
     return None
 
 
+# ── chat active-time aggregation (post-Week-16 follow-up) ──────────
+
+# Inter-message gap (seconds) below which we count the gap as
+# "active chat time."  Above this we treat the gap as idle (user
+# walked away, slept, switched repos) and stop the running clock
+# until the next message.
+#
+# 5 minutes balances two failure modes:
+#   - Too low (e.g. 60s): a single thoughtful pause where the user
+#     reads a long tool result resets the clock, undercounting time.
+#   - Too high (e.g. 30m): a coffee break / overnight session that
+#     resumed the next morning gets counted as continuous, wildly
+#     overcounting time.
+#
+# 300s captures "user is typing / model is replying / user is reading
+# tool output" — anything where the chat session is the user's
+# primary focus.  Tunable here without rerunning anything else.
+CHAT_ACTIVE_GAP_THRESHOLD_SEC: int = 300
+
+
+def aggregate_chat_active_time_per_date(
+    project_filter: str | None = None,
+) -> dict[str, float]:
+    """Walk Claude session JSONLs and return per-date "active chat
+    seconds".  Same project-filter semantics as
+    [`aggregate_tokens_per_date`].
+
+    Algorithm: per session (one .jsonl file), sort messages by
+    timestamp.  For each consecutive pair (cur, nxt):
+      - If `nxt.ts - cur.ts < THRESHOLD`, attribute the delta to the
+        date of `cur.ts` (so cross-midnight sessions split between
+        two date buckets the same way tokens do).
+      - Else (idle gap), contribute nothing.
+
+    The first message of each session contributes nothing on its
+    own (active time is INTER-message).  This under-counts solo-
+    message sessions (e.g. a quick `/perf-stat` invocation that
+    doesn't reply) — fine for our use case where chat duration
+    matters most for sessions that actually exchanged work.
+
+    Returns `{YYYY-MM-DD: float seconds}` across all matched
+    sessions.
+
+    Failures swallowed silently: corrupt JSONL lines, missing
+    timestamps, or unparseable date strings contribute zero.
+    """
+    out: dict[str, float] = defaultdict(float)
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return {}
+    needle = project_filter.lower() if project_filter else None
+    for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        if needle and needle not in project_dir.name.lower():
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            # Per-session list of (parsed_datetime, date_string).
+            stamps: list[tuple[datetime, str]] = []
+            try:
+                with jsonl.open() as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        ts = r.get("timestamp")
+                        if not ts or not isinstance(ts, str):
+                            continue
+                        try:
+                            # Normalize to a timezone-aware datetime;
+                            # `fromisoformat` handles `+02:00` and `Z`
+                            # suffix forms (Python 3.11+).
+                            ts_norm = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+                            dt = datetime.fromisoformat(ts_norm)
+                        except ValueError:
+                            continue
+                        stamps.append((dt, ts[:10]))
+            except OSError:
+                continue
+            stamps.sort(key=lambda x: x[0])
+            for i in range(len(stamps) - 1):
+                delta = (stamps[i + 1][0] - stamps[i][0]).total_seconds()
+                if 0 < delta < CHAT_ACTIVE_GAP_THRESHOLD_SEC:
+                    out[stamps[i][1]] += delta
+    return dict(out)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Compact human-readable duration.  0 → '—'; <60s → 'Ns'; <1h →
+    'Nm'; >=1h → 'Hh Mm'.  Right-aligns in a 7-char field for table
+    rendering."""
+    if seconds <= 0:
+        return "    —"
+    if seconds < 60:
+        return f"{int(seconds):>4}s"
+    if seconds < 3600:
+        return f"{int(seconds / 60):>4}m"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if minutes == 0:
+        return f"{hours:>3}h  "
+    return f"{hours:>2}h{minutes:02d}m"
+
+
 def aggregate_tokens_per_date(
     project_filter: str | None = None,
 ) -> dict[str, dict[str, int]]:
@@ -237,13 +341,17 @@ def aggregate_tokens_per_date(
 
 
 def compute_velocity(
-    weeks:           dict[int, dict[str, Any]],
-    tokens_per_date: dict[str, dict[str, int]] | None = None,
+    weeks:               dict[int, dict[str, Any]],
+    tokens_per_date:     dict[str, dict[str, int]] | None = None,
+    chat_time_per_date:  dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Render the per-week table rows.  When `tokens_per_date` is
     provided (schema v2), each row gains a `tokens` dict summed
-    across that week's dates + a tokens_per_sp ratio."""
-    tokens_per_date = tokens_per_date or {}
+    across that week's dates + a tokens_per_sp ratio.  Schema v2.2
+    adds `chat_active_seconds` aggregated from `chat_time_per_date`
+    (post Week-16-Fri follow-up — see SKILL.md §"Chat active time")."""
+    tokens_per_date    = tokens_per_date    or {}
+    chat_time_per_date = chat_time_per_date or {}
     out: list[dict[str, Any]] = []
     for w in sorted(weeks.keys()):
         info = weeks[w]
@@ -268,22 +376,35 @@ def compute_velocity(
         tokens_per_sp = (week_tokens["total"] / sp) if sp > 0 else 0
         tokens_per_alex_day = (week_tokens["total"] / alex_days) if alex_days > 0 else 0
 
+        # Chat active time (schema v2.2) — sum across week's dates.
+        # Same cross-week double-counting caveat as tokens (a single
+        # date attributed to multiple weeks contributes to both per-
+        # week sums; summary() uses unique-date totals for the
+        # project-wide number to keep it honest).
+        chat_seconds = 0.0
+        for d in info["dates"]:
+            chat_seconds += chat_time_per_date.get(d, 0.0)
+        chat_seconds_per_sp = (chat_seconds / sp) if sp > 0 else 0.0
+
         out.append({
-            "week":                w,
-            "sp":                  sp,
-            "alex_days":           alex_days,
-            "velocity":            round(velocity, 2),
-            "tokens":              week_tokens,
-            "tokens_per_sp":       int(tokens_per_sp),
-            "tokens_per_alex_day": int(tokens_per_alex_day),
-            "dates":               sorted(info["dates"]),
+            "week":                  w,
+            "sp":                    sp,
+            "alex_days":             alex_days,
+            "velocity":              round(velocity, 2),
+            "tokens":                week_tokens,
+            "tokens_per_sp":         int(tokens_per_sp),
+            "tokens_per_alex_day":   int(tokens_per_alex_day),
+            "chat_active_seconds":   round(chat_seconds, 1),
+            "chat_seconds_per_sp":   round(chat_seconds_per_sp, 1),
+            "dates":                 sorted(info["dates"]),
         })
     return out
 
 
 def summary(
-    rows:            list[dict[str, Any]],
-    tokens_per_date: dict[str, dict[str, int]] | None = None,
+    rows:               list[dict[str, Any]],
+    tokens_per_date:    dict[str, dict[str, int]] | None = None,
+    chat_time_per_date: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Mean + stdev of velocity, restricted to weeks with SP > 0.
     Schema v2 also rolls up project-wide token totals.
@@ -304,7 +425,8 @@ def summary(
     std = math.sqrt(variance)
 
     # Project-wide token total: sum across UNIQUE dates from all weeks.
-    tokens_per_date = tokens_per_date or {}
+    tokens_per_date    = tokens_per_date    or {}
+    chat_time_per_date = chat_time_per_date or {}
     unique_dates: set[str] = set()
     for r in rows:
         for d in r.get("dates", []):
@@ -312,10 +434,12 @@ def summary(
 
     # Per-class totals across unique dates.
     totals = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0, "total": 0}
+    chat_active_seconds_total = 0.0
     for d in unique_dates:
         if d in tokens_per_date:
             for k in totals:
                 totals[k] += tokens_per_date[d][k]
+        chat_active_seconds_total += chat_time_per_date.get(d, 0.0)
 
     # tokens / SP using unique-date totals divided by total SP across
     # SP-claiming weeks.  This is the most-honest per-SP number.
@@ -328,6 +452,11 @@ def summary(
     # (expensive).
     total_usd     = compute_usd_cost(totals)
     usd_per_sp    = (total_usd / total_sp) if total_sp > 0 else 0
+
+    # Schema v2.2: chat active time across unique dates.  See
+    # `aggregate_chat_active_time_per_date` for the per-session
+    # active-vs-idle gap heuristic.
+    chat_secs_per_sp = (chat_active_seconds_total / total_sp) if total_sp > 0 else 0.0
 
     return {
         "n_weeks":               n,
@@ -348,6 +477,14 @@ def summary(
         # USD-equivalent cost at the reference rates (Sonnet 4.6).
         "total_usd":             round(total_usd, 4),
         "usd_per_sp_avg":        round(usd_per_sp, 4),
+        # Schema v2.2 (post Week-16-Fri follow-up): active chat-time
+        # spent on milestone implementation.  Distinct from Alex-days
+        # (which counts CALENDAR days touched) — `chat_active_seconds`
+        # is the WITHIN-day active time, capped per inter-message gap
+        # at CHAT_ACTIVE_GAP_THRESHOLD_SEC (5 min).
+        "chat_active_seconds":   round(chat_active_seconds_total, 1),
+        "chat_seconds_per_sp":   round(chat_secs_per_sp, 1),
+        "chat_gap_threshold_sec": CHAT_ACTIVE_GAP_THRESHOLD_SEC,
     }
 
 
@@ -443,21 +580,31 @@ def render_table(
         # is weighted by class: output is 5× input, cache reads are
         # 10× cheaper than uncached input.  This makes per-week
         # comparison meaningful even when token mixes differ wildly.
-        out.append("Week  SP   Days  Vel.   In       Cache-R  Out      $ cost")
-        out.append("----  ---  ----  -----  -------  -------  -------  -------")
+        #
+        # v2.2: trailing `chat` column carries within-day active chat
+        # time (idle gaps ≥5 min excluded — see CHAT_ACTIVE_GAP_*).
+        # Distinct from `Days` (calendar days touched) — `chat`
+        # answers "how many hours of focused chat work did this week
+        # cost?"  Empty (—) when JSONL telemetry is unavailable.
+        out.append(
+            "Week  SP   Days  Vel.   In       Cache-R  Out      $ cost   Chat")
+        out.append(
+            "----  ---  ----  -----  -------  -------  -------  -------  -------")
         for r in rows:
             tk = r.get("tokens", {})
             # "In" = uncached input + cache writes (both billed at
             # input-ish rates; combine for legibility).
             in_combined = tk.get("input", 0) + tk.get("cache_creation", 0)
             usd = compute_usd_cost(tk)
+            chat = r.get("chat_active_seconds", 0.0)
             out.append(
                 f"{r['week']:<4}  {r['sp']:<3}  {r['alex_days']:<4}  "
                 f"{r['velocity']:>5.2f}  "
                 f"{_fmt_tokens(in_combined):>7}  "
                 f"{_fmt_tokens(tk.get('cache_read', 0)):>7}  "
                 f"{_fmt_tokens(tk.get('output', 0)):>7}  "
-                f"{_fmt_usd(usd):>7}"
+                f"{_fmt_usd(usd):>7}  "
+                f"{_fmt_duration(chat):>7}"
             )
     else:
         out.append("Week  SP   Alex-days  Velocity (SP/day)")
@@ -554,6 +701,31 @@ def render_table(
                     f"         $ / LoC                     = "
                     f"${total_usd / loc_now:.3f}"
                 )
+            # Chat active-time totals — v2.2 schema.  Distinct from
+            # Alex-days (calendar days touched) — answers "how many
+            # hours of actually-typing-with-Claude did the milestone
+            # cost?"  Idle gaps ≥ CHAT_ACTIVE_GAP_THRESHOLD_SEC are
+            # excluded so overnight / lunch-break sessions don't
+            # inflate the number.
+            chat_total = s.get("chat_active_seconds", 0.0)
+            chat_per_sp = s.get("chat_seconds_per_sp", 0.0)
+            gap = s.get("chat_gap_threshold_sec", CHAT_ACTIVE_GAP_THRESHOLD_SEC)
+            if chat_total > 0:
+                out.append("")
+                out.append("         ── chat time (active wall-clock) ──")
+                out.append(
+                    f"         total active chat time      = "
+                    f"{_fmt_duration(chat_total).strip()}"
+                )
+                out.append(
+                    f"         chat time / SP (mean)       = "
+                    f"{_fmt_duration(chat_per_sp).strip()}"
+                )
+                out.append(
+                    f"         (gaps ≥{gap // 60} min treated as idle "
+                    "+ excluded; tune CHAT_ACTIVE_GAP_THRESHOLD_SEC)"
+                )
+
             # Pricing reference footer.
             out.append("")
             out.append(
@@ -633,8 +805,12 @@ def cmd_retrofit(
     if not weeks:
         print("perf-stat: no `Week N <Day>:` commits found.", file=sys.stderr)
         return 1
-    rows = compute_velocity(weeks, tokens_per_date)
-    s = summary(rows, tokens_per_date)
+    # v2.2: chat active-time aggregation (post Week-16-Fri follow-up).
+    # Empty when ~/.claude/projects/ is missing or has no parseable
+    # JSONLs — render gracefully degrades.
+    chat_time_per_date = aggregate_chat_active_time_per_date(project_filter)
+    rows = compute_velocity(weeks, tokens_per_date, chat_time_per_date)
+    s = summary(rows, tokens_per_date, chat_time_per_date)
     write_cache(rows, s)
     print(render_table(rows, s, language))
     return 0
