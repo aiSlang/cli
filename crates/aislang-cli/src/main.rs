@@ -3596,6 +3596,7 @@ mod tests {
             secrets: Some(vec![Ref {
                 kind:  RefKind::Secret,
                 label: secret_label.to_string(),
+                module: None,
             }]),
         };
         Project {
@@ -3608,12 +3609,12 @@ mod tests {
                 Secret {
                     label:  "a_only".into(),
                     source: "env://TEST_SCOPE_A_ONLY".into(),
-                    scope:  vec![Ref { kind: RefKind::McpServer, label: "alpha".into() }],
+                    scope:  vec![Ref { kind: RefKind::McpServer, label: "alpha".into(), module: None }],
                 },
                 Secret {
                     label:  "b_only".into(),
                     source: "env://TEST_SCOPE_B_ONLY".into(),
-                    scope:  vec![Ref { kind: RefKind::McpServer, label: "beta".into()  }],
+                    scope:  vec![Ref { kind: RefKind::McpServer, label: "beta".into(),  module: None }],
                 },
             ],
             ..Project::default()
@@ -3696,6 +3697,7 @@ mod tests {
                 secrets: Some(vec![Ref {
                     kind:  RefKind::Secret,
                     label: "phantom".into(),
+                    module: None,
                 }]),
             }],
             secrets: vec![],   // phantom doesn't exist

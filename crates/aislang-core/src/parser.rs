@@ -180,6 +180,13 @@ enum RawValue {
     /// Comma-separated list literal, `[a, b, c]`. Elements may be any
     /// `RawValue`, including nested lists/objects.
     List(Vec<RawValue>),
+    /// v0.3 Week 16 Tue: cross-module reference parsed from
+    /// `use <module>.<label>` syntax (Decision 44.1).  The `use`
+    /// keyword disambiguates this from the same-module 2-segment
+    /// `<kind>.<label>` form (`AttributeAccess`).  Kind is inferred
+    /// from the attribute context at converter time (e.g.
+    /// `system_prompt = use coder.foo` → `RefKind::Prompt`).
+    ModuleRef { module: String, label: String },
     /// Comma-separated attribute set inside braces, `{ k = v, k = v }`.
     /// Distinct from a `block` body which uses whitespace separation.
     /// Used for typed-map fields like `deploy.expose = { port = 8080 }`.
@@ -467,6 +474,32 @@ fn value_parser<'src>(
                 None => RawValue::Money(m),
             });
 
+        // v0.3 Week 16 Tue: `use <module>.<label>` — cross-module ref.
+        //
+        // Placed in the choice() BEFORE ident_or_access so the `use`
+        // keyword is consumed as a hard keyword.  If the trailing
+        // `<ident>.<ident>` shape doesn't match, choice() backtracks
+        // and ident_or_access re-parses "use" as an EnumMember
+        // (preserves the "use as a bare identifier" escape hatch —
+        // no v0.2 .ais file uses `use` that way, but the fallthrough
+        // keeps the change non-breaking for hypothetical authors).
+        //
+        // Implementation note re: `just("use")` vs `text::ascii::keyword`:
+        // mirrors the `just("per")` rationale at line ~406 — keyword()
+        // triggers a chumsky-0.10 type-inference bug inside recursive(),
+        // so we use just() + rely on choice-arm backtracking to handle
+        // the no-keyword case.  The required `.` between module and
+        // label gives word-boundary discipline: `useful.foo` would
+        // start matching this arm but the `.` enforces module + label
+        // separation, and `usewell` (no dot) would fail at the dot
+        // expectation — both fall through to ident_or_access cleanly.
+        let use_ref = just("use")
+            .ignore_then(pad.clone())
+            .ignore_then(ident_parser())
+            .then_ignore(just('.'))
+            .then(ident_parser())
+            .map(|(module, label)| RawValue::ModuleRef { module, label });
+
         // Combined ident-or-access. Parse an ident, then zero-or-more
         // `.ident` segments. If the tail is empty, dispatch on the first
         // ident's text (true / false / other-enum). If the tail is
@@ -503,6 +536,10 @@ fn value_parser<'src>(
             string_lit_parser().map(RawValue::String),
             list,
             object,
+            // v0.3 Week 16 Tue: cross-module ref MUST come before
+            // ident_or_access — `use` would otherwise be eaten as
+            // an EnumMember.
+            use_ref,
             ident_or_access,
         ))
         .padded_by(pad.clone())
@@ -1533,7 +1570,10 @@ fn parse_ref_from_access(path: &[String]) -> Result<Ref, String> {
             path.join(".")
         )),
     };
-    Ok(Ref { kind, label: path[1].clone() })
+    // module: None — same-module ref (v0.2 baseline).  Cross-module
+    // refs go through a separate parse path (the `use` keyword, see
+    // `value_parser` for the RawValue::ModuleRef variant).
+    Ok(Ref { kind, label: path[1].clone(), module: None })
 }
 
 fn ref_kind_str(k: RefKind) -> &'static str {
@@ -1548,21 +1588,36 @@ fn ref_kind_str(k: RefKind) -> &'static str {
 
 fn expect_ref(field: &str, expected_kind: RefKind, v: RawValue) -> Result<Ref, String> {
     let prefix = ref_kind_str(expected_kind);
-    let path = match v {
-        RawValue::AttributeAccess(p) => p,
-        other => return Err(format!(
-            "`{field}` expects a {prefix} reference (e.g. `{prefix}.label`); got {other:?}"
+    match v {
+        // v0.2 same-module form: `<kind>.<label>`.
+        RawValue::AttributeAccess(path) => {
+            let r = parse_ref_from_access(&path)
+                .map_err(|e| format!("`{field}`: {e}"))?;
+            if r.kind != expected_kind {
+                return Err(format!(
+                    "`{field}` expects a `{prefix}` reference; got a `{}` reference (`{}`)",
+                    ref_kind_str(r.kind), path.join(".")
+                ));
+            }
+            Ok(r)
+        }
+        // v0.3 Week 16 Tue cross-module form: `use <module>.<label>`.
+        // Kind is inferred from the attribute context (`expected_kind`)
+        // — the surface syntax intentionally omits it for brevity,
+        // matching PLAN-v0_3.md Decision 44.1's `use coder.system_prompt`
+        // example.  Cross-module ref resolution (does the module exist?
+        // does it export the label?) lives in the checker's
+        // `check_multi` entry point.
+        RawValue::ModuleRef { module, label } => Ok(Ref {
+            kind:   expected_kind,
+            label,
+            module: Some(module),
+        }),
+        other => Err(format!(
+            "`{field}` expects a {prefix} reference (e.g. `{prefix}.label` \
+             or `use <module>.<label>`); got {other:?}"
         )),
-    };
-    let r = parse_ref_from_access(&path)
-        .map_err(|e| format!("`{field}`: {e}"))?;
-    if r.kind != expected_kind {
-        return Err(format!(
-            "`{field}` expects a `{prefix}` reference; got a `{}` reference (`{}`)",
-            ref_kind_str(r.kind), path.join(".")
-        ));
     }
-    Ok(r)
 }
 
 fn expect_list_of_refs(field: &str, expected_kind: RefKind, v: RawValue)
@@ -3005,8 +3060,8 @@ mod project_tests {
             name: "demo".into(),
             mains: vec![Main {
                 label:         "u".into(),
-                model:         Ref { kind: RefKind::Model,  label: "primary".into() },
-                system_prompt: Ref { kind: RefKind::Prompt, label: "b".into() },
+                model:         Ref { kind: RefKind::Model,  label: "primary".into(), module: None },
+                system_prompt: Ref { kind: RefKind::Prompt, label: "b".into(),       module: None },
                 chat_client:   ChatClient::ClaudeDesktop,
                 pattern:       Pattern::Orchestrator,
             }],
@@ -3054,5 +3109,168 @@ mod project_tests {
         let json = serde_json::to_string(&model).unwrap();
         assert!(json.contains("\"source\":\"subscription\""),
             "subscription source must serialize; got: {json}");
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 16 Tue — cross-module ref parsing via `use` keyword.
+    // ---------------------------------------------------------------- //
+
+    /// Helper: parse + extract the first agent's resolved Refs.  Every
+    /// cross-module test below builds a minimal project with `use`-form
+    /// refs and asserts the AST shape.
+    fn parse_first_agent(src: &str) -> Agent {
+        let p = assert_parse_ok(src);
+        p.agents.into_iter().next().expect("at least one agent")
+    }
+
+    #[test] fn use_keyword_parses_cross_module_ref_for_model_attribute() {
+        // `use coder.fast` in agent.model position — module = "coder",
+        // label = "fast", kind inferred from attribute (= Model).
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          agent "a" {
+            model         = use coder.fast
+            system_prompt = prompt.system
+            tools         = []
+          }
+        }"#;
+        let a = parse_first_agent(src);
+        assert_eq!(a.model.module, Some("coder".to_string()));
+        assert_eq!(a.model.label,  "fast");
+        assert_eq!(a.model.kind,   RefKind::Model);
+    }
+
+    #[test] fn use_keyword_parses_cross_module_ref_for_prompt_attribute() {
+        // Same syntax, different attribute → kind dispatches to Prompt.
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "m" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          agent "a" {
+            model         = model.m
+            system_prompt = use coder.system
+            tools         = []
+          }
+        }"#;
+        let a = parse_first_agent(src);
+        assert_eq!(a.system_prompt.module, Some("coder".to_string()));
+        assert_eq!(a.system_prompt.label,  "system");
+        assert_eq!(a.system_prompt.kind,   RefKind::Prompt);
+    }
+
+    #[test] fn use_keyword_parses_cross_module_ref_inside_tools_list() {
+        // `tools = [use coder.docs, mcp_server.local]` — mixed list of
+        // cross-module + same-module refs.  Pins both code paths
+        // share the same list element parser.
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "m" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          mcp_server "local" {
+            image = "docker.io/x/y:1"
+          }
+          agent "a" {
+            model         = model.m
+            system_prompt = prompt.system
+            tools         = [use coder.docs, mcp_server.local]
+          }
+        }"#;
+        let a = parse_first_agent(src);
+        assert_eq!(a.tools.len(), 2);
+        assert_eq!(a.tools[0].module, Some("coder".to_string()));
+        assert_eq!(a.tools[0].label,  "docs");
+        assert_eq!(a.tools[0].kind,   RefKind::McpServer);
+        assert_eq!(a.tools[1].module, None);
+        assert_eq!(a.tools[1].label,  "local");
+    }
+
+    #[test] fn use_keyword_round_trips_through_json() {
+        // Forward-compat pin: a Ref with module=Some serializes WITH
+        // the field; a Ref with module=None serializes WITHOUT it.
+        let with_module = Ref {
+            kind: RefKind::Prompt, label: "x".into(),
+            module: Some("coder".into()),
+        };
+        let without = Ref {
+            kind: RefKind::Prompt, label: "x".into(), module: None,
+        };
+        let json_with = serde_json::to_string(&with_module).unwrap();
+        let json_without = serde_json::to_string(&without).unwrap();
+        assert!(json_with.contains("\"module\":\"coder\""),
+            "module=Some must serialize the field; got: {json_with}");
+        assert!(!json_without.contains("module"),
+            "module=None must NOT serialize the field (v0.2 forward-compat); \
+             got: {json_without}");
+        // Round-trip: deserializing the without-module JSON yields
+        // module=None (defaulted).
+        let parsed: Ref = serde_json::from_str(&json_without).unwrap();
+        assert_eq!(parsed.module, None);
+    }
+
+    #[test] fn bare_use_word_without_dot_is_parse_error() {
+        // `use coder` (no dot) — the use-ref arm starts matching but
+        // fails at the dot expectation; choice() backtracks; ident_or_
+        // access tries to parse `use` as an ident → `use` becomes
+        // `EnumMember("use")` which is the WRONG type for agent.model
+        // → converter rejects with a "expects model reference" error.
+        // What we pin: SOMETHING fails (not silently accepted).
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          agent "a" {
+            model         = use coder
+            system_prompt = prompt.system
+            tools         = []
+          }
+        }"#;
+        // Either the parser fails outright OR the converter fails.
+        // Both are acceptable "rejected" outcomes.
+        let result = parse(src);
+        assert!(result.is_err(),
+            "`use coder` (no dot) must be rejected; got Ok");
+    }
+
+    #[test] fn use_form_carries_correct_kind_via_attribute_context() {
+        // Same `use coder.thing` syntax in three different attribute
+        // positions → three different kinds.  Pin the
+        // expected_kind-from-context inference.
+        let src_model = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          agent "a" {
+            model         = use coder.thing
+            system_prompt = prompt.system
+            tools         = []
+          }
+        }"#;
+        let m_kind = parse_first_agent(src_model).model.kind;
+        assert_eq!(m_kind, RefKind::Model);
+
+        let src_prompt = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "m" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          agent "a" {
+            model         = model.m
+            system_prompt = use coder.thing
+            tools         = []
+          }
+        }"#;
+        let p_kind = parse_first_agent(src_prompt).system_prompt.kind;
+        assert_eq!(p_kind, RefKind::Prompt);
     }
 }
