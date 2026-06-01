@@ -14,10 +14,21 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A reference to another resource by label. Resolved during validation.
+///
+/// v0.3 Week 16 Tue: `module` distinguishes same-module refs (`None` —
+/// the v0.2 baseline; parsed from `<kind>.<label>`) from cross-module
+/// refs (`Some(<module>)` — v0.3 multi-module projects; parsed from
+/// `use <module>.<label>` where the kind is inferred from the attribute
+/// context).  `#[serde(default, skip_serializing_if = Option::is_none)]`
+/// keeps v0.2 fixture JSON files byte-stable — a Ref with `module:
+/// None` serializes to `{"kind": "...", "label": "..."}` exactly as
+/// before; the field only appears when populated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ref {
     pub kind:  RefKind,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

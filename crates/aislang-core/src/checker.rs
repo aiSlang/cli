@@ -15,7 +15,7 @@
 use crate::ast::*;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 //
 // NOTE: aislang-catalog is *not* a dependency of aislang-core — that
 // would create a cycle (catalog already depends on core for the typed
@@ -54,9 +54,48 @@ pub struct Warning {
 /// empty, but the signature is stable so future in-core warnings
 /// (e.g. deprecated grammar form, unused resource) can be added
 /// additively without rippling through callers.
+///
+/// v0.3 Week 16 Tue: single-file (`check`) errors on any cross-module
+/// `Ref` (`r.module = Some(_)`) — single-file projects have no module
+/// symbol table.  Multi-module projects go through [`check_multi`].
 pub fn check(project: &Project) -> Result<Vec<Warning>, String> {
     let graph = build_resource_graph(project)?;
-    check_refs(project, &graph)?;
+    check_refs(project, &graph, None)?;
+    Ok(Vec::new())
+}
+
+/// v0.3 Week 16 Tue — multi-module semantic check.
+///
+/// Builds one `ResourceGraph` per module, then walks every `Ref` in
+/// every module and routes the lookup:
+///
+/// - Same-module ref (`r.module = None`) → look up in the *source*
+///   module's local graph.  Identical behaviour to [`check`].
+/// - Cross-module ref (`r.module = Some(target)`) → look up in
+///   `target`'s graph; errors if `target` isn't a declared module
+///   ("module … not declared in the project manifest") or if `target`
+///   doesn't export the labelled resource ("module `target` does not
+///   export …").  Same source-aware diagnostic style as v0.2's
+///   undeclared-ref errors.
+///
+/// `modules` is the project manifest's `[modules]` table mapping
+/// module name to parsed AST.  Iteration order is `BTreeMap`-sorted
+/// for deterministic error messages.
+///
+/// Decision 44.1 sub-point: all cross-module resources are public
+/// (private-resource access control deferred to v0.5+).
+pub fn check_multi(modules: &BTreeMap<String, Project>) -> Result<Vec<Warning>, String> {
+    let mut graphs: BTreeMap<String, ResourceGraph> = BTreeMap::new();
+    for (name, project) in modules {
+        let g = build_resource_graph(project)
+            .map_err(|e| format!("module `{name}`: {e}"))?;
+        graphs.insert(name.clone(), g);
+    }
+    for (name, project) in modules {
+        let local = graphs.get(name).expect("preloaded above");
+        check_refs(project, local, Some((name.as_str(), &graphs)))
+            .map_err(|e| format!("module `{name}`: {e}"))?;
+    }
     Ok(Vec::new())
 }
 
@@ -195,14 +234,22 @@ fn add_block(
 /// `X`?" suggestion when a label within Levenshtein distance ≤2 exists,
 /// otherwise list the available labels of the expected kind (or note
 /// none are declared at all).
-fn check_refs(project: &Project, graph: &ResourceGraph) -> Result<(), String> {
+///
+/// v0.3 Week 16 Tue: `multi` is `None` for single-file projects
+/// (cross-module refs error) or `Some((src_module, graphs))` for
+/// multi-module projects (cross-module refs route to `graphs[target]`).
+fn check_refs(
+    project: &Project,
+    graph:   &ResourceGraph,
+    multi:   Option<(&str, &BTreeMap<String, ResourceGraph>)>,
+) -> Result<(), String> {
     for agent in &project.agents {
-        check_one_ref(graph, &agent.model,
+        dispatch_ref(graph, multi, &agent.model,
             "agent", &agent.label, "model")?;
-        check_one_ref(graph, &agent.system_prompt,
+        dispatch_ref(graph, multi, &agent.system_prompt,
             "agent", &agent.label, "system_prompt")?;
         for (i, tool) in agent.tools.iter().enumerate() {
-            check_one_ref(graph, tool,
+            dispatch_ref(graph, multi, tool,
                 "agent", &agent.label, &format!("tools[{i}]"))?;
         }
     }
@@ -211,32 +258,75 @@ fn check_refs(project: &Project, graph: &ResourceGraph) -> Result<(), String> {
     // enum members already validated at parse time, so no ref work
     // for them.
     for main in &project.mains {
-        check_one_ref(graph, &main.model,
+        dispatch_ref(graph, multi, &main.model,
             "main", &main.label, "model")?;
-        check_one_ref(graph, &main.system_prompt,
+        dispatch_ref(graph, multi, &main.system_prompt,
             "main", &main.label, "system_prompt")?;
     }
     for secret in &project.secrets {
         for (i, scope_ref) in secret.scope.iter().enumerate() {
-            check_one_ref(graph, scope_ref,
+            dispatch_ref(graph, multi, scope_ref,
                 "secret", &secret.label, &format!("scope[{i}]"))?;
         }
     }
     for eval in &project.evals {
         if let Some(agent_ref) = &eval.agent {
-            check_one_ref(graph, agent_ref,
+            dispatch_ref(graph, multi, agent_ref,
                 "eval", &eval.label, "agent")?;
         }
     }
     for mcp in &project.mcp_servers {
         if let Some(secrets) = &mcp.secrets {
             for (i, sec_ref) in secrets.iter().enumerate() {
-                check_one_ref(graph, sec_ref,
+                dispatch_ref(graph, multi, sec_ref,
                     "mcp_server", &mcp.label, &format!("secrets[{i}]"))?;
             }
         }
     }
     Ok(())
+}
+
+/// v0.3 Week 16 Tue — picks the lookup graph for one ref based on
+/// `r.module` + dispatches to the (unchanged) [`check_one_ref`]
+/// primitive.  Diagnostic strings match the v0.2 style.
+fn dispatch_ref(
+    local_graph: &ResourceGraph,
+    multi:       Option<(&str, &BTreeMap<String, ResourceGraph>)>,
+    r:           &Ref,
+    src_kind:    &str,
+    src_label:   &str,
+    src_field:   &str,
+) -> Result<(), String> {
+    let Some(target_module) = &r.module else {
+        return check_one_ref(local_graph, r, src_kind, src_label, src_field);
+    };
+
+    // Cross-module ref.  Either single-file (no module map → error) or
+    // multi-module (look up the target).
+    let Some((_src_module, graphs)) = multi else {
+        return Err(format!(
+            "{src_kind} `{src_label}` field `{src_field}` is a cross-module \
+             reference (`use {target_module}.{label}`) but the project is a \
+             single-file build with no module manifest; declare an \
+             `aislang.toml` listing `{target_module}` to enable this ref",
+            label = r.label,
+        ));
+    };
+    let Some(target_graph) = graphs.get(target_module) else {
+        let mut known: Vec<&str> = graphs.keys().map(|s| s.as_str()).collect();
+        known.sort();
+        return Err(format!(
+            "{src_kind} `{src_label}` field `{src_field}` references module \
+             `{target_module}` which is not declared in the project \
+             manifest; declared modules: {known:?}",
+        ));
+    };
+    // Reuse the same diagnostic surface as same-module refs, but
+    // prefix the source field hint so the error names the cross-
+    // module ownership.
+    check_one_ref(target_graph, r,
+        src_kind, src_label,
+        &format!("{src_field} (cross-module → `{target_module}`)"))
 }
 
 /// Validate one `Ref` against the resource graph. On miss, produce a
@@ -998,5 +1088,187 @@ mod tests {
             "graph should expose main node kind; got: {json}");
         assert!(json.contains("\"user_facing\""),
             "graph should expose the main's label");
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 16 Tue — cross-module ref resolution (check_multi).
+    // ---------------------------------------------------------------- //
+
+    /// Helper: parse a labelled source string into a Project so the
+    /// multi-module tests can compose two-module fixtures.
+    fn parse_labelled(label: &str, src: &str) -> Project {
+        parse(src).unwrap_or_else(|errs| {
+            let joined = errs.iter().map(|e| e.message.as_str())
+                .collect::<Vec<_>>().join("\n");
+            panic!("module `{label}` source failed to parse:\n{joined}")
+        })
+    }
+
+    /// Helper: build the two-module fixture used by most cross-module
+    /// tests.  Module `app` references resources in module `shared`.
+    fn two_module_fixture() -> BTreeMap<String, Project> {
+        let shared = parse_labelled("shared", r#"project "shared" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "fast" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+        }"#);
+        let app = parse_labelled("app", r#"project "app" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          agent "support" {
+            model         = use shared.fast
+            system_prompt = use shared.system
+            tools         = []
+          }
+        }"#);
+        let mut m = BTreeMap::new();
+        m.insert("shared".to_string(), shared);
+        m.insert("app".to_string(),    app);
+        m
+    }
+
+    #[test] fn check_multi_resolves_cross_module_refs() {
+        let modules = two_module_fixture();
+        check_multi(&modules).expect(
+            "two-module project with valid cross-module refs must validate");
+    }
+
+    #[test] fn check_multi_rejects_unknown_module() {
+        // App refers to module `missing` which isn't in the manifest.
+        let mut modules = BTreeMap::new();
+        modules.insert("app".to_string(), parse_labelled("app", r#"project "app" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          agent "support" {
+            model         = use missing.fast
+            system_prompt = prompt.system
+            tools         = []
+          }
+        }"#));
+        let err = check_multi(&modules).unwrap_err();
+        assert!(err.contains("module `missing`"),
+            "error should name the missing module; got: {err}");
+        assert!(err.contains("not declared in the project manifest"),
+            "error should hint at the manifest; got: {err}");
+        assert!(err.contains("declared modules"),
+            "error should list the modules that ARE declared; got: {err}");
+    }
+
+    #[test] fn check_multi_rejects_unknown_label_in_known_module() {
+        // App refers to module `shared.zzz` but `shared` only exports
+        // `fast` (model) + `system` (prompt).  Pin the source-aware
+        // suggestion shape: name the source module + the available
+        // labels of the target kind.
+        let shared = parse_labelled("shared", r#"project "shared" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "fast" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+        }"#);
+        let app = parse_labelled("app", r#"project "app" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          agent "support" {
+            model         = use shared.zzz
+            system_prompt = use shared.system
+            tools         = []
+          }
+        }"#);
+        let mut m = BTreeMap::new();
+        m.insert("shared".to_string(), shared);
+        m.insert("app".to_string(),    app);
+        let err = check_multi(&m).unwrap_err();
+        assert!(err.contains("undeclared model `zzz`"),
+            "error should name the missing label + kind; got: {err}");
+        assert!(err.contains("cross-module → `shared`"),
+            "error should name the source module to disambiguate; \
+             got: {err}");
+    }
+
+    #[test] fn check_multi_did_you_mean_works_across_modules() {
+        // Typo `fst` for `fast` → Levenshtein within ≤2 → suggester
+        // should fire just like the same-module case.
+        let shared = parse_labelled("shared", r#"project "shared" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "fast" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+        }"#);
+        let app = parse_labelled("app", r#"project "app" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          agent "support" {
+            model         = use shared.fst
+            system_prompt = prompt.system
+            tools         = []
+          }
+        }"#);
+        let mut m = BTreeMap::new();
+        m.insert("shared".to_string(), shared);
+        m.insert("app".to_string(),    app);
+        let err = check_multi(&m).unwrap_err();
+        assert!(err.contains("did you mean `fast`?"),
+            "near-match should be suggested across modules too; \
+             got: {err}");
+    }
+
+    #[test] fn single_file_check_rejects_cross_module_ref() {
+        // A .ais that uses `use <module>.<label>` syntax but is run
+        // through the single-file checker (no manifest) → must error
+        // with a useful hint.
+        let project = parse_labelled("p", r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          prompt "system" { file = "./s.md"  version = "1.0.0" }
+          agent "support" {
+            model         = use shared.fast
+            system_prompt = prompt.system
+            tools         = []
+          }
+        }"#);
+        let err = check(&project).unwrap_err();
+        assert!(err.contains("cross-module reference"),
+            "error should explain WHY single-file rejects this ref; \
+             got: {err}");
+        assert!(err.contains("aislang.toml"),
+            "error should point at the manifest as the fix; got: {err}");
+    }
+
+    #[test] fn check_multi_per_module_duplicate_labels_still_caught() {
+        // Same-module duplicate-label detection must keep working
+        // when running through check_multi.
+        let bad = parse_labelled("bad", r#"project "bad" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          model "fast" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          model "fast" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+        }"#);
+        let mut m = BTreeMap::new();
+        m.insert("bad".to_string(), bad);
+        let err = check_multi(&m).unwrap_err();
+        assert!(err.contains("duplicate"),
+            "duplicate-label detection should still fire in multi-module; \
+             got: {err}");
+        assert!(err.contains("module `bad`"),
+            "error should be prefixed with the source module name; \
+             got: {err}");
     }
 }

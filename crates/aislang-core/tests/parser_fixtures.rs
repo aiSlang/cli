@@ -104,9 +104,9 @@ fn expected_support_agent() -> Project {
 
     let agent_support = Agent {
         label:         "support".into(),
-        model:         Ref { kind: RefKind::Model,     label: "fast".into()   },
-        system_prompt: Ref { kind: RefKind::Prompt,    label: "system".into() },
-        tools:         vec![Ref { kind: RefKind::McpServer, label: "docs".into() }],
+        model:         Ref { kind: RefKind::Model,     label: "fast".into(),   module: None },
+        system_prompt: Ref { kind: RefKind::Prompt,    label: "system".into(), module: None },
+        tools:         vec![Ref { kind: RefKind::McpServer, label: "docs".into(), module: None }],
     };
 
     let eval_accuracy = Eval {
