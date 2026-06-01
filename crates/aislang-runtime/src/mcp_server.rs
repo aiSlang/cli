@@ -1787,7 +1787,21 @@ async fn build_session_for_agent_multi_module(
             std::fs::canonicalize(&resolved).unwrap_or(resolved)
         });
         let env = resolve_mcp_secrets_for_agent(project, mcp, source_dir)?;
-        mcp_specs.push((mcp.label.clone(), SpawnConfig {
+        // v0.3 Week 17 Tue follow-up: the merged project's mcp_server
+        // labels are module-qualified (`coder.docs`).  Anthropic
+        // Messages API requires tool names to match
+        // `^[a-zA-Z0-9_-]{1,64}$` — DOTS aren't allowed.  The
+        // ToolRegistry composes LLM-visible names as
+        // `{server_label}__{mcp_tool_name}`, so a `.`-bearing
+        // server_label produces tool names like
+        // `coder.docs__read_text_file` which the LLM either rejects
+        // outright (strict APIs) or struggles to select (Ollama
+        // accepts but tool-call selection degrades — the user's
+        // session looped 8× on `get_file_info` instead of picking
+        // `read_text_file`).  Replace `.` with `_` so labels stay
+        // unique per-module + spec-compliant.
+        let llm_safe_label = mcp.label.replace('.', "_");
+        mcp_specs.push((llm_safe_label, SpawnConfig {
             image: format_image(&mcp.image),
             args:  Vec::new(),
             mount,
