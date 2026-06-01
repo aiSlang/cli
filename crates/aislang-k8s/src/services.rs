@@ -490,6 +490,13 @@ pub fn build_budget_counter(
 pub const PROJECT_CM_AIS_KEY:      &str = "project.ais";
 pub const PROJECT_CM_LOCKFILE_KEY: &str = "aislang.lock";
 
+/// v0.3 Week 16 Thu — multi-module ConfigMap data key for the project
+/// manifest (`aislang.toml`).  When the CM holds per-module sources
+/// instead of a single `project.ais`, this key carries the manifest
+/// body so `aislang mcp-serve` inside the pod can autodiscover modules
+/// the same way the CLI does outside the cluster.
+pub const PROJECT_CM_MANIFEST_KEY: &str = "aislang.toml";
+
 /// Directory where the `aislang-project` ConfigMap mounts inside
 /// the agent-runtime pod.  Pod command: `aislang mcp-serve --http
 /// 0.0.0.0:<port> /etc/aislang/project.ais` (Decision 43.3).
@@ -564,10 +571,76 @@ pub fn build_aislang_project_configmap(
     lockfile:      Option<&str>,
     prompt_bodies: &BTreeMap<String, String>,
 ) -> ConfigMap {
+    build_aislang_project_configmap_inner(
+        deploy_label,
+        ais_source,
+        lockfile,
+        prompt_bodies,
+        &BTreeMap::new(),     // no module sources
+        None,                 // no manifest
+    )
+}
+
+/// v0.3 Week 16 Thu — multi-module CM variant.  Same shape as the
+/// single-file builder above but writes one data key per module
+/// (`<name>.ais` → source bytes) + a `PROJECT_CM_MANIFEST_KEY`
+/// entry for the `aislang.toml` body, INSTEAD OF the single
+/// `PROJECT_CM_AIS_KEY` entry.  Lockfile + prompt bodies behave
+/// identically.
+///
+/// Callers: the K8s `emit()` entry point — picks this variant
+/// when `sources.is_multi_module()` returns true.
+pub fn build_aislang_project_configmap_multi(
+    deploy_label:    &str,
+    module_sources:  &BTreeMap<String, String>,
+    manifest:        Option<&str>,
+    lockfile:        Option<&str>,
+    prompt_bodies:   &BTreeMap<String, String>,
+) -> ConfigMap {
+    build_aislang_project_configmap_inner(
+        deploy_label,
+        "",                  // no single ais_source in multi-module mode
+        lockfile,
+        prompt_bodies,
+        module_sources,
+        manifest,
+    )
+}
+
+/// Common backing implementation.  Single-file callers pass an
+/// `ais_source` + empty module map; multi-module callers pass an
+/// empty `ais_source` + populated module map.
+///
+/// The data layout pins the on-disk shape inside the pod's mounted
+/// CM volume (one file per data key, plus the items[] remap to
+/// drop prompt bodies into `prompts/<label>`).  When multi-module,
+/// per-module `.ais` files land at `/etc/aislang/<name>.ais` and
+/// `aislang.toml` at `/etc/aislang/aislang.toml`, mirroring exactly
+/// what the dir-input CLI sees on the host filesystem.
+fn build_aislang_project_configmap_inner(
+    deploy_label:    &str,
+    ais_source:      &str,
+    lockfile:        Option<&str>,
+    prompt_bodies:   &BTreeMap<String, String>,
+    module_sources:  &BTreeMap<String, String>,
+    manifest:        Option<&str>,
+) -> ConfigMap {
     let labels = aislang_labels("agent_runtime", deploy_label);
     let mut data = BTreeMap::new();
-    data.insert(PROJECT_CM_AIS_KEY.to_string(),      ais_source.to_string());
-    data.insert(PROJECT_CM_LOCKFILE_KEY.to_string(), lockfile.unwrap_or("").to_string());
+    if module_sources.is_empty() {
+        // Single-file (v0.2 baseline).
+        data.insert(PROJECT_CM_AIS_KEY.to_string(), ais_source.to_string());
+    } else {
+        // Multi-module (v0.3 Thu).
+        for (name, source) in module_sources {
+            data.insert(format!("{name}.ais"), source.clone());
+        }
+        if let Some(m) = manifest {
+            data.insert(PROJECT_CM_MANIFEST_KEY.to_string(), m.to_string());
+        }
+    }
+    data.insert(PROJECT_CM_LOCKFILE_KEY.to_string(),
+        lockfile.unwrap_or("").to_string());
     for (label, body) in prompt_bodies {
         // Prompt-label key.  Mounted as `/etc/aislang/prompts/<label>`
         // via items[] mapping in build_agent_runtime — see the
@@ -601,6 +674,45 @@ pub fn build_agent_runtime(
     ais_source:    &str,
     lockfile:      Option<&str>,
 ) -> (Deployment, Service) {
+    // v0.3 Week 16 Thu: backward-compat shim — single-file callers
+    // pass through this 2-arg form unchanged; multi-module callers
+    // go through [`build_agent_runtime_with_sources`].
+    let sources = crate::ProjectSources {
+        ais_source:    ais_source.to_string(),
+        lockfile:      lockfile.map(str::to_string),
+        prompt_bodies: BTreeMap::new(),    // annotations come from
+                                           // `resolved.prompt_hashes`
+                                           // directly; the bag's
+                                           // prompt_bodies is for the
+                                           // CM builder only.
+        modules:       BTreeMap::new(),
+        manifest:      None,
+    };
+    build_agent_runtime_with_sources(resolved, deploy_label, &sources)
+}
+
+/// v0.3 Week 16 Thu — full-fat agent-runtime builder.  Routes the
+/// single-file vs multi-module branches based on
+/// `sources.is_multi_module()`.  Single-file behaviour is byte-
+/// identical to [`build_agent_runtime`] (regression-pinned via the
+/// existing v0.2 tests + the v0.2 fixture comparison).
+///
+/// Multi-module changes:
+///   - cm_items lists `<module>.ais` (one per declared module) +
+///     `aislang.toml`, INSTEAD OF the single `project.ais`.
+///   - Pod `args` point at `PROJECT_MOUNT_DIR` (the mount directory)
+///     so `aislang mcp-serve` runs the same dir-vs-file dispatch
+///     the CLI does outside the cluster.
+///   - The `aislang.project-hash` annotation hashes the
+///     deterministic concatenation of every module's source +
+///     manifest + lockfile, so a byte change in ANY module rolls
+///     the ReplicaSet (matches the lockfile reconciler's "any
+///     module changed → re-resolve everything" v0.3 semantic).
+pub fn build_agent_runtime_with_sources(
+    resolved:      &ResolvedProject,
+    deploy_label:  &str,
+    sources:       &crate::ProjectSources,
+) -> (Deployment, Service) {
     let labels   = aislang_labels("agent_runtime", deploy_label);
     let selector = component_selector("agent_runtime");
     let port     = agent_runtime_port(resolved, deploy_label);
@@ -616,28 +728,51 @@ pub fn build_agent_runtime(
     }
     annotations.insert(
         PROJECT_HASH_ANNOTATION.to_string(),
-        sha256_hex_of_source_and_lockfile(ais_source, lockfile),
+        if sources.is_multi_module() {
+            sha256_hex_of_multi_module(sources)
+        } else {
+            sha256_hex_of_source_and_lockfile(
+                &sources.ais_source, sources.lockfile.as_deref())
+        },
     );
 
     // ── Volume mounts: aislang-project CM mounted at /etc/aislang.
     //
     // items[] selects + remaps keys: `project.ais` + `aislang.lock`
-    // land at the mount root; each `<prompt-label>` key lands inside
-    // the `prompts/` sub-directory.  Without items[], every CM key
-    // (including prompt-label keys) would mount at the root and
-    // overwrite each other if any label happened to be `project.ais`
-    // (unlikely but possible) — explicit remapping is safer + makes
-    // the on-disk layout match the .ais user's intuition.
-    let mut cm_items = vec![
-        KeyToPath {
-            key:  PROJECT_CM_AIS_KEY.to_string(),
-            path: PROJECT_CM_AIS_KEY.to_string(),
-        },
-        KeyToPath {
+    // (single-file) OR `<module>.ais` + `aislang.toml` + `aislang.lock`
+    // (multi-module) land at the mount root; each `<prompt-label>` key
+    // lands inside the `prompts/` sub-directory.  Without items[],
+    // every CM key (including prompt-label keys) would mount at the
+    // root and overwrite each other if any label happened to be
+    // `project.ais` (unlikely but possible) — explicit remapping is
+    // safer + makes the on-disk layout match the .ais user's intuition.
+    let mut cm_items = if sources.is_multi_module() {
+        let mut v = Vec::with_capacity(sources.modules.len() + 2);
+        for name in sources.modules.keys() {
+            let path = format!("{name}.ais");
+            v.push(KeyToPath { key: path.clone(), path });
+        }
+        v.push(KeyToPath {
+            key:  PROJECT_CM_MANIFEST_KEY.to_string(),
+            path: PROJECT_CM_MANIFEST_KEY.to_string(),
+        });
+        v.push(KeyToPath {
             key:  PROJECT_CM_LOCKFILE_KEY.to_string(),
             path: PROJECT_CM_LOCKFILE_KEY.to_string(),
-        },
-    ];
+        });
+        v
+    } else {
+        vec![
+            KeyToPath {
+                key:  PROJECT_CM_AIS_KEY.to_string(),
+                path: PROJECT_CM_AIS_KEY.to_string(),
+            },
+            KeyToPath {
+                key:  PROJECT_CM_LOCKFILE_KEY.to_string(),
+                path: PROJECT_CM_LOCKFILE_KEY.to_string(),
+            },
+        ]
+    };
     // Sorted iteration over prompt labels for determinism.
     let mut prompt_labels: Vec<&String> =
         resolved.prompt_hashes.keys().collect();
@@ -682,13 +817,19 @@ pub fn build_agent_runtime(
         // Default image entrypoint is `aislang`; pass the mcp-serve
         // subcommand + flags as args.  `--http 0.0.0.0:<port>` binds
         // on every pod interface so the Service can reach it; the
-        // trailing positional is the .ais source path inside the pod.
+        // trailing positional is the .ais source path inside the pod
+        // (single-file) OR the mount directory (multi-module — the
+        // CLI's dir-input dispatch loads `aislang.toml` from there).
         command: None,
         args: Some(vec![
             "mcp-serve".to_string(),
             "--http".to_string(),
             format!("0.0.0.0:{port}"),
-            format!("{PROJECT_MOUNT_DIR}/{PROJECT_CM_AIS_KEY}"),
+            if sources.is_multi_module() {
+                PROJECT_MOUNT_DIR.to_string()
+            } else {
+                format!("{PROJECT_MOUNT_DIR}/{PROJECT_CM_AIS_KEY}")
+            },
         ]),
         volume_mounts: Some(vec![VolumeMount {
             name:       "project".to_string(),
@@ -753,6 +894,43 @@ pub fn build_agent_runtime(
 /// any byte change in either input shifts the hash → ReplicaSet
 /// rolls out.  Same `sha2` crate the resolver uses for prompt
 /// hashing (shared dep transitively via aislang-resolver).
+/// v0.3 Week 16 Thu — project-fingerprint hash for multi-module
+/// projects.  Deterministically combines:
+///
+///   1. Each module's name + source bytes (BTreeMap order)
+///   2. The `aislang.toml` manifest body (if present)
+///   3. The lockfile body (if present)
+///
+/// Same `||` separator + per-key tagging style as
+/// [`sha256_hex_of_source_and_lockfile`], so reverse-debug paths can
+/// distinguish the inputs.  Any byte change in ANY module shifts the
+/// hash → ReplicaSet rolls (matches the lockfile reconciler's "any
+/// module changed → re-resolve" v0.3 semantic).
+fn sha256_hex_of_multi_module(sources: &crate::ProjectSources) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (name, body) in &sources.modules {
+        h.update(b"module:");
+        h.update(name.as_bytes());
+        h.update(b"||");
+        h.update(body.as_bytes());
+        h.update(b"||");
+    }
+    if let Some(m) = &sources.manifest {
+        h.update(b"manifest||");
+        h.update(m.as_bytes());
+        h.update(b"||");
+    }
+    if let Some(l) = &sources.lockfile {
+        h.update(b"lockfile||");
+        h.update(l.as_bytes());
+    }
+    let bytes = h.finalize();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes { out.push_str(&format!("{b:02x}")); }
+    out
+}
+
 fn sha256_hex_of_source_and_lockfile(ais_source: &str, lockfile: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
