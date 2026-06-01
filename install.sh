@@ -22,14 +22,21 @@
 #                  (PLAN §Week 11 Thu) uses this. When BASE_URL is set,
 #                  VERSION must be a concrete tag (no "latest" resolve).
 #   GITHUB_TOKEN — Personal Access Token (Classic with `repo` scope,
-#     or GH_TOKEN    or fine-grained with read-access to the repo).
+#     or GH_TOKEN    or fine-grained with `Contents: Read` on the repo).
 #                  REQUIRED for private repos; ignored for public ones.
 #                  Phase 2 Week 15 Fri (post-Phase-2-close) addition —
 #                  unblocks cold-VM rehearsal against private forks
 #                  before the v0.4 public-launch flip.  When set, the
-#                  installer passes `Authorization: Bearer $TOKEN` on
-#                  every curl call (latest-tag resolve + tarball
-#                  fetch + checksums fetch).
+#                  installer:
+#                    1. Queries the GitHub API
+#                       (api.github.com/.../releases/tags/<TAG>) to
+#                       discover asset URLs — works for both public
+#                       and private repos when authenticated.
+#                    2. Downloads each asset via its per-asset API
+#                       URL with `Accept: application/octet-stream`,
+#                       NOT via the github.com/releases/download/...
+#                       pattern (which is browser-cookie-auth-only
+#                       for private repos — returns 404 to Bearer).
 #
 # Flags:
 #   --check-deps   — skip install, just probe runtime prerequisites
@@ -215,23 +222,42 @@ resolve_version() {
     if [ -n "$BASE_URL" ]; then
       die "VERSION=latest is not supported with BASE_URL override; pass a concrete tag."
     fi
-    info "resolving latest release tag from github.com/$REPO …"
-    # Follow redirects (auth_curl handles `-L` + Bearer-strip-on-CDN), print
-    # final URL (-w), no body (-o /dev/null).  Token-aware so private
-    # repos can resolve the latest tag via the same redirect chain.
-    final="$(auth_curl -sS -o /dev/null -w '%{url_effective}' \
-      "https://github.com/$REPO/releases/latest")" \
-      || die "failed to resolve latest release URL"
-    # Final URL shape: .../releases/tag/v0.1.0
-    VERSION="${final##*/}"
-    if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
-      die "could not parse latest tag from: $final"
-    fi
+    info "resolving latest release tag via GitHub API …"
+    # Use api.github.com (not github.com/releases/latest's redirect)
+    # because the API endpoint works uniformly for public + private
+    # repos with PAT auth — the github.com redirect path only honours
+    # cookie-based browser sessions, not Bearer headers.
+    json="$(auth_curl -sSf \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/$REPO/releases/latest")" \
+      || die "failed to query latest release via API
+       (token scope? Classic PAT needs \`repo\`; fine-grained PAT needs Contents: Read)"
+    # Extract "tag_name": "v0.X.Y" — awk on the first match.
+    VERSION="$(printf '%s' "$json" | awk -F'"' '/"tag_name":/{print $4; exit}')"
+    [ -n "$VERSION" ] || die "could not parse tag_name from latest release JSON"
   fi
   info "installing version: $VERSION"
 }
 
 # ── fetch tarball + checksums into a tmpdir ─────────────────────
+#
+# v0.3-prep correction: the github.com/<owner>/<repo>/releases/
+# download/<tag>/<file> URL pattern does NOT accept PAT-Bearer auth
+# for private repos — it's a browser-cookie-only endpoint.  Live
+# repro: github.com returns HTTP/2 404 with no Location header to
+# `curl -L -H "Authorization: Bearer <PAT>" …/releases/download/…`
+# even when the same PAT works fine against api.github.com.
+#
+# Correct path: discover asset metadata via the API, then download
+# via the per-asset API URL with `Accept: application/octet-stream`
+# — which IS the supported way per GitHub's REST API docs:
+#   https://docs.github.com/en/rest/releases/assets#get-a-release-asset
+#
+# Public repos benefit too: same code path, no special-casing.
+#
+# BASE_URL override path stays on the old github.com URL pattern —
+# it's for local-HTTP-mirror rehearsal which doesn't go through
+# api.github.com.
 fetch_assets() {
   TMPDIR="$(mktemp -d -t aislang-install-XXXXXX)"
   trap 'rm -rf "$TMPDIR"' EXIT INT TERM
@@ -240,17 +266,92 @@ fetch_assets() {
   # `aislang-0.1.0-<target>.tar.gz`, not `aislang-v0.1.0-…`).
   v_strip="${VERSION#v}"
   TARBALL="aislang-${v_strip}-${TARGET}.tar.gz"
-  base="${BASE_URL:-https://github.com/$REPO/releases/download}/${VERSION}"
 
-  info "downloading ${base}/${TARBALL}"
-  auth_curl -sSf -o "$TMPDIR/$TARBALL" "$base/$TARBALL" \
-    || die "failed to download tarball: $base/$TARBALL
-       (private repo? set GITHUB_TOKEN / GH_TOKEN — see header comment)"
+  if [ -n "$BASE_URL" ]; then
+    # Local-mirror override — keep the v0.2 path that hits the
+    # plain URL (no API involved; mirror serves the file directly).
+    base="${BASE_URL}/${VERSION}"
+    info "downloading ${base}/${TARBALL}"
+    auth_curl -sSf -o "$TMPDIR/$TARBALL" "$base/$TARBALL" \
+      || die "failed to download tarball: $base/$TARBALL"
+    info "downloading ${base}/checksums.txt"
+    auth_curl -sSf -o "$TMPDIR/checksums.txt" "$base/checksums.txt" \
+      || die "failed to download checksums.txt"
+    return
+  fi
 
-  info "downloading ${base}/checksums.txt"
-  auth_curl -sSf -o "$TMPDIR/checksums.txt" "$base/checksums.txt" \
-    || die "failed to download checksums.txt
-       (private repo? set GITHUB_TOKEN / GH_TOKEN — see header comment)"
+  # Default path — discover assets via the GitHub API.
+  info "querying release $VERSION via GitHub API …"
+  api_url="https://api.github.com/repos/$REPO/releases/tags/$VERSION"
+  release_json="$(auth_curl -sSf \
+    -H 'Accept: application/vnd.github+json' \
+    "$api_url")" \
+    || die "failed to query release: $api_url
+       (token scope? Classic PAT needs \`repo\`; fine-grained PAT needs Contents: Read.
+        Also verify VERSION='$VERSION' matches an existing tag — drafts have
+        tag_name but no published binary; publish via gh release edit --draft=false.)"
+
+  tarball_asset_url="$(extract_asset_url "$release_json" "$TARBALL")"
+  [ -n "$tarball_asset_url" ] || die \
+    "asset $TARBALL not in release $VERSION's asset list.
+     (release exists but the matrix-build job may not have attached
+      this target's tarball — check the release page.)"
+
+  checksums_asset_url="$(extract_asset_url "$release_json" "checksums.txt")"
+  [ -n "$checksums_asset_url" ] || die \
+    "checksums.txt not in release $VERSION's asset list"
+
+  info "downloading $TARBALL via API"
+  # `Accept: application/octet-stream` tells the API to return the
+  # binary content (it 302s to a signed CDN URL; curl -L follows
+  # and strips Bearer on cross-origin — same posture as auth_curl).
+  auth_curl -sSf \
+    -H 'Accept: application/octet-stream' \
+    -o "$TMPDIR/$TARBALL" \
+    "$tarball_asset_url" \
+    || die "failed to download tarball via API: $tarball_asset_url"
+
+  info "downloading checksums.txt via API"
+  auth_curl -sSf \
+    -H 'Accept: application/octet-stream' \
+    -o "$TMPDIR/checksums.txt" \
+    "$checksums_asset_url" \
+    || die "failed to download checksums.txt via API: $checksums_asset_url"
+}
+
+# Extract the API asset-URL for the asset with the given filename
+# from a release JSON response.
+#
+# Awk walks the JSON line-by-line, remembering the most recently-seen
+# "url" field that looks like an asset URL (i.e. matches the
+# `/releases/assets/<id>` pattern, distinguishing it from the
+# release's own `/releases/<release_id>` URL).  When it hits the
+# "name" field matching our target asset filename, it prints the
+# remembered URL and exits.
+#
+# Works because GitHub's JSON response orders each asset object as
+# `url` → `id` → `node_id` → `name` → …, so the most-recently-seen
+# asset URL is always the one belonging to the asset whose name we
+# match against.  Tested empirically against the live API response.
+#
+# JSON-parsing without jq (deliberately — install.sh's prereq list
+# says "POSIX sh, curl, tar, mktemp, sha256sum/shasum.  No bash, no
+# jq.").  Robust enough for the well-formed GitHub API responses we
+# consume; would not be robust against arbitrary JSON in general.
+extract_asset_url() {
+  json="$1"
+  target="$2"
+  printf '%s' "$json" | awk -v target="$target" '
+    /"url":[[:space:]]*"https:\/\/api\.github\.com.*\/releases\/assets\// {
+      url = $0
+      sub(/.*"url":[[:space:]]*"/, "", url)
+      sub(/".*/, "", url)
+    }
+    $0 ~ "\"name\":[[:space:]]*\"" target "\"" {
+      print url
+      exit
+    }
+  '
 }
 
 # ── verify sha256 against the published checksums file ──────────
