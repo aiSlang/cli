@@ -155,9 +155,11 @@ pub const INGRESS_MANIFEST_FILENAME:               &str = "ingress.yaml";
 /// `Project.prompts[i].file`).
 #[derive(Debug, Default, Clone)]
 pub struct ProjectSources {
-    /// Verbatim .ais source text.  Lands in the `aislang-project`
-    /// ConfigMap under key `project.ais`, mounted at
-    /// `/etc/aislang/project.ais` inside the agent-runtime pod.
+    /// Verbatim .ais source text for single-file projects.  Lands in
+    /// the `aislang-project` ConfigMap under key `project.ais`,
+    /// mounted at `/etc/aislang/project.ais` inside the agent-runtime
+    /// pod.  Empty string for multi-module projects (the per-module
+    /// sources live in [`modules`] below).
     pub ais_source: String,
 
     /// Lockfile body (`aislang.lock` content).  `None` when the
@@ -171,7 +173,41 @@ pub struct ProjectSources {
     /// one mounted file per entry (at `/etc/aislang/prompts/<label>`).
     /// Empty map is fine — projects with no prompts skip the
     /// prompts/ sub-directory entirely.
+    ///
+    /// v0.3 multi-module: keys are MODULE-QUALIFIED — `<module>.<label>`
+    /// — matching the merged `ResolvedProject.prompt_hashes` shape.
     pub prompt_bodies: BTreeMap<String, String>,
+
+    /// v0.3 Week 16 Thu — multi-module mode.  Empty for single-file
+    /// projects (the `ais_source` field above is authoritative).  When
+    /// non-empty, the K8s emitter switches to multi-module CM layout:
+    ///
+    /// - one CM data key per module (`<module-name>.ais` → source bytes)
+    /// - one CM data key `aislang.toml` → manifest body
+    /// - the agent-runtime pod command points at the mount DIRECTORY
+    ///   (`/etc/aislang`) rather than a single file, so `aislang
+    ///   mcp-serve` runs the same dir-vs-file dispatch the CLI does.
+    ///
+    /// Keys are bare module names (no `.ais` suffix); the emitter
+    /// appends the suffix when generating CM data keys + file mount
+    /// paths.  Iteration order is `BTreeMap`-sorted so CM YAML stays
+    /// byte-stable across plan runs.
+    pub modules: BTreeMap<String, String>,
+
+    /// v0.3 Week 16 Thu — the project manifest (aislang.toml) body
+    /// for multi-module projects.  Empty for single-file projects.
+    /// Lands in the CM under key `aislang.toml` so `aislang mcp-serve`
+    /// inside the pod can autodiscover modules the same way the CLI
+    /// does outside the cluster.
+    pub manifest: Option<String>,
+}
+
+impl ProjectSources {
+    /// True when this bag describes a multi-module project (per the
+    /// non-empty `modules` map).  K8s emitter branches on this for
+    /// CM layout + pod-command path; single-file `ais_source` shape
+    /// stays unchanged.
+    pub fn is_multi_module(&self) -> bool { !self.modules.is_empty() }
 }
 
 // ============================================================================
@@ -273,11 +309,10 @@ pub fn emit(
     //    same port.  Per-prompt + project-fingerprint annotations
     //    on the pod template drive ReplicaSet rollouts on any input
     //    change (Decision 43.4).
-    let (agent_dep, agent_svc) = services::build_agent_runtime(
+    let (agent_dep, agent_svc) = services::build_agent_runtime_with_sources(
         resolved,
         &deploy_label,
-        &sources.ais_source,
-        sources.lockfile.as_deref(),
+        sources,
     );
     manifests.insert(
         AGENT_RUNTIME_MANIFEST_FILENAME.to_string(),
@@ -293,12 +328,26 @@ pub fn emit(
     //    `kubectl apply -f manifests/aislang-project-config.yaml`
     //    can refresh the project content without touching the
     //    Deployment YAML.
-    let project_cm = services::build_aislang_project_configmap(
-        &deploy_label,
-        &sources.ais_source,
-        sources.lockfile.as_deref(),
-        &sources.prompt_bodies,
-    );
+    //
+    // v0.3 Week 16 Thu: multi-module branches into a different CM
+    // shape (per-module data keys + aislang.toml).  Single-file
+    // path is byte-identical to v0.2.
+    let project_cm = if sources.is_multi_module() {
+        services::build_aislang_project_configmap_multi(
+            &deploy_label,
+            &sources.modules,
+            sources.manifest.as_deref(),
+            sources.lockfile.as_deref(),
+            &sources.prompt_bodies,
+        )
+    } else {
+        services::build_aislang_project_configmap(
+            &deploy_label,
+            &sources.ais_source,
+            sources.lockfile.as_deref(),
+            &sources.prompt_bodies,
+        )
+    };
     manifests.insert(
         AISLANG_PROJECT_CM_MANIFEST_FILENAME.to_string(),
         join_manifests(&[
@@ -889,6 +938,7 @@ mod tests {
             ais_source:    ais_source.to_string(),
             lockfile:      lockfile.map(String::from),
             prompt_bodies: bodies,
+            ..Default::default()
         }
     }
 
@@ -1528,5 +1578,128 @@ mod tests {
             "otlp_endpoint: \"{}\"", services::OTEL_ENDPOINT_DEFAULT)),
             "values.yaml must surface observability.otlp_endpoint default; got:\n{}",
             artifacts.values_yaml);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // v0.3 Week 16 Thu — multi-module emit tests
+    // ────────────────────────────────────────────────────────────────
+
+    /// Helper: synthesize a multi-module `ProjectSources` with two
+    /// modules (`m1`, `m2`) for the CM-layout / pod-command tests.
+    fn multi_module_sources() -> ProjectSources {
+        let mut modules = Btm::new();
+        modules.insert("m1".to_string(), "project \"m1\" { }".to_string());
+        modules.insert("m2".to_string(), "project \"m2\" { }".to_string());
+        ProjectSources {
+            ais_source:    String::new(),
+            modules,
+            manifest:      Some("[project]\nname = \"multi\"\nversion = \"0.1.0\"\n".to_string()),
+            lockfile:      None,
+            prompt_bodies: Btm::new(),
+        }
+    }
+
+    #[test] fn multi_module_cm_carries_per_module_ais_keys_plus_manifest() {
+        let resolved = resolved_with_k8s_deploy("prod");
+        let sources  = multi_module_sources();
+        let catalog  = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+
+        let cm_yaml = artifacts.manifests.get("aislang-project-config.yaml")
+            .expect("aislang-project ConfigMap must be emitted");
+        let cm: serde_yaml::Value = serde_yaml::from_str(cm_yaml).expect("yaml");
+        let data = &cm["data"];
+        // Per-module .ais keys present.
+        assert!(data["m1.ais"].as_str().is_some(),
+            "CM data must carry `m1.ais` key for multi-module; got:\n{cm_yaml}");
+        assert!(data["m2.ais"].as_str().is_some(),
+            "CM data must carry `m2.ais` key for multi-module; got:\n{cm_yaml}");
+        // Manifest present under aislang.toml.
+        assert!(data["aislang.toml"].as_str().is_some(),
+            "CM data must carry `aislang.toml` key for multi-module; got:\n{cm_yaml}");
+        // Lockfile key present (empty string is fine — None lockfile).
+        assert!(data["aislang.lock"].as_str().is_some(),
+            "CM data must always carry `aislang.lock` key; got:\n{cm_yaml}");
+        // The single-file project.ais key MUST NOT appear — multi-
+        // module replaces it.
+        assert!(data["project.ais"].as_str().is_none(),
+            "CM must NOT carry `project.ais` in multi-module mode \
+             (it's replaced by per-module keys); got:\n{cm_yaml}");
+    }
+
+    #[test] fn multi_module_pod_command_points_at_mount_directory() {
+        let resolved = resolved_with_k8s_deploy("prod");
+        let sources  = multi_module_sources();
+        let catalog  = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+
+        let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
+            .expect("agent-runtime Deployment must be emitted");
+        // The pod's mcp-serve args end in the mount DIRECTORY
+        // (`/etc/aislang`), not a file path — pins that aislang
+        // mcp-serve will run the same dir-vs-file dispatch the CLI
+        // does, autodiscovering aislang.toml + modules at the
+        // mount root.
+        assert!(dep_yaml.contains("- /etc/aislang\n"),
+            "agent-runtime args must contain the mount directory \
+             (multi-module); got:\n{dep_yaml}");
+        // Negative: the single-file file-path form must NOT appear.
+        assert!(!dep_yaml.contains("/etc/aislang/project.ais"),
+            "agent-runtime args must NOT contain the project.ais file \
+             path in multi-module mode; got:\n{dep_yaml}");
+    }
+
+    #[test] fn multi_module_cm_volume_mount_items_remap_per_module() {
+        // Pin that the agent-runtime pod's ConfigMap volume items[]
+        // selects + remaps the per-module data keys + aislang.toml
+        // + aislang.lock at the mount root.  Without items[] every
+        // key would still mount but at risk of name collisions with
+        // future prompt labels.
+        let resolved = resolved_with_k8s_deploy("prod");
+        let sources  = multi_module_sources();
+        let catalog  = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+
+        let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
+            .expect("agent-runtime Deployment must be emitted");
+        // Pin both module files appear in the items[] remap.
+        for needle in ["m1.ais", "m2.ais", "aislang.toml", "aislang.lock"] {
+            assert!(dep_yaml.contains(&format!("key: {needle}")),
+                "items[] must remap `{needle}`; got:\n{dep_yaml}");
+        }
+        assert!(!dep_yaml.contains("key: project.ais"),
+            "items[] must NOT remap project.ais in multi-module mode; \
+             got:\n{dep_yaml}");
+    }
+
+    #[test] fn single_file_cm_layout_byte_identical_to_v02() {
+        // Regression guard: single-file emit goes through the same
+        // emit() function but `sources.is_multi_module()` is false,
+        // so the CM + pod-args must look EXACTLY like v0.2.  Pins
+        // that v0.2 .ais fixtures keep working unchanged.
+        let resolved = resolved_with_k8s_deploy("prod");
+        let mut sources = empty_sources();
+        sources.ais_source = "project \"single\" { }".to_string();
+        // sources.modules + sources.manifest stay empty — single-file.
+        assert!(!sources.is_multi_module(),
+            "synthetic single-file sources must report false");
+
+        let catalog  = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+
+        let cm_yaml = artifacts.manifests.get("aislang-project-config.yaml")
+            .expect("CM emitted");
+        let cm: serde_yaml::Value = serde_yaml::from_str(cm_yaml).expect("yaml");
+        let data = &cm["data"];
+        assert!(data["project.ais"].as_str().is_some(),
+            "single-file mode must carry `project.ais`; got:\n{cm_yaml}");
+        // Multi-module keys MUST NOT appear.
+        assert!(data["aislang.toml"].as_str().is_none(),
+            "single-file mode must NOT carry `aislang.toml`; got:\n{cm_yaml}");
+
+        let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
+            .expect("dep emitted");
+        assert!(dep_yaml.contains("/etc/aislang/project.ais"),
+            "single-file mode pod args must end in project.ais; got:\n{dep_yaml}");
     }
 }

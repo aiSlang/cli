@@ -13,7 +13,7 @@ project "architect-module" {
   }
   model "thinker" {
     requires    = [chat]
-    context_min = 200k
+    context_min = 32k
     prefer      = [ollama.llama_3_1_8b]
     pin         = ollama.llama_3_1_8b
   }

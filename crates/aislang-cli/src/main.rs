@@ -387,6 +387,13 @@ fn run_mcp_serve_http(addr: SocketAddr) -> Result<()> {
 }
 
 fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
+    // v0.3 Week 16 Thu: dir-vs-file dispatch.  Multi-module inputs
+    // go through the load_project_input pipeline (which runs parser
+    // + check_multi + catalog-check internally), so we just summarize
+    // the result here.
+    if file.is_dir() {
+        return run_validate_dir(file, verbose);
+    }
     let source = std::fs::read_to_string(&file)?;
 
     // ── Stage 1: parse + typecheck (in aislang-core::validate) ──
@@ -475,6 +482,44 @@ fn run_validate(file: PathBuf, verbose: u8) -> Result<()> {
 /// Shared by `run_validate` and `run_plan` so error output is identical
 /// regardless of which command the user invoked.
 ///
+/// v0.3 Week 16 Thu — multi-module validate.  Runs the same
+/// load_project_input pipeline as `aislang plan` (parser +
+/// check_multi + catalog-check per module) but doesn't emit
+/// anything; success is the parsed + checked merged project.
+fn run_validate_dir(dir: PathBuf, verbose: u8) -> Result<()> {
+    let t_start = std::time::Instant::now();
+    let loaded = load_project_input(&dir)?;
+    let t_total = t_start.elapsed();
+
+    println!("OK: {} parsed and type-checked ({} modules)",
+        dir.display(), loaded.resolved.module_source_hashes.len());
+
+    if !loaded.warnings.is_empty() {
+        eprintln!();
+        eprintln!("warnings:");
+        for w in &loaded.warnings {
+            eprintln!("  - {}", w.message);
+        }
+    }
+
+    if verbose >= 1 {
+        print_summary(&loaded.resolved.project);
+        eprintln!();
+        eprintln!("checks: ✓ parse  ✓ typecheck  ✓ catalog  ✓ cross-module");
+        eprintln!("elapsed: {t_total:.2?}");
+        eprintln!("modules:");
+        for (m, h) in &loaded.resolved.module_source_hashes {
+            eprintln!("  - {m} ({})", &h[..12]);
+        }
+    }
+    if verbose >= 2 {
+        eprintln!();
+        eprintln!("Merged AST (Debug):");
+        eprintln!("{:#?}", loaded.resolved.project);
+    }
+    Ok(())
+}
+
 /// - `Parse(errors)` with `Some(span)` → `diagnostic::render_with_source`
 ///   (line:col + 2-3-line snippet + caret).
 /// - `Parse(errors)` with `None` (converter errors) → plain message.
@@ -499,6 +544,219 @@ fn render_validate_error(source: &str, err: &aislang_core::ValidateError) {
 }
 
 // ============================================================================
+// v0.3 Week 16 Thu — dir-vs-file dispatch for the project input
+// ============================================================================
+
+/// Output of [`load_project_input`].  Encapsulates everything the
+/// downstream subcommands (plan / validate / apply) need to operate
+/// on a project, regardless of whether the input was a single `.ais`
+/// file or a directory holding an `aislang.toml` manifest.
+struct LoadedProject {
+    /// Resolved project (catalog bindings + prompt hashes).  For
+    /// multi-module inputs this carries module-qualified keys per
+    /// the Wed resolver contract.
+    resolved: aislang_resolver::ResolvedProject,
+    /// In-core validate warnings — accumulated across each module
+    /// for multi-module inputs.
+    warnings: Vec<aislang_core::Warning>,
+    /// True when the input is a directory holding `aislang.toml`.
+    /// Drives the K8s emitter's CM layout + the pod command line.
+    is_multi_module: bool,
+    /// Bag of ready-to-mount sources for the K8s emitter.  For
+    /// single-file: `ais_source` populated.  For multi-module:
+    /// `modules` + `manifest` populated.
+    sources: aislang_k8s::ProjectSources,
+    /// Root directory for lockfile + emitted-artifact placement.
+    /// For single-file: the parent of the .ais file.  For multi-
+    /// module: the manifest's containing dir.
+    project_root: PathBuf,
+    /// Per-input source bytes used by the lockfile reconciler.
+    /// Single-file: the `.ais` content.  Multi-module: empty (the
+    /// per-module hashes in `resolved.module_source_hashes` drive
+    /// reconciliation via `reconcile_multi`).
+    single_file_source: String,
+}
+
+/// Load a project from a CLI positional path argument.  If the path
+/// is a file, the v0.2 single-file pipeline runs (read → validate →
+/// catalog-check → resolve).  If the path is a directory, the v0.3
+/// multi-module pipeline runs (load `aislang.toml` → read every
+/// declared module → check_multi → resolve_multi).
+///
+/// Errors carry the input path so the user sees what went wrong
+/// without having to guess.  Stage-by-stage logging mirrors the
+/// single-file pipeline so verbose output looks the same regardless
+/// of input shape.
+fn load_project_input(input: &Path) -> Result<LoadedProject> {
+    if input.is_dir() {
+        load_multi_module_project(input)
+    } else {
+        load_single_file_project(input)
+    }
+}
+
+fn load_single_file_project(file: &Path) -> Result<LoadedProject> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
+    // `Path::parent` returns `Some("")` (NOT None) when the input is
+    // a single-component relative path like `support-agent.ais` —
+    // catch that case too so `canonicalize` doesn't choke on `""`.
+    let source_dir = match file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+
+    let (project, mut warnings) = aislang_core::validate(&source)
+        .map_err(|err| {
+            render_validate_error(&source, &err);
+            anyhow::anyhow!("(see error above)")
+        })?;
+
+    let cat_warnings = aislang_resolver::check_against_bundled_catalog(&project)
+        .map_err(|e| anyhow::anyhow!("catalog error: {e}"))?;
+    warnings.extend(cat_warnings);
+
+    let resolved = aislang_resolver::resolve_against_bundled_catalog(
+        &project, source_dir)
+        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+
+    // Prompt bodies for the K8s emitter — same loader logic as the
+    // legacy K8s apply path, hoisted up here so dir+file inputs
+    // share one code path.
+    let mut prompt_bodies = std::collections::BTreeMap::new();
+    for prompt in &project.prompts {
+        let abs = if prompt.file.is_absolute() {
+            prompt.file.clone()
+        } else {
+            source_dir.join(&prompt.file)
+        };
+        let body = std::fs::read_to_string(&abs)
+            .map_err(|e| anyhow::anyhow!(
+                "read prompt `{}` from {}: {e}", prompt.label, abs.display()))?;
+        prompt_bodies.insert(prompt.label.clone(), body);
+    }
+
+    let sources = aislang_k8s::ProjectSources {
+        ais_source: source.clone(),
+        prompt_bodies,
+        ..Default::default()
+    };
+
+    Ok(LoadedProject {
+        resolved,
+        warnings,
+        is_multi_module: false,
+        sources,
+        project_root: source_dir.to_path_buf(),
+        single_file_source: source,
+    })
+}
+
+fn load_multi_module_project(dir: &Path) -> Result<LoadedProject> {
+    // ── Stage 0: load + validate the manifest.
+    let manifest = aislang_core::manifest::load_manifest(dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!(
+            "no `aislang.toml` in directory `{}`; either point at a `.ais` \
+             file directly or add a manifest declaring `[modules]`",
+            dir.display()))?;
+    let manifest_body = std::fs::read_to_string(
+        dir.join(aislang_core::manifest::MANIFEST_FILE_NAME))
+        .map_err(|e| anyhow::anyhow!("read aislang.toml: {e}"))?;
+
+    // ── Stage 1: read + parse every module the manifest declares.
+    let mut module_inputs: std::collections::BTreeMap<String,
+        aislang_resolver::ModuleInput> = std::collections::BTreeMap::new();
+    let mut module_projects: std::collections::BTreeMap<String,
+        aislang_core::ast::Project> = std::collections::BTreeMap::new();
+    let mut module_sources: std::collections::BTreeMap<String, String>
+        = std::collections::BTreeMap::new();
+    let mut module_prompt_bodies: std::collections::BTreeMap<String, String>
+        = std::collections::BTreeMap::new();
+    let mut warnings = Vec::new();
+
+    for (name, rel_path) in &manifest.modules {
+        let abs = dir.join(rel_path);
+        let source = std::fs::read_to_string(&abs)
+            .map_err(|e| anyhow::anyhow!(
+                "module `{name}`: read {}: {e}", abs.display()))?;
+        let (project, mod_warnings) = aislang_core::validate(&source)
+            .map_err(|err| {
+                eprintln!("module `{name}`:");
+                render_validate_error(&source, &err);
+                anyhow::anyhow!("(see error above)")
+            })?;
+        warnings.extend(mod_warnings.into_iter().map(|w| aislang_core::Warning {
+            message: format!("module `{name}`: {}", w.message),
+        }));
+
+        // Per-module prompts: read body, key under `<module>.<label>`
+        // matching the Wed resolver's prompt-hash key convention.
+        let module_dir = abs.parent().unwrap_or(dir).to_path_buf();
+        for prompt in &project.prompts {
+            let prompt_abs = if prompt.file.is_absolute() {
+                prompt.file.clone()
+            } else {
+                module_dir.join(&prompt.file)
+            };
+            let body = std::fs::read_to_string(&prompt_abs)
+                .map_err(|e| anyhow::anyhow!(
+                    "module `{name}`: read prompt `{}` from {}: {e}",
+                    prompt.label, prompt_abs.display()))?;
+            module_prompt_bodies.insert(
+                format!("{name}.{}", prompt.label), body);
+        }
+
+        module_projects.insert(name.clone(), project.clone());
+        module_sources.insert(name.clone(), source.clone());
+        module_inputs.insert(name.clone(), aislang_resolver::ModuleInput {
+            project,
+            source,
+            source_dir: module_dir,
+        });
+    }
+
+    // ── Stage 2: cross-module checker.
+    let check_warnings = aislang_core::checker::check_multi(&module_projects)
+        .map_err(|e| anyhow::anyhow!("validate error: {e}"))?;
+    warnings.extend(check_warnings);
+
+    // ── Stage 3: catalog-id check (per module — picks up resources
+    // the bundled catalog doesn't carry).  Each module's
+    // catalog-warning gets prefixed for clarity.
+    for (name, project) in &module_projects {
+        let cat = aislang_resolver::check_against_bundled_catalog(project)
+            .map_err(|e| anyhow::anyhow!("module `{name}` catalog error: {e}"))?;
+        warnings.extend(cat.into_iter().map(|w| aislang_core::Warning {
+            message: format!("module `{name}`: {}", w.message),
+        }));
+    }
+
+    // ── Stage 4: multi-module resolve.
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("bundled catalog load: {e}"))?;
+    let resolved = aislang_resolver::resolve_multi(&module_inputs, &catalog)
+        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
+
+    let sources = aislang_k8s::ProjectSources {
+        ais_source:    String::new(),
+        prompt_bodies: module_prompt_bodies,
+        modules:       module_sources,
+        manifest:      Some(manifest_body),
+        ..Default::default()
+    };
+
+    Ok(LoadedProject {
+        resolved,
+        warnings,
+        is_multi_module: true,
+        sources,
+        project_root: dir.to_path_buf(),
+        single_file_source: String::new(),
+    })
+}
+
+// ============================================================================
 // `aislang plan` — Friday of week 4
 // ============================================================================
 
@@ -510,54 +768,39 @@ fn run_plan(
     smoke_test:      bool,
     smoke_test_live: bool,
 ) -> Result<()> {
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-    let source_dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let t_total_start = std::time::Instant::now();
 
-    // Resolve the output dir: explicit --output-dir wins; otherwise
-    // default to the source file's directory. Canonicalised to an
-    // absolute path so the emitted Compose YAML embeds an unambiguous
-    // host-side mount path (works regardless of `docker compose`'s CWD).
+    // v0.3 Week 16 Thu: dir-vs-file dispatch via load_project_input.
+    // Single-file inputs follow the v0.2 pipeline byte-stably; dir
+    // inputs walk every module declared in `aislang.toml` and merge
+    // the resolved state.
+    let t = std::time::Instant::now();
+    let loaded = load_project_input(&file)?;
+    let t_validate = t.elapsed();
+
+    // Output dir defaults to the project root (file's parent OR
+    // dir itself).  Canonicalised so the emitted Compose YAML
+    // embeds an unambiguous host-side mount path.
     let output_dir: PathBuf = match output_dir {
         Some(p) => p,
-        None    => source_dir.to_path_buf(),
+        None    => loaded.project_root.clone(),
     };
     let output_dir = std::fs::canonicalize(&output_dir).map_err(|e| {
         anyhow::anyhow!("output dir `{}` doesn't exist or unreadable: {e}",
             output_dir.display())
     })?;
 
-    let t_total_start = std::time::Instant::now();
-
-    // ── Stage 1: validate (parse + checker) ──
-    let t = std::time::Instant::now();
-    let validate_result = aislang_core::validate(&source);
-    let t_validate = t.elapsed();
-    let (project, mut warnings) = match validate_result {
-        Ok(v) => v,
-        Err(err) => {
-            render_validate_error(&source, &err);
-            return Err(anyhow::anyhow!("(see error above)"));
-        }
-    };
-
-    // ── Stage 2: catalog ID validation ──
-    let t = std::time::Instant::now();
-    let cat_result = aislang_resolver::check_against_bundled_catalog(&project);
-    let t_catalog = t.elapsed();
-    match cat_result {
-        Ok(cat_warnings) => warnings.extend(cat_warnings),
-        Err(e) => return Err(anyhow::anyhow!("catalog error: {e}")),
-    }
-
-    // ── Stage 3: resolve (model selection + prompt hashing) ──
-    let t = std::time::Instant::now();
-    let resolved = aislang_resolver::resolve_against_bundled_catalog(&project, source_dir)
-        .map_err(|e| anyhow::anyhow!("resolve error: {e}"))?;
-    let t_resolve = t.elapsed();
+    let warnings  = loaded.warnings.clone();
+    let resolved      = &loaded.resolved;
+    let source        = loaded.single_file_source.as_str();
+    let t_catalog     = std::time::Duration::ZERO;   // catalog folded
+                                                     // into load_project_input
+    let t_resolve     = std::time::Duration::ZERO;   // same
 
     // ── Stage 4: lockfile reconcile (unless --no-lock) ──
-    // Lockfile and litellm config both live under `output_dir`.
+    // Lockfile lives under `output_dir`.  Multi-module projects use
+    // `reconcile_multi` against per-module source hashes; single-file
+    // projects use the v0.2 `reconcile()` path unchanged.
     let t = std::time::Instant::now();
     let lock_path = output_dir.join("aislang.lock");
     let lockfile_status: &str = if no_lock {
@@ -565,18 +808,31 @@ fn run_plan(
     } else {
         let existing = aislang_resolver::lockfile::read(&lock_path)
             .map_err(|e| anyhow::anyhow!("lockfile read error: {e}"))?;
-        let diff = aislang_resolver::lockfile::reconcile(
-            &source,
-            existing.as_ref(),
-            &resolved.catalog_version,
-            &resolved.prompt_hashes,
-        );
+        let diff = if loaded.is_multi_module {
+            aislang_resolver::lockfile::reconcile_multi(
+                existing.as_ref(),
+                &resolved.catalog_version,
+                &resolved.module_source_hashes,
+                &resolved.prompt_hashes,
+            )
+        } else {
+            aislang_resolver::lockfile::reconcile(
+                source,
+                existing.as_ref(),
+                &resolved.catalog_version,
+                &resolved.prompt_hashes,
+            )
+        };
         match diff {
             aislang_resolver::LockfileDiff::Match => {
                 "match — reused cached bindings"
             }
             aislang_resolver::LockfileDiff::Fresh => {
-                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                let new_lock = if loaded.is_multi_module {
+                    aislang_resolver::Lockfile::build_multi(resolved)
+                } else {
+                    aislang_resolver::Lockfile::build(source, resolved)
+                };
                 aislang_resolver::lockfile::write(&lock_path, &new_lock)
                     .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
                 "fresh — wrote new lockfile"
@@ -589,7 +845,11 @@ fn run_plan(
                         eprintln!("  - {r}");
                     }
                 }
-                let new_lock = aislang_resolver::Lockfile::build(&source, &resolved);
+                let new_lock = if loaded.is_multi_module {
+                    aislang_resolver::Lockfile::build_multi(resolved)
+                } else {
+                    aislang_resolver::Lockfile::build(source, resolved)
+                };
                 aislang_resolver::lockfile::write(&lock_path, &new_lock)
                     .map_err(|e| anyhow::anyhow!("lockfile write error: {e}"))?;
                 "stale — rewrote lockfile"
@@ -646,34 +906,14 @@ fn run_plan(
     let mut k8s_manifest_paths: Vec<PathBuf> = Vec::new();
     let mut k8s_artifacts_for_stdout: Option<aislang_k8s::K8sArtifacts> = None;
     if emit_k8s {
-        // Build ProjectSources for the emitter: .ais source verbatim,
-        // lockfile body (if present), and per-prompt file bodies.
-        // Wed (Decision 43.4): each prompt body lands in the
-        // `aislang-project` ConfigMap keyed by prompt label.
+        // v0.3 Week 16 Thu: ProjectSources was assembled in
+        // load_project_input (single-file OR multi-module).  The
+        // lockfile body comes from the file we just (re)wrote above.
         let lockfile_body = std::fs::read_to_string(&lock_path).ok();
-        let mut prompt_bodies: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for prompt in &project.prompts {
-            // Prompts live relative to the .ais source dir — same
-            // resolution rule the resolver uses for hashing.
-            let abs = if prompt.file.is_absolute() {
-                prompt.file.clone()
-            } else {
-                source_dir.join(&prompt.file)
-            };
-            let body = std::fs::read_to_string(&abs)
-                .map_err(|e| anyhow::anyhow!(
-                    "k8s emit: read prompt `{}` from {}: {e}",
-                    prompt.label, abs.display()))?;
-            prompt_bodies.insert(prompt.label.clone(), body);
-        }
-        let sources = aislang_k8s::ProjectSources {
-            ais_source:    source.clone(),
-            lockfile:      lockfile_body,
-            prompt_bodies,
-        };
+        let mut sources = loaded.sources.clone();
+        sources.lockfile = lockfile_body;
 
-        let k8s_artifacts = aislang_k8s::emit(&resolved, &catalog, &sources)
+        let k8s_artifacts = aislang_k8s::emit(resolved, &catalog, &sources)
             .map_err(|e| anyhow::anyhow!("k8s emit error: {e}"))?;
         let manifests_dir = output_dir.join(aislang_k8s::MANIFESTS_DIRNAME);
         std::fs::create_dir_all(&manifests_dir)
@@ -788,9 +1028,12 @@ fn run_plan(
     if verbose >= 3 {
         eprintln!();
         eprintln!("Full IR (JSON — ast + graph + resolution):");
-        let graph = aislang_core::checker::graph_summary(&project).ok();
+        // v0.3 Thu: the AST is `resolved.project` (multi-module merge
+        // for dir inputs; same Project shape for single-file).  The
+        // graph_summary builds against that merged AST.
+        let graph = aislang_core::checker::graph_summary(&resolved.project).ok();
         let combined = serde_json::json!({
-            "ast":        &project,
+            "ast":        &resolved.project,
             "graph":      graph,
             "resolution": &resolved,
         });
@@ -1314,6 +1557,25 @@ fn prepare_stack(
 
 /// `aislang apply <file>` — plan, then `docker compose up -d`.
 fn run_apply(file: PathBuf) -> Result<()> {
+    // v0.3 Week 16 Thu: directory input not yet wired through the
+    // apply path (state writing + Compose stack-up touch many
+    // single-file assumptions).  For Thu, give a clear error that
+    // points at the workaround: run `aislang plan <dir>` then bring
+    // the stack up via the generated artifacts directly.  Full dir-
+    // input apply lands as a v0.3 carry-over (Week 17 / Fri close).
+    if file.is_dir() {
+        return Err(anyhow::anyhow!(
+            "`aislang apply` does not yet accept a directory input \
+             (multi-module projects).  Workaround: run\n\
+             \n  \
+             aislang plan {} && \\\n    \
+             docker compose -f {}/stack.yml up -d   # Compose target\n    \
+             helm upgrade --install <release> {}/chart  # Kubernetes target\n\
+             \nDirectory-input apply lands in Week 16 Fri close \
+             (v0.3 carry-over).",
+            file.display(), file.display(), file.display(),
+        ));
+    }
     // Phase 2 Week 14 Thu — dispatch on the declared deploy target.
     // `target = kubernetes` deploys go through the helm path; v0.1
     // Compose path (the rest of this function) is unchanged.
@@ -1590,6 +1852,7 @@ fn run_apply_k8s(file: PathBuf) -> Result<()> {
         ais_source:    source.clone(),
         lockfile:      lockfile_body,
         prompt_bodies,
+        ..Default::default()
     };
 
     // ── Stage 6: emit. ──
