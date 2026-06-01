@@ -152,6 +152,11 @@ fn expected_support_agent() -> Project {
         // Forward-compat: existing `.ais` files continue to validate
         // with an empty mains Vec (serde(default) on the field).
         mains:       vec![],
+        // v0.3 Week 17 Mon: v0.1/v0.2 demos have no `pipeline` block.
+        // Forward-compat via serde(default) + skip_serializing_if =
+        // Vec::is_empty — the expected-AST JSON fixtures don't carry
+        // the `pipelines` field when empty.
+        pipelines:   vec![],
     }
 }
 

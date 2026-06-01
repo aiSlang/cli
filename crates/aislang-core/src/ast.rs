@@ -74,6 +74,57 @@ pub struct Project {
     // role to the host client.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mains: Vec<Main>,
+
+    /// v0.3 Week 17 Mon — `pipeline { … }` composition blocks
+    /// (Decision 44.5).  Sequential agent composition: each step's
+    /// output is the next's input.  Empty for v0.1 / v0.2 files —
+    /// `serde(default)` makes existing JSON load without the field;
+    /// `skip_serializing_if = Vec::is_empty` re-serializes the
+    /// no-pipelines case identically to v0.2, so the parser_fixtures
+    /// expected-AST JSON files stay byte-stable.
+    ///
+    /// Tue extends the block set with `loop` + `branch`; Wed-Fri
+    /// wire `aislang-runtime::patterns::*` to actually execute
+    /// pipelines at chat time.  Mon: AST + parser + checker only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipelines: Vec<Pipeline>,
+}
+
+/// v0.3 Week 17 Mon — composition primitive #1.
+///
+/// Grammar (Decision 44.5 sketch):
+///
+/// ```hcl
+/// pipeline "<label>" {
+///   steps  = [agent.<a>, agent.<b>, …]
+///   input  = "<description>"   # optional, String for v0.3
+///   output = "<description>"   # optional, String for v0.3
+/// }
+/// ```
+///
+/// Semantics (runtime — Wed/Thu/Fri):
+///   - sequential composition; each `step[i]`'s output feeds
+///     `step[i+1]` verbatim
+///   - `input` / `output` are descriptive metadata in v0.3
+///     (String-only); structured types v0.5+
+///   - `steps[]` references resolve to `agent` blocks via the
+///     existing `Ref` machinery (cross-module-aware as of Tue
+///     Week 16)
+///
+/// Mon ships the AST + parser + checker only — no runtime
+/// dispatch.  Composition primitive #2 + #3 (`loop`, `branch`)
+/// land Tue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pipeline {
+    pub label: String,
+    pub steps: Vec<Ref>,
+    /// Optional input-description.  String-only in v0.3 per
+    /// Decision 44.5; structured types (typed message envelopes,
+    /// schema refs) deferred to v0.5+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input:  Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -117,7 +117,8 @@ pub(crate) enum BlockKind {
     Eval,
     Secret,
     Deploy,
-    Main,   // v0.2 Fri
+    Main,      // v0.2 Fri
+    Pipeline,  // v0.3 Week 17 Mon (Decision 44.5)
 }
 
 impl BlockKind {
@@ -131,6 +132,7 @@ impl BlockKind {
             Self::Secret    => "secret",
             Self::Deploy    => "deploy",
             Self::Main      => "main",
+            Self::Pipeline  => "pipeline",
         }
     }
 
@@ -193,6 +195,12 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
     // detection works (`main "x"` + `main "x"` → error) AND so
     // future graph-renderers visualize them alongside agents.
     for m in &project.mains       { add_block(&mut graph, &mut nodes, BlockKind::Main,      &m.label)?; }
+    // v0.3 Week 17 Mon: pipeline blocks join the graph for the same
+    // duplicate-label detection.  Pipelines are terminal nodes in
+    // the resource graph (no other block kind references a pipeline
+    // — yet; Tue's `loop` + `branch` will, and they go through the
+    // edges pass like agents/secrets do today).
+    for p in &project.pipelines   { add_block(&mut graph, &mut nodes, BlockKind::Pipeline,  &p.label)?; }
 
     Ok(ResourceGraph { graph, nodes })
 }
@@ -281,6 +289,16 @@ fn check_refs(
                 dispatch_ref(graph, multi, sec_ref,
                     "mcp_server", &mcp.label, &format!("secrets[{i}]"))?;
             }
+        }
+    }
+    // v0.3 Week 17 Mon: pipeline steps[] — each entry references an
+    // `agent` block.  Same dispatch machinery as `agent.tools[i]` —
+    // cross-module aware, source-aware diagnostics, did-you-mean
+    // suggester all reused as-is.
+    for pipeline in &project.pipelines {
+        for (i, step_ref) in pipeline.steps.iter().enumerate() {
+            dispatch_ref(graph, multi, step_ref,
+                "pipeline", &pipeline.label, &format!("steps[{i}]"))?;
         }
     }
     Ok(())
@@ -1270,5 +1288,90 @@ mod tests {
         assert!(err.contains("module `bad`"),
             "error should be prefixed with the source module name; \
              got: {err}");
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 17 Mon — `pipeline { … }` block validation.
+    // ---------------------------------------------------------------- //
+
+    /// Helper for the pipeline-checker tests.  Same shape as the
+    /// other helpers — builds a synthetic project body and runs
+    /// `check()` against it.
+    fn pipeline_body(steps_block: &str) -> String {
+        format!(r#"
+          model "m" {{
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }}
+          prompt "sys" {{ file = "./s.md"  version = "1.0.0" }}
+          agent "a" {{ model = model.m  system_prompt = prompt.sys  tools = [] }}
+          agent "b" {{ model = model.m  system_prompt = prompt.sys  tools = [] }}
+          {steps_block}
+        "#)
+    }
+
+    #[test] fn pipeline_with_valid_step_refs_passes() {
+        check_src(&pipeline_body(r#"
+          pipeline "two_step" {
+            steps = [agent.a, agent.b]
+          }
+        "#)).expect("valid agent refs in steps[] must pass");
+    }
+
+    #[test] fn pipeline_step_ref_to_undeclared_agent_fails() {
+        let err = check_src(&pipeline_body(r#"
+          pipeline "broken" {
+            steps = [agent.a, agent.ghost]
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("pipeline `broken`"),
+            "error should name the source pipeline; got: {err}");
+        assert!(err.contains("field `steps[1]`"),
+            "error should index the bad step; got: {err}");
+        assert!(err.contains("undeclared agent `ghost`"),
+            "error should name the missing label + kind; got: {err}");
+    }
+
+    #[test] fn pipeline_step_typo_suggests_did_you_mean() {
+        // Typo `agent.a` vs `agent.aa` (1-edit) — Levenshtein
+        // suggester should fire from the same `suggest_or_list`
+        // path same-module refs use.
+        let err = check_src(&pipeline_body(r#"
+          pipeline "typo" {
+            steps = [agent.aa]
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("did you mean `a`?"),
+            "near-match should be suggested for pipeline steps too; \
+             got: {err}");
+    }
+
+    #[test] fn duplicate_pipeline_label_rejected() {
+        let err = check_src(&pipeline_body(r#"
+          pipeline "dup" {
+            steps = [agent.a]
+          }
+          pipeline "dup" {
+            steps = [agent.b]
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("duplicate `pipeline` block label `dup`"),
+            "duplicate-label detection should fire for pipelines; \
+             got: {err}");
+    }
+
+    #[test] fn pipeline_and_agent_can_share_label() {
+        // Pipelines + agents live in disjoint namespaces (different
+        // BlockKind variants), so `pipeline "foo"` + `agent "foo"`
+        // is legal — same rule v0.2 Fri shipped for `agent` vs `main`.
+        check_src(&pipeline_body(r#"
+          pipeline "a" {
+            steps = [agent.a]
+          }
+        "#)).expect(
+            "pipeline + agent sharing a label must be allowed \
+             (different BlockKinds)");
     }
 }
