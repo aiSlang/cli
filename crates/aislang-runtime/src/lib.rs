@@ -43,6 +43,10 @@ pub mod state;
 // Decision 18 (official Rust SDK) + Decision 22 (Jaeger UI URL to
 // stderr). Child-span instrumentation in litellm/session lands Tue/Wed.
 pub mod tracing;
+// v0.3 Week 17 Tue: dir-vs-file project loader, hoisted from
+// aislang-cli so `aislang mcp-serve` can dispatch multi-module
+// dir inputs at chat-turn time.
+pub mod project_loader;
 
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
@@ -77,4 +81,9 @@ pub use eval::metric::{score as metric_score, MetricError};
 pub use tracing::{
     init_tracer, shutdown_tracer, jaeger_url, jaeger_url_with_span,
     RootSpan, TracingError,
+};
+// v0.3 Week 17 Tue: re-export the dir-vs-file loader.  CLI +
+// mcp-serve are the two callers.
+pub use project_loader::{
+    load_project_input, LoadedProject, ProjectLoadError,
 };

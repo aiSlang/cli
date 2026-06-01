@@ -1533,6 +1533,14 @@ async fn build_session_for_agent(
     source_dir:  &Path,
     agent_label: &str,
 ) -> Result<Session, String> {
+    // v0.3 Week 17 Tue: dir-input dispatch.  When the source_dir
+    // holds an `aislang.toml`, route through the multi-module
+    // builder which uses `load_project_input` (cross-module check,
+    // qualified labels, pre-loaded prompt bodies).  Single-file
+    // path below stays byte-stable for v0.2 chat sessions.
+    if source_dir.join(aislang_core::manifest::MANIFEST_FILE_NAME).exists() {
+        return build_session_for_agent_multi_module(source_dir, agent_label).await;
+    }
     use crate::{BudgetConfig, SpawnConfig, StdioChild, ToolRegistry};
 
     // ── 1. validate + find agent ──
@@ -1643,6 +1651,150 @@ async fn build_session_for_agent(
     ).map_err(|e| format!("open session: {e}"))?;
     let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };
     let s = match tracker    { Some(t) => s.with_tracker(t),    None => s };
+    Ok(s)
+}
+
+/// v0.3 Week 17 Tue — multi-module session builder.  Mirrors the
+/// single-file `build_session_for_agent` but sources the merged
+/// project from [`crate::load_project_input`] and uses module-
+/// qualified label lookups for model_bindings + prompt_bodies.
+///
+/// `agent_label` is the module-qualified form (e.g. `coder.coder`)
+/// — the CLI's `run_chat` calls `LoadedProject::find_agent_label`
+/// to map a bare user input (`coder`) to this form before dispatch.
+async fn build_session_for_agent_multi_module(
+    source_dir:  &Path,
+    agent_label: &str,
+) -> Result<Session, String> {
+    use crate::{BudgetConfig, SpawnConfig, StdioChild, ToolRegistry};
+
+    let loaded = crate::load_project_input(source_dir)
+        .map_err(|e| format!("load multi-module project: {e}"))?;
+    let project = &loaded.resolved.project;
+
+    // ── 1. find agent in the merged project (label is module-
+    //       qualified — `coder.coder`, `architect.architect`).
+    let agent = project.agents.iter()
+        .find(|a| a.label == agent_label)
+        .ok_or_else(|| {
+            let labels: Vec<&str> = project.agents.iter()
+                .map(|a| a.label.as_str()).collect();
+            format!("no agent named `{agent_label}` in multi-module project; \
+                available: {}",
+                if labels.is_empty() { "(none declared)".to_string() }
+                else { labels.join(", ") })
+        })?;
+
+    // The agent's containing module = prefix before the FIRST `.`.
+    // E.g. `coder.coder` → containing = `coder`.
+    let containing_module = agent.label.split_once('.').map(|(m, _)| m);
+
+    // Inner-ref resolver: qualify a same-module ref against the
+    // agent's containing module; pass-through a cross-module ref's
+    // explicit module.  Returns the merged-project lookup key.
+    let qualified = |r: &aislang_core::ast::Ref| -> String {
+        match (&r.module, containing_module) {
+            (Some(m), _)     => format!("{m}.{}", r.label),
+            (None, Some(c))  => format!("{c}.{}", r.label),
+            (None, None)     => r.label.clone(),
+        }
+    };
+
+    let model_key  = qualified(&agent.model);
+    let prompt_key = qualified(&agent.system_prompt);
+
+    // ── 2. load system prompt body (pre-loaded by load_project_input).
+    let system_prompt = loaded.prompt_bodies.get(&prompt_key)
+        .ok_or_else(|| format!(
+            "agent `{}` references prompt `{}` which has no pre-loaded body \
+             (load_project_input should have read every module's prompts)",
+            agent.label, prompt_key))?
+        .clone();
+
+    // ── 3. budget config (uses module-qualified model_key for the
+    //       resolved binding lookup).
+    let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
+        Some(b) => {
+            let model_id = loaded.resolved.model_bindings.get(&model_key)
+                .ok_or_else(|| format!(
+                    "model `{model_key}` has no resolved binding in the \
+                     merged project (multi-module resolve_multi should \
+                     have populated it)"))?;
+            let catalog = aislang_catalog::bundled()
+                .map_err(|e| format!("catalog load: {e}"))?;
+            let entry = catalog.find(model_id)
+                .ok_or_else(|| format!(
+                    "catalog entry `{}.{}` not found",
+                    model_id.provider, model_id.name))?;
+            Some(BudgetConfig {
+                per_run_cap:        b.hard_cap_per_day,  // matches single-file
+                per_day_cap:        b.hard_cap_per_run,
+                cost_input_per_1k:  entry.cost_input,
+                cost_output_per_1k: entry.cost_output,
+                model_id_str:       format!("{}.{}", model_id.provider, model_id.name),
+            })
+        }
+        None => None,
+    };
+    let tracker = match budget_cfg.as_ref() {
+        Some(_) => Some(crate::SpendTracker::open_default(&project.name)
+            .map_err(|e| format!("open spend tracker: {e}"))?),
+        None => None,
+    };
+
+    // ── 4. collect MCP-child specs for the agent's tools (each
+    //       tool_ref points at an mcp_server, qualified per the
+    //       module-context rule above).
+    let mut mcp_specs: Vec<(String, SpawnConfig)> = Vec::new();
+    for tool_ref in &agent.tools {
+        if tool_ref.kind != aislang_core::ast::RefKind::McpServer {
+            return Err(format!(
+                "agent `{}.tools` ref `{}` is not an mcp_server ref",
+                agent.label, tool_ref.label));
+        }
+        let tool_key = qualified(tool_ref);
+        let mcp = project.mcp_servers.iter()
+            .find(|m| m.label == tool_key)
+            .ok_or_else(|| format!(
+                "agent `{}` references mcp_server `{}` which doesn't exist \
+                 in the merged project",
+                agent.label, tool_key))?;
+        let mount = mcp.mount.as_ref().map(|p| {
+            let resolved = source_dir.join(p);
+            std::fs::canonicalize(&resolved).unwrap_or(resolved)
+        });
+        let env = resolve_mcp_secrets_for_agent(project, mcp, source_dir)?;
+        mcp_specs.push((mcp.label.clone(), SpawnConfig {
+            image: format_image(&mcp.image),
+            args:  Vec::new(),
+            mount,
+            env,
+        }));
+    }
+
+    // ── 5. spawn MCP children + list tools (identical to single-file).
+    let mut mcp_clients = Vec::with_capacity(mcp_specs.len());
+    let mut server_tools: Vec<(String, Vec<crate::ToolSpec>)> = Vec::new();
+    for (label, cfg) in &mcp_specs {
+        let child = StdioChild::spawn(cfg).await
+            .map_err(|e| format!("spawn MCP `{label}`: {e}"))?;
+        let tools = child.list_tools().await
+            .map_err(|e| format!("list tools `{label}`: {e}"))?;
+        server_tools.push((label.clone(), tools));
+        mcp_clients.push(child);
+    }
+    let tool_registry = ToolRegistry::from_servers(&server_tools);
+
+    // ── 6. open Session.  model_label passed to LiteLLM is the
+    //       FULL qualified key (`coder.fast` etc) — LiteLLM's
+    //       router config from `aislang plan` uses the same key,
+    //       so the dispatch stays consistent across plan + chat.
+    let s = Session::open_with_tools(
+        &model_key, system_prompt, None,
+        mcp_clients, tool_registry,
+    ).map_err(|e| format!("open session: {e}"))?;
+    let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };
+    let s = match tracker    { Some(t) => s.with_tracker(t), None => s };
     Ok(s)
 }
 

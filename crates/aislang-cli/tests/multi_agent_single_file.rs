@@ -41,7 +41,11 @@ fn two_agent_path(suffix: &str) -> PathBuf {
   }
   model "thinker" {
     requires    = [chat]
-    context_min = 200k
+    # v0.3 Week 17 Tue: run_chat now goes through load_project_input
+    # (was validate-only) — context_min must satisfy the pinned
+    # ollama model's 128k window.  Drop from 200k → 32k so resolve
+    # passes against the bundled catalog.
+    context_min = 32k
     prefer      = [ollama.llama_3_1_8b]
     pin         = ollama.llama_3_1_8b
   }
