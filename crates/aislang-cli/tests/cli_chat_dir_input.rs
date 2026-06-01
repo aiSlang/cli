@@ -125,3 +125,47 @@ fn bin() -> Command { Command::new(env!("CARGO_BIN_EXE_aislang")) }
     assert!(stderr.contains("session ended"),
         "/exit should mark clean close; got:\n{stderr}");
 }
+
+/// v0.3 Week 17 Tue follow-up — regression guard for the "chat
+/// against dir input fails with `cannot read source_path … Is a
+/// directory`" bug.  Pre-fix, mcp-serve's `chat_turn` handler called
+/// `resolve_source(p.source_path)` which read the dir as a file +
+/// errored before the multi-module dispatch could kick in.  Fix:
+/// detect dir-input early in `chat_turn` + skip `resolve_source`
+/// for that path.
+///
+/// This test sends a user message that requires chat_turn to
+/// actually run — not just opening + EOF-closing the session.  If
+/// the bug returns, the response carries the literal
+/// "cannot read source_path" string from the rmcp error.
+///
+/// **Live LLM dependency**: this test depends on a reachable
+/// LiteLLM (typically localhost:4000 from `aislang apply
+/// examples/multi-module-demo/`).  Marked `#[ignore]` so CI doesn't
+/// require live infra; run manually via `cargo test -- --ignored`
+/// after standing up the stack.
+#[test]
+#[ignore = "live LiteLLM round-trip; opt-in via `--ignored`"]
+fn chat_dir_input_chat_turn_does_not_fail_on_source_path_read() {
+    let dir = examples_dir().join("multi-module-demo");
+    let mut child = bin().args(["chat", "coder"]).arg(&dir)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().expect("spawn aislang");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(stdin, "say hello in two words").expect("write user message");
+        writeln!(stdin, "/exit").expect("write /exit");
+    }
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The regression manifests as this exact stderr message coming
+    // back from mcp-serve via the rmcp envelope.  Absence pins
+    // that the chat_turn handler routed through the dir-input
+    // branch instead of the read-as-file branch.
+    assert!(!stderr.contains("cannot read source_path"),
+        "chat_turn must not try to read a dir as a file; stderr:\n{stderr}");
+    assert!(!stdout.contains("cannot read source_path"),
+        "ditto, stdout:\n{stdout}");
+}
+

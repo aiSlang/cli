@@ -1008,11 +1008,34 @@ impl AislangServer {
         meta:   Meta,
         client: Peer<RoleServer>,
     ) -> Result<CallToolResult, RmcpError> {
-        let source_dir = resolve_source_dir_or_infer_from_path(
-            p.source_dir.as_deref(),
-            p.source_path.as_deref(),
-        )?;
-        let source     = resolve_source(p.source, p.source_path, &source_dir)?;
+        // v0.3 Week 17 Tue: dir-input dispatch.  When the caller
+        // (CLI's `run_chat`) passes a project directory as
+        // `source_path`, source_dir IS that dir and we skip the
+        // `resolve_source` read-as-file step entirely (would fail
+        // with "Is a directory").  `build_session_for_agent` detects
+        // the multi-module shape via aislang.toml presence and
+        // routes through `build_session_for_agent_multi_module`,
+        // which reads each module via `load_project_input` —
+        // the empty `source` string is unused on that path.
+        let dir_input: Option<PathBuf> = p.source_path.as_deref()
+            .map(std::path::Path::new)
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf());
+        let (source_dir, source) = if let Some(dir) = dir_input.as_ref() {
+            let canonical = std::fs::canonicalize(dir).map_err(|e|
+                RmcpError::invalid_params(
+                    format!("source_path dir `{}` not readable: {e}",
+                        dir.display()),
+                    None))?;
+            (canonical, String::new())
+        } else {
+            let sd = resolve_source_dir_or_infer_from_path(
+                p.source_dir.as_deref(),
+                p.source_path.as_deref(),
+            )?;
+            let s = resolve_source(p.source, p.source_path, &sd)?;
+            (sd, s)
+        };
         let key = SessionKey {
             source_dir:  source_dir.clone(),
             agent_label: p.agent_label.clone(),
