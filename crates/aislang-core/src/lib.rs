@@ -10,6 +10,7 @@
 pub mod ast;
 pub mod checker;
 pub mod diagnostic;
+pub mod manifest;
 pub mod parser;
 pub mod types;
 

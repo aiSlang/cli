@@ -1,0 +1,20 @@
+# v0.3 Week 16 Mon — multi-module project manifest stub.
+#
+# Decision 44.1: aislang.toml declares the project root + the [modules]
+# table mapping module names to .ais file paths.  Mon ships the parser
+# + file-discovery helper; Tue Week 16 wires `use <module>.<resource>`
+# syntax; Wed wires the multi-file resolver.
+#
+# Today this fixture is a SCAFFOLD — the .ais files declare their own
+# self-contained `project { ... }` blocks (v0.2 single-file shape) so
+# they validate against the current parser.  Week 16 Wed switches the
+# .ais files to module-shape (drop the outer `project { ... }`) once
+# the parser learns multi-module mode.
+
+[project]
+name    = "multi-module-demo"
+version = "0.1.0"
+
+[modules]
+architect = "agents/architect.ais"
+coder     = "agents/coder.ais"

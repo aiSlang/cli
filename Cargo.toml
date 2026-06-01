@@ -34,6 +34,10 @@ petgraph    = "0.6"
 serde       = { version = "1",   features = ["derive"] }
 serde_json  = "1"
 serde_yaml  = "0.9"
+# v0.3 Week 16 Mon: aislang.toml manifest parsing (Decision 44.1).
+# Workspace-pinned so per-crate Cargo.toml just references it; the
+# `default` feature pulls serde-derive integration in.
+toml        = "0.8"
 thiserror   = "1"
 anyhow      = "1"
 semver      = { version = "1",   features = ["serde"] }
