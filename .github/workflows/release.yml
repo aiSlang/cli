@@ -311,7 +311,19 @@ jobs:
           # Distroless base for minimal attack surface + small image;
           # binary baked from the matrix-built Linux release tarball
           # (no in-image cargo build).  Multi-arch via buildx.
-          ARG TARGETARCH
+          #
+          # v0.2.0 release fix: dropped the pre-FROM `ARG TARGETARCH`.
+          # When declared globally without a default value, that arg
+          # shadowed BuildKit's automatic TARGETARCH population — the
+          # post-FROM `ARG TARGETARCH` inherited the empty global
+          # instead of getting the buildx-injected value (`amd64` /
+          # `arm64`), so `${TARGETARCH}/aislang` collapsed to
+          # `/aislang` and the COPY failed checksum on both platforms:
+          #   "failed to calculate checksum of ref ...: /aislang: not found"
+          # Only the in-stage `ARG TARGETARCH` is needed — buildx
+          # auto-populates it from the `--platform` request.  Pre-FROM
+          # ARGs are only relevant for ARGs used in the FROM line
+          # itself (e.g. `FROM image:${TAG}`), which we're not doing.
           FROM gcr.io/distroless/cc-debian12 AS final
           ARG TARGETARCH
           # COPY resolves $TARGETARCH at build time so the same Dockerfile
