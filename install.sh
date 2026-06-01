@@ -86,26 +86,34 @@ die()  { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; exit 1; }
 #
 # Drop-in replacement for `curl …` that:
 #   1. Adds `Authorization: Bearer $TOKEN` when TOKEN is non-empty.
-#   2. Uses `--location-trusted` instead of plain `-L` so the
-#      Authorization header survives the cross-origin redirect from
-#      `github.com/…/releases/download/…` to the temporary signed
-#      URL on `objects.githubusercontent.com`.  curl 7.86+ strips
-#      auth on cross-origin redirects by default — the GitHub
-#      releases CDN crosses origins, so without `--location-trusted`
-#      private-repo asset downloads 404 even with a valid token.
+#   2. Uses plain `-L` (NOT `--location-trusted`) so the
+#      Authorization header is STRIPPED on the cross-origin redirect
+#      from `github.com/…/releases/download/…` to the temporary
+#      signed URL on `objects.githubusercontent.com`.
 #
-# Cross-origin trust caveat: `--location-trusted` passes the auth
-# header to ANY redirect target.  In practice GitHub redirects only
-# between its own hostnames, so the leak surface is bounded — but
-# users worried about token exposure should use a fine-grained PAT
-# scoped to read-access on the single repo + an expiration date.
+# Why this matters (corrected v0.3-prep — earlier v0.2 commit got it
+# backwards): GitHub's private-repo release-asset flow uses TWO
+# different auth schemes on the two hops:
 #
-# Callers pass curl args after the function name; the wrapper
-# prepends the auth + redirect flags.  `set --` re-builds positional
-# args so the inner `curl "$@"` invocation passes everything through.
+#   hop 1: `github.com/.../releases/download/<tag>/<file>`
+#          → expects `Authorization: Bearer <PAT>` to verify
+#            the caller has repo-read access; responds 302 with
+#            a Location header pointing at the signed CDN URL.
+#
+#   hop 2: `objects.githubusercontent.com/...?token=<signed>`
+#          → uses QUERY-STRING signing (the `?token=` param +
+#            related ones).  The CDN REJECTS an extra
+#            Authorization header — observed 404 in the wild
+#            on private repos when `--location-trusted` keeps
+#            the Bearer through to this hop.
+#
+# Plain `-L` since curl 7.86 (Oct 2022, ubiquitous now) strips
+# `Authorization` on cross-origin redirects by default.  Result:
+# hop-1 gets Bearer auth (PAT verifies), hop-2 gets just the
+# signed URL (no spurious Bearer that the CDN would reject).
 auth_curl() {
   if [ -n "$TOKEN" ]; then
-    curl --location-trusted \
+    curl -L \
          -H "Authorization: Bearer $TOKEN" \
          "$@"
   else
@@ -208,7 +216,7 @@ resolve_version() {
       die "VERSION=latest is not supported with BASE_URL override; pass a concrete tag."
     fi
     info "resolving latest release tag from github.com/$REPO …"
-    # Follow redirects (auth_curl does -L/--location-trusted), print
+    # Follow redirects (auth_curl handles `-L` + Bearer-strip-on-CDN), print
     # final URL (-w), no body (-o /dev/null).  Token-aware so private
     # repos can resolve the latest tag via the same redirect chain.
     final="$(auth_curl -sS -o /dev/null -w '%{url_effective}' \
