@@ -1,0 +1,29 @@
+## v0.3 Week 16 Mon scaffold — see the sibling `aislang.toml`.
+##
+## Today this is a self-contained single-module .ais (carries its own
+## outer `project { … }` block).  Week 16 Wed (multi-file resolver)
+## switches multi-module modules to module-shape (drop the project
+## keyword block; the module body contributes resources directly to
+## the project named in `aislang.toml`).
+
+project "architect-module" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  model "thinker" {
+    requires    = [chat]
+    context_min = 200k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+  }
+  prompt "system" {
+    file    = "./system.md"
+    version = "1.0.0"
+  }
+  agent "architect" {
+    model         = model.thinker
+    system_prompt = prompt.system
+    tools         = []
+  }
+}

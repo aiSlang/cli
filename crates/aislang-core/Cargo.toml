@@ -19,5 +19,7 @@ chumsky    = { workspace = true }
 petgraph   = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+# v0.3 Week 16 Mon: aislang.toml manifest parsing (Decision 44.1).
+toml       = { workspace = true }
 thiserror  = { workspace = true }
 semver     = { workspace = true }
