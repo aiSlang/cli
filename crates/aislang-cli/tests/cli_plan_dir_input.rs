@@ -63,10 +63,17 @@ fn bin() -> Command { Command::new(env!("CARGO_BIN_EXE_aislang")) }
     assert!(lock_body.contains("\"coder\""),
         "lockfile `modules` must include `coder`; got:\n{lock_body}");
     // Per-module-qualified keys in model_bindings + prompt_hashes.
+    // The fixture has `coder.ais` referencing `architect.thinker` via
+    // `use architect.thinker` (v0.3 cross-module ref) — so the merged
+    // model_bindings only carry the architect-owned model entry.  Both
+    // modules' prompts contribute their own qualified keys.
     assert!(lock_body.contains("\"architect.thinker\""),
-        "model_bindings must carry module-qualified keys; got:\n{lock_body}");
-    assert!(lock_body.contains("\"coder.fast\""),
-        "model_bindings must carry module-qualified keys; got:\n{lock_body}");
+        "model_bindings must carry the cross-referenced model under \
+         its owning module; got:\n{lock_body}");
+    assert!(lock_body.contains("\"architect.system\""),
+        "prompt_hashes must carry module-qualified keys; got:\n{lock_body}");
+    assert!(lock_body.contains("\"coder.system\""),
+        "prompt_hashes must carry module-qualified keys; got:\n{lock_body}");
 }
 
 #[test] fn validate_accepts_multi_module_dir() {

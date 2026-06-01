@@ -345,6 +345,56 @@ prompt "main_brief" {
 
 The customer's Claude Pro subscription becomes the orchestrator infrastructure for the agentic system; only the deployed agents (`agent "triage"`, `agent "drafter"`, etc.) hit the API.
 
+### 4.11 Multi-module projects — `aislang.toml` + `use <module>.<label>` (v0.3, Week 16)
+
+v0.3 lifts the v0.1 deferral of §7.2 (multi-file projects) for the narrow case the dogfood-agent workflow needs: cross-file resource references within a single project root.  Larger composition primitives (workspaces, package registries) remain v0.5+.
+
+**Project manifest (`aislang.toml`).**  A multi-module project is a directory containing an `aislang.toml` plus one or more `.ais` files.  The manifest declares:
+
+```toml
+[project]
+name    = "support-stack"
+version = "0.1.0"
+
+[modules]
+architect = "agents/architect.ais"
+coder     = "agents/coder.ais"
+reviewer  = "agents/reviewer.ais"
+```
+
+- `[project] name` (String, required) — project label.  Same role as the in-`.ais` `project "<name>" { … }` block's label for single-file projects.
+- `[project] version` (String, required) — semver-compatible.  Stamped into the lockfile.
+- `[modules]` (table, required, non-empty) — `<module-name>` → `<path-relative-to-manifest>`.  Module name is the namespace used by `use <module>.<label>` references (below); path is the `.ais` file holding the module body.
+
+Forward-compat: unknown top-level tables / fields are ignored at parse time — same `skip_serializing_if` discipline that keeps v0.2 expected-AST JSON fixtures byte-stable when v0.3 fields default to empty.
+
+**Module shape.**  Each `.ais` file in a multi-module project still carries a `project "<label>" { … }` block declaring its resources.  Within the `[modules]` table the module's resources live in the `<module-name>.` namespace at resolution time — `model "fast"` declared in `agents/coder.ais` becomes `coder.fast` in the merged `ResolvedProject`.
+
+**Cross-module references — `use <module>.<label>`.**  Reference a resource declared in a sibling module via the `use` keyword in any value position where a same-module reference (`<kind>.<label>`) is legal:
+
+```aislang
+agent "coder" {
+  ## Same-module ref (v0.2 shape): kind explicit.
+  system_prompt = prompt.system
+
+  ## Cross-module ref (v0.3): `use` + module name + label.
+  ## Kind is inferred from the attribute context (`model =` →
+  ## `RefKind::Model`); the validator resolves `architect.thinker`
+  ## against the cross-module symbol table.
+  model         = use architect.thinker
+}
+```
+
+Single-module `validate()` rejects `use <module>.<label>` refs with a diagnostic pointing the user at `aislang.toml`; multi-module `check_multi()` resolves them against the loaded module set, surfacing source-aware errors for unknown modules or unknown labels (with the same did-you-mean Levenshtein suggester v0.2 ships for same-module refs).
+
+**CLI dispatch.**  `aislang validate <dir>` and `aislang plan <dir>` autodetect the manifest and switch to the multi-module pipeline (load every declared module → check_multi → resolve_multi → emit one merged stack).  Single-file inputs (`aislang plan file.ais`) follow the v0.2 path byte-stably.  `aislang apply <dir>` ships a deferred-friendly error in v0.3 pointing at the `plan <dir>` + `docker compose` / `helm upgrade --install` two-step workaround; full dir-input `apply` lands later in v0.3.
+
+**Lockfile.**  Multi-module projects gain a `modules` section in `aislang.lock` carrying per-module SHA-256 source hashes.  Reconciliation is over-broad on purpose: any module's hash mismatch (or any add/remove of a manifest entry) triggers a full re-resolve.  Per-module incremental rebuilds are a v0.5+ carry-over.
+
+**Decision 44.1 sub-points deferred.**  Cross-module access control (private vs public resources) is v0.5+; v0.3 makes every resource cross-module-accessible.  Cross-module refs in `secret.scope` lists are not supported in v0.3 — the union-kind syntax can't infer kind from context the way single-field attributes do.
+
+See `examples/multi-module-demo/` for a worked example exercising the surface end-to-end + `crates/aislang-cli/tests/cli_plan_dir_input.rs` for the integration-test contract pinning the user-facing CLI flows.
+
 ---
 
 ## 5. Model catalog
@@ -605,27 +655,29 @@ Design these in Phase 1 *if and only if* one of these fires after launch:
 
 If neither fires within 6 months of launch, the feature is unnecessary and should be removed from the reserved-word list to free the identifiers.
 
-### 7.2 Multi-file projects — deferred with locked backward-compat invariants
+### 7.2 Multi-file projects — DELIVERED in v0.3 Week 16 (see §4.11)
 
-v0.1 compiles exactly one `.ais` file per project. Multi-file composition (sharing a `budget` block across projects, distributing reusable `model` declarations, etc.) is Phase 1+.
+**Status update (v0.3 Week 16 Fri):** the narrow case of cross-file resource references within a single project root is now implemented; see §4.11 for the full `aislang.toml` + `use <module>.<label>` surface.  This subsection retains its v0.1 backward-compat invariants for historical reference + as the contract every successor surface must continue to honor.
 
-To guarantee any v0.1 file remains valid under every future spec version, the parser and AST design must hold these three invariants forever:
+The three invariants v0.1 locked in are still upheld by v0.3's implementation:
 
-1. **A complete `project "name" { ... }` block always means exactly what it means today.** No future feature redefines what a top-level project block produces.
-2. **Resource block syntax (`model "fast" { ... }`, `prompt "x" { ... }`, etc.) never changes meaning.** Adding new fields with sensible defaults is allowed; renaming, removing, or repurposing existing fields is not.
-3. **Multi-file constructs are added *above* or *alongside* the `project` block, never inside it.** Cross-module references use a new namespaced syntax (e.g. `shared.models.fast`) and don't repurpose v0.1 reference syntax.
+1. **A complete `project "name" { ... }` block always means exactly what it means today.** ✅ v0.3 multi-module modules each carry their own `project` block; the `[modules]` table in `aislang.toml` composes them — no redefinition.
+2. **Resource block syntax (`model "fast" { ... }`, `prompt "x" { ... }`, etc.) never changes meaning.** ✅ v0.3 modules use the same resource block syntax verbatim.
+3. **Multi-file constructs are added *above* or *alongside* the `project` block, never inside it.** ✅ `aislang.toml` lives ABOVE the `.ais` files; the `use <module>.<label>` syntax is additive in value position and doesn't repurpose any v0.1 reference syntax.
 
-Concrete v0.1 parser obligation: the **file-level production must be a list of top-level statements**, not just a single `project` block (even though only one statement form — `project` — is legal in v0.1). This leaves the door open for `import`, `module`, `package`, `include` statements at the top level in later versions without changing the v0.1 grammar.
+The v0.1 parser obligation — file-level production as a list of top-level statements — is still honored, leaving room for the post-v0.3 successor surfaces below.
 
-**Three-stage evolution after launch**
+**Three-stage evolution — status update**
 
-| Phase | Capability | Sketch | Backward-compat |
+| Phase | Capability | Status | Notes |
 |---|---|---|---|
-| v0.2 | **Includes** (Terraform-style) | `include "./shared/budget.ais"` at top level; injects blocks into the surrounding project | ✅ additive |
-| v0.3 | **Modules with explicit exports** (Rust-style) | `module shared.models { export model "fast" { … } }` + `import shared.models` | ✅ uses reserved `module` / `import` / `export` |
-| v1.0+ | **Package registry** (npm-style) | `package "myorg/aislang-stdlib" version "^1.2.0"` + registry-backed resolution | ✅ uses reserved `package` |
+| v0.3 | **Manifest-driven multi-module** (Cargo-style) | ✅ shipped Week 16 | `aislang.toml` + `[modules]` + `use <module>.<label>`; see §4.11 |
+| v0.5+ | **Package registry** (npm-style) | deferred | `package "myorg/aislang-stdlib" version "^1.2.0"` + registry-backed resolution — uses reserved `package` keyword |
+| v0.5+ | **Workspaces** (Cargo-style) | deferred | Multiple projects under one manifest; cross-project deps + shared lockfile |
 
-Reserved keywords for all three are already claimed in §2.
+Reserved keywords for the v0.5+ tier are already claimed in §2.
+
+**v0.3 sub-points deferred to v0.5+:** cross-module access control (private vs public resources — all v0.3 cross-module resources are public); cross-module refs in `secret.scope` lists (the union-kind list can't infer kind from context the way single-field attributes do); per-module incremental lockfile invalidation (v0.3 invalidates the whole project on any module change).
 
 ### 7.3 Multi-platform deploy targets — emitter-first, additive resources later
 

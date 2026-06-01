@@ -680,15 +680,19 @@ fn load_multi_module_project(dir: &Path) -> Result<LoadedProject> {
         let source = std::fs::read_to_string(&abs)
             .map_err(|e| anyhow::anyhow!(
                 "module `{name}`: read {}: {e}", abs.display()))?;
-        let (project, mod_warnings) = aislang_core::validate(&source)
-            .map_err(|err| {
+        // v0.3 Week 16 Thu: parse-only per module — the v0.2-style
+        // single-file `validate()` runs the checker which errors on
+        // any cross-module `use <module>.<label>` ref (correctly so
+        // for single-file inputs).  Multi-module checking happens
+        // below via `check_multi(modules)` which has the cross-module
+        // symbol table.
+        let project = aislang_core::parser::parse(&source)
+            .map_err(|errs| {
                 eprintln!("module `{name}`:");
+                let err = aislang_core::ValidateError::Parse(errs);
                 render_validate_error(&source, &err);
                 anyhow::anyhow!("(see error above)")
             })?;
-        warnings.extend(mod_warnings.into_iter().map(|w| aislang_core::Warning {
-            message: format!("module `{name}`: {}", w.message),
-        }));
 
         // Per-module prompts: read body, key under `<module>.<label>`
         // matching the Wed resolver's prompt-hash key convention.

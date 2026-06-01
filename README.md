@@ -95,6 +95,69 @@ project "support-agent" {
 
 See [examples/support-agent.ais](examples/support-agent.ais) for the full reference example.
 
+### Multi-module projects (v0.3 Week 16)
+
+Split a project across multiple `.ais` files when one agent's resources should be reusable by another.  Drop an `aislang.toml` at the project root + reference sibling resources via `use <module>.<label>`:
+
+```toml
+# examples/multi-module-demo/aislang.toml
+[project]
+name    = "multi-module-demo"
+version = "0.1.0"
+
+[modules]
+architect = "agents/architect.ais"
+coder     = "agents/coder.ais"
+```
+
+```hcl
+# examples/multi-module-demo/agents/architect.ais
+project "architect-module" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  model "thinker" {                          # exported as `architect.thinker`
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.llama_3_1_8b]
+    pin         = ollama.llama_3_1_8b
+  }
+  prompt "system" { file = "./system.md"  version = "1.0.0" }
+  agent "architect" {
+    model         = model.thinker            # same-module ref (v0.2 syntax)
+    system_prompt = prompt.system
+    tools         = []
+  }
+}
+```
+
+```hcl
+# examples/multi-module-demo/agents/coder.ais
+project "coder-module" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+  prompt "system" { file = "./system.md"  version = "1.0.0" }
+  agent "coder" {
+    model         = use architect.thinker    # v0.3 cross-module ref
+    system_prompt = prompt.system
+    tools         = []
+  }
+}
+```
+
+CLI accepts the project directory in place of a single file:
+
+```sh
+aislang validate examples/multi-module-demo/    # OK: 2 modules
+aislang plan     examples/multi-module-demo/    # emits Compose + lockfile
+                                                # with module-qualified keys
+```
+
+The lockfile gains a `modules` section recording per-module SHA-256 source hashes; any module's source change re-resolves the whole project on the next plan.  Full LANGUAGE-SPEC §4.11 documents the manifest + `use` syntax + scope deferrals.
+
 ```sh
 # Stand up the stack (LiteLLM + Jaeger + budget counter) in Docker.
 aislang apply examples/support-agent.ais

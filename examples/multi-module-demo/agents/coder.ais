@@ -1,26 +1,30 @@
-## v0.3 Week 16 Mon scaffold — see the sibling `aislang.toml`.
+## v0.3 Week 16 multi-module demo — the `coder` module.
 ##
-## Today this is a self-contained single-module .ais (carries its own
-## outer `project { … }` block).  Week 16 Wed switches it to module-
-## shape.
+## Shape: a self-contained `project { … }` block.  All resources
+## declared here live in the `coder` module namespace; sibling
+## modules reference them as `use coder.<label>`.
+##
+## Cross-module reference: the `coder` agent's `system_prompt` lives
+## in this module (`prompt.system`), but the `model` is shared with
+## the `architect` module via `use architect.thinker` — pinning that
+## cross-module dispatch actually resolves end-to-end.
 
 project "coder-module" {
   budget {
     hard_cap_per_day = $1
     hard_cap_per_run = $0.01
   }
-  model "fast" {
-    requires    = [chat]
-    context_min = 32k
-    prefer      = [ollama.llama_3_1_8b]
-    pin         = ollama.llama_3_1_8b
-  }
   prompt "system" {
     file    = "./system.md"
     version = "1.0.0"
   }
   agent "coder" {
-    model         = model.fast
+    ## v0.3 Tue (Decision 44.1): `use <module>.<label>` references a
+    ## resource declared in a sibling module.  The validator's
+    ## cross-module symbol table resolves this against the `architect`
+    ## module's `model "thinker"` block; resolver maps it to
+    ## `architect.thinker` in the merged ResolvedProject.
+    model         = use architect.thinker
     system_prompt = prompt.system
     tools         = []
   }
