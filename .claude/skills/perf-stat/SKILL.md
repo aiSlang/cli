@@ -1,6 +1,6 @@
 ---
 name: perf-stat
-description: Story-Points-style velocity tracking against PLAN-90-days.md PLUS token-spend tracking from Claude Code session JSONLs (schema v2, added Phase 1 Week 12 close). Treats each `Week N <Mon|Tue|Wed|Thu|Fri>` day-row as 1 SP. Cross-references git log for completion timestamps; walks ~/.claude/projects/*/*.jsonl for per-message token usage; aggregates both per calendar date. Per-week report shows velocity (SP/Alex-day) + tokens (total, T/SP, T/day). Summary appends project-wide token totals + tokens/SP + tokens/Rust-LoC bottom-line ratio.
+description: Story-Points-style velocity tracking against PLAN-90-days.md PLUS token-spend tracking PLUS chat-active-time tracking from Claude Code session JSONLs (schema v2.2, chat-time added post Week-16 Fri). Treats each `Week N <Mon|Tue|Wed|Thu|Fri>` day-row as 1 SP. Cross-references git log for completion timestamps; walks ~/.claude/projects/*/*.jsonl for per-message token usage AND inter-message active-time deltas (idle gaps ≥5 min excluded); aggregates all three per calendar date. Per-week report shows velocity (SP/Alex-day) + tokens (total, T/SP, T/day) + chat time. Summary appends project-wide token totals + tokens/SP + tokens/Rust-LoC bottom-line ratio + total active chat hours + chat-time/SP.
 ---
 
 # perf-stat
@@ -173,3 +173,39 @@ What we count per message:
 3. **`tokens / LoC` is `total tokens / CURRENT LoC`**, NOT `tokens / LoC delta`.  The skill doesn't track historical LoC at past commits.  For a more accurate per-period ratio, divide per-week token totals by the LoC delta you tracked manually via `code-stat` that week.  v0.3 may track per-week LoC deltas natively.
 
 4. **Failed parses are silent.**  Corrupt JSONL lines or missing `usage` fields contribute zero.  Token metric is informational; broken telemetry shouldn't break the perf-stat run.
+
+## Chat active time — schema v2.2 (post-Week-16-Fri follow-up)
+
+The `Chat` column on the per-week table + the **"chat time (active wall-clock)"** summary block answer a complementary question to tokens + Alex-days:
+
+- **Alex-days** = how many CALENDAR days saw a commit attributable to the week.  Coarse — a 10-minute morning slot and an 8-hour focused session both count as one day.
+- **Chat active time** = within-day active wall-clock spent typing with / waiting for Claude.  Captures the actual cognitive cost of the milestone.
+
+### Algorithm (`aggregate_chat_active_time_per_date`)
+
+Per session JSONL file:
+1. Sort messages by timestamp.
+2. For each consecutive pair `(cur, nxt)`:
+   - If `nxt.ts - cur.ts < CHAT_ACTIVE_GAP_THRESHOLD_SEC` (default 300s / 5 min), attribute `delta` seconds to the **date of `cur.ts`**.
+   - Otherwise (idle gap — user walked away, slept, switched repos), contribute zero.
+3. First message of each session contributes nothing (active time is INTER-message).
+
+### Tuning
+
+The 300s threshold balances two failure modes:
+
+- **Too low (e.g. 60s)**: a thoughtful pause where the user reads a long tool result resets the clock → undercounts.
+- **Too high (e.g. 30m)**: overnight or coffee-break gaps get counted as continuous → wildly overcounts.
+
+Tune via `CHAT_ACTIVE_GAP_THRESHOLD_SEC` at the top of `analyze.py`.
+
+### When to look at it vs. Alex-days
+
+| Question | Metric |
+|---|---|
+| "How many CALENDAR days did this milestone span?" | Alex-days |
+| "How many HOURS of actual chat work did this milestone cost?" | Chat active time |
+| "What's our SP/calendar-day velocity?" | `velocity` (= SP / Alex-days) |
+| "How many minutes of chat per SP?" | `chat_seconds_per_sp` |
+
+Chat-per-SP is a much tighter productivity proxy than velocity — it's robust against the "spent 6 hours over 3 calendar days" vs. "spent 1 hour over 1 day" inflation that Alex-days has.
