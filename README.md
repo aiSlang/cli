@@ -148,32 +148,42 @@ project "coder-module" {
 }
 ```
 
-CLI accepts the project directory in place of a single file:
+**Dir-vs-file dispatch — same CLI surface for both shapes.** Every command that takes a positional `<file.ais>` argument (`validate`, `plan`, `apply`, `destroy`) accepts a project directory holding `aislang.toml` in its place — the CLI autodetects which shape it was handed.  Single-file projects work byte-stably; multi-module projects route through the manifest loader + cross-module checker + multi-file resolver.  The `chat` and `eval` subcommands stay file-only in v0.3 (in-pod `mcp-serve` needs multi-module awareness per Decision 44.1's deferred scope).
 
 ```sh
 aislang validate examples/multi-module-demo/    # OK: 2 modules
 aislang plan     examples/multi-module-demo/    # emits Compose + lockfile
                                                 # with module-qualified keys
+aislang apply    examples/multi-module-demo/    # bring stack up
+aislang destroy  examples/multi-module-demo/    # tear it down
 ```
 
 The lockfile gains a `modules` section recording per-module SHA-256 source hashes; any module's source change re-resolves the whole project on the next plan.  Full LANGUAGE-SPEC §4.11 documents the manifest + `use` syntax + scope deferrals.
 
+The single-file commands below work identically — substitute a project directory anywhere `examples/support-agent.ais` appears:
+
 ```sh
 # Stand up the stack (LiteLLM + Jaeger + budget counter) in Docker.
+# Same command shape against either a .ais file (v0.2 baseline) or
+# a project directory holding aislang.toml (v0.3 multi-module).
 aislang apply examples/support-agent.ais
 
 # Chat with the agent — `aislang chat` runs the loop in-CLI:
 # the agent talks to the Compose-managed LiteLLM and spawns the
 # declared MCP servers (e.g. `mcp/filesystem:1.0.2`) as stdio
 # children for the duration of the session.
+# Note: in v0.3, `chat` requires the .ais file directly; multi-
+# module dir-input chat lands later in v0.3.
 aislang chat support examples/support-agent.ais
 
 # Run the declared evals against the deployed agent and print a
 # JSON report (per-case scores + trace URLs that deep-link into
 # the bundled Jaeger UI at localhost:16686 for each case).
+# Same v0.3 carry-over as `chat` — file-only for now.
 aislang eval examples/support-agent.ais
 
 # When you're done, tear it all down (containers + volumes).
+# Accepts dir input too — `aislang destroy examples/multi-module-demo/`.
 aislang destroy examples/support-agent.ais
 ```
 
