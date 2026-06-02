@@ -418,9 +418,11 @@ A `skill` block declares a named, typed operation an agent can invoke — either
 
 **`mcp`** takes a 4-segment dotted reference: `mcp_server.<server-label>.tool.<tool-name>`. The checker validates the server label resolves against a declared `mcp_server` block; the tool-name's existence on that server is a runtime check (the catalog of remote tools isn't known at parse time). Skills can reuse `mcp_server` blocks declared for agent `tools = [mcp_server.<x>]` — the StdioChild fleet is shared, so the same container backs both agent-tool and skill paths without spawning duplicates.
 
-**Wed lands AST + parser + checker.** Runtime execution + sandboxing land Thu under `aislang-runtime::skills`. Cross-module refs in the `mcp` field (e.g. `mcp = use coder.docs.tool.read`) are deferred to v0.5+.
+**Wed ships AST + parser + checker. Thu (v0.3 Week 18) ships the runtime executor** under `aislang-runtime::skills` — two entry points `run_shell_skill(label, command, source_dir, output_type)` and `run_mcp_skill(label, server, tool_name, args, output_type)`.  Cross-module refs in the `mcp` field (e.g. `mcp = use coder.docs.tool.read`) are deferred to v0.5+.
 
-See `crates/aislang-core/src/parser.rs` + `checker.rs` for the source-aware diagnostics + duplicate-label detection.
+**Shell-skill sandbox (v0.3 Thu).**  Shell-exec skills run inside a per-skill working directory at `<source_dir>/.aislang/skills/<label>/`; the inherited environment is CLEARED and only `PATH=/usr/bin:/bin` + `HOME=<cwd>` are re-injected (drops `/usr/local/sbin` etc. where `sudo` typically lives).  Before spawn, the command string is matched against a conservative substring denylist (`sudo `, `rm -rf /`, `:(){`, `mkfs`, `/etc/passwd`, …) — match → reject without spawning.  **Not a full sandbox** — proper seccomp / namespace isolation is v0.5+ work; the v0.3 Thu surface stops obvious shell-injection footguns + accidental destruction.  PII-conscious deployments should run agent-runtime under a dedicated UID.
+
+See `crates/aislang-core/src/parser.rs` + `checker.rs` for the source-aware diagnostics + duplicate-label detection; `crates/aislang-runtime/src/skills.rs` for the runtime executor + sandbox policy.
 
 ---
 
