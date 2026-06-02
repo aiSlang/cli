@@ -162,6 +162,10 @@ fn expected_support_agent() -> Project {
         // block.  Same forward-compat discipline as `pipelines`.
         loops:       vec![],
         branches:    vec![],
+        // v0.3 Week 18 Wed: support-agent demo has no `skill` block;
+        // forward-compat empty Vec — same serde discipline as
+        // `loops` / `branches`.
+        skills:      vec![],
     }
 }
 

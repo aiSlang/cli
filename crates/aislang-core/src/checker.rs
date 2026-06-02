@@ -121,6 +121,7 @@ pub(crate) enum BlockKind {
     Pipeline,  // v0.3 Week 17 Mon (Decision 44.5)
     Loop,      // v0.3 Week 17 Wed (Decision 44.5 #2)
     Branch,    // v0.3 Week 17 Wed (Decision 44.5 #3)
+    Skill,     // v0.3 Week 18 Wed (Decision 44.x)
 }
 
 impl BlockKind {
@@ -137,6 +138,7 @@ impl BlockKind {
             Self::Pipeline  => "pipeline",
             Self::Loop      => "loop",
             Self::Branch    => "branch",
+            Self::Skill     => "skill",
         }
     }
 
@@ -210,6 +212,12 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
     // duplicate-label discipline as pipeline/main/agent.
     for l in &project.loops       { add_block(&mut graph, &mut nodes, BlockKind::Loop,      &l.label)?; }
     for b in &project.branches    { add_block(&mut graph, &mut nodes, BlockKind::Branch,    &b.label)?; }
+    // v0.3 Week 18 Wed: skill blocks join the graph for duplicate-
+    // label detection.  Skills are terminal nodes today — Thu's
+    // runtime executor reads the `exec`/`mcp` field directly; no
+    // other block kind references a skill yet (agent.skills wiring
+    // is Phase-2 work).
+    for s in &project.skills      { add_block(&mut graph, &mut nodes, BlockKind::Skill,     &s.label)?; }
 
     Ok(ResourceGraph { graph, nodes })
 }
@@ -327,6 +335,18 @@ fn check_refs(
         }
         dispatch_ref(graph, multi, &br.default,
             "branch", &br.label, "default")?;
+    }
+    // v0.3 Week 18 Wed: skill blocks with `mcp = mcp_server.<x>.tool.
+    // <y>` execution carry a Ref<McpServer>.  Validate the server
+    // label resolves — same dispatch_ref machinery as agent.tools.
+    // Shell-exec skills (`SkillExec::Shell`) carry no ref + need no
+    // checking at this layer; the runtime (Thu) handles command
+    // sandboxing.
+    for sk in &project.skills {
+        if let crate::ast::SkillExec::Mcp { server, .. } = &sk.exec {
+            dispatch_ref(graph, multi, server,
+                "skill", &sk.label, "mcp.server")?;
+        }
     }
     Ok(())
 }
@@ -1545,5 +1565,79 @@ mod tests {
         "#)).expect(
             "loop + branch + pipeline sharing a label must be allowed \
              (different BlockKinds)");
+    }
+
+    // ---- skill block (v0.3 Week 18 Wed) ------------------------- //
+
+    #[test] fn skill_with_shell_exec_passes() {
+        // Shell-exec skills carry no Ref → nothing for the checker
+        // to resolve.  Validate the block lands in the graph + the
+        // checker is happy.
+        check_src(&composition_body(r#"
+          skill "list_files" {
+            exec        = "git ls-files"
+            output_type = list_string
+          }
+        "#)).expect("shell-exec skill must check cleanly");
+    }
+
+    #[test] fn skill_with_mcp_ref_to_existing_server_passes() {
+        // The composition_body fixture has no mcp_server; declare
+        // one inline.  Skill's `mcp = mcp_server.docs.tool.<name>`
+        // ref must resolve against it.
+        check_src(&composition_body(r#"
+          mcp_server "docs" { image = "ghcr.io/x/y:1.0" mount = "./k/" }
+          skill "read_doc" {
+            mcp         = mcp_server.docs.tool.read_text_file
+            output_type = string
+          }
+        "#)).expect("skill referencing a declared mcp_server must check");
+    }
+
+    #[test] fn skill_with_mcp_ref_to_undeclared_server_fails() {
+        // Mirror of `branch_default_ref_to_undeclared_pipeline_fails`
+        // but for the skill→mcp_server edge.  Diagnostic must name
+        // both the source skill and the missing mcp_server label.
+        let err = check_src(&composition_body(r#"
+          skill "broken" {
+            mcp         = mcp_server.ghost.tool.anything
+            output_type = string
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("skill `broken`"),
+            "error must name the source skill; got: {err}");
+        assert!(err.contains("mcp.server"),
+            "error must name the failing field; got: {err}");
+        assert!(err.contains("undeclared mcp_server `ghost`"),
+            "error must name the missing label + kind; got: {err}");
+    }
+
+    #[test] fn duplicate_skill_label_rejected() {
+        let err = check_src(&composition_body(r#"
+          skill "dup" {
+            exec        = "ls"
+            output_type = string
+          }
+          skill "dup" {
+            exec        = "pwd"
+            output_type = string
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("duplicate `skill` block label `dup`"),
+            "duplicate-label detection should fire for skills; got: {err}");
+    }
+
+    #[test] fn skill_label_can_collide_with_other_block_kinds() {
+        // Skills are their own BlockKind → label `foo` is independent
+        // from `pipeline foo` / `agent foo` / `mcp_server foo`.
+        check_src(&composition_body(r#"
+          mcp_server "shared" { image = "ghcr.io/x/y:1.0" mount = "./k/" }
+          skill "shared" {
+            exec        = "ls"
+            output_type = string
+          }
+          pipeline "shared" { steps = [agent.a] }
+        "#)).expect(
+            "skill + pipeline + mcp_server sharing a label must be allowed");
     }
 }

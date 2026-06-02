@@ -673,11 +673,17 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
             // wires actual rendering.
             "loop"       => project.loops.push(to_loop(block)?),
             "branch"     => project.branches.push(to_branch(block)?),
+            // v0.3 Week 18 Wed (Decision 44.x): `skill { … }` first-
+            // class block — declares a shell command (`exec = …`) or
+            // an MCP-tool delegate (`mcp = …`) with a typed output
+            // shape.  Wed lands AST + parser + checker only; runtime
+            // executor + sandboxing land Thu.
+            "skill"      => project.skills.push(to_skill(block)?),
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
                      v0.3 supports: budget, model, prompt, mcp_server, \
-                     agent, eval, secret, deploy, main, pipeline, loop, branch"
+                     agent, eval, secret, deploy, main, pipeline, loop, branch, skill"
                 ));
             }
         }
@@ -1434,6 +1440,133 @@ fn expect_cases_object(
         }
     }
     Ok(out)
+}
+
+// ============================================================================
+// `skill` block converter — v0.3 Week 18 Wed (Decision 44.x)
+// ============================================================================
+
+fn to_skill(raw: RawBlock) -> Result<Skill, String> {
+    let label = require_single_label("skill", raw.labels)?;
+    let mut exec_cmd:    Option<String>     = None;
+    let mut mcp_ref:     Option<SkillExec>  = None;
+    let mut output_type: Option<OutputType> = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("skill", item)?;
+        match attr.name.as_str() {
+            "exec"        => exec_cmd    = Some(expect_string(&attr.name, attr.value)?),
+            "mcp"         => mcp_ref     = Some(expect_skill_mcp(&attr.name, attr.value)?),
+            "output_type" => output_type = Some(expect_output_type(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in skill block; \
+                 allowed: exec, mcp, output_type"
+            )),
+        }
+    }
+
+    // XOR check: exactly one of `exec` / `mcp` must be set.  Both-set
+    // is a config error (the runtime would have to pick one); neither-
+    // set leaves the skill with nothing to execute.
+    let exec = match (exec_cmd, mcp_ref) {
+        (Some(cmd), None) => {
+            if cmd.trim().is_empty() {
+                return Err(
+                    "skill `exec` must be a non-empty shell command \
+                     (e.g. `exec = \"echo hello\"`)".to_string());
+            }
+            SkillExec::Shell { command: cmd }
+        }
+        (None, Some(mcp))    => mcp,
+        (Some(_), Some(_)) => return Err(
+            "skill block declares both `exec` and `mcp` — these are \
+             mutually exclusive (a skill is either a shell command OR \
+             an MCP-tool delegate, not both)".to_string()),
+        (None, None) => return Err(
+            "skill block requires one of `exec = \"<shell command>\"` or \
+             `mcp = mcp_server.<server>.tool.<name>`".to_string()),
+    };
+
+    Ok(Skill {
+        label,
+        exec,
+        output_type: output_type.ok_or_else(||
+            "skill block missing required attribute `output_type` \
+             (one of: string, json, list_string)".to_string())?,
+    })
+}
+
+/// Parse a `mcp = mcp_server.<server>.tool.<name>` attribute value
+/// into a [`SkillExec::Mcp`].  Surface form is a 4-segment dotted
+/// path: `mcp_server` (literal) → `<server-label>` → `tool`
+/// (literal) → `<tool-name>`.  Same-module ref only in v0.3 Wed —
+/// cross-module form (e.g. `mcp = use coder.docs.tool.read`) lands
+/// at v0.5+ when skill-from-module semantics are sketched.
+fn expect_skill_mcp(field: &str, v: RawValue) -> Result<SkillExec, String> {
+    let path = match v {
+        RawValue::AttributeAccess(p) => p,
+        other => return Err(format!(
+            "`{field}` expects an `mcp_server.<server>.tool.<name>` reference; \
+             got {other:?}"
+        )),
+    };
+    if path.len() != 4 {
+        return Err(format!(
+            "`{field}` expects a 4-segment reference like \
+             `mcp_server.<server>.tool.<name>`; got `{}` ({} segment(s))",
+            path.join("."), path.len()
+        ));
+    }
+    if path[0] != "mcp_server" {
+        return Err(format!(
+            "`{field}` first segment must be `mcp_server`; got `{}`",
+            path[0]));
+    }
+    if path[2] != "tool" {
+        return Err(format!(
+            "`{field}` third segment must be `tool`; got `{}` (expected \
+             `mcp_server.<server>.tool.<name>`)", path[2]));
+    }
+    let server_label = path[1].clone();
+    let tool_name    = path[3].clone();
+    if tool_name.trim().is_empty() {
+        return Err(format!(
+            "`{field}` tool name (4th segment) must be non-empty"));
+    }
+    Ok(SkillExec::Mcp {
+        server: Ref {
+            kind:   RefKind::McpServer,
+            label:  server_label,
+            module: None,
+        },
+        tool: tool_name,
+    })
+}
+
+/// Parse `output_type = <ident>` against the closed v0.3 set.
+fn expect_output_type(field: &str, v: RawValue) -> Result<OutputType, String> {
+    // Bare identifiers in attribute-value position parse as
+    // `RawValue::EnumMember` (see parser line ~519); we also accept
+    // quoted-string form for author-friendliness.  Both round-trip
+    // identically through the AST.
+    let token = match v {
+        RawValue::String(s)          => s,
+        RawValue::EnumMember(s)      => s,
+        RawValue::AttributeAccess(p) if p.len() == 1 => p[0].clone(),
+        other => return Err(format!(
+            "`{field}` expects an output-type identifier (one of: \
+             string, json, list_string); got {other:?}"
+        )),
+    };
+    match token.as_str() {
+        "string"       => Ok(OutputType::String),
+        "json"         => Ok(OutputType::Json),
+        "list_string"  => Ok(OutputType::ListString),
+        other => Err(format!(
+            "`{field}` unknown output-type `{other}`; \
+             allowed: string, json, list_string"
+        )),
+    }
 }
 
 // ============================================================================
@@ -3907,5 +4040,138 @@ mod project_tests {
         assert_eq!(p.branches[0].cases.get("ok").unwrap().module,
                    Some("other".to_string()));
         assert_eq!(p.branches[0].default.module, Some("other".to_string()));
+    }
+
+    // ---- skill block (v0.3 Week 18 Wed) ------------------------- //
+
+    #[test] fn skill_block_parses_with_exec_variant() {
+        let p = project_with_composition(r#"
+          skill "list_files" {
+            exec        = "git ls-files"
+            output_type = list_string
+          }
+        "#);
+        assert_eq!(p.skills.len(), 1);
+        let sk = &p.skills[0];
+        assert_eq!(sk.label, "list_files");
+        assert_eq!(sk.output_type, OutputType::ListString);
+        match &sk.exec {
+            SkillExec::Shell { command } => assert_eq!(command, "git ls-files"),
+            other => panic!("expected Shell, got {other:?}"),
+        }
+    }
+
+    #[test] fn skill_block_parses_with_mcp_variant() {
+        // Add an mcp_server block so the ref resolves at checker time
+        // even though this test only exercises the PARSER — pinning
+        // the mcp = mcp_server.<server>.tool.<name> 4-segment shape.
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          mcp_server "docs" { image = "ghcr.io/x/y:1.0" mount = "./k/" }
+          skill "read_doc" {
+            mcp         = mcp_server.docs.tool.read_text_file
+            output_type = string
+          }
+        }"#;
+        let p = assert_parse_ok(src);
+        assert_eq!(p.skills.len(), 1);
+        let sk = &p.skills[0];
+        assert_eq!(sk.label, "read_doc");
+        assert_eq!(sk.output_type, OutputType::String);
+        match &sk.exec {
+            SkillExec::Mcp { server, tool } => {
+                assert_eq!(server.label, "docs");
+                assert_eq!(server.kind,  RefKind::McpServer);
+                assert_eq!(tool, "read_text_file");
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+    }
+
+    #[test] fn skill_block_rejects_both_exec_and_mcp_set() {
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          mcp_server "docs" { image = "ghcr.io/x/y:1.0" mount = "./k/" }
+          skill "bad" {
+            exec        = "ls"
+            mcp         = mcp_server.docs.tool.read
+            output_type = string
+          }
+        }"#;
+        assert_parse_err_contains(src, "mutually exclusive");
+    }
+
+    #[test] fn skill_block_rejects_neither_exec_nor_mcp_set() {
+        let src = project_with_composition_body(r#"
+          skill "bad" {
+            output_type = string
+          }
+        "#);
+        assert_parse_err_contains(&src, "skill block requires one of");
+    }
+
+    #[test] fn skill_block_rejects_missing_output_type() {
+        let src = project_with_composition_body(r#"
+          skill "bad" {
+            exec = "ls"
+          }
+        "#);
+        assert_parse_err_contains(&src, "missing required attribute `output_type`");
+    }
+
+    #[test] fn skill_block_rejects_unknown_output_type() {
+        let src = project_with_composition_body(r#"
+          skill "bad" {
+            exec        = "ls"
+            output_type = csv
+          }
+        "#);
+        assert_parse_err_contains(&src, "unknown output-type `csv`");
+    }
+
+    #[test] fn skill_block_rejects_unknown_attribute() {
+        let src = project_with_composition_body(r#"
+          skill "bad" {
+            exec        = "ls"
+            output_type = string
+            bogus       = true
+          }
+        "#);
+        assert_parse_err_contains(
+            &src, "allowed: exec, mcp, output_type");
+    }
+
+    #[test] fn skill_block_rejects_empty_exec() {
+        let src = project_with_composition_body(r#"
+          skill "bad" {
+            exec        = ""
+            output_type = string
+          }
+        "#);
+        assert_parse_err_contains(&src, "non-empty shell command");
+    }
+
+    #[test] fn skill_block_rejects_malformed_mcp_ref() {
+        // Missing the `tool` literal segment — `mcp_server.docs.read`
+        // is 3 segments, not 4.  Diagnostic must point at the
+        // expected shape.
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          mcp_server "docs" { image = "ghcr.io/x/y:1.0" mount = "./k/" }
+          skill "bad" {
+            mcp         = mcp_server.docs.read_text_file
+            output_type = string
+          }
+        }"#;
+        assert_parse_err_contains(src, "mcp_server.<server>.tool.<name>");
+    }
+
+    /// Helper: wrap a body block in a minimal project envelope (no
+    /// agents / pipelines / mcp_servers needed for these tests).
+    fn project_with_composition_body(extra: &str) -> String {
+        format!(r#"project "p" {{
+          budget {{ hard_cap_per_day = $1  hard_cap_per_run = $0.01 }}
+          {extra}
+        }}"#)
     }
 }

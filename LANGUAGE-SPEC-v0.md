@@ -398,6 +398,30 @@ Single-module `validate()` rejects `use <module>.<label>` refs with a diagnostic
 
 See `examples/multi-module-demo/` for a worked example exercising the surface end-to-end + `crates/aislang-cli/tests/cli_plan_dir_input.rs` for the integration-test contract pinning the user-facing CLI flows.
 
+### 4.12 `skill` (v0.3, Week 18 Wed)
+
+```
+skill "<identifier>" {
+  exec        : String?                          # one of exec | mcp (XOR)
+  mcp         : Ref<McpServer>.tool.<name>?      # one of exec | mcp (XOR)
+  output_type : OutputType                       # string | json | list_string
+}
+```
+
+A `skill` block declares a named, typed operation an agent can invoke — either by shelling out (`exec`) or by delegating to a tool exposed by an `mcp_server` (`mcp`). Exactly one of the two execution modes is required (the parser rejects both-set and neither-set configurations). `output_type` is a closed enum:
+
+- `string` — raw UTF-8 text passed through verbatim.
+- `json` — parsed as JSON; invalid JSON surfaces as a runtime error.
+- `list_string` — split into a `Vec<String>` on newline boundaries; trailing empty line dropped.
+
+**`exec`** takes a shell-command string. The runtime (Thu Week 18) shells out via a sandboxed `std::process::Command` with a PATH denylist; template-context substitution into the command string lands the same day. Long-running commands inherit the per-run budget cap.
+
+**`mcp`** takes a 4-segment dotted reference: `mcp_server.<server-label>.tool.<tool-name>`. The checker validates the server label resolves against a declared `mcp_server` block; the tool-name's existence on that server is a runtime check (the catalog of remote tools isn't known at parse time). Skills can reuse `mcp_server` blocks declared for agent `tools = [mcp_server.<x>]` — the StdioChild fleet is shared, so the same container backs both agent-tool and skill paths without spawning duplicates.
+
+**Wed lands AST + parser + checker.** Runtime execution + sandboxing land Thu under `aislang-runtime::skills`. Cross-module refs in the `mcp` field (e.g. `mcp = use coder.docs.tool.read`) are deferred to v0.5+.
+
+See `crates/aislang-core/src/parser.rs` + `checker.rs` for the source-aware diagnostics + duplicate-label detection.
+
 ---
 
 ## 5. Model catalog
