@@ -1,0 +1,132 @@
+## v0.3 Week 18 Wed-Thu — worked `skill { … }` block demo.
+##
+## Wed shipped the grammar (parser + checker + LANGUAGE-SPEC §4.12);
+## Thu shipped the runtime (`aislang-runtime::skills::{run_shell_skill,
+## run_mcp_skill}`).  This file exercises BOTH execution modes end-
+## to-end via the new `aislang skill run` CLI subcommand.
+##
+## ## Skill blocks declared here
+##
+##   - **`echo_greeting`** — shell-exec; output_type = string.
+##     Trivial round-trip — prints a fixed greeting.  Useful as a
+##     smoke test that the per-skill sandbox is wired (cwd, scrubbed
+##     PATH).
+##
+##   - **`describe_self`** — shell-exec; output_type = json.
+##     Emits a JSON object via stdout; runtime parses + surfaces
+##     as `SkillOutput::Json`.
+##
+##   - **`list_cwd_files`** — shell-exec; output_type = list_string.
+##     Lists everything in the per-skill sandbox cwd (`<project>/
+##     .aislang/skills/list_cwd_files/`).  First run shows the dir
+##     empty; rerun-after-touching-a-file shows the new entries.
+##     Demonstrates that the sandbox dir is persistent across runs
+##     (useful for skills that want to cache state).
+##
+##   - **`evil_sudo`** — shell-exec; output_type = string.
+##     Tries to run `sudo cat /etc/shadow`.  The runtime's pre-flight
+##     denylist (`SkillError::DeniedCommand`) blocks it BEFORE
+##     spawning — no process ever runs.  Demonstrates the v0.3 Thu
+##     sandbox's deny posture.  Expected to FAIL with exit 1.
+##
+##   - **`read_notes`** — MCP delegate; output_type = string.
+##     Calls `read_text_file` on the bundled `mcp/filesystem` MCP
+##     server (same image agent.tools = [mcp_server.docs] would
+##     use).  Demonstrates that an `mcp_server` block can back BOTH
+##     an agent's tool fleet AND a skill — single container, no
+##     duplicate spawn.  Requires Docker.
+##
+## ## Run them
+##
+## Build the binary first (release):
+##
+## ```
+## cargo build --release --bin aislang
+## ```
+##
+## ### Shell-exec skills (no infra needed)
+##
+## ```
+## ./target/release/aislang skill run echo_greeting    examples/skill-demo/skill-demo.ais
+## # → hello from the aislang skill runtime
+##
+## ./target/release/aislang skill run describe_self    examples/skill-demo/skill-demo.ais
+## # → {"runtime":"aislang","mode":"shell","sandbox":"per-skill"}
+##
+## ./target/release/aislang skill run list_cwd_files   examples/skill-demo/skill-demo.ais
+## # → (empty list on first run; populates after touching files
+## #    in `.aislang/skills/list_cwd_files/`)
+##
+## ./target/release/aislang skill run evil_sudo        examples/skill-demo/skill-demo.ais
+## # → ERROR (exit 1): skill `evil_sudo` shell command denied: matched
+## #   pattern `sudo ` (denylist policy — v0.3 Thu sandbox; ...)
+## ```
+##
+## ### MCP-delegate skill (requires Docker)
+##
+## The `mcp/filesystem:1.0.2` image bind-mounts `./knowledge/` from
+## the project into the container's `/projects/`; pass the path the
+## tool sees as JSON args:
+##
+## ```
+## ./target/release/aislang skill run read_notes \
+##     examples/skill-demo/skill-demo.ais \
+##     --args '{"path":"/data/notes.md"}'
+## # → <the contents of examples/skill-demo/knowledge/notes.md>
+##
+## (The aislang `mcp_server.mount` field bind-mounts `./knowledge/`
+## at `/data/` inside the container — see `aislang-runtime::mcp::
+## config` for the wire shape.)
+## ```
+
+project "skill-demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+
+  ## The mcp_server block backing `read_notes` below.  Identical to
+  ## what agent.tools = [mcp_server.docs] would use — the StdioChild
+  ## fleet is shared across both surfaces in v0.5+ multi-agent
+  ## demos.
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "./knowledge/"
+  }
+
+  # ── Shell-exec skills ─────────────────────────────────────────
+
+  skill "echo_greeting" {
+    exec        = "echo 'hello from the aislang skill runtime'"
+    output_type = string
+  }
+
+  ## `output_type = json` demo.  aislang string literals don't
+  ## support `\"` escapes (would be needed to inline a JSON object
+  ## with double-quoted keys), so we base64-decode a pre-encoded
+  ## body instead.  Decoded: `{"runtime":"aislang","mode":"shell"}`.
+  skill "describe_self" {
+    exec        = "echo eyJydW50aW1lIjoiYWlzbGFuZyIsIm1vZGUiOiJzaGVsbCJ9 | base64 -d"
+    output_type = json
+  }
+
+  skill "list_cwd_files" {
+    exec        = "ls -1"
+    output_type = list_string
+  }
+
+  ## Sandboxing demo — the pre-flight denylist rejects this BEFORE
+  ## spawning any process.  Running this skill should produce a
+  ## non-zero exit with `SkillError::DeniedCommand` rendered.
+  skill "evil_sudo" {
+    exec        = "sudo cat /etc/shadow"
+    output_type = string
+  }
+
+  # ── MCP-delegate skill ────────────────────────────────────────
+
+  skill "read_notes" {
+    mcp         = mcp_server.docs.tool.read_text_file
+    output_type = string
+  }
+}
