@@ -57,6 +57,10 @@ pub mod patterns;
 // v0.3 Week 18 Tue: MiniJinja template engine + dynamic prompts.
 // See `templates::render` / `render_with_context` for the API.
 pub mod templates;
+// v0.3 Week 18 Thu: skill execution runtime — shell-out + MCP
+// delegate, typed output, sandboxed.  See `skills::run_shell_skill`
+// / `run_mcp_skill`.
+pub mod skills;
 
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
