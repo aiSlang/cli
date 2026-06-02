@@ -324,7 +324,18 @@ jobs:
           # auto-populates it from the `--platform` request.  Pre-FROM
           # ARGs are only relevant for ARGs used in the FROM line
           # itself (e.g. `FROM image:${TAG}`), which we're not doing.
-          FROM gcr.io/distroless/cc-debian12 AS final
+          # v0.3 Week 18 Thu follow-up: base bumped cc-debian12 →
+          # cc-debian13 to match the glibc the ubuntu-latest builder
+          # links against (24.04 → glibc 2.39, debian:12 → glibc
+          # 2.36).  Mismatched bases make the released binary
+          # immediately exit at pod start with:
+          #   /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38'
+          #   not found
+          # cc-debian13 ships glibc 2.41 — covers required symbols
+          # AND is forward-compat with future ubuntu-26+ runners.
+          # Same fix the k8s-smoke (kind+helm) + (k3s+helm) jobs
+          # got in ci.yml.
+          FROM gcr.io/distroless/cc-debian13 AS final
           ARG TARGETARCH
           # COPY resolves $TARGETARCH at build time so the same Dockerfile
           # serves both amd64 + arm64 from per-arch source dirs.
