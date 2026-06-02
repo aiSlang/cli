@@ -12,7 +12,7 @@
 project "coder-module" {
   budget {
     hard_cap_per_day = $1
-    hard_cap_per_run = $0.01
+    hard_cap_per_run = $0.05
   }
   prompt "system" {
     file    = "./system.md"
@@ -26,6 +26,10 @@ project "coder-module" {
     ## `architect.thinker` in the merged ResolvedProject.
     model         = use architect.thinker
     system_prompt = prompt.system
-    tools         = []
+    tools         = [mcp_server.docs]
+  }
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "../knowledge/"
   }
 }
