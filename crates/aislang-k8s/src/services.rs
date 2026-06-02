@@ -815,21 +815,27 @@ pub fn build_agent_runtime_with_sources(
         // from multiple aislang stacks (multi-tenant clusters).
         env: Some(otel_env_vars("agent_runtime", deploy_label)),
         // Default image entrypoint is `aislang`; pass the mcp-serve
-        // subcommand + flags as args.  `--http 0.0.0.0:<port>` binds
-        // on every pod interface so the Service can reach it; the
-        // trailing positional is the .ais source path inside the pod
-        // (single-file) OR the mount directory (multi-module — the
-        // CLI's dir-input dispatch loads `aislang.toml` from there).
+        // subcommand + transport flag as args.  `--http 0.0.0.0:<port>`
+        // binds on every pod interface so the Service can reach it.
+        //
+        // **No trailing positional source-path argument.** The CLI's
+        // `mcp-serve` subcommand doesn't accept one — clients pass
+        // `source_path` / `source_dir` per-`aislang_chat_turn` call
+        // in the MCP request, which is the same posture the local
+        // `aislang chat … <project>` flow takes after Week 17 Tue's
+        // dir-input dispatch.  An extra positional here crashes the
+        // pod at startup with "unexpected argument", which is what
+        // the v0.3 Week 18 Wed k8s-smoke CI failure surfaced.
+        //
+        // The CM-mounted project lives at `PROJECT_MOUNT_DIR`
+        // (`/etc/aislang/`); MCP clients send that path explicitly
+        // in their chat_turn args.  See `aislang-runtime::mcp_server::
+        // chat_turn` for the per-call source_path/dir contract.
         command: None,
         args: Some(vec![
             "mcp-serve".to_string(),
             "--http".to_string(),
             format!("0.0.0.0:{port}"),
-            if sources.is_multi_module() {
-                PROJECT_MOUNT_DIR.to_string()
-            } else {
-                format!("{PROJECT_MOUNT_DIR}/{PROJECT_CM_AIS_KEY}")
-            },
         ]),
         volume_mounts: Some(vec![VolumeMount {
             name:       "project".to_string(),
