@@ -324,6 +324,28 @@ fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
     env.insert("AISLANG_CATALOG_VERSION".to_string(),
                resolved.catalog_version.clone());
 
+    // v0.3 Week 18 Mon follow-up: wire LiteLLM's OTel callback at
+    // the container env layer.  LiteLLM's `litellm_settings.
+    // callbacks: - otel` config (set in `litellm::generate_config`)
+    // emits spans for every chat-completion / embedding call —
+    // request body, response body, latency, model used, token
+    // counts.  Without `OTEL_EXPORTER_OTLP_ENDPOINT` pointing at
+    // the bundled Jaeger, the spans default to no exporter +
+    // never land in Jaeger; users see Jaeger empty + can't debug
+    // why a classifier picked `general` (etc).
+    //
+    // The endpoint uses Docker's internal DNS — `jaeger:4318` is
+    // the bundled Jaeger sidecar's OTLP HTTP receiver port (set by
+    // `COLLECTOR_OTLP_ENABLED=true` in `build_jaeger_service`).
+    // `http/protobuf` is the wire format LiteLLM emits.  Adding
+    // `depends_on: [jaeger]` further down keeps boot order sane.
+    env.insert("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+               "http://jaeger:4318".to_string());
+    env.insert("OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+               "http/protobuf".to_string());
+    env.insert("OTEL_SERVICE_NAME".to_string(),
+               "litellm".to_string());
+
     // Forward every provider env var the project references into the
     // litellm container so LiteLLM's `os.environ/X` lookups in the
     // mounted config resolve. We use `${X}` syntax — Docker Compose
@@ -358,7 +380,10 @@ fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
         environment: Some(env_list(env)),
         volumes:     Some(vec![volume_spec]),
         ports:       Some(vec!["4000:4000".to_string()]),  // LiteLLM default
-        depends_on:  None,
+        // Wait for Jaeger to be reachable before LiteLLM starts up
+        // — keeps the OTLP exporter from logging connect-refused on
+        // every initial chat call while Jaeger is still booting.
+        depends_on:  Some(vec!["jaeger".to_string()]),
         command:     Some(vec![
             "--config".to_string(),
             "/app/config.yaml".to_string(),

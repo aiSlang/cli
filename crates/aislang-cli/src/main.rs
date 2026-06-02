@@ -323,6 +323,35 @@ fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
     // stdout corrupts the JSON-RPC framing).
     eprintln!("aislang mcp-serve: starting stdio MCP server …");
 
+    // v0.3 Week 18 Mon: tracing-in-mcp-serve KNOWN GAP.  Calling
+    // `init_tracer` here would panic on every `aislang_chat_turn`:
+    // the simple-processor + blocking-reqwest exporter (workspace
+    // Cargo.toml lines 71-76) creates + drops its own inner runtime
+    // when a span ends, which panics if the drop happens inside a
+    // tokio task.  Session.turn creates spans via `Context::
+    // current_with_span(...).attach()`; when the resulting
+    // ContextGuard drops at end of turn, the owned span is dropped
+    // → span.end() → exporter.export() → inner-runtime panic.
+    // Eval mode side-steps this by holding the RootSpan in plain
+    // sync code (RootSpan::drop runs OUTSIDE block_on), but
+    // mcp-serve has no such sync boundary — each chat_turn is an
+    // async tool call.
+    //
+    // The fix requires either (1) switching to an async-batched
+    // exporter (Cargo.toml comment notes that panicked at exit
+    // when first tried), or (2) hoisting span-end out of session
+    // turn's async path.  Both are bigger than this PR.  Tracked
+    // as a v0.5+ Phase-3 deliverable; for now mcp-serve runs
+    // without local tracing.
+    //
+    // **What the user gets in the meantime**: LiteLLM-side OTel
+    // tracing IS wired (`litellm_settings.callbacks: - otel` plus
+    // the compose emitter wires `OTEL_EXPORTER_OTLP_ENDPOINT` →
+    // bundled Jaeger).  Each LLM call's request/response lands as
+    // a Jaeger span, which is exactly the visibility needed to
+    // debug classifier-style flows ("which prompt was sent? what
+    // did the model reply?").  Service name in Jaeger: `litellm`.
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -350,6 +379,14 @@ fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
 /// server config / Cursor / a raw `curl` directly.
 fn run_mcp_serve_http(addr: SocketAddr) -> Result<()> {
     eprintln!("aislang mcp-serve: starting HTTP MCP server on http://{addr}/mcp …");
+
+    // tracing-in-mcp-serve KNOWN GAP — see `run_mcp_serve` (stdio)
+    // for the full reason.  Short form: simple-processor + blocking-
+    // reqwest exporter panics when spans end inside an async tokio
+    // task, which is the normal lifecycle of session.turn's
+    // `Context::current_with_span(...).attach()` guard.  Tracked
+    // as v0.5+ Phase-3 work.  LiteLLM-side OTel is wired and gives
+    // request/response visibility in Jaeger today.
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
