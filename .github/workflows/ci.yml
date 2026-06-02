@@ -206,6 +206,53 @@ jobs:
           }
 
   # ──────────────────────────────────────────────────────────────
+  # K8s smoke build — v0.3 Week 18 Thu follow-up.
+  #
+  # Splits the ~5-min release `aislang` build out of the per-axis
+  # k8s-smoke matrix so the binary is built ONCE per main-push and
+  # shared via actions/upload-artifact.  Before this split, each
+  # axis (kind, k3s) paid the full build cost independently — a
+  # wasted ~5 Linux-mins per merge.
+  #
+  # Posture: build aislang only (not the full workspace); upload
+  # the release binary as a single-file artifact.  Cache keyed
+  # WITHOUT the cluster axis (single shared cache → 2nd consumer
+  # benefits on subsequent merges).  Both matrix axes then
+  # `actions/download-artifact` it instead of running cargo.
+  # ──────────────────────────────────────────────────────────────
+  k8s-smoke-build:
+    name: k8s-smoke (build artifact)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Single cache key (no per-axis suffix) — this job is the
+          # only writer + both matrix axes downstream just read the
+          # artifact, no per-axis cache contention.
+          key: ${{ env.CACHE_VERSION }}-k8s-smoke-build
+
+      - name: Build aislang (release profile for the cluster image)
+        run: cargo build --release --bin aislang --locked
+
+      - name: Upload aislang release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: aislang-release-binary
+          path: target/release/aislang
+          retention-days: 1   # cheap — only consumers are the
+                              # matrix jobs that run minutes later
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────
   # K8s smoke — Phase 2 Week 14 Fri (Track B close), Week 15 Wed
   # added the k3s matrix axis.
   #
@@ -226,65 +273,79 @@ jobs:
   # IngressClass + DNS plugin defaults.
   #
   # Pipeline steps (per axis):
-  #   1. Stand up the cluster (kind OR k3s via k3d).
-  #   2. Build the aislang binary + a local `aislang:ci` image
+  #   0. **`k8s-smoke-build` (prep job)** — builds the aislang
+  #      release binary ONCE per main-push + uploads as artifact.
+  #      Each axis below downloads instead of rebuilding.
+  #   1. Download the aislang binary artifact.
+  #   2. Stand up the cluster (kind OR k3s via k3d).
+  #   3. Wrap the binary in a local `aislang:ci` Docker image
   #      (the published `ghcr.io/aislang/aislang:latest` may not
   #      exist on every commit — pre-release branches especially).
-  #   3. Side-load the image (cluster-specific: `kind load
+  #   4. Side-load the image (cluster-specific: `kind load
   #      docker-image` vs. `k3d image import`).
-  #   4. Create the fake `aislang-providers` Secret so the
+  #   5. Create the fake `aislang-providers` Secret so the
   #      preflight check passes (dummy values — no provider
   #      calls happen in smoke).
-  #   5. `aislang plan` → `helm upgrade --install` + chart.
-  #   6. Wait for every aislang-labelled Deployment to be Ready
+  #   6. `aislang plan` → `helm upgrade --install` + chart.
+  #   7. Wait for every aislang-labelled Deployment to be Ready
   #      (kubectl rollout status, 2-min per-Deployment timeout).
-  #   7. `helm lint` the emitted chart.
-  #   8. `helm uninstall prod`; assert exit 0 + no aislang
+  #   8. `helm lint` the emitted chart.
+  #   9. `helm uninstall prod`; assert exit 0 + no aislang
   #      resources remain.
-  #   9. Diagnostic dump on failure (cluster-independent).
+  #  10. Diagnostic dump on failure (cluster-independent).
   #
-  # Time budget per axis: 20 min ceiling (was 10 min Mon, revised
-  # after first live-run image-pull cost).  Both axes run in
-  # parallel — total wall time = max(kind, k3s), not sum.
-  # Free-tier cost = 2 × ~10-15 Linux-min per main-push run.
+  # Time budget per axis: 15 min ceiling (was 20 min before the
+  # build-share split — the per-axis cargo build was ~5 min of
+  # that).  Both axes run in parallel after `k8s-smoke-build`
+  # finishes — total wall time ≈ build (5 min) + max(kind, k3s)
+  # (~4 min) ≈ 9 min, vs. ~10 min before with both axes
+  # rebuilding independently.  Free-tier cost ≈ 1 build × ~5
+  # Linux-mins + 2 axes × ~4 Linux-mins ≈ 13 Linux-mins per
+  # main-push (was ~20 mins — ~35% savings).
   # ──────────────────────────────────────────────────────────────
   k8s-smoke:
     name: k8s-smoke (${{ matrix.cluster }} + helm)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: build
-    # Up to 20 Linux-min per run × 2 cluster axes — Gate to main-
-    # push + workflow_dispatch only (PRs that touch k8s code can
-    # `workflow_dispatch` from the Actions tab against the PR
-    # branch).  Week 16+ may add `paths-filter` to auto-trigger.
+    timeout-minutes: 15
+    # v0.3 Week 18 Thu follow-up: depends on `k8s-smoke-build`, NOT
+    # on `build` directly.  The binary is built once in
+    # `k8s-smoke-build` + uploaded as an artifact; each matrix axis
+    # downloads it (≤ 30s) instead of re-running cargo (~5 min).
+    # Saves ~5 Linux-mins per main-push (the second axis stops
+    # re-doing the build).  Both axes still run in parallel post-
+    # download so wall-clock = max(kind-test, k3s-test) ≈ ~4 min.
+    needs: k8s-smoke-build
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     strategy:
       # Both axes run independently — a kind-only regression
       # surfaces on the kind axis without blocking the k3s
-      # signal (and vice versa).
+      # signal (and vice versa).  Worth keeping BOTH axes
+      # despite the cost — they catch DIFFERENT regressions:
+      # kind ships debian + `standard` StorageClass; k3s ships
+      # alpine + `local-path` SC + traefik.  Past regressions
+      # caught here include the openwebui PVC's missing
+      # `storageClassName` default + the k3d-vs-k3s version-skew
+      # restart loop (Week 16's manual k3d install fix).
       fail-fast: false
       matrix:
         cluster: [kind, k3s]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
+      # No Rust toolchain / cargo build here — the binary is
+      # downloaded as an artifact from `k8s-smoke-build`.
+      - name: Download aislang release binary
+        uses: actions/download-artifact@v4
         with:
-          # Per-axis cache keys: both axes run cargo build with
-          # the same workspace state, but split caches avoid the
-          # last-writer-wins race when both finish around the
-          # same time.
-          key: ${{ env.CACHE_VERSION }}-k8s-smoke-${{ matrix.cluster }}
+          name: aislang-release-binary
+          path: target/release/
 
-      # Build aislang binary first — the cluster image build needs it
-      # and we want compile errors to surface here, not deep inside
-      # the docker build context.
-      - name: Build aislang (release profile for the cluster image)
-        run: cargo build --release --bin aislang --locked
+      - name: Restore executable bit on the downloaded binary
+        # actions/upload-artifact serializes through tar but
+        # restores POSIX modes on download via v4 — explicit chmod
+        # is belt-and-suspenders in case a future v5 changes
+        # default behaviour.
+        run: chmod +x target/release/aislang
 
       # ──── Cluster setup (kind OR k3s/k3d, conditional) ────
 
