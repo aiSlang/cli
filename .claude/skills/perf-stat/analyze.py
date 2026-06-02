@@ -73,11 +73,19 @@ def compute_usd_cost(tokens: dict[str, int]) -> float:
 # any single-day marker on the first hit per commit (multi-day combos
 # like `Wed+Thu` still count as 1 SP — they're one commit closing
 # multiple PLAN slots; double-counting would inflate velocity).
+#
+# v0.3 Week 17 Fri retrofit: commit-subject conventions drifted after
+# Week 13 — v0.3 prefixes (`v0.3 Week 17 Thu:`) and Phase-N suffixes
+# (`Phase 2 Week 15 Wed.`) both appeared.  The SP_RE now matches the
+# `Week N <Day>` token ANYWHERE in the subject (not just at start)
+# so the retrofit captures Weeks 14-17 retrospectively without
+# rewriting commit history.  Each subject still counts at most once
+# per (week, day) pair, so a passing mention can't double-count.
 SP_RE = re.compile(
-    r"^\s*Week\s+(\d+)\s+(Mon|Tue|Wed|Thu|Fri)",
+    r"\bWeek\s+(\d+)\s+(Mon|Tue|Wed|Thu|Fri)\b",
     flags=re.IGNORECASE,
 )
-WEEK_PREFIX_RE = re.compile(r"^\s*Week\s+(\d+)\b", flags=re.IGNORECASE)
+WEEK_PREFIX_RE = re.compile(r"\bWeek\s+(\d+)\b", flags=re.IGNORECASE)
 
 
 # ── git log ingestion ──────────────────────────────────────────────
@@ -121,8 +129,12 @@ def aggregate(rows: list[tuple[str, str]]) -> dict[int, dict[str, Any]]:
     # only hotfixes still appears in the report, signalling "0 SP, M
     # days spent" — useful for "we slipped a hotfix-only week" detection).
     for iso, subject in rows:
-        sp_match = SP_RE.match(subject)
-        week_match = WEEK_PREFIX_RE.match(subject)
+        # v0.3 Week 17 Fri retrofit: use re.search so the `Week N <Day>`
+        # token is found ANYWHERE in the subject (not just at start),
+        # accommodating both v0.X prefixes (`v0.3 Week 17 Thu:`) and
+        # Phase-N suffixes (`Phase 2 Week 15 Wed.`).
+        sp_match = SP_RE.search(subject)
+        week_match = WEEK_PREFIX_RE.search(subject)
         if not week_match:
             continue
         week_num = int(week_match.group(1))
