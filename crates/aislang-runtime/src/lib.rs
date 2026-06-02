@@ -94,8 +94,9 @@ pub use tracing::{
 pub use project_loader::{
     load_project_input, LoadedProject, ProjectLoadError,
 };
-// v0.3 Week 17 Thu: re-export pattern dispatchers + the shared
+// v0.3 Week 17 Thu+Fri: re-export pattern dispatchers + the shared
 // `DispatchFuture` type alias used by their callbacks.
 pub use patterns::{
-    orchestrator, router, DispatchFuture, PatternError,
+    orchestrator, reflector, router, supervisor, DispatchFuture,
+    PatternError, ReflectorOutcome, SupervisorOutcome,
 };
