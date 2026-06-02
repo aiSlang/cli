@@ -992,9 +992,15 @@ mod tests {
             "args must include the --http bind `0.0.0.0:9000`; got: {args:?}");
         assert!(args.contains(&"mcp-serve"),
             "args must include the mcp-serve subcommand; got: {args:?}");
-        // The .ais source path positional arg.
-        assert!(args.iter().any(|a| a.ends_with("/project.ais")),
-            "args must include /etc/aislang/project.ais path; got: {args:?}");
+        // **No trailing positional path arg.** The CLI's mcp-serve
+        // subcommand doesn't accept one; per-call source_path goes
+        // in each chat_turn MCP request.  Pinned negatively so a
+        // future regression that reintroduces the positional fails
+        // here AND in the k8s-smoke axis simultaneously.
+        assert!(!args.iter().any(|a| a.ends_with(".ais") || a.contains("/etc/aislang")),
+            "args must NOT include a .ais source path positional — \
+             it crashes the pod at startup with 'unexpected argument'; \
+             got: {args:?}");
     }
 
     #[test] fn agent_runtime_defaults_to_port_8080_when_expose_absent() {
@@ -1628,7 +1634,16 @@ mod tests {
              (it's replaced by per-module keys); got:\n{cm_yaml}");
     }
 
-    #[test] fn multi_module_pod_command_points_at_mount_directory() {
+    #[test] fn multi_module_pod_command_args_do_not_carry_source_path() {
+        // v0.3 Week 18 Wed follow-up: dropped the trailing positional
+        // source-path arg from the agent-runtime pod's mcp-serve
+        // invocation.  The CLI's `mcp-serve` subcommand only takes
+        // `--stdio` / `--http`; any extra positional crashes the pod
+        // at startup with "unexpected argument", which is exactly
+        // what the k8s-smoke CI failure surfaced (rollout timeout).
+        // chat_turn requests carry source_path per-call so the boot
+        // path doesn't need it.  Both multi-module + single-file
+        // modes share this shape now.
         let resolved = resolved_with_k8s_deploy("prod");
         let sources  = multi_module_sources();
         let catalog  = aislang_catalog::bundled().expect("bundled");
@@ -1636,18 +1651,22 @@ mod tests {
 
         let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
             .expect("agent-runtime Deployment must be emitted");
-        // The pod's mcp-serve args end in the mount DIRECTORY
-        // (`/etc/aislang`), not a file path — pins that aislang
-        // mcp-serve will run the same dir-vs-file dispatch the CLI
-        // does, autodiscovering aislang.toml + modules at the
-        // mount root.
-        assert!(dep_yaml.contains("- /etc/aislang\n"),
-            "agent-runtime args must contain the mount directory \
-             (multi-module); got:\n{dep_yaml}");
-        // Negative: the single-file file-path form must NOT appear.
+        // Args must contain mcp-serve + --http <bind>, NOTHING else
+        // positional.
+        assert!(dep_yaml.contains("- mcp-serve\n"),
+            "agent-runtime args must carry the mcp-serve subcommand; \
+             got:\n{dep_yaml}");
+        assert!(dep_yaml.contains("- --http\n"),
+            "agent-runtime args must carry the --http transport flag; \
+             got:\n{dep_yaml}");
+        // Neither the file-path nor the directory-path positional
+        // forms should appear — the CLI rejects both.
         assert!(!dep_yaml.contains("/etc/aislang/project.ais"),
-            "agent-runtime args must NOT contain the project.ais file \
-             path in multi-module mode; got:\n{dep_yaml}");
+            "agent-runtime args must NOT carry a .ais file-path \
+             positional; got:\n{dep_yaml}");
+        assert!(!dep_yaml.contains("- /etc/aislang\n"),
+            "agent-runtime args must NOT carry an /etc/aislang \
+             directory positional; got:\n{dep_yaml}");
     }
 
     #[test] fn multi_module_cm_volume_mount_items_remap_per_module() {
@@ -1700,7 +1719,16 @@ mod tests {
 
         let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
             .expect("dep emitted");
-        assert!(dep_yaml.contains("/etc/aislang/project.ais"),
-            "single-file mode pod args must end in project.ais; got:\n{dep_yaml}");
+        // v0.3 Week 18 Wed follow-up: single-file mode args MIRROR
+        // the multi-module no-positional shape — the CLI's mcp-serve
+        // takes no source-path positional, and chat_turn supplies it
+        // per-call.  The CM still mounts project.ais at
+        // /etc/aislang/project.ais (verified above via the CM data
+        // assertion); the agent-runtime pod just doesn't pass it as
+        // an argv slot.
+        assert!(!dep_yaml.contains("- /etc/aislang/project.ais\n"),
+            "single-file mode pod args must NOT carry the project.ais \
+             positional — the CLI rejects extra positionals on mcp-serve; \
+             got:\n{dep_yaml}");
     }
 }
