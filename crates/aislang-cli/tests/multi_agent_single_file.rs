@@ -157,8 +157,8 @@ fn bin() -> Command { Command::new(env!("CARGO_BIN_EXE_aislang")) }
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no agent named `zzzzzzzzz`")
-            || stderr.contains("no agent named `zzzzzzzz`"),
+    assert!(stderr.contains("no agent or pipeline named `zzzzzzzzz`")
+            || stderr.contains("no agent or pipeline named `zzzzzzzz`"),
         "stderr should name the missing label; got:\n{stderr}");
     // Order is declaration-order today; pin both labels are listed,
     // not the exact separator (avoids fighting future hint-formatting

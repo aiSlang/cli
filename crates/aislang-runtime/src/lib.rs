@@ -47,6 +47,13 @@ pub mod tracing;
 // aislang-cli so `aislang mcp-serve` can dispatch multi-module
 // dir inputs at chat-turn time.
 pub mod project_loader;
+// v0.3 Week 17 Thu: composition-pattern state machines
+// (orchestrator / router / supervisor / reflector / planner_
+// executor / coordinator).  Decision 44.2: runtime owns the
+// dispatchers, CLI just calls in.  Thu ships orchestrator +
+// router; Fri adds supervisor + reflector; Week 18 Mon closes
+// the set with planner_executor + coordinator.
+pub mod patterns;
 
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
@@ -86,4 +93,9 @@ pub use tracing::{
 // mcp-serve are the two callers.
 pub use project_loader::{
     load_project_input, LoadedProject, ProjectLoadError,
+};
+// v0.3 Week 17 Thu: re-export pattern dispatchers + the shared
+// `DispatchFuture` type alias used by their callbacks.
+pub use patterns::{
+    orchestrator, router, DispatchFuture, PatternError,
 };

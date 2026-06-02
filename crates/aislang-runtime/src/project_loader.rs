@@ -160,6 +160,29 @@ impl LoadedProject {
         // the explicit `<module>.<agent>` form).
         None
     }
+
+    /// v0.3 Week 17 Thu — `aislang chat <pipeline-label> <project>`
+    /// dispatches through `patterns::orchestrator::run`.  Same
+    /// resolution rules as [`find_agent_label`]: exact match, then
+    /// unique suffix match.
+    ///
+    /// Returns the qualified pipeline label (e.g. `coder.review_cycle`
+    /// for multi-module) so callers can look it up in
+    /// `resolved.project.pipelines` directly.
+    pub fn find_pipeline_label(&self, input: &str) -> Option<String> {
+        if self.resolved.project.pipelines.iter().any(|p| p.label == input) {
+            return Some(input.to_string());
+        }
+        let suffix = format!(".{input}");
+        let matches: Vec<&str> = self.resolved.project.pipelines.iter()
+            .map(|p| p.label.as_str())
+            .filter(|l| l.ends_with(&suffix))
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].to_string());
+        }
+        None
+    }
 }
 
 /// Errors `load_project_input` can produce.  Variant-per-failure-

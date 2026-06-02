@@ -2774,50 +2774,72 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
     let loaded = load_project_input(&file)?;
     let project = &loaded.resolved.project;
 
-    // ── 2. find agent.  Multi-module projects use module-qualified
-    //       labels — `LoadedProject::find_agent_label` handles both
-    //       bare input (`coder` → `coder.coder`) AND explicit
-    //       `<module>.<agent>` form.
-    let resolved_label = loaded.find_agent_label(&agent_label);
-    let agent = match resolved_label.as_deref()
-        .and_then(|l| project.agents.iter().find(|a| a.label == l))
-    {
-        Some(a) => a,
-        None => {
-            let mut available: Vec<&str> = project.agents.iter()
-                .map(|a| a.label.as_str())
-                .collect();
-            available.sort();
-            let hint = nearest_agent_label(&agent_label, &available);
-            let hint_line = match hint {
-                Some(h) => format!(" — did you mean `{h}`?"),
-                None    => String::new(),
-            };
-            let avail_line = if available.is_empty() {
-                "  (no agents declared in this project)".to_string()
-            } else {
-                format!("  available: {}", available.join(", "))
-            };
-            return Err(anyhow::anyhow!(
-                "no agent named `{agent_label}` in {}{hint_line}\n{avail_line}",
-                file.display()
-            ));
-        }
-    };
-    let qualified_agent_label = agent.label.clone();
+    // ── 2. find dispatch target.  v0.3 Week 17 Thu: try agent
+    //       first; if no match, try pipeline (orchestrator pattern).
+    //       Branch dispatch (router pattern) lands Fri alongside
+    //       supervisor + reflector.
+    let qualified_agent_label: String;
+    let model_label:           String;
+    let orchestrator_steps: Option<Vec<String>>;
 
-    // Stash the model alias for the banner (the only thing we know
-    // upfront about the resolved chat target).  The actual model
-    // resolution, prompt loading, MCP children spawning, budget +
-    // tracker setup all happen inside mcp-serve on the first
-    // `aislang_chat_turn` call.  For multi-module, this is the
-    // module-qualified key (e.g. `architect.thinker`).
-    let containing = qualified_agent_label.split_once('.').map(|(m, _)| m);
-    let model_label = match (&agent.model.module, containing) {
-        (Some(m), _)    => format!("{m}.{}", agent.model.label),
-        (None, Some(c)) => format!("{c}.{}", agent.model.label),
-        (None, None)    => agent.model.label.clone(),
-    };
+    if let Some(resolved) = loaded.find_agent_label(&agent_label) {
+        let agent = project.agents.iter()
+            .find(|a| a.label == resolved)
+            .expect("find_agent_label returned a label that doesn't exist");
+        qualified_agent_label = agent.label.clone();
+        let containing = qualified_agent_label.split_once('.').map(|(m, _)| m);
+        model_label = match (&agent.model.module, containing) {
+            (Some(m), _)    => format!("{m}.{}", agent.model.label),
+            (None, Some(c)) => format!("{c}.{}", agent.model.label),
+            (None, None)    => agent.model.label.clone(),
+        };
+        orchestrator_steps = None;
+    } else if let Some(resolved) = loaded.find_pipeline_label(&agent_label) {
+        // v0.3 Week 17 Thu: pipeline-label dispatch → orchestrator
+        // pattern.  Each user message triggers a full pipeline run;
+        // we resolve each step's qualified agent label upfront so
+        // the chat loop can drive mcp-serve sequentially.
+        let pipeline = project.pipelines.iter()
+            .find(|p| p.label == resolved)
+            .expect("find_pipeline_label returned a label that doesn't exist");
+        if pipeline.steps.is_empty() {
+            return Err(anyhow::anyhow!(
+                "pipeline `{resolved}` has no steps to dispatch"));
+        }
+        let containing = pipeline.label.split_once('.').map(|(m, _)| m);
+        orchestrator_steps = Some(pipeline.steps.iter().map(|r|
+            match (&r.module, containing) {
+                (Some(m), _)    => format!("{m}.{}", r.label),
+                (None, Some(c)) => format!("{c}.{}", r.label),
+                (None, None)    => r.label.clone(),
+            }
+        ).collect());
+        qualified_agent_label = pipeline.label.clone();
+        model_label = "(orchestrator)".to_string();   // banner-only
+    } else {
+        // No agent + no pipeline matched — surface a combined hint.
+        let mut available: Vec<String> = project.agents.iter()
+            .map(|a| a.label.clone()).collect();
+        available.extend(project.pipelines.iter()
+            .map(|p| format!("{} (pipeline)", p.label)));
+        available.sort();
+        let agent_labels: Vec<&str> = project.agents.iter()
+            .map(|a| a.label.as_str()).collect();
+        let hint = nearest_agent_label(&agent_label, &agent_labels);
+        let hint_line = match hint {
+            Some(h) => format!(" — did you mean `{h}`?"),
+            None    => String::new(),
+        };
+        let avail_line = if available.is_empty() {
+            "  (no agents or pipelines declared in this project)".to_string()
+        } else {
+            format!("  available: {}", available.join(", "))
+        };
+        return Err(anyhow::anyhow!(
+            "no agent or pipeline named `{agent_label}` in {}{hint_line}\n{avail_line}",
+            file.display()
+        ));
+    }
 
     // Canonical source_dir for mcp-serve.  For dir input this IS
     // the project root; for file input it's the file's parent dir.
@@ -2840,7 +2862,9 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
     let result = rt.block_on(chat_via_mcp_serve(
-        source_path, source_dir, qualified_agent_label, model_label,
+        source_path, source_dir,
+        qualified_agent_label, model_label,
+        orchestrator_steps,
     ));
     drop(rt);
     result
@@ -2888,11 +2912,17 @@ impl rmcp::ClientHandler for AislangChatClient {
     }
 }
 
+/// v0.3 Week 17 Thu: `orchestrator_steps` — when `Some(steps)`,
+/// each user input triggers an orchestrator-pattern dispatch:
+/// N sequential `aislang_chat_turn` calls threading each step's
+/// reply as the next step's `user_input`.  When `None`, the legacy
+/// single-agent-per-turn shape (v0.2 Week 13 Wed) runs.
 async fn chat_via_mcp_serve(
     source_path: PathBuf,
     source_dir:  PathBuf,
     agent_label: String,
     model_label: String,
+    orchestrator_steps: Option<Vec<String>>,
 ) -> Result<()> {
     use rmcp::{ServiceExt,
         model::{CallToolRequestParams, NumberOrString, ProgressToken, RawContent,
@@ -2926,8 +2956,18 @@ async fn chat_via_mcp_serve(
     // tool count; both move into mcp-serve and surface lazily on
     // the first `aislang_chat_turn` call.  The CLI knows only the
     // agent label + model alias upfront.
-    eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`) \
-               via aislang mcp-serve --stdio");
+    //
+    // v0.3 Week 17 Thu: orchestrator-pattern dispatch banner names
+    // the pipeline + the step count.  Single-agent path keeps the
+    // v0.2 wording byte-stable for the existing chat-banner tests.
+    if let Some(steps) = orchestrator_steps.as_ref() {
+        eprintln!("aislang chat — pipeline `{agent_label}` (orchestrator pattern, \
+                   {} steps) via aislang mcp-serve --stdio", steps.len());
+        eprintln!("steps: {}", steps.join(" → "));
+    } else {
+        eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`) \
+                   via aislang mcp-serve --stdio");
+    }
     eprintln!("connected to LiteLLM via mcp-serve's Session pool.");
     eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
     eprintln!();
@@ -2970,37 +3010,70 @@ async fn chat_via_mcp_serve(
         // as dim-stderr lines as they arrive.
         turn_counter += 1;
         let progress_token = ProgressToken(NumberOrString::Number(turn_counter as i64));
-        // Pass `source_path` (file path) instead of `source` (inline
-        // file contents) so the request envelope stays tiny.  Same
-        // resolution policy as Claude Desktop / Cursor / any other
-        // MCP host that drives chat_turn — the path WINS over inline
-        // source if both are set; here we set only the path.
-        let mut params = CallToolRequestParams::new("aislang_chat_turn")
-            .with_arguments(serde_json::json!({
-                "source_path": source_path.to_string_lossy(),
-                "source_dir":  source_dir.to_string_lossy(),
-                "agent_label": agent_label,
-                "user_input":  line,
-            }).as_object().unwrap().clone());
-        // RequestParamsMeta trait gives us set_progress_token —
-        // populates `params.meta._meta.progressToken` per the MCP
-        // 2025-11-25 spec.
-        params.set_progress_token(progress_token);
-        match client.peer().call_tool(params).await {
-            Ok(result) => {
-                let reply = result.content.first()
-                    .and_then(|c| match &c.raw {
-                        RawContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("(empty response)");
-                println!("{reply}");
+
+        // v0.3 Week 17 Thu: orchestrator-pattern dispatch threads
+        // each step's reply as the next step's user_input.  Single-
+        // agent (v0.2) shape is the steps.len() == 1 case where
+        // `agent_label` IS the only step.
+        let steps: Vec<String> = match orchestrator_steps.as_ref() {
+            Some(s) => s.clone(),
+            None    => vec![agent_label.clone()],
+        };
+        let mut current_input = line.to_string();
+        let mut last_reply: Option<String> = None;
+        let mut dispatch_failed = false;
+        for (step_idx, step_label) in steps.iter().enumerate() {
+            if steps.len() > 1 {
+                eprintln!("\x1b[2;3m  · orchestrator step {}/{} → agent `{step_label}`\x1b[0m",
+                    step_idx + 1, steps.len());
             }
-            Err(e) => {
-                // Per-turn error — don't abort the session.  Same
-                // posture v0.1's chat loop took: surface the error
-                // on stderr and let the user retry or `/exit`.
-                eprintln!("aislang chat: {e}");
+            let mut params = CallToolRequestParams::new("aislang_chat_turn")
+                .with_arguments(serde_json::json!({
+                    "source_path": source_path.to_string_lossy(),
+                    "source_dir":  source_dir.to_string_lossy(),
+                    "agent_label": step_label,
+                    "user_input":  current_input,
+                }).as_object().unwrap().clone());
+            params.set_progress_token(progress_token.clone());
+            match client.peer().call_tool(params).await {
+                Ok(result) => {
+                    let reply = result.content.first()
+                        .and_then(|c| match &c.raw {
+                            RawContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "(empty response)".to_string());
+                    // v0.3 Week 17 Thu follow-up: surface the INTERMEDIATE
+                    // step replies on stderr (dim/italic) so the user can
+                    // SEE the chain progress instead of staring at a
+                    // black-box "step N/M" line + only the final answer.
+                    // The final step's reply still lands on stdout via
+                    // the println! below (pipe-clean for `aislang chat
+                    // … | jq`).  Single-agent path (steps.len() == 1) is
+                    // unchanged.
+                    if steps.len() > 1 && step_idx + 1 < steps.len() {
+                        // Multi-line replies get an indent so the dim
+                        // block visually distinguishes from the step
+                        // header above.
+                        let indented = reply.lines()
+                            .map(|l| format!("    \x1b[2;3m{l}\x1b[0m"))
+                            .collect::<Vec<_>>().join("\n");
+                        eprintln!("{indented}");
+                    }
+                    current_input = reply.clone();
+                    last_reply = Some(reply);
+                }
+                Err(e) => {
+                    eprintln!("aislang chat: orchestrator step {}/{} (`{step_label}`) failed: {e}",
+                        step_idx + 1, steps.len());
+                    dispatch_failed = true;
+                    break;
+                }
+            }
+        }
+        if !dispatch_failed {
+            if let Some(reply) = last_reply {
+                println!("{reply}");
             }
         }
     };
