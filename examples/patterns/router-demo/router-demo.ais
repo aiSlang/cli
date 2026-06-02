@@ -83,6 +83,11 @@ project "patterns-router-demo" {
     version = "1.0.0"
   }
 
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "./knowledge/"
+  }
+
   agent "classifier" {
     model         = model.thinker
     system_prompt = prompt.classifier_sys
