@@ -180,8 +180,10 @@ pub enum Role {
 
 /// What LiteLLM returns for a non-streaming chat completion. Mirrors
 /// the OpenAI schema, with optional fields skipped — we only care
-/// about `choices[0].message.content` for v0.1 Wed.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// about `choices[0].message.content` for v0.1 Wed.  `Serialize` was
+/// added v0.3 Week 18 Mon so the response body can be stamped as a
+/// span attribute (debug visibility into "what did the LLM say?").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatResponse {
     #[serde(default)] pub id:      Option<String>,
     #[serde(default)] pub model:   Option<String>,
@@ -191,14 +193,14 @@ pub struct ChatResponse {
     #[serde(default)] pub usage:   Option<UsageStats>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatChoice {
     #[serde(default)] pub index:         u32,
     pub message:                          ChatMessage,
     #[serde(default)] pub finish_reason:  Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageStats {
     #[serde(default)] pub prompt_tokens:     u32,
     #[serde(default)] pub completion_tokens: u32,
@@ -412,6 +414,19 @@ impl LiteLlmClient {
             .with_kind(SpanKind::Client)
             .with_attributes(gen_ai_request_attrs(req))
             .start(&tracer);
+        // v0.3 Week 18 Mon follow-up: stamp the request body as a
+        // span attr so Jaeger shows the actual prompt the model
+        // saw.  Truncation cap 8 KB — chat requests with bundled
+        // system prompt + RAG context can run long; this fits the
+        // typical case while staying clickable in the UI.  Uses
+        // the same truncate helper as session.rs's span attrs.
+        if let Ok(req_json) = serde_json::to_string(req) {
+            span.set_attribute(KeyValue::new(
+                "aislang.chat.request_json",
+                crate::session::truncate_for_span_attr(&req_json, 8192)));
+            span.set_attribute(KeyValue::new(
+                "aislang.chat.request_bytes_total", req_json.len() as i64));
+        }
 
         let response = self.http.post(&url)
             .json(req)
@@ -448,6 +463,21 @@ impl LiteLlmClient {
         // Response-derived attrs go on the span before it ends.
         for kv in gen_ai_response_attrs(&parsed) {
             span.set_attribute(kv);
+        }
+        // v0.3 Week 18 Mon follow-up: stamp the response BODY too
+        // (truncated).  Pairs with `aislang.chat.request_json` above
+        // so each `chat <model>` span carries the full Q&A in one
+        // place — exactly the visibility the user needed to debug
+        // "why did the classifier pick X?" / "what did the model
+        // actually say?".  We dump the full ChatResponse JSON so
+        // tool_calls + finish_reason + usage are all greppable in
+        // Jaeger without re-fetching.
+        if let Ok(resp_json) = serde_json::to_string(&parsed) {
+            span.set_attribute(KeyValue::new(
+                "aislang.chat.response_json",
+                crate::session::truncate_for_span_attr(&resp_json, 8192)));
+            span.set_attribute(KeyValue::new(
+                "aislang.chat.response_bytes_total", resp_json.len() as i64));
         }
         span.end();
         Ok(parsed)
