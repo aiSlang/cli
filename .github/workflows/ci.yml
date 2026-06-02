@@ -457,7 +457,22 @@ jobs:
           # aislang destroy would do.  Equivalence is pinned by
           # the cli_apply_destroy_k8s unit tests.
           helm uninstall prod
-          # Sanity: every aislang-labelled resource should be gone.
+          # v0.3 Week 18 Thu follow-up: `helm uninstall` returns as
+          # soon as the K8s API accepts the DELETE — pods continue
+          # to TERMINATE asynchronously (graceful shutdown +
+          # terminationGracePeriodSeconds, default 30s).  An
+          # immediate `kubectl get all` therefore sees 5 pods in
+          # `Status=Terminating` and the assertion fires falsely.
+          # Wait up to 90s for full eviction; `kubectl wait
+          # --for=delete` returns 0 once every matched resource is
+          # actually gone from the apiserver.  Bounded by 90s to
+          # avoid hanging CI on a stuck finalizer.
+          kubectl wait --for=delete -l aislang.generated=true \
+            --timeout=90s pods,services,deployments,replicasets,pvc \
+            2>&1 || true
+          # Sanity: every aislang-labelled resource should be gone
+          # AFTER the wait drains.  --no-headers omits the empty-set
+          # warning so `wc -l` reads 0 cleanly when nothing matches.
           remaining=$(kubectl get all -l aislang.generated=true \
             --no-headers 2>/dev/null | wc -l)
           if [ "$remaining" -gt 0 ]; then
