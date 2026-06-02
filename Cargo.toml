@@ -78,6 +78,11 @@ opentelemetry        = "0.32"
 opentelemetry_sdk    = "0.32"
 opentelemetry-otlp   = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.32"
+# v0.3 Week 18 Tue: MiniJinja template engine — drives dynamic prompts
+# (`prompt "<l>" { template = true … }`) + the runtime::templates::*
+# API.  Default features only — we don't need the optional `builtins`
+# / `loader` / `multi_template` extras for v0.3.
+minijinja            = { version = "2", default-features = false, features = ["builtins", "serde"] }
 
 [profile.release]
 opt-level = 3

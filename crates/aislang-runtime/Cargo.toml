@@ -52,6 +52,8 @@ opentelemetry-semantic-conventions = { workspace = true }
 # time.  futures_executor sidesteps this; transitively available via
 # opentelemetry_sdk + rmcp already.
 futures-executor                   = "0.3"
+# v0.3 Week 18 Tue: dynamic prompt rendering — see `templates.rs`.
+minijinja                          = { workspace = true }
 # week-13 Mon: HTTP transport for `aislang mcp-serve --http`.
 # rmcp ships `StreamableHttpService` as a tower service that we
 # nest under an axum `Router`; `axum::serve` drives the TcpListener.

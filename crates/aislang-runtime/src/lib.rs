@@ -54,10 +54,13 @@ pub mod project_loader;
 // router; Fri adds supervisor + reflector; Week 18 Mon closes
 // the set with planner_executor + coordinator.
 pub mod patterns;
+// v0.3 Week 18 Tue: MiniJinja template engine + dynamic prompts.
+// See `templates::render` / `render_with_context` for the API.
+pub mod templates;
 
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
-    load_system_prompt, hex_sha256,
+    load_system_prompt, render_system_prompt_if_template, hex_sha256,
     SessionProgress,   // week 13 Wed — chat-turn streaming
 };
 pub use litellm::{

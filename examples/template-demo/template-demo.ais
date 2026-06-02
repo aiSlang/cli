@@ -1,0 +1,94 @@
+## v0.3 Week 18 Tue — worked dynamic-prompts demo.
+##
+## Pins the `prompt "<l>" { template = true }` flag end-to-end:
+##
+##   1. `agent.static_explainer`  uses `prompt.static_sys`  — plain
+##      text body; passed to the LLM verbatim (v0.2-equivalent path).
+##   2. `agent.dynamic_explainer` uses `prompt.dynamic_sys` — body
+##      contains `{{ agent }}`, `{{ model }}`, `{{ prompt }}`
+##      variables AND a `{% if model == "thinker" %}…{% endif %}`
+##      control-flow block.  The runtime renders the file as a
+##      MiniJinja template at chat-turn time, substituting the
+##      built-in context built from the (agent, prompt, model)
+##      triple.
+##
+## ## What this demo proves at runtime
+##
+##   - `aislang chat dynamic_explainer …` → system prompt the LLM
+##     sees has `agent=dynamic_explainer`, `model=thinker`,
+##     `prompt=dynamic_sys` substituted into the body (verifiable
+##     via Jaeger: open the `aislang.turn` span, inspect the
+##     `aislang.system_prompt` attribute — substitutions visible).
+##   - `aislang chat static_explainer …` → byte-stable v0.2
+##     behaviour; the LLM sees `prompts/static_sys.md` verbatim.
+##   - The control-flow `{% if model == "thinker" %}` block emits
+##     a different paragraph depending on which model the agent
+##     resolves to — change the agent's `model = model.X` ref to
+##     try both arms without editing the prompt.
+##
+## ## Run it
+##
+## ```
+## aislang apply examples/template-demo/template-demo.ais
+##
+## # Template-enabled agent — ask about its identity:
+## aislang chat dynamic_explainer examples/template-demo/template-demo.ais
+## > Which model are you running on?
+## I'm running on model `thinker`.
+## > Which agent are you?
+## I'm the `dynamic_explainer` agent.
+##
+## # Static-prompt agent — same question, doesn't know:
+## aislang chat static_explainer examples/template-demo/template-demo.ais
+## > Which model are you running on?
+## I don't know — my system prompt is plain static text...
+## ```
+
+project "template-demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.05
+  }
+
+  model "thinker" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.llama_3_1_8b]
+  }
+
+  ## Static prompt — v0.2-style.  No `template` field declared, so
+  ## defaults to `template = false`; the LLM sees the file body
+  ## byte-stable.
+  prompt "static_sys" {
+    file    = "./prompts/static_sys.md"
+    version = "1.0.0"
+  }
+
+  ## Dynamic prompt — v0.3+ MiniJinja rendering.  `template = true`
+  ## opts the file body into the template engine; the chat-turn
+  ## hop renders `{{ agent }}`, `{{ model }}`, `{{ prompt }}`
+  ## substitutions against the built-in context built from the
+  ## agent referencing this prompt (see LANGUAGE-SPEC §4.4).
+  prompt "dynamic_sys" {
+    file     = "./prompts/dynamic_sys.md"
+    version  = "1.0.0"
+    template = true
+  }
+
+  agent "static_explainer" {
+    model         = model.thinker
+    system_prompt = prompt.static_sys
+    tools         = []
+  }
+
+  agent "dynamic_explainer" {
+    model         = model.thinker
+    system_prompt = prompt.dynamic_sys
+    tools         = []
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
