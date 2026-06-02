@@ -108,6 +108,16 @@ pub struct Project {
     /// required `default` fallback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<Branch>,
+
+    /// v0.3 Week 18 Wed — `skill "<label>" { … }` first-class
+    /// blocks.  Two execution modes — shell command (`exec = …`)
+    /// or MCP-tool delegate (`mcp = …`) — both produce typed output
+    /// per `output_type`.  Wed lands AST + parser + checker;
+    /// runtime executor + sandboxing lands Thu (`runtime::skills`).
+    /// Same byte-stability discipline as `mains` / `pipelines` /
+    /// `loops` / `branches`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<Skill>,
 }
 
 /// v0.3 Week 17 Mon — composition primitive #1.
@@ -217,6 +227,84 @@ pub struct Branch {
     pub on:      String,                     // MiniJinja template
     pub cases:   std::collections::BTreeMap<String, Ref>,
     pub default: Ref,                        // RefKind::Pipeline
+}
+
+/// v0.3 Week 18 Wed — first-class `skill` block (Decision 44.x).
+///
+/// Grammar:
+///
+/// ```hcl
+/// skill "<label>" {
+///   exec        = "<shell command>"               # one of exec | mcp
+///   mcp         = mcp_server.<server>.tool.<name> # one of exec | mcp
+///   output_type = string | json | list<string>    # required
+/// }
+/// ```
+///
+/// Exactly ONE of `exec` / `mcp` is required (XOR).  The parser
+/// rejects both-set and neither-set configurations; the checker
+/// validates the `mcp` ref's server label resolves + the tool name
+/// is non-empty (full MCP-tool-existence is a Thu/runtime concern —
+/// the catalog of remote tools isn't known at parse time).
+///
+/// `output_type` is a closed enum (`String` / `Json` / `ListString`)
+/// — open-ended types are deferred to v0.5+.  Runtime parses the
+/// skill's stdout / MCP-tool result through this shape before
+/// returning to the caller.
+///
+/// Wed lands AST + parser + checker only; runtime execution +
+/// sandboxing land Thu under `aislang-runtime::skills`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skill {
+    pub label:       String,
+    pub exec:        SkillExec,
+    pub output_type: OutputType,
+}
+
+/// One of the two execution modes a skill block can declare.  See
+/// the [`Skill`] docstring for the XOR semantics + parser-time
+/// rejection of both-set / neither-set configurations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillExec {
+    /// Shell command — `"cargo test"` / `"echo hello | jq ."`.  The
+    /// runtime (Thu) shells out via `std::process::Command` with a
+    /// PATH-denylist sandbox per Decision 44.x.  Template-context
+    /// substitution into the command string is a Thu deliverable.
+    Shell { command: String },
+    /// MCP-tool delegate — `mcp_server.<server>.tool.<name>`.
+    /// Re-uses the StdioChild fleet built per the agent's `tools`
+    /// list, so the same `mcp_server` declaration can be both an
+    /// agent tool AND a skill backend without spawning two
+    /// containers.
+    Mcp {
+        /// The `mcp_server` block this skill delegates to.  Stored
+        /// as a `Ref` so cross-module qualification (Week 16 Tue's
+        /// `module: Option<String>`) flows through unchanged.
+        server: Ref,
+        /// The tool name advertised by the MCP server.  Non-empty
+        /// at parse time; existence-validated at runtime against
+        /// the server's actual tool list.
+        tool:   String,
+    },
+}
+
+/// Shape the skill's output is parsed into before handing back to
+/// the caller.  Closed enum for v0.3 — open-ended types (custom
+/// schema refs, typed message envelopes) are v0.5+ per the
+/// composition-primitive discipline (Decision 44.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputType {
+    /// Raw UTF-8 text passed through as a `String`.
+    String,
+    /// Parsed as JSON; runtime returns `serde_json::Value`.  Invalid
+    /// JSON surfaces as a runtime error (Thu).
+    Json,
+    /// Split into a `Vec<String>` on newline boundaries; empty
+    /// trailing line dropped.  Useful for tools whose stdout is
+    /// one-item-per-line (`ls`, `git ls-files`, etc.).
+    ListString,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
