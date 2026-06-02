@@ -43,7 +43,14 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use opentelemetry_otlp::{Protocol, WithExportConfig};
-use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
+use opentelemetry_sdk::{
+    error::OTelSdkResult,
+    trace::{SdkTracerProvider, Span as SdkSpan, SpanData, SpanExporter, SpanProcessor},
+    Resource,
+};
+use std::sync::{mpsc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 // ───────────────────────────────────────────────────────────────────
 // Errors
@@ -118,6 +125,197 @@ static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// Service-name tag used as the global tracer scope.
 const TRACER_SCOPE: &str = "aislang";
 
+// ───────────────────────────────────────────────────────────────────
+// ThreadedSpanProcessor — v0.3 Week 18 Mon follow-up
+// ───────────────────────────────────────────────────────────────────
+//
+// **Why a custom processor?**  The bundled `SimpleSpanProcessor` calls
+// `exporter.export(...)` via `futures_executor::block_on` on whatever
+// thread the span ended on.  With our `reqwest-blocking-client`-backed
+// OTLP exporter, `reqwest::blocking::Client.execute()` reaches into its
+// own internal tokio runtime for the HTTP POST.  If the span ended
+// inside the chat-turn loop (a tokio task on a `tokio-rt-worker`
+// thread), reqwest::blocking detects the parent tokio context +
+// panics with "Cannot drop a runtime in a context where blocking is
+// not allowed".
+//
+// The CLI eval path side-steps this because RootSpan is dropped in
+// plain sync code outside `block_on`.  But every aislang.turn /
+// chat <model> / mcp <server>.<tool> span (session.rs + litellm.rs +
+// session.rs:833) ends inside the async tool-call lifecycle — those
+// CANNOT end on a tokio worker without the panic.
+//
+// **Design.**  `on_end` pushes `SpanData` onto a bounded
+// `std::sync::mpsc::sync_channel`; a dedicated OS thread (NOT
+// tokio-managed) consumes the channel and drives the actual export
+// on its own single-threaded tokio runtime.  Because the worker
+// thread is a plain `std::thread` with no parent tokio context, the
+// blocking-reqwest client's internal runtime drops without issue.
+// `on_end` itself is fire-and-forget (try_send drops on a full
+// channel) so a slow exporter never back-pressures the chat hot path.
+//
+// **Trade-offs in v0.3.**
+//   - Spans dropped on channel-full: capacity 1024 is generous for
+//     typical chat workloads (≤ a few dozen spans per turn).  v0.5+
+//     may surface a metric for drop count.
+//   - Shutdown drains the channel before joining the worker — pinned
+//     by `shutdown_tracer` (CLI's eval + mcp-serve call this on exit).
+//   - Force-flush sends a sync barrier through the channel + waits
+//     up to 5s for the worker to ack.  Eval's per-case JSON write
+//     calls force_flush so trace URLs land before the report ships.
+
+/// Channel message between the SpanProcessor (any thread) and the
+/// dedicated export worker thread.
+enum ExportMsg {
+    /// Newly-ended span.  Worker accumulates a small batch then
+    /// drains in one export call.
+    Span(SpanData),
+    /// Force-flush barrier — worker acks once any buffered spans
+    /// have been exported.
+    Flush(mpsc::SyncSender<()>),
+    /// Resource update from the TracerProvider builder (passes
+    /// service.name + version + custom attrs down to the exporter).
+    SetResource(Resource),
+    /// Shutdown signal — worker drains remaining buffer + exits.
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct ThreadedSpanProcessor {
+    sender: mpsc::SyncSender<ExportMsg>,
+    /// `Option` so `shutdown_with_timeout` can `.take()` the handle
+    /// without consuming `self`.  `Mutex` because `SpanProcessor`'s
+    /// shutdown method takes `&self`.
+    join:   Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl ThreadedSpanProcessor {
+    fn new<E: SpanExporter + 'static>(exporter: E) -> Self {
+        let (tx, rx) = mpsc::sync_channel(1024);
+        let handle = thread::Builder::new()
+            .name("aislang-otel-export".into())
+            .spawn(move || run_export_loop(rx, exporter))
+            .expect("spawn span-export thread");
+        Self { sender: tx, join: Mutex::new(Some(handle)) }
+    }
+}
+
+fn run_export_loop<E: SpanExporter>(rx: mpsc::Receiver<ExportMsg>, mut exporter: E) {
+    // **Critical: drive the async export future via
+    // `futures_executor::block_on`, NOT tokio.**  Even though we're
+    // on a plain OS thread, using a tokio runtime here re-creates
+    // the panic the dedicated thread was meant to solve:
+    // `reqwest::blocking::Client.execute()` (the wire used by our
+    // OTLP HTTP exporter with the `reqwest-blocking-client` feature)
+    // creates its OWN inner tokio runtime per call, and dropping
+    // that runtime panics if ANY tokio context is currently active
+    // — including one we created ourselves on this worker.
+    // `futures_executor::block_on` is a tokio-free executor (uses
+    // a thread parker) and leaves the tokio-context check happy.
+    // Mirror of OTel's SimpleSpanProcessor (`span_processor.rs:184`),
+    // just with the dedicated-thread isolation layered on top.
+
+    let mut buf: Vec<SpanData> = Vec::new();
+    loop {
+        let msg = match rx.recv() {
+            Ok(m)  => m,
+            Err(_) => break,   // sender dropped → shutdown
+        };
+        match msg {
+            ExportMsg::Span(span) => {
+                buf.push(span);
+                // Opportunistic batching: drain any other spans that
+                // are already queued without blocking.  Keeps export
+                // calls fewer when the chat hot path bursts.
+                while let Ok(ExportMsg::Span(s)) = rx.try_recv() {
+                    buf.push(s);
+                }
+                let batch = std::mem::take(&mut buf);
+                let _ = futures_executor::block_on(exporter.export(batch));
+            }
+            ExportMsg::Flush(ack) => {
+                if !buf.is_empty() {
+                    let batch = std::mem::take(&mut buf);
+                    let _ = futures_executor::block_on(exporter.export(batch));
+                }
+                let _ = ack.send(());
+            }
+            ExportMsg::SetResource(r) => {
+                exporter.set_resource(&r);
+            }
+            ExportMsg::Shutdown => break,
+        }
+    }
+    // Drain any remaining buffered spans before the worker exits.
+    if !buf.is_empty() {
+        let _ = futures_executor::block_on(exporter.export(buf));
+    }
+    let _ = exporter.shutdown_with_timeout(Duration::from_secs(5));
+}
+
+impl SpanProcessor for ThreadedSpanProcessor {
+    fn on_start(&self, _span: &mut SdkSpan, _cx: &Context) {
+        // Span attrs are mutated by litellm.rs::send_chat_full AFTER
+        // start (response token counts) — those updates happen
+        // in-place on the span, not via the processor.  Nothing for
+        // us to do at start time.
+    }
+
+    fn on_end(&self, span: SpanData) {
+        // Sampling check mirrors SimpleSpanProcessor's behaviour —
+        // unsampled spans are skipped at the processor boundary.
+        if !span.span_context.is_sampled() {
+            return;
+        }
+        // Fire-and-forget: a full channel drops the span rather than
+        // blocking the chat hot path.  1024-deep capacity gives us
+        // ~30+ chat turns of buffer at typical span-per-turn rates,
+        // which is well above what any realistic workload bursts.
+        let _ = self.sender.try_send(ExportMsg::Span(span));
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if self.sender.send(ExportMsg::Flush(ack_tx)).is_err() {
+            return Ok(());  // worker already gone → nothing to flush
+        }
+        // 5s ceiling — long enough that a chat-turn's worth of spans
+        // can drain even on a sluggish network; short enough that
+        // CLI exits don't hang on a dead OTLP receiver.
+        let _ = ack_rx.recv_timeout(Duration::from_secs(5));
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let _ = self.sender.send(ExportMsg::Shutdown);
+        if let Ok(mut guard) = self.join.lock() {
+            if let Some(handle) = guard.take() {
+                // Best-effort join with a deadline.  Spawn a watcher
+                // thread that drops the join handle if the worker
+                // takes too long — keeps shutdown bounded even when
+                // the OTLP endpoint is unreachable + the in-flight
+                // POST is mid-retry.
+                let (done_tx, done_rx) = mpsc::sync_channel(1);
+                thread::Builder::new()
+                    .name("aislang-otel-shutdown-watcher".into())
+                    .spawn(move || {
+                        let _ = handle.join();
+                        let _ = done_tx.send(());
+                    })
+                    .ok();
+                let _ = done_rx.recv_timeout(timeout);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        // Forward via channel — the exporter (which owns the
+        // resource handle) lives on the worker thread.
+        let _ = self.sender.send(ExportMsg::SetResource(resource.clone()));
+    }
+}
+
 /// Initialise the global tracer provider. Idempotent — only the first
 /// successful call installs the provider; subsequent calls return
 /// `Ok(())` without rebuilding anything.
@@ -151,13 +349,18 @@ pub fn init_tracer(service_name: &str) -> Result<(), TracingError> {
         ])
         .build();
 
-    // *Simple* span processor (Decision 18, revised Mon late). For
-    // our scale — a few root + child spans per CLI invocation — sync
-    // export at span-end time has trivial overhead and avoids the
-    // background-thread / tokio-runtime-lifecycle pitfall a batch
-    // processor would create at process exit.
+    // v0.3 Week 18 Mon follow-up: switch from `with_simple_exporter`
+    // to our dedicated-thread `ThreadedSpanProcessor`.  The simple
+    // processor exports SYNCHRONOUSLY on the thread that ended the
+    // span — fine for `aislang eval` (RootSpan dropped in sync code
+    // outside block_on), broken for `aislang chat` via mcp-serve
+    // (every span ends inside an async chat-turn task on a tokio
+    // worker, which panics under reqwest-blocking).  The threaded
+    // processor decouples export from the calling thread by
+    // forwarding via a sync channel to a single dedicated OS
+    // worker thread — see `ThreadedSpanProcessor` docstring above.
     let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(span_exporter)
+        .with_span_processor(ThreadedSpanProcessor::new(span_exporter))
         .with_resource(resource)
         .build();
 

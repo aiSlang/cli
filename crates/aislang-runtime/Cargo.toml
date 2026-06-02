@@ -45,6 +45,13 @@ opentelemetry                      = { workspace = true }
 opentelemetry_sdk                  = { workspace = true }
 opentelemetry-otlp                 = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
+# v0.3 Week 18 Mon: `ThreadedSpanProcessor` drives export via
+# `futures_executor::block_on` (tokio-free) on a dedicated OS thread.
+# Using tokio's block_on there panics because reqwest::blocking creates
+# its own internal tokio runtime — nested tokio contexts fail at drop
+# time.  futures_executor sidesteps this; transitively available via
+# opentelemetry_sdk + rmcp already.
+futures-executor                   = "0.3"
 # week-13 Mon: HTTP transport for `aislang mcp-serve --http`.
 # rmcp ships `StreamableHttpService` as a tower service that we
 # nest under an axum `Router`; `axum::serve` drives the TcpListener.
