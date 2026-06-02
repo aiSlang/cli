@@ -2765,6 +2765,139 @@ fn render_service_rows(rows: &[ComposeService], drift: &mut bool) {
 ///     simplification.
 ///   - The CLI's OTel tracing init moves to mcp-serve. The chat CLI
 ///     itself emits no spans now — just dispatches MCP tool calls.
+/// v0.3 Week 17 Fri — router-pattern dispatch state.
+///
+/// Built once at `run_chat` entry when the user typed a branch label;
+/// each user message in the chat loop runs the classifier → matches a
+/// case key → dispatches the matched case's pipeline as an
+/// orchestrator run.  Resolving steps upfront keeps the per-turn hot
+/// path simple (no AST lookups during the loop).
+///
+/// **v0.3 classifier-agent convention**: the project's FIRST declared
+/// agent (in source order) is used to run the classifier turn.  This
+/// avoids adding a new grammar field to `branch { … }` for v0.3 Fri;
+/// v0.5+ may add an explicit `classifier = agent.<label>` field.
+/// Demos that exercise the router pattern should declare a toolless
+/// classifier-style agent FIRST.
+struct RouterDispatch {
+    /// User-facing label (banner) — the qualified branch label.
+    branch_label:           String,
+    /// Qualified agent label used for the classifier turn.
+    classifier_agent_label: String,
+    /// `(case-key, qualified-step-labels)` pairs, source order
+    /// preserved so the banner can show the route table deterministically.
+    case_keys_and_steps:    Vec<(String, Vec<String>)>,
+    /// Qualified step labels for the branch's `default` pipeline.
+    /// Falls back to this when no case key matches the classifier reply.
+    default_steps:          Vec<String>,
+}
+
+impl RouterDispatch {
+    fn build(
+        loaded: &aislang_runtime::LoadedProject,
+        branch: &aislang_core::ast::Branch,
+    ) -> Result<Self> {
+        let project = &loaded.resolved.project;
+        // Classifier: first agent in source order (v0.3 convention).
+        // If the project has no agents at all, fail with a clear hint.
+        let classifier_agent = project.agents.first().ok_or_else(|| {
+            anyhow::anyhow!(
+                "branch `{}` needs at least one agent in the project to act as \
+                 the router classifier (v0.3 uses the first declared agent)",
+                branch.label)
+        })?;
+        let classifier_agent_label = classifier_agent.label.clone();
+
+        // Each case-pipeline must resolve to a non-empty step list.
+        // Cases preserve source order (BTreeMap iteration is
+        // deterministic by key — good enough for v0.3).
+        let mut case_keys_and_steps = Vec::with_capacity(branch.cases.len());
+        for (case_key, case_ref) in &branch.cases {
+            let pipeline = project.pipelines.iter()
+                .find(|p| {
+                    // Match by qualified label OR bare label given the
+                    // case ref's optional module field.
+                    match (&case_ref.module, p.label.split_once('.')) {
+                        (Some(m), Some((pm, pl))) => m == pm && pl == case_ref.label,
+                        _ => p.label == case_ref.label
+                            || p.label.ends_with(&format!(".{}", case_ref.label)),
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!(
+                    "branch `{}` case `{case_key}` references unknown pipeline `{}`",
+                    branch.label, case_ref.label))?;
+            if pipeline.steps.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "branch `{}` case `{case_key}` → pipeline `{}` has no steps",
+                    branch.label, pipeline.label));
+            }
+            case_keys_and_steps.push((case_key.clone(),
+                qualify_pipeline_steps(pipeline)));
+        }
+
+        let default_pipeline = project.pipelines.iter()
+            .find(|p| {
+                match (&branch.default.module, p.label.split_once('.')) {
+                    (Some(m), Some((pm, pl))) => m == pm && pl == branch.default.label,
+                    _ => p.label == branch.default.label
+                        || p.label.ends_with(&format!(".{}", branch.default.label)),
+                }
+            })
+            .ok_or_else(|| anyhow::anyhow!(
+                "branch `{}` default → unknown pipeline `{}`",
+                branch.label, branch.default.label))?;
+        if default_pipeline.steps.is_empty() {
+            return Err(anyhow::anyhow!(
+                "branch `{}` default pipeline `{}` has no steps",
+                branch.label, default_pipeline.label));
+        }
+        let default_steps = qualify_pipeline_steps(default_pipeline);
+
+        Ok(Self {
+            branch_label: branch.label.clone(),
+            classifier_agent_label,
+            case_keys_and_steps,
+            default_steps,
+        })
+    }
+}
+
+/// CLI-side classifier prompt (mirrors `patterns::router::
+/// build_classifier_prompt` — duplicated here to avoid exposing that
+/// private helper).  Asks the classifier agent to emit ONE of the
+/// case keys for the supplied user input.
+fn build_router_classifier_prompt(
+    case_keys_and_steps: &[(String, Vec<String>)],
+    user_input:          &str,
+) -> String {
+    let case_list = case_keys_and_steps.iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "You are a routing classifier.  Given the user input below, \
+         reply with ONE of the case keys: {case_list}.  Output ONLY \
+         the case key, no other text, no punctuation, no quotes.\n\
+         \nUser input: {user_input}",
+    )
+}
+
+/// Shared step-qualifier — folds a pipeline's `Vec<Ref>` to qualified
+/// agent labels.  Used by both orchestrator-mode and router-mode
+/// dispatch resolution; identical rules as `patterns::orchestrator::
+/// qualified_step_labels` (kept here as a CLI helper to avoid making
+/// that fn public).
+fn qualify_pipeline_steps(
+    pipeline: &aislang_core::ast::Pipeline,
+) -> Vec<String> {
+    let containing = pipeline.label.split_once('.').map(|(m, _)| m);
+    pipeline.steps.iter().map(|r| match (&r.module, containing) {
+        (Some(m), _)    => format!("{m}.{}", r.label),
+        (None, Some(c)) => format!("{c}.{}", r.label),
+        (None, None)    => r.label.clone(),
+    }).collect()
+}
+
 fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
     // ── 1. read + validate source (single-file OR multi-module dir) ──
     // v0.3 Week 17 Tue: dir-vs-file dispatch via load_project_input.
@@ -2776,11 +2909,11 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
 
     // ── 2. find dispatch target.  v0.3 Week 17 Thu: try agent
     //       first; if no match, try pipeline (orchestrator pattern).
-    //       Branch dispatch (router pattern) lands Fri alongside
-    //       supervisor + reflector.
+    //       v0.3 Week 17 Fri: branch label → router pattern (this commit).
     let qualified_agent_label: String;
     let model_label:           String;
     let orchestrator_steps: Option<Vec<String>>;
+    let router_dispatch:    Option<RouterDispatch>;
 
     if let Some(resolved) = loaded.find_agent_label(&agent_label) {
         let agent = project.agents.iter()
@@ -2794,6 +2927,7 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
             (None, None)    => agent.model.label.clone(),
         };
         orchestrator_steps = None;
+        router_dispatch    = None;
     } else if let Some(resolved) = loaded.find_pipeline_label(&agent_label) {
         // v0.3 Week 17 Thu: pipeline-label dispatch → orchestrator
         // pattern.  Each user message triggers a full pipeline run;
@@ -2806,22 +2940,34 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
             return Err(anyhow::anyhow!(
                 "pipeline `{resolved}` has no steps to dispatch"));
         }
-        let containing = pipeline.label.split_once('.').map(|(m, _)| m);
-        orchestrator_steps = Some(pipeline.steps.iter().map(|r|
-            match (&r.module, containing) {
-                (Some(m), _)    => format!("{m}.{}", r.label),
-                (None, Some(c)) => format!("{c}.{}", r.label),
-                (None, None)    => r.label.clone(),
-            }
-        ).collect());
+        orchestrator_steps = Some(qualify_pipeline_steps(pipeline));
         qualified_agent_label = pipeline.label.clone();
         model_label = "(orchestrator)".to_string();   // banner-only
+        router_dispatch = None;
+    } else if let Some(resolved) = loaded.find_branch_label(&agent_label) {
+        // v0.3 Week 17 Fri: branch-label dispatch → router pattern.
+        // Per turn: classifier picks a case key from user input →
+        // matched case's pipeline runs via orchestrator.  Cases
+        // and default are resolved upfront to qualified step
+        // labels; the per-turn classifier callback runs against
+        // the project's FIRST declared agent (v0.3 convention —
+        // see `RouterDispatch` docstring).
+        let branch = project.branches.iter()
+            .find(|b| b.label == resolved)
+            .expect("find_branch_label returned a label that doesn't exist");
+        router_dispatch = Some(RouterDispatch::build(&loaded, branch)?);
+        qualified_agent_label = branch.label.clone();
+        model_label = "(router)".to_string();   // banner-only
+        orchestrator_steps = None;
     } else {
-        // No agent + no pipeline matched — surface a combined hint.
+        // No agent + no pipeline + no branch matched — surface a
+        // combined hint.
         let mut available: Vec<String> = project.agents.iter()
             .map(|a| a.label.clone()).collect();
         available.extend(project.pipelines.iter()
             .map(|p| format!("{} (pipeline)", p.label)));
+        available.extend(project.branches.iter()
+            .map(|b| format!("{} (branch)", b.label)));
         available.sort();
         let agent_labels: Vec<&str> = project.agents.iter()
             .map(|a| a.label.as_str()).collect();
@@ -2836,7 +2982,7 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
             format!("  available: {}", available.join(", "))
         };
         return Err(anyhow::anyhow!(
-            "no agent or pipeline named `{agent_label}` in {}{hint_line}\n{avail_line}",
+            "no agent, pipeline, or branch named `{agent_label}` in {}{hint_line}\n{avail_line}",
             file.display()
         ));
     }
@@ -2864,7 +3010,7 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
     let result = rt.block_on(chat_via_mcp_serve(
         source_path, source_dir,
         qualified_agent_label, model_label,
-        orchestrator_steps,
+        orchestrator_steps, router_dispatch,
     ));
     drop(rt);
     result
@@ -2917,12 +3063,20 @@ impl rmcp::ClientHandler for AislangChatClient {
 /// N sequential `aislang_chat_turn` calls threading each step's
 /// reply as the next step's `user_input`.  When `None`, the legacy
 /// single-agent-per-turn shape (v0.2 Week 13 Wed) runs.
+///
+/// v0.3 Week 17 Fri: `router_dispatch` — when `Some(state)`, each
+/// user input runs a classifier turn first (against the project's
+/// first declared agent), matches the reply against the branch's
+/// case keys, then dispatches the matched case-pipeline as an
+/// orchestrator run.  Mutually exclusive with `orchestrator_steps`
+/// (we'd never have both — `run_chat` picks one or the other).
 async fn chat_via_mcp_serve(
     source_path: PathBuf,
     source_dir:  PathBuf,
     agent_label: String,
     model_label: String,
     orchestrator_steps: Option<Vec<String>>,
+    router_dispatch:    Option<RouterDispatch>,
 ) -> Result<()> {
     use rmcp::{ServiceExt,
         model::{CallToolRequestParams, NumberOrString, ProgressToken, RawContent,
@@ -2958,12 +3112,25 @@ async fn chat_via_mcp_serve(
     // agent label + model alias upfront.
     //
     // v0.3 Week 17 Thu: orchestrator-pattern dispatch banner names
-    // the pipeline + the step count.  Single-agent path keeps the
-    // v0.2 wording byte-stable for the existing chat-banner tests.
+    // the pipeline + the step count.  v0.3 Week 17 Fri: router-pattern
+    // banner names the branch + lists the case keys.  Single-agent
+    // path keeps the v0.2 wording byte-stable for the existing
+    // chat-banner tests.
     if let Some(steps) = orchestrator_steps.as_ref() {
         eprintln!("aislang chat — pipeline `{agent_label}` (orchestrator pattern, \
                    {} steps) via aislang mcp-serve --stdio", steps.len());
         eprintln!("steps: {}", steps.join(" → "));
+    } else if let Some(r) = router_dispatch.as_ref() {
+        let case_keys: Vec<&str> = r.case_keys_and_steps.iter()
+            .map(|(k, _)| k.as_str()).collect();
+        eprintln!("aislang chat — branch `{}` (router pattern, {} cases) \
+                   via aislang mcp-serve --stdio",
+            r.branch_label, case_keys.len());
+        eprintln!("cases: {} (default: {} step{})",
+            case_keys.join(" | "),
+            r.default_steps.len(),
+            if r.default_steps.len() == 1 { "" } else { "s" });
+        eprintln!("classifier agent: `{}`", r.classifier_agent_label);
     } else {
         eprintln!("aislang chat — agent `{agent_label}` (model alias `{model_label}`) \
                    via aislang mcp-serve --stdio");
@@ -3015,9 +3182,73 @@ async fn chat_via_mcp_serve(
         // each step's reply as the next step's user_input.  Single-
         // agent (v0.2) shape is the steps.len() == 1 case where
         // `agent_label` IS the only step.
-        let steps: Vec<String> = match orchestrator_steps.as_ref() {
-            Some(s) => s.clone(),
-            None    => vec![agent_label.clone()],
+        //
+        // v0.3 Week 17 Fri: router-pattern dispatch runs an extra
+        // classifier turn BEFORE the orchestrator loop, against the
+        // project's first declared agent.  The classifier reply
+        // picks a case-key (substring + case-insensitive match,
+        // same logic as `patterns::router::route` — kept in sync,
+        // inlined here for closure-lifetime simplicity).  If no
+        // case matches → fall through to the `default` steps.
+        let steps: Vec<String> = if let Some(r) = router_dispatch.as_ref() {
+            let prompt = build_router_classifier_prompt(
+                &r.case_keys_and_steps, line);
+            eprintln!("\x1b[2;3m  · router classifying via agent \
+                       `{}` against cases [{}]\x1b[0m",
+                r.classifier_agent_label,
+                r.case_keys_and_steps.iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>().join(", "));
+            let mut cls_params = CallToolRequestParams::new("aislang_chat_turn")
+                .with_arguments(serde_json::json!({
+                    "source_path": source_path.to_string_lossy(),
+                    "source_dir":  source_dir.to_string_lossy(),
+                    "agent_label": &r.classifier_agent_label,
+                    "user_input":  prompt,
+                }).as_object().unwrap().clone());
+            cls_params.set_progress_token(progress_token.clone());
+            match client.peer().call_tool(cls_params).await {
+                Ok(result) => {
+                    let reply = result.content.first()
+                        .and_then(|c| match &c.raw {
+                            RawContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let normalized = reply.trim().to_lowercase();
+                    let picked = r.case_keys_and_steps.iter()
+                        .find(|(k, _)| {
+                            let lk = k.to_lowercase();
+                            lk == normalized || normalized.contains(&lk)
+                        });
+                    match picked {
+                        Some((k, s)) => {
+                            eprintln!("\x1b[2;3m  · router → case `{k}` ({} steps)\x1b[0m",
+                                s.len());
+                            s.clone()
+                        }
+                        None => {
+                            eprintln!("\x1b[2;3m  · router → no case match \
+                                       (reply: {:?}) → default ({} steps)\x1b[0m",
+                                reply.trim(), r.default_steps.len());
+                            r.default_steps.clone()
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("aislang chat: router classifier turn failed: {e}");
+                    // Fall through to default — degraded but
+                    // continues the chat session rather than killing it.
+                    eprintln!("\x1b[2;3m  · falling back to default ({} steps)\x1b[0m",
+                        r.default_steps.len());
+                    r.default_steps.clone()
+                }
+            }
+        } else {
+            match orchestrator_steps.as_ref() {
+                Some(s) => s.clone(),
+                None    => vec![agent_label.clone()],
+            }
         };
         let mut current_input = line.to_string();
         let mut last_reply: Option<String> = None;

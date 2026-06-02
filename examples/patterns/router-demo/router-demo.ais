@@ -1,0 +1,146 @@
+## v0.3 Week 17 Fri — worked router-pattern demo.
+##
+## Three-way customer-support router: each user message goes through
+## a classifier agent that picks one of {billing, technical, general},
+## and the matched case's pipeline handles the actual reply.
+##
+##   user → classifier → case key → matched pipeline → answer
+##
+## ## Why router (not orchestrator)?
+##
+## Orchestrator chains agents UNCONDITIONALLY — every message visits
+## every step.  Router DISPATCHES: each message visits exactly ONE
+## case-pipeline (chosen by the classifier), keeping latency + cost
+## down when the case-pipelines are heavyweight.  Use the router
+## when handling distinct workloads under one chat surface (a
+## customer-support intake, a routing dispatcher, a question-typing
+## triage).
+##
+## ## v0.3 classifier-agent convention
+##
+## v0.3 Fri's CLI uses the project's FIRST declared agent as the
+## router's classifier.  We declare `agent "classifier"` first
+## here for that reason; it's a toolless agent whose prompt is
+## tuned to emit the case key only.  (v0.5+ may add an explicit
+## `classifier = agent.<label>` field in the `branch { … }` block;
+## until then the source-order convention rules.)
+##
+## ## Run it
+##
+## ```
+## aislang apply examples/patterns/router-demo/router-demo.ais       # bring stack up
+## aislang chat triage examples/patterns/router-demo/router-demo.ais
+##
+## > How do I reset my password?
+##  · router classifying via agent `classifier` against cases [billing, general, technical]
+##  · router → case `technical` (1 steps)
+##  · orchestrator step 1/1 → agent `technical`
+## You can reset your password from the login page → "Forgot password"
+## link.  We'll email you a reset link valid for 30 minutes.
+##
+## > How do I update my payment method?
+##  · router → case `billing` (1 steps)
+##  · orchestrator step 1/1 → agent `billing`
+## You can update your payment method in your account settings under
+## Billing → Payment Methods.  Changes apply to your next invoice.
+##
+## > Hi!
+##  · router → case `general` (1 steps)
+##  · orchestrator step 1/1 → agent `general`
+## Hello!  How can I help today?
+## ```
+
+project "patterns-router-demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.05
+  }
+
+  model "thinker" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.llama_3_1_8b]
+  }
+
+  ## NOTE: agent "classifier" is declared FIRST — the v0.3 CLI uses
+  ## the first declared agent as the router's classifier.  See the
+  ## top-of-file note for the source-order convention.
+  prompt "classifier_sys" {
+    file    = "./prompts/router_classifier.md"
+    version = "1.0.0"
+  }
+  prompt "billing_sys" {
+    file    = "./prompts/billing_agent.md"
+    version = "1.0.0"
+  }
+  prompt "technical_sys" {
+    file    = "./prompts/technical_agent.md"
+    version = "1.0.0"
+  }
+  prompt "general_sys" {
+    file    = "./prompts/general_agent.md"
+    version = "1.0.0"
+  }
+
+  agent "classifier" {
+    model         = model.thinker
+    system_prompt = prompt.classifier_sys
+    tools         = []
+  }
+  agent "billing" {
+    model         = model.thinker
+    system_prompt = prompt.billing_sys
+    tools         = []
+  }
+  agent "technical" {
+    model         = model.thinker
+    system_prompt = prompt.technical_sys
+    tools         = []
+  }
+  agent "general" {
+    model         = model.thinker
+    system_prompt = prompt.general_sys
+    tools         = []
+  }
+
+  ## Each case is a 1-step pipeline today (the router demo's case-
+  ## pipelines are deliberately single-agent so it's clear the
+  ## ROUTER is what's doing the work — not a deeper composition).
+  ## You can grow these into multi-step pipelines later (e.g. add
+  ## a `summarizer` after `technical` to compress long answers).
+  pipeline "handle_billing" {
+    steps  = [agent.billing]
+    input  = "the user's billing question"
+    output = "a 1-3 sentence billing reply"
+  }
+  pipeline "handle_technical" {
+    steps  = [agent.technical]
+    input  = "the user's technical question"
+    output = "a 2-4 sentence technical reply"
+  }
+  pipeline "handle_general" {
+    steps  = [agent.general]
+    input  = "the user's general/greeting question"
+    output = "a 1-2 sentence conversational reply"
+  }
+
+  ## v0.3 Week 17 Wed (Decision 44.5 #3): `branch` composition block.
+  ## Classifier picks one of `cases`; if nothing matches, falls back
+  ## to `default`.  v0.3 Fri (this commit) wires CLI dispatch via
+  ## the router pattern runtime — `aislang chat triage <project>`
+  ## routes each user message through the classifier + matched case.
+  branch "triage" {
+    on      = "{{ classifier_result }}"
+    cases   = {
+      billing   = pipeline.handle_billing,
+      technical = pipeline.handle_technical,
+      general   = pipeline.handle_general,
+    }
+    default = pipeline.handle_general
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
