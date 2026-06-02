@@ -103,6 +103,7 @@ dependencies = [
  "aislang-core",
  "aislang-resolver",
  "axum",
+ "futures-executor",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

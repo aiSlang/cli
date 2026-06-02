@@ -3,9 +3,10 @@
 //! Decision 44.2: the pattern state machines live HERE (not in
 //! aislang-cli).  The CLI just dispatches a user's chat input
 //! through the right pattern; this module owns the per-pattern
-//! execution shape.  Phase 1 ships orchestrator + router (Thu) +
-//! supervisor + reflector (Fri); Week 18 Mon closes the 6-pattern
-//! set with planner_executor + coordinator.
+//! execution shape.  v0.3 Week 17 Thu shipped orchestrator + router;
+//! Week 17 Fri shipped supervisor + reflector; Week 18 Mon (this
+//! commit) closes the 6-pattern roster with planner_executor +
+//! coordinator.
 //!
 //! ## v0.3 Fri grammar status (supervisor + reflector)
 //!
@@ -123,6 +124,41 @@ pub enum SupervisorOutcome {
 pub enum ReflectorOutcome {
     Accepted   { draft: String, retry_count: u32 },
     MaxRetries { draft: String, attempted:   u32 },
+}
+
+/// `planner_executor::run` outcome.  Carries the planner's decisions
+/// (each non-leaf DECOMPOSE reply, in source order) + the executor's
+/// per-leaf-task replies + the aggregated final reply for the
+/// chat surface.  Bounds metadata (`max_depth_reached`,
+/// `steps_executed`) lets callers verify cap behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerExecutorOutcome {
+    /// Each DECOMPOSE-verdict reply the planner produced, in order.
+    /// Empty if the very first planner reply was EXECUTE (no tree
+    /// expansion happened).
+    pub plan_history:     Vec<String>,
+    /// Per-leaf executor replies, BFS-order of leaf visits.
+    pub leaf_results:     Vec<String>,
+    /// Concatenated final reply ready to ship to the chat surface.
+    pub final_reply:      String,
+    /// Deepest BFS level reached (0 = no decomposition happened).
+    pub max_depth_reached: u32,
+    /// Total executor invocations (= leaf count).
+    pub steps_executed:   u32,
+    /// True when the BFS terminated because the global step budget
+    /// (`max_total_steps`) was hit before the queue drained.  False
+    /// on normal queue exhaustion.
+    pub budget_exhausted: bool,
+}
+
+/// `coordinator::run` outcome.  `Converged` = consecutive rounds
+/// produced identical messages (round-robin reached fixed point);
+/// `MaxRounds` = budget exhausted before convergence (still surfaces
+/// the last message as a degraded response).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorOutcome {
+    Converged { final_message: String, rounds: u32 },
+    MaxRounds { final_message: String, rounds: u32 },
 }
 
 /// Convenience alias for the boxed-future shape every dispatcher
@@ -562,6 +598,369 @@ pub mod reflector {
              \nRevise your reply to address the feedback.  Output ONLY \
              the revised reply, no meta-commentary.",
         )
+    }
+}
+
+// ============================================================================
+// Planner-executor pattern (Decision 44.2 #5 — plan-then-execute)
+// ============================================================================
+
+pub mod planner_executor {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Two-agent pattern: a `planner` agent decomposes the user
+    /// request into smaller tasks (possibly recursively, up to
+    /// `max_depth`); each leaf task is dispatched to an `executor`
+    /// agent + the per-leaf replies are concatenated into the
+    /// final answer.
+    ///
+    /// ## Algorithm (depth-bound BFS)
+    ///
+    /// ```text
+    /// queue ← [(user_input, depth=0)]
+    /// plan_history ← []
+    /// leaf_results ← []
+    /// while queue and steps_executed < max_total_steps:
+    ///     (task, depth) ← pop
+    ///     if depth >= max_depth:
+    ///         // forced executor — no more decomposition allowed
+    ///         result ← dispatch(executor, task)
+    ///         leaf_results.append(result)
+    ///     else:
+    ///         verdict ← dispatch(planner, build_planner_prompt(task, depth, max_depth))
+    ///         if verdict starts with "EXECUTE":
+    ///             result ← dispatch(executor, task)
+    ///             leaf_results.append(result)
+    ///         else (DECOMPOSE):
+    ///             plan_history.append(verdict)
+    ///             subtasks ← parse_subtasks(verdict)
+    ///             for st in subtasks: queue.push_back((st, depth+1))
+    /// return PlannerExecutorOutcome { plan_history, leaf_results,
+    ///                                 final_reply = concat(leaf_results), ... }
+    /// ```
+    ///
+    /// ## Bounds + termination
+    ///
+    /// - **max_depth**: caps the BFS depth.  At depth == max_depth
+    ///   the planner is SKIPPED + the task goes straight to executor.
+    ///   `max_depth = 0` ⇒ planner never runs; equivalent to a
+    ///   single executor call against the user_input.
+    /// - **max_total_steps**: hard global cap on executor invocations.
+    ///   When hit, the BFS terminates EARLY + `budget_exhausted` is
+    ///   set true on the outcome.  Defends against runaway planner
+    ///   blow-ups (e.g. each level produces 5 subtasks).
+    ///
+    /// ## v0.3 verdict / subtask format
+    ///
+    /// The planner agent is asked to reply with EITHER:
+    ///   - `EXECUTE` (single line, optional trailing whitespace) —
+    ///     treat the task as a leaf; dispatch to executor.
+    ///   - `DECOMPOSE:` followed by one task per line (numbered or
+    ///     bulleted is fine; we strip leading `- `, `* `, `1.`, …).
+    ///     Empty / comment lines are skipped.
+    ///
+    /// Anything that doesn't start with `EXECUTE` or `DECOMPOSE` is
+    /// treated as a SINGLE-line decomposition (one subtask = the
+    /// entire reply); this keeps things permissive on prompts that
+    /// drift.  v0.5+ may switch to JSON-mode for stricter parsing.
+    pub async fn run<F>(
+        planner_agent:   String,
+        executor_agent:  String,
+        user_input:      &str,
+        max_depth:       u32,
+        max_total_steps: u32,
+        mut dispatch_once: F,
+    ) -> Result<PlannerExecutorOutcome, PatternError>
+    where
+        F: FnMut(String /* agent_label */, String /* user_input */) -> DispatchFuture,
+    {
+        let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+        queue.push_back((user_input.to_string(), 0));
+        let mut plan_history: Vec<String>  = Vec::new();
+        let mut leaf_results: Vec<String>  = Vec::new();
+        let mut max_depth_reached: u32 = 0;
+        let mut steps_executed:   u32 = 0;
+        let mut budget_exhausted: bool = false;
+
+        while let Some((task, depth)) = queue.pop_front() {
+            if steps_executed >= max_total_steps {
+                budget_exhausted = true;
+                break;
+            }
+            max_depth_reached = max_depth_reached.max(depth);
+
+            // At depth cap → force executor (no planner consultation).
+            let force_execute = depth >= max_depth;
+            let verdict = if force_execute {
+                None
+            } else {
+                let prompt = build_planner_prompt(&task, depth, max_depth);
+                let reply = dispatch_once(planner_agent.clone(), prompt).await
+                    .map_err(|e| PatternError::Session {
+                        pattern: "planner_executor",
+                        step:    format!("planner depth={depth} (agent `{planner_agent}`)"),
+                        source:  e,
+                    })?;
+                Some(reply)
+            };
+
+            let should_execute = match verdict.as_deref() {
+                None    => true,                            // depth cap
+                Some(r) => is_execute_verdict(r),
+            };
+
+            if should_execute {
+                let result = dispatch_once(executor_agent.clone(), task).await
+                    .map_err(|e| PatternError::Session {
+                        pattern: "planner_executor",
+                        step:    format!("executor step {} (agent `{executor_agent}`)",
+                                         steps_executed + 1),
+                        source:  e,
+                    })?;
+                leaf_results.push(result);
+                steps_executed += 1;
+            } else {
+                let verdict = verdict.expect("verdict present when not force-executing");
+                let subtasks = parse_subtasks(&verdict);
+                plan_history.push(verdict);
+                // Empty decomposition: the planner declined to expand
+                // but also didn't EXECUTE.  Coerce to executor to
+                // keep the BFS moving (defensive — happens when the
+                // LLM emits `DECOMPOSE:` with nothing after).
+                if subtasks.is_empty() {
+                    let result = dispatch_once(executor_agent.clone(), task).await
+                        .map_err(|e| PatternError::Session {
+                            pattern: "planner_executor",
+                            step:    format!("executor step {} (empty-decompose fallback)",
+                                             steps_executed + 1),
+                            source:  e,
+                        })?;
+                    leaf_results.push(result);
+                    steps_executed += 1;
+                } else {
+                    for st in subtasks {
+                        queue.push_back((st, depth + 1));
+                    }
+                }
+            }
+        }
+
+        let final_reply = aggregate_leaf_results(&leaf_results);
+        Ok(PlannerExecutorOutcome {
+            plan_history, leaf_results, final_reply,
+            max_depth_reached, steps_executed, budget_exhausted,
+        })
+    }
+
+    fn is_execute_verdict(reply: &str) -> bool {
+        reply.trim().to_lowercase().starts_with("execute")
+    }
+
+    /// Pull subtasks out of a DECOMPOSE-verdict reply.  Strips the
+    /// leading `DECOMPOSE:` marker + walks lines, dropping empties
+    /// and stripping common bullet/number prefixes (`- `, `* `,
+    /// `1.`, `1)`, `(1)`).  Each non-empty surviving line is one
+    /// subtask.  Permissive on purpose: LLM output varies.
+    fn parse_subtasks(verdict: &str) -> Vec<String> {
+        let trimmed = verdict.trim();
+        // Strip a `DECOMPOSE[:]` prefix if present; otherwise treat
+        // the whole reply as the task list.
+        let body = if trimmed.to_lowercase().starts_with("decompose") {
+            // Find the first colon or newline after `decompose`.
+            let lc = trimmed.to_lowercase();
+            let offset = "decompose".len();
+            let rest = &trimmed[offset..];
+            // Skip optional `:` + leading whitespace/newline.
+            let lc_rest = &lc[offset..];
+            let strip_colon = lc_rest.trim_start().starts_with(':');
+            let after_colon = if strip_colon {
+                let pos = rest.find(':').map(|p| p + 1).unwrap_or(0);
+                &rest[pos..]
+            } else {
+                rest
+            };
+            after_colon
+        } else {
+            trimmed
+        };
+        body.lines()
+            .map(|l| strip_bullet_prefix(l.trim()))
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// Strip `- `, `* `, `1.`, `1)`, `(1)` and similar from the
+    /// front of a task line.  Leaves the actual task text intact.
+    fn strip_bullet_prefix(line: &str) -> &str {
+        let trimmed = line.trim_start();
+        // Markdown bullets / asterisk.
+        if let Some(rest) = trimmed.strip_prefix("- ") { return rest.trim_start(); }
+        if let Some(rest) = trimmed.strip_prefix("* ") { return rest.trim_start(); }
+        // Numbered: digits then `.` or `)` then space.
+        let bytes = trimmed.as_bytes();
+        let mut i = 0;
+        // Optional `(` before digits.
+        let opened = bytes.first().copied() == Some(b'(');
+        if opened { i = 1; }
+        let digit_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+        if i > digit_start && i < bytes.len() {
+            // Need to see a closing punctuator + a space.
+            let punct = bytes[i];
+            let closes_match = (opened && punct == b')') || punct == b'.' || punct == b')';
+            if closes_match {
+                // Consume the punctuator + any following whitespace.
+                let after = &trimmed[i + 1..];
+                let rest = after.trim_start();
+                if rest.len() < after.len() || after.starts_with(' ') {
+                    return rest;
+                }
+            }
+        }
+        trimmed
+    }
+
+    fn build_planner_prompt(task: &str, depth: u32, max_depth: u32) -> String {
+        format!(
+            "You are a planner agent.  You receive a task and decide \
+             whether it is small enough to execute directly, or whether \
+             it should be DECOMPOSED into smaller subtasks.\n\
+             \nCurrent task:\n{task}\n\
+             \nDepth: {depth} (max {max_depth}).  You CANNOT decompose \
+             past max_depth, so be decisive near the cap.\n\
+             \nReply with EXACTLY one of:\n\
+             - `EXECUTE` — this task is small enough to handle directly.\n\
+             - `DECOMPOSE:` followed by ONE subtask per line.  Use \
+             plain text per line (no JSON, no markdown).\n\
+             \nNo preamble.  No explanation.  Just the verdict.",
+        )
+    }
+
+    fn aggregate_leaf_results(results: &[String]) -> String {
+        // v0.3: simplest possible aggregation — concatenate with
+        // newlines.  v0.5+ may add a final-aggregator agent ("read
+        // these N results + write a unified reply") for non-trivial
+        // synthesis.
+        results.join("\n\n")
+    }
+}
+
+// ============================================================================
+// Coordinator pattern (Decision 44.2 #6 — peer-to-peer round-robin)
+// ============================================================================
+
+pub mod coordinator {
+    use super::*;
+
+    /// N-peer round-robin: each round, every peer agent sees the
+    /// current shared message in order + emits its contribution.
+    /// The pattern terminates when consecutive rounds produce
+    /// IDENTICAL messages (fixed point = consensus) or when
+    /// `max_rounds` is exhausted.
+    ///
+    /// ## Algorithm
+    ///
+    /// ```text
+    /// message ← user_input
+    /// for round in 1..=max_rounds:
+    ///     round_input ← message
+    ///     for peer in peers:           # round-robin in declared order
+    ///         message ← dispatch(peer, build_peer_prompt(round, peer_idx, message))
+    ///     if message == round_input:   # no peer added anything this round
+    ///         return Converged { final_message = message, rounds = round }
+    /// return MaxRounds { final_message = message, rounds = max_rounds }
+    /// ```
+    ///
+    /// ## Convergence rule (v0.3)
+    ///
+    /// "Identical message" = exact string equality after the full
+    /// round-robin pass.  Pragmatic + cheap: if no peer changed the
+    /// message this round, the conversation has plateaued + we
+    /// stop.  v0.5+ may switch to semantic-similarity (embedding
+    /// cosine ≥ threshold) for cases where peers reformat without
+    /// adding info.
+    ///
+    /// ## v0.3 limitations
+    ///
+    /// - **No early termination per-peer**: even when peer N writes
+    ///   "we're done", peers N+1..|peers| still get called this
+    ///   round.  Convergence check fires only after the FULL
+    ///   round-robin.  Cheap to fix later if needed.
+    /// - **String-only message**: same as orchestrator's String-
+    ///   only handoff (no structured envelopes).  v0.5+ may add.
+    /// - **Static peer list**: peers cannot drop out / be added
+    ///   mid-coordination.  v0.5+ may add a "leave" verdict.
+    pub async fn run<F>(
+        peers:       Vec<String>,
+        user_input:  &str,
+        max_rounds:  u32,
+        mut dispatch_once: F,
+    ) -> Result<CoordinatorOutcome, PatternError>
+    where
+        F: FnMut(String /* agent_label */, String /* user_input */) -> DispatchFuture,
+    {
+        if peers.len() < 2 {
+            // Single-peer coordination is meaningless — there's no
+            // round-robin to do.  Reject early so callers don't
+            // silently get a 1-peer "echo" loop.
+            return Err(PatternError::Session {
+                pattern: "coordinator",
+                step:    format!("peer-list-validation: got {} peers, need ≥2",
+                                 peers.len()),
+                // Reuse EmptyChoices as the lightest existing variant
+                // for "caller misconfiguration"; v0.5+ may add a
+                // dedicated PatternError::BadConfig variant.
+                source:  SessionError::EmptyChoices,
+            });
+        }
+        if max_rounds == 0 {
+            // 0 rounds = no work + nothing to converge on.  Surface
+            // the initial input as MaxRounds at round 0 — caller's
+            // explicit "skip" should not be reinterpreted.
+            return Ok(CoordinatorOutcome::MaxRounds {
+                final_message: user_input.to_string(),
+                rounds:        0,
+            });
+        }
+
+        let mut message = user_input.to_string();
+        for round in 1..=max_rounds {
+            let round_input = message.clone();
+            for (peer_idx, peer) in peers.iter().enumerate() {
+                // v0.3 design choice: dispatch passes the RAW message
+                // (no per-call prompt wrap).  Each peer's "you are a
+                // coordinator peer; contribute or echo to converge"
+                // framing belongs in the peer agent's SYSTEM prompt
+                // (declared in the .ais file), not in this runtime.
+                // This keeps the threading semantic clean — a peer
+                // that just echoes its input causes the convergence
+                // check at end-of-round to fire correctly.  Compare
+                // to router/reflector/supervisor which DO wrap input
+                // (those patterns need per-call structure to drive
+                // verdict parsing); coordinator's value IS the
+                // verbatim round-tripping.
+                let reply = dispatch_once(peer.clone(), message.clone()).await
+                    .map_err(|e| PatternError::Session {
+                        pattern: "coordinator",
+                        step:    format!("round {round}/{max_rounds} peer {} (`{peer}`)",
+                                         peer_idx + 1),
+                        source:  e,
+                    })?;
+                message = reply;
+            }
+            if message == round_input {
+                return Ok(CoordinatorOutcome::Converged {
+                    final_message: message,
+                    rounds:        round,
+                });
+            }
+        }
+        Ok(CoordinatorOutcome::MaxRounds {
+            final_message: message,
+            rounds:        max_rounds,
+        })
     }
 }
 
@@ -1035,6 +1434,306 @@ mod tests {
                 assert!(step.contains("attempt 1"));
             }
             other => panic!("expected Session error; got {other:?}"),
+        }
+    }
+
+    // -- planner_executor ----------------------------------------- //
+    //
+    // Each test's `dispatch_once` switches on the agent-label arg:
+    // `planner` agents return EXECUTE or DECOMPOSE verdicts;
+    // `executor` agents return synthetic leaf results.  The synthetic
+    // planner replies mock LLM output: DECOMPOSE listings include the
+    // various bullet/number prefixes parse_subtasks must strip.
+
+    #[tokio::test]
+    async fn planner_executor_runs_single_leaf_when_planner_says_execute() {
+        // Planner sees the user input + says EXECUTE → executor runs
+        // once → final reply is just the executor's result.  No
+        // decomposition history.
+        let dispatch = |agent: String, _input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "planner"  => Box::pin(async { Ok("EXECUTE".into()) }),
+                "executor" => Box::pin(async { Ok("answer: 42".into()) }),
+                _ => unreachable!(),
+            }
+        };
+        let out = planner_executor::run("planner".into(), "executor".into(),
+            "what's 6*7?", /* max_depth = */ 3, /* max_total_steps = */ 16,
+            dispatch).await.expect("run");
+        assert_eq!(out.steps_executed, 1);
+        assert_eq!(out.max_depth_reached, 0);
+        assert!(out.plan_history.is_empty(),
+            "no decomposition happened → plan_history must be empty");
+        assert_eq!(out.leaf_results, vec!["answer: 42".to_string()]);
+        assert_eq!(out.final_reply, "answer: 42");
+        assert!(!out.budget_exhausted);
+    }
+
+    #[tokio::test]
+    async fn planner_executor_decomposes_then_executes_leaves() {
+        // First planner call (depth=0) returns DECOMPOSE with 2 subtasks.
+        // Subsequent planner calls (depth=1) return EXECUTE for each.
+        // Outcome: 2 executor results aggregated; max_depth_reached=1.
+        let planner_counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let pc_clone = planner_counter.clone();
+        let exec_counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let ec_clone = exec_counter.clone();
+        let dispatch = move |agent: String, _input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "planner" => {
+                    let mut c = pc_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        // First call: decompose into 2 subtasks (with
+                        // mixed bullet styles to exercise the stripper).
+                        if n == 1 {
+                            Ok("DECOMPOSE:\n- subtask one\n2. subtask two".into())
+                        } else {
+                            Ok("EXECUTE".into())
+                        }
+                    })
+                }
+                "executor" => {
+                    let mut c = ec_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move { Ok(format!("leaf-{n}")) })
+                }
+                _ => unreachable!(),
+            }
+        };
+        let out = planner_executor::run("planner".into(), "executor".into(),
+            "do the thing", 3, 16, dispatch).await.expect("run");
+        assert_eq!(out.steps_executed, 2,
+            "exactly 2 leaves were executed");
+        assert_eq!(out.max_depth_reached, 1,
+            "BFS reached depth 1 (the 2 subtasks at depth=1)");
+        assert_eq!(out.plan_history.len(), 1,
+            "exactly one DECOMPOSE happened (the root)");
+        assert_eq!(out.leaf_results, vec!["leaf-1".to_string(), "leaf-2".to_string()]);
+        assert!(out.final_reply.contains("leaf-1")
+                && out.final_reply.contains("leaf-2"),
+            "final reply must aggregate both leaf results");
+    }
+
+    #[tokio::test]
+    async fn planner_executor_forces_executor_at_max_depth() {
+        // PLAN DoD: "planner_executor depth-bound BFS terminates
+        // within max-depth budget".  We use max_depth = 1: the
+        // root decomposes (planner called at depth 0), but at
+        // depth 1 the planner is SKIPPED entirely + executor runs
+        // directly.  Counting planner calls verifies the cap.
+        let planner_counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let pc_clone = planner_counter.clone();
+        let dispatch = move |agent: String, _input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "planner" => {
+                    *pc_clone.lock().unwrap() += 1;
+                    Box::pin(async {
+                        // Always decompose into 3 subtasks; depth cap
+                        // is what stops the recursion.
+                        Ok("DECOMPOSE:\n- a\n- b\n- c".into())
+                    })
+                }
+                "executor" => Box::pin(async { Ok("leaf".into()) }),
+                _ => unreachable!(),
+            }
+        };
+        let out = planner_executor::run("planner".into(), "executor".into(),
+            "do something", 1, 16, dispatch).await.expect("run");
+        assert_eq!(*planner_counter.lock().unwrap(), 1,
+            "planner called exactly ONCE (depth=0); at depth=1 the cap forces \
+             executor without consulting planner");
+        assert_eq!(out.steps_executed, 3, "3 subtasks at depth=1 all executed");
+        assert_eq!(out.max_depth_reached, 1);
+    }
+
+    #[tokio::test]
+    async fn planner_executor_honours_max_total_steps_budget() {
+        // Hard global budget cap: planner keeps decomposing
+        // recursively into 2 subtasks per level; we set
+        // max_total_steps = 4 → BFS terminates early after 4
+        // executor calls.  budget_exhausted must be true.
+        let dispatch = |agent: String, _input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "planner" => Box::pin(async {
+                    // Each planner call says decompose into 2; with
+                    // max_depth=3 and bushy decomposition the queue
+                    // grows fast.  Budget cap should fire first.
+                    Ok("DECOMPOSE:\n- sub-a\n- sub-b".into())
+                }),
+                "executor" => Box::pin(async { Ok("leaf".into()) }),
+                _ => unreachable!(),
+            }
+        };
+        let out = planner_executor::run("planner".into(), "executor".into(),
+            "task", /* max_depth = */ 3, /* max_total_steps = */ 4,
+            dispatch).await.expect("run");
+        assert_eq!(out.steps_executed, 4,
+            "budget cap = 4 → exactly 4 executor invocations");
+        assert!(out.budget_exhausted,
+            "budget_exhausted must be set when we stopped on the cap");
+    }
+
+    #[tokio::test]
+    async fn planner_executor_coerces_executor_on_empty_decompose() {
+        // Defensive: a planner that says `DECOMPOSE:` with no body
+        // (empty subtask list) must still make progress.  We fall
+        // back to executor for that task so the BFS doesn't stall.
+        let dispatch = |agent: String, _input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "planner"  => Box::pin(async { Ok("DECOMPOSE:".into()) }),
+                "executor" => Box::pin(async { Ok("fallback-result".into()) }),
+                _ => unreachable!(),
+            }
+        };
+        let out = planner_executor::run("planner".into(), "executor".into(),
+            "task", 2, 16, dispatch).await.expect("run");
+        assert_eq!(out.steps_executed, 1,
+            "empty-decompose must coerce to a single executor call");
+        assert_eq!(out.leaf_results, vec!["fallback-result".to_string()]);
+        // Empty DECOMPOSE still gets recorded — useful for tracing
+        // why the planner stalled.
+        assert_eq!(out.plan_history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn planner_executor_bubbles_planner_session_error_with_context() {
+        let dispatch = |agent: String, _input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "planner" => Box::pin(async { Err(SessionError::EmptyChoices) }),
+                _         => Box::pin(async { Ok("never".into()) }),
+            }
+        };
+        let err = planner_executor::run("planner".into(), "executor".into(),
+            "task", 3, 16, dispatch).await.unwrap_err();
+        match err {
+            PatternError::Session { pattern, step, .. } => {
+                assert_eq!(pattern, "planner_executor");
+                assert!(step.contains("planner"));
+                assert!(step.contains("depth=0"));
+            }
+            other => panic!("expected Session error; got {other:?}"),
+        }
+    }
+
+    // -- coordinator ---------------------------------------------- //
+
+    #[tokio::test]
+    async fn coordinator_converges_when_round_produces_no_change() {
+        // PLAN DoD: peer-to-peer convergence on fixed point.  Two
+        // peers; round 1 both peers append distinct contributions;
+        // round 2 both peers echo unchanged → converged after round 2.
+        let counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let c_clone = counter.clone();
+        let dispatch = move |_agent: String, input: String| -> DispatchFuture {
+            let mut c = c_clone.lock().unwrap();
+            *c += 1;
+            let n = *c;
+            Box::pin(async move {
+                // Calls 1, 2 (round 1) modify the message; calls 3, 4
+                // (round 2) echo unchanged.
+                if n <= 2 {
+                    Ok(format!("{input}\npeer-call-{n}"))
+                } else {
+                    Ok(input)
+                }
+            })
+        };
+        let out = coordinator::run(vec!["peer-a".into(), "peer-b".into()],
+            "kickoff", /* max_rounds = */ 5, dispatch).await.expect("run");
+        match out {
+            CoordinatorOutcome::Converged { final_message, rounds } => {
+                assert_eq!(rounds, 2,
+                    "convergence on round 2 (round 1 changed, round 2 didn't)");
+                assert!(final_message.contains("peer-call-1")
+                        && final_message.contains("peer-call-2"));
+            }
+            CoordinatorOutcome::MaxRounds { .. } => panic!("expected Converged"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_honours_max_rounds_cap() {
+        // PLAN DoD: "coordinator round-robin honours max-rounds cap".
+        // Peers NEVER converge — every call appends a unique tag.
+        // With max_rounds=2 + 3 peers, expect exactly 2×3 = 6 calls
+        // + MaxRounds outcome.
+        let counter = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let c_clone = counter.clone();
+        let dispatch = move |_agent: String, input: String| -> DispatchFuture {
+            let mut c = c_clone.lock().unwrap();
+            *c += 1;
+            let n = *c;
+            Box::pin(async move { Ok(format!("{input}+{n}")) })
+        };
+        let out = coordinator::run(
+            vec!["a".into(), "b".into(), "c".into()],
+            "start", 2, dispatch).await.expect("run");
+        match out {
+            CoordinatorOutcome::MaxRounds { final_message: _, rounds } => {
+                assert_eq!(rounds, 2);
+            }
+            CoordinatorOutcome::Converged { .. } => panic!("expected MaxRounds"),
+        }
+        assert_eq!(*counter.lock().unwrap(), 6,
+            "exactly max_rounds × peers = 2 × 3 = 6 dispatch calls");
+    }
+
+    #[tokio::test]
+    async fn coordinator_visits_peers_in_declared_round_robin_order() {
+        // Pin the round-robin order: with peers [a, b, c] declared,
+        // dispatch must visit a → b → c each round.
+        let visits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let v_clone = visits.clone();
+        let dispatch = move |agent: String, input: String| -> DispatchFuture {
+            v_clone.lock().unwrap().push(agent);
+            Box::pin(async move { Ok(input) })   // immediate convergence (round 1)
+        };
+        let _ = coordinator::run(
+            vec!["a".into(), "b".into(), "c".into()],
+            "x", 3, dispatch).await.expect("run");
+        let order = visits.lock().unwrap();
+        assert_eq!(*order, vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "round-robin must follow declared peer order; got {order:?}");
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_fewer_than_two_peers() {
+        // Defensive: 1-peer (or 0-peer) coordination is a misconfig.
+        let dispatch = |_agent: String, _input: String| -> DispatchFuture {
+            Box::pin(async { Ok("never called".into()) })
+        };
+        let err = coordinator::run(vec!["solo".into()], "x", 3, dispatch).await
+            .unwrap_err();
+        match err {
+            PatternError::Session { pattern, step, .. } => {
+                assert_eq!(pattern, "coordinator");
+                assert!(step.contains("peer-list-validation"));
+                assert!(step.contains("got 1"));
+            }
+            other => panic!("expected validation error; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_with_zero_max_rounds_returns_input_unchanged() {
+        // Edge: max_rounds = 0 → no work; surface user_input as the
+        // final message under MaxRounds (NOT converged, since there
+        // was no opportunity to converge).
+        let dispatch = |_agent: String, _input: String| -> DispatchFuture {
+            Box::pin(async { Ok("never called".into()) })
+        };
+        let out = coordinator::run(
+            vec!["a".into(), "b".into()],
+            "hello", 0, dispatch).await.expect("run");
+        match out {
+            CoordinatorOutcome::MaxRounds { final_message, rounds } => {
+                assert_eq!(rounds, 0);
+                assert_eq!(final_message, "hello");
+            }
+            CoordinatorOutcome::Converged { .. } => panic!("expected MaxRounds"),
         }
     }
 }

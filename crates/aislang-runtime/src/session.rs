@@ -56,6 +56,24 @@ use opentelemetry::{
 /// `aislang.eval`) so the operation hierarchy in Jaeger reads cleanly.
 pub(crate) fn turn_span_name() -> &'static str { "aislang.turn" }
 
+/// Trim a long string to a span-attribute-friendly size.  OTel
+/// backends (Jaeger, Tempo, etc.) impose per-attribute limits; the
+/// SDK default is 128 KB but Jaeger UI gets hard to navigate well
+/// before that.  4 KB is generous enough to show full prompts /
+/// tool args / model replies while staying clickable.  We append
+/// `…[trimmed at N B]` when truncation fires so the viewer
+/// understands it's a partial view, not the full content.
+///
+/// Boundary handling: cut at a char boundary (not a byte boundary)
+/// to keep the truncated string valid UTF-8.  If `cap` falls inside
+/// a multi-byte char, we round DOWN to the previous boundary.
+pub(crate) fn truncate_for_span_attr(s: &str, cap: usize) -> String {
+    if s.len() <= cap { return s.to_string(); }
+    let mut cut = cap;
+    while cut > 0 && !s.is_char_boundary(cut) { cut -= 1; }
+    format!("{}…[trimmed at {} B]", &s[..cut], s.len())
+}
+
 /// Span name for one iteration of the tool-use loop. `N` is the
 /// 0-indexed iteration counter; `tool_use_iteration[0]` is the
 /// first LLM call. Bracket notation matches OTel-GenAI convention
@@ -155,6 +173,14 @@ pub enum SessionProgress {
     /// final answer.  Caller can use this as the "drain" / "done"
     /// marker before the function result arrives over the wire.
     FinalAnswer { step: u64, iteration: u32, bytes: usize },
+    /// Jaeger UI URL for the trace covering this turn.  Emitted
+    /// once per turn (immediately after the turn span opens) so the
+    /// chat stdout carries a clickable link the user can pivot from
+    /// "I saw this reply" → "what was the actual prompt + response".
+    /// `url` is built via `tracing::jaeger_url(trace_id)` against the
+    /// `AISLANG_JAEGER_UI` env override (defaults to
+    /// http://localhost:16686).
+    TraceUrl { step: u64, url: String },
 }
 
 impl SessionProgress {
@@ -169,6 +195,7 @@ impl SessionProgress {
             Self::ToolCall          { step, .. } => *step,
             Self::ToolResult        { step, .. } => *step,
             Self::FinalAnswer       { step, .. } => *step,
+            Self::TraceUrl          { step, .. } => *step,
         }
     }
 
@@ -193,6 +220,8 @@ impl SessionProgress {
                 ),
             Self::FinalAnswer { bytes, .. } =>
                 format!("final answer ready ({bytes}B)"),
+            Self::TraceUrl { url, .. } =>
+                format!("trace: {url}"),
         }
     }
 }
@@ -575,11 +604,49 @@ impl Session {
         // Parent = `Context::current()` (per-command root attached
         // by the CLI sync wrapper). Each iteration below opens its
         // own `tool_use_iteration[N]` child under this turn span.
+        //
+        // v0.3 Week 18 Mon follow-up: stamp the turn span with the
+        // model alias + a truncated user_input so the span lists in
+        // Jaeger carry enough context to navigate without expanding
+        // each one.  Truncation budget = 4 KB per attribute; bigger
+        // inputs land in chunks via tool calls anyway (RAG retrievals,
+        // etc.) so the head is the discriminating part.
         let tracer = global::tracer("aislang");
         let turn_span = tracer.span_builder(turn_span_name())
             .with_kind(SpanKind::Internal)
+            .with_attributes([
+                KeyValue::new("aislang.model_alias", self.model_label.clone()),
+                KeyValue::new("aislang.user_input",
+                    truncate_for_span_attr(user_input, 4096)),
+                KeyValue::new("aislang.user_input.bytes_total",
+                    user_input.len() as i64),
+                KeyValue::new("aislang.system_prompt",
+                    truncate_for_span_attr(&self.system_prompt, 4096)),
+                KeyValue::new("aislang.system_prompt.bytes_total",
+                    self.system_prompt.len() as i64),
+                KeyValue::new("aislang.tools.count",
+                    self.tools.len() as i64),
+            ])
             .start(&tracer);
+        // Pluck the trace id BEFORE attaching the context — we
+        // surface it via SessionProgress::TraceUrl below so the chat
+        // stdout carries a clickable Jaeger link for this turn.
+        let trace_id_for_url = {
+            use opentelemetry::trace::Span;
+            turn_span.span_context().trace_id()
+        };
         let _turn_guard = Context::current_with_span(turn_span).attach();
+
+        // Fire the TraceUrl progress event FIRST, before any LLM
+        // call — gives the user a clickable Jaeger link the moment
+        // a turn starts.  If tracing wasn't initialized
+        // (`init_tracer` not called / failed), the trace id is the
+        // all-zeros sentinel; jaeger_url still formats fine and the
+        // URL is harmless even though it won't resolve.
+        on_progress(SessionProgress::TraceUrl {
+            step: bump(),
+            url:  crate::tracing::jaeger_url(trace_id_for_url),
+        });
 
         // Per-turn running cost (week 7 Wed). Initialized to $0; only
         // mutated when `self.budget` is Some. Currency follows the
@@ -823,12 +890,17 @@ impl Session {
         // 3. Open the MCP `call_tool` span — child of whatever
         // `Context::current()` resolves to (the active
         // `tool_use_iteration[N]` span, set by `turn()` above).
-        // PII safety (Decision 21): we tag the byte length of the
-        // serialised args, NOT the args themselves. See
-        // `mcp::mcp_call_tool_attrs` for rationale.
+        // v0.3 Week 18 Mon follow-up: relax the strict PII-safety
+        // posture for debug visibility — attach truncated args JSON
+        // + result body as span attrs so users can pivot from
+        // "agent answered X" → "what did the tool actually return?"
+        // in Jaeger.  Truncation cap = 4 KB per attribute (see
+        // `truncate_for_span_attr`).  PII-conscious deployments can
+        // strip these attrs at the OTel collector layer.
         let server_label = self.tools.server_label_of(server_idx).to_owned();
-        let args_size_bytes = serde_json::to_string(&args_obj)
-            .map(|s| s.len()).unwrap_or(0);
+        let args_json = serde_json::to_string(&args_obj)
+            .unwrap_or_default();
+        let args_size_bytes = args_json.len();
         let tracer = global::tracer("aislang");
         let mut mcp_span = tracer.span_builder(
                 mcp_call_tool_span_name(&server_label, mcp_name)
@@ -838,40 +910,60 @@ impl Session {
                 &server_label, mcp_name, args_size_bytes,
             ))
             .start(&tracer);
+        // Args body as a span attr (truncated).  Goes ABOVE the
+        // tool call so the Jaeger pane shows what the LLM asked
+        // for before the result.
+        {
+            use opentelemetry::trace::Span;
+            mcp_span.set_attribute(KeyValue::new(
+                "mcp.tool.args_json",
+                truncate_for_span_attr(&args_json, 4096)));
+        }
 
         // 4. Invoke through the routed MCP client.
         let client = &self.mcp_clients[server_idx];
         let result = client.call_tool(mcp_name, args_obj).await?;
 
-        // 4b. Tag the result size + error status for searchability
-        // (still no PII — only counts + a boolean). These supplement
-        // the three core attrs Wed's DoD names; they're cheap to add
-        // and useful in Jaeger's grouping.
+        // 4b. Tag the result size + error status for searchability,
+        // PLUS a truncated result body so the Jaeger view of an
+        // MCP tool call shows the actual returned content (e.g.
+        // the file contents a `read_text_file` tool fetched).
+        // Concatenate text fragments for the attr; non-text frags
+        // are labelled inline (same convention as the assistant
+        // message body below).
+        let mut result_body = String::new();
+        for frag in &result.content {
+            if !result_body.is_empty() { result_body.push('\n'); }
+            match frag {
+                ToolContent::Text { text } => result_body.push_str(text),
+                ToolContent::Unsupported { type_name } =>
+                    result_body.push_str(&format!("[unsupported content: {type_name}]")),
+            }
+        }
         use opentelemetry::trace::Span;
         mcp_span.set_attribute(KeyValue::new(
             "mcp.tool.result_fragments_count", result.content.len() as i64));
         mcp_span.set_attribute(KeyValue::new(
             "mcp.tool.is_error", result.is_error));
+        mcp_span.set_attribute(KeyValue::new(
+            "mcp.tool.result_bytes_total", result_body.len() as i64));
+        mcp_span.set_attribute(KeyValue::new(
+            "mcp.tool.result_body",
+            truncate_for_span_attr(&result_body, 4096)));
         mcp_span.end();
 
-        // 4. Concatenate textual fragments. Non-text fragments get
-        // a visible placeholder so the model can see they happened.
-        let mut out = String::new();
-        for frag in &result.content {
-            if !out.is_empty() { out.push('\n'); }
-            match frag {
-                ToolContent::Text { text }       => out.push_str(text),
-                ToolContent::Unsupported { type_name } => {
-                    out.push_str(&format!("[unsupported content: {type_name}]"));
-                }
-            }
-        }
-        if result.is_error {
+        // 4. Hand the (already-built) result body back to the LLM.
+        // Note: `result_body` was constructed above (when stamping the
+        // span attr) using the exact same concatenation rule, so we
+        // avoid the duplicate walk.
+        let out = if result.is_error {
             // Prefix so the model knows the tool failed at the MCP
             // layer (not a Rust-side error — that bubbles via
             // SessionError instead).
-            out = format!("[tool reported error]\n{out}");
-        }
+            format!("[tool reported error]\n{result_body}")
+        } else {
+            result_body
+        };
         Ok(out)
     }
 
@@ -1119,6 +1211,8 @@ mod tests {
                                                  fragments: 1, bytes: 128,
                                                  is_error:  false },
             SessionProgress::FinalAnswer       { step: 4, iteration: 1, bytes: 7 },
+            SessionProgress::TraceUrl          { step: 5,
+                                                 url: "http://j/trace/abc".into() },
         ];
         for (i, ev) in cases.iter().enumerate() {
             assert_eq!(ev.step(), i as u64,
@@ -1195,24 +1289,35 @@ mod tests {
         // Final reply unchanged from the bare `turn()` path.
         assert_eq!(out, "ack: hi");
 
-        // Exactly two events, in order, both for iteration 0.
+        // v0.3 Week 18 Mon follow-up: turn now emits TraceUrl FIRST
+        // (before any LLM call) so the chat stdout carries a clickable
+        // Jaeger link.  Sequence is now: TraceUrl → IterationStart →
+        // FinalAnswer.
         let evs = events.lock().unwrap();
-        assert_eq!(evs.len(), 2, "expected 2 events; got: {evs:?}");
+        assert_eq!(evs.len(), 3, "expected 3 events; got: {evs:?}");
         match &evs[0] {
-            SessionProgress::IterationStart { step: 0, iteration: 0, max } => {
-                assert_eq!(*max, MAX_TOOL_ITERS as u32);
+            SessionProgress::TraceUrl { step: 0, url } => {
+                assert!(url.contains("/trace/"),
+                    "TraceUrl must format the Jaeger URL; got: {url:?}");
             }
-            other => panic!("expected IterationStart{{step:0, iter:0}}; got {other:?}"),
+            other => panic!("expected TraceUrl{{step:0}}; got {other:?}"),
         }
         match &evs[1] {
-            SessionProgress::FinalAnswer { step: 1, iteration: 0, bytes } => {
+            SessionProgress::IterationStart { step: 1, iteration: 0, max } => {
+                assert_eq!(*max, MAX_TOOL_ITERS as u32);
+            }
+            other => panic!("expected IterationStart{{step:1, iter:0}}; got {other:?}"),
+        }
+        match &evs[2] {
+            SessionProgress::FinalAnswer { step: 2, iteration: 0, bytes } => {
                 assert_eq!(*bytes, "ack: hi".len());
             }
-            other => panic!("expected FinalAnswer{{step:1, iter:0}}; got {other:?}"),
+            other => panic!("expected FinalAnswer{{step:2, iter:0}}; got {other:?}"),
         }
         // step() values are monotonically increasing (rmcp's
         // notify_progress requires this).
         assert!(evs[0].step() < evs[1].step());
+        assert!(evs[1].step() < evs[2].step());
     }
 
     #[tokio::test]

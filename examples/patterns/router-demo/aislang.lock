@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "93c6b96003f4d055754be20efd190a4aadbce92225ec724008778a4961b89beb",
+  "source_hash": "7cb2db3f617d408a25a593a1a212dc4ab8cb163591ba7a8f02590d4d546e90e6",
   "model_bindings": {
     "thinker": {
       "provider": "anthropic",
@@ -10,9 +10,11 @@
   },
   "prompt_hashes": {
     "billing_sys": "af1ccb15b99410ce51bb382bf84c088e7f8042ce60b5bd3479b330741e885e15",
-    "classifier_sys": "6e786c28e8c119c3aea8d92dc3b1e23ed3dc85cd225e7e8cd93ef360bbad7e5b",
+    "classifier_sys": "eb453a9283f07f92a451db0ce7d0f7cded525f886560e5b99d4d0eef72779a7c",
     "general_sys": "bf80a06eeb2a340b6ff46347d4377bf1e05908d2f7bdd7bb4af1b327c9e5014b",
     "technical_sys": "3255363a16e760724fef72e3dcc85512f54b2b8459af6fc53f0686efc0998964"
   },
-  "oci_digests": {}
+  "oci_digests": {
+    "docs": ""
+  }
 }

@@ -323,6 +323,22 @@ fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
     // stdout corrupts the JSON-RPC framing).
     eprintln!("aislang mcp-serve: starting stdio MCP server …");
 
+    // v0.3 Week 18 Mon follow-up: install the OTel tracer BEFORE the
+    // runtime starts.  With the new `ThreadedSpanProcessor` (see
+    // `aislang-runtime::tracing` docs), span export happens on a
+    // dedicated OS thread + can't conflict with the tokio chat-turn
+    // lifecycle.  This re-enables aislang-side tracing for the chat
+    // flow — each chat_turn now produces a `aislang.turn` span +
+    // child `tool_use_iteration[N]` spans + `chat <model>` spans
+    // with the OTel-GenAI semantic attrs (gen_ai.system,
+    // gen_ai.request.model, gen_ai.usage.input_tokens, etc.) defined
+    // in `litellm.rs::gen_ai_*`.  Service name in Jaeger:
+    // `aislang-mcp-serve`.  Fail-soft (same shape as `run_eval`):
+    // exporter build failure logs + continues without tracing.
+    if let Err(e) = aislang_runtime::init_tracer("aislang-mcp-serve") {
+        eprintln!("aislang mcp-serve: tracing disabled: {e}");
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -332,6 +348,11 @@ fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
         aislang_runtime::mcp_serve_stdio().await
             .map_err(|e| anyhow::anyhow!("mcp-serve: {e}"))
     })?;
+
+    // Flush + drain the threaded exporter before exit so the last
+    // in-flight batch lands in Jaeger.  Bounded by the processor's
+    // 5s shutdown timeout — never blocks indefinitely.
+    aislang_runtime::shutdown_tracer();
 
     eprintln!("aislang mcp-serve: client disconnected; shutting down.");
     Ok(())
@@ -350,6 +371,13 @@ fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
 /// server config / Cursor / a raw `curl` directly.
 fn run_mcp_serve_http(addr: SocketAddr) -> Result<()> {
     eprintln!("aislang mcp-serve: starting HTTP MCP server on http://{addr}/mcp …");
+
+    // Mirror the stdio path: install the threaded-processor tracer
+    // before the runtime starts.  See `run_mcp_serve` for the full
+    // rationale.
+    if let Err(e) = aislang_runtime::init_tracer("aislang-mcp-serve") {
+        eprintln!("aislang mcp-serve: tracing disabled: {e}");
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -381,6 +409,8 @@ fn run_mcp_serve_http(addr: SocketAddr) -> Result<()> {
         aislang_runtime::mcp_serve_http(listener, ct).await
             .map_err(|e| anyhow::anyhow!("mcp-serve: {e}"))
     })?;
+
+    aislang_runtime::shutdown_tracer();
 
     eprintln!("aislang mcp-serve: HTTP server shut down cleanly.");
     Ok(())
