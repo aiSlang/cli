@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-05-25",
+  "source_hash": "120703cf8088fd7cc7dd08d6d3996bc54927c3fcbf4c4d2ab614807a4ad2c8ce",
+  "model_bindings": {
+    "thinker": {
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
+    }
+  },
+  "prompt_hashes": {
+    "researcher_sys": "4532cd7891940ed0f2c4c547f722660715d341fd91eeed240cea2fe96f46c9e5",
+    "summarizer_sys": "8b1823a90282c86905fe1c61a88bf55ffdc00570c43bff0667bcc408caf04df8"
+  },
+  "oci_digests": {
+    "docs": ""
+  }
+}

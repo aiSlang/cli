@@ -3043,6 +3043,23 @@ async fn chat_via_mcp_serve(
                             _ => None,
                         })
                         .unwrap_or_else(|| "(empty response)".to_string());
+                    // v0.3 Week 17 Thu follow-up: surface the INTERMEDIATE
+                    // step replies on stderr (dim/italic) so the user can
+                    // SEE the chain progress instead of staring at a
+                    // black-box "step N/M" line + only the final answer.
+                    // The final step's reply still lands on stdout via
+                    // the println! below (pipe-clean for `aislang chat
+                    // … | jq`).  Single-agent path (steps.len() == 1) is
+                    // unchanged.
+                    if steps.len() > 1 && step_idx + 1 < steps.len() {
+                        // Multi-line replies get an indent so the dim
+                        // block visually distinguishes from the step
+                        // header above.
+                        let indented = reply.lines()
+                            .map(|l| format!("    \x1b[2;3m{l}\x1b[0m"))
+                            .collect::<Vec<_>>().join("\n");
+                        eprintln!("{indented}");
+                    }
                     current_input = reply.clone();
                     last_reply = Some(reply);
                 }
