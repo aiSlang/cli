@@ -1,0 +1,91 @@
+## v0.3 Week 17 Thu — worked orchestrator-pattern demo.
+##
+## Two-agent pipeline that exercises the orchestrator composition
+## primitive end-to-end:
+##
+##   1. `researcher` — reads /data/company-info.md (via mcp_server.docs
+##      bind-mounted from ./knowledge/) and returns the raw fact set.
+##   2. `summarizer` — takes the researcher's raw output and produces
+##      ONE concise sentence.
+##
+## The pipeline `research_then_summarize` chains them sequentially:
+## each user message dispatches step 1 with the user's query → step 1's
+## reply becomes step 2's input → step 2 produces the final answer.
+##
+## Run it:
+##
+## ```
+## aislang apply examples/patterns/orchestrator-demo.ais   # bring stack up
+## aislang chat research_then_summarize examples/patterns/orchestrator-demo.ais
+## > Where is Acme headquartered?
+##  · orchestrator step 1/2 → agent `researcher`
+##    [researcher reads company-info.md, returns relevant facts]
+##  · orchestrator step 2/2 → agent `summarizer`
+##    [summarizer condenses to one sentence]
+## Acme Demo Company is headquartered in Berlin, Germany.
+## ```
+##
+## You can also chat the individual agents directly:
+##
+## ```
+## aislang chat researcher  examples/patterns/orchestrator-demo.ais
+## aislang chat summarizer  examples/patterns/orchestrator-demo.ais
+## ```
+##
+## — useful for debugging which step's behaviour you want to tune.
+
+project "patterns-orchestrator-demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.05
+  }
+
+  model "thinker" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.llama_3_1_8b]
+  }
+
+  prompt "researcher_sys" {
+    file    = "./prompts/researcher.md"
+    version = "1.0.0"
+  }
+  prompt "summarizer_sys" {
+    file    = "./prompts/summarizer.md"
+    version = "1.0.0"
+  }
+
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "./knowledge/"
+  }
+
+  agent "researcher" {
+    model         = model.thinker
+    system_prompt = prompt.researcher_sys
+    tools         = [mcp_server.docs]
+  }
+
+  agent "summarizer" {
+    model         = model.thinker
+    system_prompt = prompt.summarizer_sys
+    tools         = []
+  }
+
+  ## v0.3 Week 17 Mon (Decision 44.5 #1): `pipeline` composition
+  ## block.  Sequential dispatch through `steps[]` — each agent's
+  ## reply threads into the next agent as its `user_input`.  Wed
+  ## adds `loop` + `branch`; Thu (this commit) wires the
+  ## orchestrator runtime that drives sequential pipelines end-to-
+  ## end via `aislang chat <pipeline-label> <project>`.
+  pipeline "research_then_summarize" {
+    steps  = [agent.researcher, agent.summarizer]
+    input  = "the user's question — e.g. 'Where is Acme HQ?'"
+    output = "one-sentence answer drawn from the knowledge base"
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
