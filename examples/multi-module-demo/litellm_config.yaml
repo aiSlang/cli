@@ -1,0 +1,16 @@
+model_list:
+- model_name: architect.thinker
+  litellm_params:
+    model: anthropic/claude-haiku-4-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+- model_name: architect.thinker-fb-ollama-llama-3-1-8b
+  litellm_params:
+    model: ollama/llama3.1:8b
+    api_base: os.environ/OLLAMA_API_BASE
+router_settings:
+  fallbacks:
+  - architect.thinker:
+    - architect.thinker-fb-ollama-llama-3-1-8b
+litellm_settings:
+  callbacks:
+  - otel

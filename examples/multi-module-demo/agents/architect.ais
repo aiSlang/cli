@@ -9,13 +9,13 @@
 project "architect-module" {
   budget {
     hard_cap_per_day = $1
-    hard_cap_per_run = $0.01
+    hard_cap_per_run = $0.05
   }
   model "thinker" {
     requires    = [chat]
     context_min = 32k
-    prefer      = [ollama.llama_3_1_8b]
-    pin         = ollama.llama_3_1_8b
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.llama_3_1_8b]
   }
   prompt "system" {
     file    = "./system.md"
@@ -25,5 +25,9 @@ project "architect-module" {
     model         = model.thinker
     system_prompt = prompt.system
     tools         = []
+  }
+  mcp_server "docs" {
+    image = "docker.io/mcp/filesystem:1.0.2"
+    mount = "../knowledge/"
   }
 }
