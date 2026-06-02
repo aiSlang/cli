@@ -15,8 +15,8 @@
 ## Run it:
 ##
 ## ```
-## aislang apply examples/patterns/orchestrator-demo.ais   # bring stack up
-## aislang chat research_then_summarize examples/patterns/orchestrator-demo.ais
+## aislang apply examples/patterns/orchestrator-demo/orchestrator-demo.ais   # bring stack up
+## aislang chat research_then_summarize examples/patterns/orchestrator-demo/orchestrator-demo.ais
 ## > Where is Acme headquartered?
 ##  · orchestrator step 1/2 → agent `researcher`
 ##    [researcher reads company-info.md, returns relevant facts]
@@ -28,8 +28,8 @@
 ## You can also chat the individual agents directly:
 ##
 ## ```
-## aislang chat researcher  examples/patterns/orchestrator-demo.ais
-## aislang chat summarizer  examples/patterns/orchestrator-demo.ais
+## aislang chat researcher  examples/patterns/orchestrator-demo/orchestrator-demo.ais
+## aislang chat summarizer  examples/patterns/orchestrator-demo/orchestrator-demo.ais
 ## ```
 ##
 ## — useful for debugging which step's behaviour you want to tune.

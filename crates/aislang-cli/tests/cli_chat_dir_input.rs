@@ -97,7 +97,7 @@ fn bin() -> Command { Command::new(env!("CARGO_BIN_EXE_aislang")) }
         .output().expect("spawn aislang");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no agent or pipeline named `zzzzzzz`"),
+    assert!(stderr.contains("no agent, pipeline, or branch named `zzzzzzz`"),
         "stderr must name the missing label; got:\n{stderr}");
     // Both module-qualified labels must appear so the user can
     // pick.  Order is sorted alphabetically by the existing

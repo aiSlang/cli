@@ -183,6 +183,26 @@ impl LoadedProject {
         }
         None
     }
+
+    /// v0.3 Week 17 Fri — `aislang chat <branch-label> <project>`
+    /// dispatches through `patterns::router::route` then
+    /// `patterns::orchestrator::run` against the matched case.  Same
+    /// resolution rules as [`find_agent_label`] /
+    /// [`find_pipeline_label`].
+    pub fn find_branch_label(&self, input: &str) -> Option<String> {
+        if self.resolved.project.branches.iter().any(|b| b.label == input) {
+            return Some(input.to_string());
+        }
+        let suffix = format!(".{input}");
+        let matches: Vec<&str> = self.resolved.project.branches.iter()
+            .map(|b| b.label.as_str())
+            .filter(|l| l.ends_with(&suffix))
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].to_string());
+        }
+        None
+    }
 }
 
 /// Errors `load_project_input` can produce.  Variant-per-failure-

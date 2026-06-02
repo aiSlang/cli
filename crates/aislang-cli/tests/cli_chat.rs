@@ -160,7 +160,7 @@ fn bin() -> Command {
     assert!(!out.status.success(),
         "expected non-zero exit on bad agent label");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no agent or pipeline named `suport`"),
+    assert!(stderr.contains("no agent, pipeline, or branch named `suport`"),
         "stderr should name the missing label; got:\n{stderr}");
     assert!(stderr.contains("did you mean `support`?"),
         "stderr should suggest the close match; got:\n{stderr}");
@@ -176,7 +176,7 @@ fn bin() -> Command {
         .expect("spawn aislang");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no agent or pipeline named `zzzzzzzzz`"));
+    assert!(stderr.contains("no agent, pipeline, or branch named `zzzzzzzzz`"));
     assert!(stderr.contains("available: support"),
         "stderr should list available labels when no close match; got:\n{stderr}");
 }
