@@ -1782,8 +1782,24 @@ async fn build_session_for_agent_multi_module(
                 "agent `{}` references mcp_server `{}` which doesn't exist \
                  in the merged project",
                 agent.label, tool_key))?;
+        // v0.3 Week 17 Tue follow-up #2: resolve relative `mount`
+        // paths against the CONTAINING MODULE's dir, NOT the project
+        // root.  The author's mental model is "paths in coder.ais
+        // are relative to coder.ais's dir" — so `mount =
+        // "../knowledge/"` in `agents/coder.ais` resolves to
+        // `agents/../knowledge/` = `examples/multi-module-demo/
+        // knowledge/`, not `examples/knowledge/`.
+        //
+        // The containing module is the prefix before the FIRST `.`
+        // in the qualified mcp_server label (`coder.docs` → `coder`).
+        // Look that up in `loaded.module_dirs` to get the canonical
+        // module-source dir + join the relative path against THAT.
+        let mount_base: &Path = mcp.label.split_once('.')
+            .and_then(|(m, _)| loaded.module_dirs.get(m))
+            .map(PathBuf::as_path)
+            .unwrap_or(source_dir);
         let mount = mcp.mount.as_ref().map(|p| {
-            let resolved = source_dir.join(p);
+            let resolved = mount_base.join(p);
             std::fs::canonicalize(&resolved).unwrap_or(resolved)
         });
         let env = resolve_mcp_secrets_for_agent(project, mcp, source_dir)?;

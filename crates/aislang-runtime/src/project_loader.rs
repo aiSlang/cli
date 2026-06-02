@@ -75,6 +75,24 @@ pub struct LoadedProject {
     /// Multi-module: keyed by `<module>.<label>` matching the
     /// resolver's `prompt_hashes` convention.
     pub prompt_bodies: BTreeMap<String, String>,
+
+    /// v0.3 Week 17 Tue follow-up — per-module canonical source
+    /// directory (where each module's `.ais` file lives).  Used by
+    /// the multi-module session builder to resolve RELATIVE paths
+    /// inside each module's blocks (`mcp_server.mount`,
+    /// future `skill.exec_dir`, …) against the AUTHOR's mental
+    /// model: paths are relative to the `.ais` file the author
+    /// wrote them in, NOT the project root.
+    ///
+    /// Example: if `agents/coder.ais` declares
+    /// `mcp_server "docs" { mount = "../knowledge/" }`, the path
+    /// resolves against `agents/` → `examples/multi-module-demo/
+    /// knowledge/`, NOT against the project root (which would have
+    /// landed at `examples/knowledge/`).
+    ///
+    /// Empty for single-file projects (`project_root` is the
+    /// authoritative source dir there).
+    pub module_dirs: BTreeMap<String, PathBuf>,
 }
 
 impl LoadedProject {
@@ -270,6 +288,7 @@ fn load_single_file_project(file: &Path) -> Result<LoadedProject, ProjectLoadErr
         modules: BTreeMap::new(),
         manifest: None,
         prompt_bodies,
+        module_dirs: BTreeMap::new(),
     })
 }
 
@@ -292,6 +311,7 @@ fn load_multi_module_project(dir: &Path) -> Result<LoadedProject, ProjectLoadErr
     let mut module_projects: BTreeMap<String, aislang_core::ast::Project> = BTreeMap::new();
     let mut module_sources:  BTreeMap<String, String>                = BTreeMap::new();
     let mut module_prompt_bodies: BTreeMap<String, String>           = BTreeMap::new();
+    let mut module_dirs:     BTreeMap<String, PathBuf>               = BTreeMap::new();
     let mut warnings = Vec::new();
 
     for (name, rel_path) in &manifest.modules {
@@ -327,6 +347,13 @@ fn load_multi_module_project(dir: &Path) -> Result<LoadedProject, ProjectLoadErr
 
         module_projects.insert(name.clone(), project.clone());
         module_sources.insert(name.clone(), source.clone());
+        // Canonicalize the module's dir so downstream relative-path
+        // resolution (mcp_server.mount, future skill exec dirs, ...)
+        // operates on stable absolute paths regardless of the CWD
+        // the user invoked aislang from.
+        let canonical_module_dir = std::fs::canonicalize(&module_dir)
+            .unwrap_or_else(|_| module_dir.clone());
+        module_dirs.insert(name.clone(), canonical_module_dir);
         module_inputs.insert(name.clone(), ModuleInput {
             project,
             source,
@@ -369,6 +396,7 @@ fn load_multi_module_project(dir: &Path) -> Result<LoadedProject, ProjectLoadErr
         modules: module_sources,
         manifest: Some(manifest_body),
         prompt_bodies: module_prompt_bodies,
+        module_dirs,
     })
 }
 
