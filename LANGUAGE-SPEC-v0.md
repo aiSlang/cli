@@ -194,12 +194,15 @@ This enables the cost-saving pattern: orchestrator runs free on the user's exist
 
 ```
 prompt "<identifier>" {
-  file    : Path
-  version : SemVer
+  file     : Path
+  version  : SemVer
+  template : Bool?            # v0.3 Week 18 Tue, default false
 }
 ```
 
 File contents are hashed at validate time; hash is included in the lockfile so a prompt edit is visible in `plan`.
+
+**`template` flag** (v0.3+). When `true`, the file body is rendered as a [MiniJinja](https://docs.rs/minijinja) template at chat time against the built-in context `{ agent, prompt, model }` (all strings) — qualified labels for multi-module, bare labels for single-file. Default `false` (v0.2 byte-stable: file body passed to the LLM verbatim). HTML auto-escape is ON for every render; opt out per-value with the standard `|safe` filter. The runtime entry point is `aislang_runtime::templates::render`.
 
 ### 4.5 `mcp_server`
 

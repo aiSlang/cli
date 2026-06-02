@@ -240,6 +240,13 @@ pub enum SessionError {
              Re-run `aislang plan` to refresh the lockfile.")]
     PromptHashMismatch { path: String, expected: String, actual: String },
 
+    /// v0.3 Week 18 Tue: MiniJinja template render failed for a
+    /// prompt declared with `template = true`.  Carries the prompt
+    /// label + the template engine's own diagnostic so callers can
+    /// surface a source-aware error.
+    #[error("template render failed for prompt `{label}`: {cause}")]
+    PromptTemplate { label: String, cause: String },
+
     #[error("LiteLLM error: {0}")]
     LiteLlm(#[from] LiteLlmError),
 
@@ -1012,6 +1019,12 @@ fn first_choice_message(response: ChatResponse) -> Result<ChatMessage, SessionEr
 ///
 /// Hashes are hex-encoded (lowercase) to match the lockfile format
 /// written by `aislang-resolver::lockfile`.
+///
+/// **Hash semantics**: the hash always covers the raw FILE bytes (the
+/// template source, not the rendered output).  This keeps lockfile
+/// reconciliation cheap + deterministic — the hash never depends on
+/// the per-turn render context.  Template rendering happens AFTER
+/// hash verification via [`render_system_prompt_if_template`].
 pub fn load_system_prompt(
     path: &Path,
     expected_hash: Option<&str>,
@@ -1037,6 +1050,38 @@ pub fn load_system_prompt(
         path:  path.display().to_string(),
         cause: format!("invalid UTF-8 in prompt: {e}"),
     })
+}
+
+/// v0.3 Week 18 Tue: render a (possibly-template) system-prompt
+/// source against the built-in context.  Static prompts pass
+/// through unchanged; template prompts go through MiniJinja per
+/// [`crate::templates::render`].
+///
+/// `template_enabled = false` returns the source verbatim — keeps
+/// the v0.2 (non-template) prompt path byte-stable.
+///
+/// `template_enabled = true` renders against a
+/// [`crate::templates::BuiltInContext`] built from the supplied
+/// (agent, prompt, model) triple.  Failures bubble as a
+/// `SessionError::PromptTemplate` variant so the caller can render
+/// a source-aware diagnostic.
+pub fn render_system_prompt_if_template(
+    source:           String,
+    template_enabled: bool,
+    agent_label:      &str,
+    prompt_label:     &str,
+    model_alias:      &str,
+) -> Result<String, SessionError> {
+    if !template_enabled {
+        return Ok(source);
+    }
+    let ctx = crate::templates::BuiltInContext::new(
+        agent_label, prompt_label, model_alias);
+    crate::templates::render(&source, &ctx)
+        .map_err(|e| SessionError::PromptTemplate {
+            label:  prompt_label.to_string(),
+            cause:  e.to_string(),
+        })
 }
 
 /// Hex-encoded lowercase SHA-256 of the given bytes. Matches the
@@ -1144,6 +1189,55 @@ mod tests {
             other => panic!("expected PromptIo, got {other:?}"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- render_system_prompt_if_template (v0.3 Week 18 Tue) ----
+
+    #[test] fn render_system_prompt_passes_through_when_template_false() {
+        // PLAN DoD: "static (non-template) prompts byte-identical
+        // to v0.2 behaviour".  The wrapper MUST return the source
+        // string verbatim when the template flag is off — no
+        // MiniJinja engine touches it, no escaping, no rendering.
+        let src = "raw prompt body — <not> escaped & not rendered";
+        let out = render_system_prompt_if_template(
+            src.to_string(),
+            /* template_enabled = */ false,
+            "agent_x", "sys_prompt", "thinker",
+        ).expect("render");
+        assert_eq!(out, src,
+            "template=false MUST return the source byte-identical");
+    }
+
+    #[test] fn render_system_prompt_substitutes_builtins_when_template_true() {
+        // The built-in context surface — `{{ agent }}`, `{{ prompt }}`,
+        // `{{ model }}` — must reach the rendered output.
+        let src = "you are agent={{ agent }} via prompt={{ prompt }} on model={{ model }}";
+        let out = render_system_prompt_if_template(
+            src.to_string(), true,
+            "support", "system_md", "fast",
+        ).expect("render");
+        assert_eq!(out,
+            "you are agent=support via prompt=system_md on model=fast");
+    }
+
+    #[test] fn render_system_prompt_template_error_surfaces_with_label() {
+        // Template syntax error must bubble as
+        // SessionError::PromptTemplate carrying the prompt label
+        // so the caller's diagnostic names WHICH prompt failed.
+        let bad_src = "{% if model %}oops"; // missing endif
+        let err = render_system_prompt_if_template(
+            bad_src.to_string(), true,
+            "support", "broken_sys", "fast",
+        ).unwrap_err();
+        match err {
+            SessionError::PromptTemplate { label, cause } => {
+                assert_eq!(label, "broken_sys",
+                    "error must name the failing prompt label");
+                assert!(!cause.is_empty(),
+                    "error must carry a non-empty cause from MiniJinja");
+            }
+            other => panic!("expected PromptTemplate, got {other:?}"),
+        }
     }
 
     // ---- Session.open (existing Wed contract) ----

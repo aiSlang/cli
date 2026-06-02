@@ -1596,6 +1596,16 @@ async fn build_session_for_agent(
     let system_prompt = crate::load_system_prompt(
         &prompt_path, expected_hash.as_deref(),
     ).map_err(|e| format!("load prompt: {e}"))?;
+    // v0.3 Week 18 Tue: render as MiniJinja template when
+    // `prompt.template = true` was declared.  Static prompts (the
+    // v0.2 default) pass through unchanged — byte-stable.
+    let system_prompt = crate::session::render_system_prompt_if_template(
+        system_prompt,
+        prompt_block.template,
+        &agent.label,
+        &prompt_block.label,
+        &model_label,
+    ).map_err(|e| format!("render template: {e}"))?;
 
     // ── 3. budget config + persistent spend tracker (when declared) ──
     let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
@@ -1907,6 +1917,17 @@ async fn run_eval_for_mcp(
     let system_prompt = crate::load_system_prompt(
         &prompt_path, expected_hash.as_deref(),
     ).map_err(|e| format!("load prompt: {e}"))?;
+    // v0.3 Week 18 Tue: same template-rendering hop as the single-
+    // file path above.  `agent.label` here is module-qualified
+    // (`coder.coder`) post-`resolve_multi`; `prompt_block.label`
+    // similarly.  Both flow into the template context as-is.
+    let system_prompt = crate::session::render_system_prompt_if_template(
+        system_prompt,
+        prompt_block.template,
+        &agent.label,
+        &prompt_block.label,
+        &model_label,
+    ).map_err(|e| format!("render template: {e}"))?;
 
     let budget_cfg: Option<BudgetConfig> = match project.budget.as_ref() {
         Some(b) => {

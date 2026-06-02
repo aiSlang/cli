@@ -261,6 +261,15 @@ pub struct Prompt {
     /// Strict exact-version pin (LANGUAGE-SPEC-v0.md §3.2 SemVer row). Range
     /// operators are rejected by the literal parser; revisit in v0.2.
     pub version: SemVer,
+    /// v0.3 Week 18 Tue: when true, the prompt body is rendered as a
+    /// MiniJinja template at chat time (against a context built by
+    /// `aislang_runtime::templates::build_default_context`).  Default
+    /// false to keep v0.2 fixtures byte-stable — every existing
+    /// `prompt "<label>" { file = … version = … }` block parses to a
+    /// `Prompt { template: false, .. }` and the loader treats the file
+    /// body verbatim, no template engine in the path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

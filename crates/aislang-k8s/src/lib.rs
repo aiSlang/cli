@@ -907,9 +907,10 @@ mod tests {
             project: Project {
                 name: "x".into(),
                 prompts: vec![Prompt {
-                    label:   prompt_label.into(),
-                    file:    "./prompts/system.md".into(),
-                    version: SemVer::from_literal("1.0.0").expect("semver"),
+                    label:    prompt_label.into(),
+                    file:     "./prompts/system.md".into(),
+                    version:  SemVer::from_literal("1.0.0").expect("semver"),
+                    template: false,
                 }],
                 deploys: vec![Deploy {
                     label:  deploy_label.into(),

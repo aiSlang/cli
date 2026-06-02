@@ -84,9 +84,10 @@ fn expected_support_agent() -> Project {
     };
 
     let prompt_system = Prompt {
-        label:   "system".into(),
-        file:    PathBuf::from("./prompts/system.md"),
-        version: SemVer::from_literal("1.0.0").expect("valid SemVer"),
+        label:    "system".into(),
+        file:     PathBuf::from("./prompts/system.md"),
+        version:  SemVer::from_literal("1.0.0").expect("valid SemVer"),
+        template: false,
     };
 
     let mcp_docs = McpServer {

@@ -834,16 +834,19 @@ fn expect_model_source(field: &str, v: RawValue) -> Result<ModelSource, String> 
 
 fn to_prompt(raw: RawBlock) -> Result<Prompt, String> {
     let label = require_single_label("prompt", raw.labels)?;
-    let mut file:    Option<PathBuf> = None;
-    let mut version: Option<SemVer>  = None;
+    let mut file:     Option<PathBuf> = None;
+    let mut version:  Option<SemVer>  = None;
+    let mut template: bool            = false;
 
     for item in raw.body {
         let attr = expect_attr_only("prompt", item)?;
         match attr.name.as_str() {
-            "file"    => file    = Some(expect_path(&attr.name, attr.value)?),
-            "version" => version = Some(expect_semver(&attr.name, attr.value)?),
+            "file"     => file     = Some(expect_path(&attr.name, attr.value)?),
+            "version"  => version  = Some(expect_semver(&attr.name, attr.value)?),
+            "template" => template = expect_bool(&attr.name, attr.value)?,
             other => return Err(format!(
-                "unknown attribute `{other}` in prompt block; allowed: file, version"
+                "unknown attribute `{other}` in prompt block; \
+                 allowed: file, version, template"
             )),
         }
     }
@@ -854,6 +857,7 @@ fn to_prompt(raw: RawBlock) -> Result<Prompt, String> {
             "prompt missing required attribute `file`".to_string())?,
         version: version.ok_or_else(||
             "prompt missing required attribute `version`".to_string())?,
+        template,
     })
 }
 
@@ -2484,6 +2488,10 @@ mod project_tests {
         assert_eq!(p.prompts.len(), 1);
         assert_eq!(p.prompts[0].label, "system");
         assert_eq!(p.prompts[0].file.to_str().unwrap(), "./p.md");
+        // v0.3 Week 18 Tue: `template` defaults to false when the
+        // field is omitted — keeps v0.2 fixtures byte-stable.
+        assert!(!p.prompts[0].template,
+            "template must default to false when the attribute is absent");
     }
 
     #[test] fn prompt_missing_file_fails() {
@@ -2495,6 +2503,36 @@ mod project_tests {
         // Strict SemVer — ^/~/>= rejected by SemVer::from_literal
         let src = project_with(r#"prompt "p" { file = "./p.md"  version = "^1.0.0" }"#);
         assert_parse_err_contains(&src, "range operators");
+    }
+
+    #[test] fn prompt_template_field_true_parses() {
+        // v0.3 Week 18 Tue: explicit `template = true` flips the
+        // flag on the AST so the chat loop renders the file body as
+        // a MiniJinja template at turn time.
+        let src = project_with(
+            r#"prompt "tmpl" { file = "./p.md"  version = "1.0.0"  template = true }"#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.prompts.len(), 1);
+        assert!(p.prompts[0].template,
+            "template = true on the source must reach the AST as true");
+    }
+
+    #[test] fn prompt_template_field_false_parses() {
+        // Explicit `template = false` parses + is byte-equivalent to omitting
+        // the field.  Pinned so users who like explicitness aren't surprised.
+        let src = project_with(
+            r#"prompt "x" { file = "./p.md"  version = "1.0.0"  template = false }"#);
+        let p = assert_parse_ok(&src);
+        assert!(!p.prompts[0].template);
+    }
+
+    #[test] fn prompt_unknown_field_fails_with_template_in_allowed_list() {
+        // Pins that the diagnostic surfaces the new field in the
+        // allowed-attributes list — a hint we get for free since the
+        // parser builds the message from the match-arm list.
+        let src = project_with(
+            r#"prompt "p" { file = "./p.md"  version = "1.0.0"  bogus = true }"#);
+        assert_parse_err_contains(&src, "allowed: file, version, template");
     }
 
     #[test] fn mcp_server_block_parses() {
