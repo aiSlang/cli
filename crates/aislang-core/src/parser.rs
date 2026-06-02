@@ -663,14 +663,21 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
             "main"       => project.mains.push(to_main(block)?),
             // v0.3 Week 17 Mon (Decision 44.5): `pipeline` composition
             // primitive.  Sequential agent composition with one Vec<Ref>
-            // step list + optional input/output descriptors.  Tue extends
-            // to `loop` + `branch`; Wed-Fri wires the runtime dispatch.
+            // step list + optional input/output descriptors.
             "pipeline"   => project.pipelines.push(to_pipeline(block)?),
+            // v0.3 Week 17 Wed (Decision 44.5 #2 + #3): `loop` +
+            // `branch` composition primitives.  Wraps a pipeline body
+            // with conditional re-execution (`loop`) or N-way dispatch
+            // (`branch`).  Both store MiniJinja `condition` / `on`
+            // strings verbatim; Week 18 Tue's MiniJinja integration
+            // wires actual rendering.
+            "loop"       => project.loops.push(to_loop(block)?),
+            "branch"     => project.branches.push(to_branch(block)?),
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
                      v0.3 supports: budget, model, prompt, mcp_server, \
-                     agent, eval, secret, deploy, main, pipeline"
+                     agent, eval, secret, deploy, main, pipeline, loop, branch"
                 ));
             }
         }
@@ -1287,6 +1294,145 @@ fn to_pipeline(raw: RawBlock) -> Result<Pipeline, String> {
 }
 
 // ============================================================================
+// `loop` block converter — v0.3 Week 17 Wed (Decision 44.5 #2)
+// ============================================================================
+
+fn to_loop(raw: RawBlock) -> Result<Loop, String> {
+    let label = require_single_label("loop", raw.labels)?;
+    let mut body:      Option<Ref>    = None;
+    let mut condition: Option<String> = None;
+    let mut max_iter:  Option<u32>    = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("loop", item)?;
+        match attr.name.as_str() {
+            "body"      => body      = Some(expect_ref(
+                &attr.name, RefKind::Pipeline, attr.value)?),
+            "condition" => condition = Some(expect_string(&attr.name, attr.value)?),
+            "max_iter"  => max_iter  = Some(expect_max_iter(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in loop block; \
+                 allowed: body, condition, max_iter"
+            )),
+        }
+    }
+
+    Ok(Loop {
+        label,
+        body: body.ok_or_else(||
+            "loop block missing required attribute `body` (a pipeline \
+             reference, e.g. `body = pipeline.review_cycle`)".to_string())?,
+        condition: condition.ok_or_else(||
+            "loop block missing required attribute `condition` (a \
+             MiniJinja template string, e.g. `condition = \"{{ output.continue }}\"`)".to_string())?,
+        max_iter: max_iter.ok_or_else(||
+            "loop block missing required attribute `max_iter` (an integer \
+             in 1..=100, e.g. `max_iter = 8`)".to_string())?,
+    })
+}
+
+/// `max_iter` must be a bare Int in 1..=100.  Decision 44.5: the
+/// 100 ceiling is the v0.3 safe shape; relaxation for batch agents
+/// is v0.5+.  Bare integers above 100 OR ≤0 OR negative are
+/// rejected at parse time with a clear message — preempts the
+/// "user wrote `max_iter = 1000000` and locked their token budget"
+/// failure mode.
+fn expect_max_iter(field: &str, v: RawValue) -> Result<u32, String> {
+    match v {
+        RawValue::Int(i) if (1..=100).contains(&i) => Ok(i as u32),
+        RawValue::Int(i) => Err(format!(
+            "`{field}` must be an integer in 1..=100 (v0.3 safe-shape ceiling); \
+             got {i}"
+        )),
+        other => Err(format!(
+            "`{field}` expects a bare integer in 1..=100; got {other:?}"
+        )),
+    }
+}
+
+// ============================================================================
+// `branch` block converter — v0.3 Week 17 Wed (Decision 44.5 #3)
+// ============================================================================
+
+fn to_branch(raw: RawBlock) -> Result<Branch, String> {
+    let label = require_single_label("branch", raw.labels)?;
+    let mut on:      Option<String>                                     = None;
+    let mut cases:   Option<std::collections::BTreeMap<String, Ref>>    = None;
+    let mut default: Option<Ref>                                        = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("branch", item)?;
+        match attr.name.as_str() {
+            "on"      => on      = Some(expect_string(&attr.name, attr.value)?),
+            "cases"   => cases   = Some(expect_cases_object(&attr.name, attr.value)?),
+            "default" => default = Some(expect_ref(
+                &attr.name, RefKind::Pipeline, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in branch block; \
+                 allowed: on, cases, default"
+            )),
+        }
+    }
+
+    let cases = cases.ok_or_else(||
+        "branch block missing required attribute `cases` (an object \
+         mapping case-string → pipeline ref, e.g. \
+         `cases = { \"approve\" = pipeline.yes, \"reject\" = pipeline.no }`)".to_string())?;
+    if cases.is_empty() {
+        return Err(
+            "branch `cases` must contain at least one case-to-pipeline \
+             mapping; got an empty object".to_string());
+    }
+    Ok(Branch {
+        label,
+        on: on.ok_or_else(||
+            "branch block missing required attribute `on` (a MiniJinja \
+             template string, e.g. `on = \"{{ classifier_result }}\"`)".to_string())?,
+        cases,
+        default: default.ok_or_else(||
+            "branch block missing required attribute `default` (a pipeline \
+             ref to dispatch to when no case matches, e.g. \
+             `default = pipeline.unknown`)".to_string())?,
+    })
+}
+
+/// `cases = { "key" = pipeline.<label>, "other" = pipeline.<label>, … }`.
+///
+/// The keys are case-strings (matched against the rendered `on`
+/// expression's value at runtime); values are `pipeline` refs.
+/// Both attribute names (the keys) must be valid identifiers per
+/// the grammar — same constraint v0.2's `deploy.expose` uses.  We
+/// surface the key as the case-label String verbatim.
+///
+/// `BTreeMap` for deterministic iteration order — matches every
+/// other emitter's sort-before-emit rule + makes branch behaviour
+/// reproducible across runs.
+fn expect_cases_object(
+    field: &str, v: RawValue,
+) -> Result<std::collections::BTreeMap<String, Ref>, String> {
+    let attrs = match v {
+        RawValue::Object(a) => a,
+        other => return Err(format!(
+            "`{field}` expects an object literal mapping case-string → \
+             pipeline ref (e.g. `{{ \"approve\" = pipeline.yes }}`); got {other:?}"
+        )),
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for attr in attrs {
+        let case_key = attr.name;
+        let pipeline_ref = expect_ref(
+            &format!("{field}.{case_key}"),
+            RefKind::Pipeline, attr.value)?;
+        if out.insert(case_key.clone(), pipeline_ref).is_some() {
+            return Err(format!(
+                "`{field}` declares case `{case_key}` more than once; \
+                 each case-string must appear at most once"));
+        }
+    }
+    Ok(out)
+}
+
+// ============================================================================
 // Model-specific value helpers
 // ============================================================================
 
@@ -1611,9 +1757,12 @@ fn parse_ref_from_access(path: &[String]) -> Result<Ref, String> {
         "mcp_server" => RefKind::McpServer,
         "agent"      => RefKind::Agent,
         "secret"     => RefKind::Secret,
+        // v0.3 Week 17 Wed: pipeline refs in loop.body /
+        // branch.cases / branch.default attribute values.
+        "pipeline"   => RefKind::Pipeline,
         other => return Err(format!(
             "unknown resource kind `{other}` in reference `{}`; \
-             expected one of: model, prompt, mcp_server, agent, secret",
+             expected one of: model, prompt, mcp_server, agent, secret, pipeline",
             path.join(".")
         )),
     };
@@ -1630,6 +1779,7 @@ fn ref_kind_str(k: RefKind) -> &'static str {
         RefKind::McpServer => "mcp_server",
         RefKind::Agent     => "agent",
         RefKind::Secret    => "secret",
+        RefKind::Pipeline  => "pipeline",
     }
 }
 
@@ -3465,5 +3615,259 @@ mod project_tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(!json.contains("\"pipelines\""),
             "empty pipelines must NOT serialize; got: {json}");
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 17 Wed — `loop { … }` + `branch { … }` blocks.
+    // ---------------------------------------------------------------- //
+
+    /// Helper: parse a project with a base pipeline `body` (referenced
+    /// by loop/branch fixtures) + the loop / branch block under test.
+    fn project_with_composition(extra_block: &str) -> Project {
+        let src = format!(r#"project "p" {{
+          budget {{ hard_cap_per_day = $1  hard_cap_per_run = $0.01 }}
+          model "m" {{
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }}
+          prompt "sys" {{ file = "./s.md"  version = "1.0.0" }}
+          agent "a" {{
+            model = model.m  system_prompt = prompt.sys  tools = []
+          }}
+          pipeline "body" {{
+            steps = [agent.a]
+          }}
+          pipeline "yes" {{
+            steps = [agent.a]
+          }}
+          pipeline "no" {{
+            steps = [agent.a]
+          }}
+          pipeline "fallback" {{
+            steps = [agent.a]
+          }}
+          {extra_block}
+        }}"#);
+        assert_parse_ok(&src)
+    }
+
+    #[test] fn loop_block_parses_with_required_fields() {
+        let p = project_with_composition(r#"
+          loop "review_cycle" {
+            body      = pipeline.body
+            condition = "{{ output.needs_more_work }}"
+            max_iter  = 5
+          }
+        "#);
+        assert_eq!(p.loops.len(), 1);
+        let lp = &p.loops[0];
+        assert_eq!(lp.label, "review_cycle");
+        assert_eq!(lp.body.kind,  RefKind::Pipeline);
+        assert_eq!(lp.body.label, "body");
+        assert_eq!(lp.condition, "{{ output.needs_more_work }}");
+        assert_eq!(lp.max_iter,  5);
+    }
+
+    /// Helper: wrap an `extra_block` snippet in a project that's
+    /// otherwise the same as `project_with_composition`'s base
+    /// (model + prompt + agent + 4 pipelines), then parse + expect
+    /// the given error needle.
+    fn assert_composition_parse_err_contains(extra: &str, needle: &str) {
+        let src = format!(r#"project "p" {{
+          budget {{ hard_cap_per_day = $1  hard_cap_per_run = $0.01 }}
+          model "m" {{
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }}
+          prompt "sys" {{ file = "./s.md"  version = "1.0.0" }}
+          agent "a" {{
+            model = model.m  system_prompt = prompt.sys  tools = []
+          }}
+          pipeline "body" {{ steps = [agent.a] }}
+          pipeline "yes" {{ steps = [agent.a] }}
+          pipeline "no" {{ steps = [agent.a] }}
+          pipeline "fallback" {{ steps = [agent.a] }}
+          {extra}
+        }}"#);
+        assert_parse_err_contains(&src, needle);
+    }
+
+    #[test] fn loop_block_rejects_missing_fields() {
+        // Missing body
+        assert_composition_parse_err_contains(
+            r#"loop "x" {
+                condition = "{{ x }}"
+                max_iter  = 1
+              }"#,
+            "missing required attribute `body`",
+        );
+        // Missing condition
+        assert_composition_parse_err_contains(
+            r#"loop "x" {
+                body     = pipeline.body
+                max_iter = 1
+              }"#,
+            "missing required attribute `condition`",
+        );
+        // Missing max_iter
+        assert_composition_parse_err_contains(
+            r#"loop "x" {
+                body      = pipeline.body
+                condition = "{{ x }}"
+              }"#,
+            "missing required attribute `max_iter`",
+        );
+    }
+
+    #[test] fn loop_max_iter_enforces_1_to_100_range() {
+        // 0 is below floor → reject
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              loop "x" {
+                body      = pipeline.b
+                condition = "{{ x }}"
+                max_iter  = 0
+              }
+            }"#,
+            "1..=100",
+        );
+        // 101 is above ceiling → reject
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              loop "x" {
+                body      = pipeline.b
+                condition = "{{ x }}"
+                max_iter  = 101
+              }
+            }"#,
+            "1..=100",
+        );
+        // Exact endpoints OK.
+        let p1 = project_with_composition(r#"
+          loop "lo" { body = pipeline.body  condition = "{{x}}"  max_iter = 1 }
+        "#);
+        assert_eq!(p1.loops[0].max_iter, 1);
+        let p2 = project_with_composition(r#"
+          loop "hi" { body = pipeline.body  condition = "{{x}}"  max_iter = 100 }
+        "#);
+        assert_eq!(p2.loops[0].max_iter, 100);
+    }
+
+    #[test] fn loop_body_must_be_pipeline_ref_not_agent() {
+        // `body = agent.a` is a kind mismatch — body MUST point at
+        // a pipeline.  Pinned by expect_ref's kind check.
+        assert_parse_err_contains(
+            r#"project "p" {
+              budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+              prompt "sys" { file = "./s.md"  version = "1.0.0" }
+              model "m" {
+                requires    = [chat]
+                context_min = 32k
+                prefer      = [ollama.llama_3_1_8b]
+                pin         = ollama.llama_3_1_8b
+              }
+              agent "a" {
+                model = model.m  system_prompt = prompt.sys  tools = []
+              }
+              loop "x" {
+                body      = agent.a
+                condition = "{{ x }}"
+                max_iter  = 1
+              }
+            }"#,
+            "expects a `pipeline` reference",
+        );
+    }
+
+    #[test] fn branch_block_parses_with_required_fields() {
+        // Case keys are identifiers (snake_case) — same shape as
+        // every other object-literal key in the v0.2 grammar
+        // (e.g. `expose { port = 8080 }`).  The case-key STRING
+        // matched against the rendered `on` value at runtime is
+        // the identifier's text verbatim.  Quoted-string keys are
+        // a v0.5+ relaxation (Decision 44.5 didn't promise them).
+        let p = project_with_composition(r#"
+          branch "review_outcome" {
+            on      = "{{ classifier_result }}"
+            cases   = {
+              approve = pipeline.yes,
+              reject  = pipeline.no,
+            }
+            default = pipeline.fallback
+          }
+        "#);
+        assert_eq!(p.branches.len(), 1);
+        let br = &p.branches[0];
+        assert_eq!(br.label, "review_outcome");
+        assert_eq!(br.on, "{{ classifier_result }}");
+        assert_eq!(br.cases.len(), 2);
+        assert_eq!(br.cases.get("approve").unwrap().label, "yes");
+        assert_eq!(br.cases.get("approve").unwrap().kind, RefKind::Pipeline);
+        assert_eq!(br.cases.get("reject").unwrap().label,  "no");
+        assert_eq!(br.default.label, "fallback");
+        assert_eq!(br.default.kind,  RefKind::Pipeline);
+    }
+
+    #[test] fn branch_rejects_empty_cases() {
+        assert_composition_parse_err_contains(
+            r#"branch "x" {
+                on      = "{{ x }}"
+                cases   = { }
+                default = pipeline.fallback
+              }"#,
+            "at least one case-to-pipeline",
+        );
+    }
+
+    #[test] fn branch_rejects_missing_default() {
+        // No default → PLAN's "branch cases must always have a
+        // default fallback" semantic invariant.
+        assert_composition_parse_err_contains(
+            r#"branch "x" {
+                on    = "{{ x }}"
+                cases = { a = pipeline.yes }
+              }"#,
+            "missing required attribute `default`",
+        );
+    }
+
+    #[test] fn loop_branch_fields_omitted_from_json_when_empty() {
+        let p: Project = Project::default();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("\"loops\""),
+            "empty loops must NOT serialize; got: {json}");
+        assert!(!json.contains("\"branches\""),
+            "empty branches must NOT serialize; got: {json}");
+    }
+
+    #[test] fn loop_branch_accept_cross_module_pipeline_refs() {
+        // `use other_mod.<pipeline_label>` form for cross-module
+        // refs into other modules' pipelines — same v0.3 Tue
+        // Week 16 plumbing reused.
+        let src = r#"project "p" {
+          budget { hard_cap_per_day = $1  hard_cap_per_run = $0.01 }
+          loop "x" {
+            body      = use other.review
+            condition = "{{ x }}"
+            max_iter  = 3
+          }
+          branch "y" {
+            on      = "{{ x }}"
+            cases   = { ok = use other.approved }
+            default = use other.rejected
+          }
+        }"#;
+        let p = assert_parse_ok(src);
+        assert_eq!(p.loops[0].body.module, Some("other".to_string()));
+        assert_eq!(p.loops[0].body.kind,   RefKind::Pipeline);
+        assert_eq!(p.branches[0].cases.get("ok").unwrap().module,
+                   Some("other".to_string()));
+        assert_eq!(p.branches[0].default.module, Some("other".to_string()));
     }
 }

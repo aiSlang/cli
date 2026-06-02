@@ -157,6 +157,10 @@ fn expected_support_agent() -> Project {
         // Vec::is_empty — the expected-AST JSON fixtures don't carry
         // the `pipelines` field when empty.
         pipelines:   vec![],
+        // v0.3 Week 17 Wed: v0.1/v0.2 demos have no `loop` / `branch`
+        // block.  Same forward-compat discipline as `pipelines`.
+        loops:       vec![],
+        branches:    vec![],
     }
 }
 

@@ -39,6 +39,11 @@ pub enum RefKind {
     McpServer,
     Agent,
     Secret,
+    /// v0.3 Week 17 Wed (Decision 44.5).  `loop.body` references a
+    /// pipeline; `branch.cases[].<case>` + `branch.default` also.
+    /// Composition primitive #2 + #3 — Mon's `pipeline` block is the
+    /// only kind that produces Pipeline refs today; v0.5+ may extend.
+    Pipeline,
 }
 
 /// `anthropic.claude_haiku_4_5` etc. — resolved against the catalog.
@@ -88,6 +93,21 @@ pub struct Project {
     /// pipelines at chat time.  Mon: AST + parser + checker only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pipelines: Vec<Pipeline>,
+
+    /// v0.3 Week 17 Wed — `loop { … }` composition blocks
+    /// (Decision 44.5 #2).  Conditional re-execution of a pipeline
+    /// body up to `max_iter` times until the MiniJinja `condition`
+    /// (rendered against the loop's running output) is satisfied.
+    /// Same byte-stability discipline as `mains` + `pipelines`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loops: Vec<Loop>,
+
+    /// v0.3 Week 17 Wed — `branch { … }` composition blocks
+    /// (Decision 44.5 #3).  Dispatch to one of N pipelines based on
+    /// a MiniJinja `on` expression's rendered string value, with a
+    /// required `default` fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<Branch>,
 }
 
 /// v0.3 Week 17 Mon — composition primitive #1.
@@ -125,6 +145,78 @@ pub struct Pipeline {
     pub input:  Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+}
+
+/// v0.3 Week 17 Wed — composition primitive #2.
+///
+/// Grammar (Decision 44.5):
+///
+/// ```hcl
+/// loop "<label>" {
+///   body      = pipeline.<p>
+///   condition = "{{ output.continue }}"   # MiniJinja — verbatim
+///                                          # in v0.3 Wed; Week 18 Tue
+///                                          # wires actual rendering
+///   max_iter  = 8                          # 1..=100, hard cap
+/// }
+/// ```
+///
+/// Semantics (runtime — Week 17 Thu-Fri / Week 18 Mon-Tue):
+///   - run `body`, then render `condition` against the running
+///     output context;
+///   - if `condition` renders to a truthy value (Jinja convention:
+///     non-empty / non-zero / non-"false"), run `body` again;
+///   - hard-cap at `max_iter` iterations regardless of `condition`
+///     (defense against infinite loops when the condition template
+///     references a missing variable).
+///
+/// `max_iter` range is 1..=100 (enforced by the parser).  v0.3 hard-
+/// caps even when the user wrote a larger number; v0.5+ may relax
+/// for batch agents but the default-100 ceiling stays the safe
+/// shape for v0.3-era debuggability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Loop {
+    pub label:     String,
+    pub body:      Ref,        // RefKind::Pipeline
+    pub condition: String,     // MiniJinja template, verbatim in v0.3 Wed
+    pub max_iter:  u32,        // 1..=100, enforced at parse time
+}
+
+/// v0.3 Week 17 Wed — composition primitive #3.
+///
+/// Grammar (Decision 44.5):
+///
+/// ```hcl
+/// branch "<label>" {
+///   on      = "{{ classifier_result }}"   # MiniJinja, verbatim
+///   cases   = {
+///     "approve" = pipeline.<p_yes>,
+///     "reject"  = pipeline.<p_no>,
+///   }
+///   default = pipeline.<p_default>
+/// }
+/// ```
+///
+/// Semantics (runtime):
+///   - render `on` against the context → string value;
+///   - look up that string in `cases` → execute the matched
+///     pipeline if present, else execute `default`.
+///
+/// `cases` is a `BTreeMap` for deterministic iteration order (helps
+/// lockfile reproducibility + makes the emit pass byte-stable).
+/// `default` is REQUIRED — there's no fallthrough-to-nothing
+/// shape in v0.3.  The parser-time exhaustiveness check the PLAN
+/// mentions ("branch cases exhaustive-checked against the on-
+/// expression's value set") is relaxed in v0.3 to "at least one
+/// case + a default" because the `on` expression is dynamic (a
+/// MiniJinja template); compile-time set-membership analysis is
+/// v0.5+ work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Branch {
+    pub label:   String,
+    pub on:      String,                     // MiniJinja template
+    pub cases:   std::collections::BTreeMap<String, Ref>,
+    pub default: Ref,                        // RefKind::Pipeline
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

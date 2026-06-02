@@ -119,6 +119,8 @@ pub(crate) enum BlockKind {
     Deploy,
     Main,      // v0.2 Fri
     Pipeline,  // v0.3 Week 17 Mon (Decision 44.5)
+    Loop,      // v0.3 Week 17 Wed (Decision 44.5 #2)
+    Branch,    // v0.3 Week 17 Wed (Decision 44.5 #3)
 }
 
 impl BlockKind {
@@ -133,6 +135,8 @@ impl BlockKind {
             Self::Deploy    => "deploy",
             Self::Main      => "main",
             Self::Pipeline  => "pipeline",
+            Self::Loop      => "loop",
+            Self::Branch    => "branch",
         }
     }
 
@@ -146,6 +150,7 @@ impl BlockKind {
             RefKind::McpServer => Self::McpServer,
             RefKind::Agent     => Self::Agent,
             RefKind::Secret    => Self::Secret,
+            RefKind::Pipeline  => Self::Pipeline,
         }
     }
 }
@@ -201,6 +206,10 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
     // — yet; Tue's `loop` + `branch` will, and they go through the
     // edges pass like agents/secrets do today).
     for p in &project.pipelines   { add_block(&mut graph, &mut nodes, BlockKind::Pipeline,  &p.label)?; }
+    // v0.3 Week 17 Wed: loop + branch blocks join the graph.  Same
+    // duplicate-label discipline as pipeline/main/agent.
+    for l in &project.loops       { add_block(&mut graph, &mut nodes, BlockKind::Loop,      &l.label)?; }
+    for b in &project.branches    { add_block(&mut graph, &mut nodes, BlockKind::Branch,    &b.label)?; }
 
     Ok(ResourceGraph { graph, nodes })
 }
@@ -300,6 +309,24 @@ fn check_refs(
             dispatch_ref(graph, multi, step_ref,
                 "pipeline", &pipeline.label, &format!("steps[{i}]"))?;
         }
+    }
+    // v0.3 Week 17 Wed: loop.body + branch.cases[case] + branch.default
+    // — each references a `pipeline` block.  Cross-module-aware via
+    // the existing dispatch_ref helper.
+    for lp in &project.loops {
+        dispatch_ref(graph, multi, &lp.body,
+            "loop", &lp.label, "body")?;
+    }
+    for br in &project.branches {
+        // Iteration over BTreeMap is sorted — deterministic
+        // diagnostic order when multiple cases reference unknown
+        // pipelines.
+        for (case_key, case_ref) in &br.cases {
+            dispatch_ref(graph, multi, case_ref,
+                "branch", &br.label, &format!("cases[{case_key}]"))?;
+        }
+        dispatch_ref(graph, multi, &br.default,
+            "branch", &br.label, "default")?;
     }
     Ok(())
 }
@@ -1372,6 +1399,151 @@ mod tests {
           }
         "#)).expect(
             "pipeline + agent sharing a label must be allowed \
+             (different BlockKinds)");
+    }
+
+    // ---------------------------------------------------------------- //
+    // v0.3 Week 17 Wed — `loop` + `branch` block validation.
+    // ---------------------------------------------------------------- //
+
+    /// Helper: same shape as `pipeline_body` but the body fragment
+    /// pre-declares 4 pipelines (body / yes / no / fallback) that
+    /// the loop + branch tests reference.
+    fn composition_body(extra: &str) -> String {
+        format!(r#"
+          model "m" {{
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }}
+          prompt "sys" {{ file = "./s.md"  version = "1.0.0" }}
+          agent "a" {{ model = model.m  system_prompt = prompt.sys  tools = [] }}
+          pipeline "body"     {{ steps = [agent.a] }}
+          pipeline "yes"      {{ steps = [agent.a] }}
+          pipeline "no"       {{ steps = [agent.a] }}
+          pipeline "fallback" {{ steps = [agent.a] }}
+          {extra}
+        "#)
+    }
+
+    #[test] fn loop_with_valid_body_ref_passes() {
+        check_src(&composition_body(r#"
+          loop "review_cycle" {
+            body      = pipeline.body
+            condition = "{{ x }}"
+            max_iter  = 5
+          }
+        "#)).expect("valid loop must check");
+    }
+
+    #[test] fn loop_body_ref_to_undeclared_pipeline_fails() {
+        let err = check_src(&composition_body(r#"
+          loop "broken" {
+            body      = pipeline.ghost
+            condition = "{{ x }}"
+            max_iter  = 1
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("loop `broken`"),
+            "error must name the source loop; got: {err}");
+        assert!(err.contains("field `body`"),
+            "error must name the failing field; got: {err}");
+        assert!(err.contains("undeclared pipeline `ghost`"),
+            "error must name the missing label + kind; got: {err}");
+    }
+
+    #[test] fn branch_with_valid_refs_passes() {
+        check_src(&composition_body(r#"
+          branch "review_outcome" {
+            on      = "{{ x }}"
+            cases   = { approve = pipeline.yes, reject = pipeline.no }
+            default = pipeline.fallback
+          }
+        "#)).expect("valid branch must check");
+    }
+
+    #[test] fn branch_case_ref_to_undeclared_pipeline_fails() {
+        let err = check_src(&composition_body(r#"
+          branch "b" {
+            on      = "{{ x }}"
+            cases   = { ok = pipeline.ghost }
+            default = pipeline.fallback
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("branch `b`"),
+            "error must name the source branch; got: {err}");
+        assert!(err.contains("cases[ok]"),
+            "error must name the failing case; got: {err}");
+        assert!(err.contains("undeclared pipeline `ghost`"),
+            "error must explain what's missing; got: {err}");
+    }
+
+    #[test] fn branch_default_ref_to_undeclared_pipeline_fails() {
+        let err = check_src(&composition_body(r#"
+          branch "b" {
+            on      = "{{ x }}"
+            cases   = { ok = pipeline.yes }
+            default = pipeline.ghost
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("field `default`"),
+            "error must name the default field; got: {err}");
+        assert!(err.contains("undeclared pipeline `ghost`"),
+            "error must explain what's missing; got: {err}");
+    }
+
+    #[test] fn duplicate_loop_label_rejected() {
+        let err = check_src(&composition_body(r#"
+          loop "dup" {
+            body      = pipeline.body
+            condition = "{{ x }}"
+            max_iter  = 1
+          }
+          loop "dup" {
+            body      = pipeline.body
+            condition = "{{ x }}"
+            max_iter  = 1
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("duplicate `loop` block label `dup`"),
+            "duplicate-label detection should fire for loops; got: {err}");
+    }
+
+    #[test] fn duplicate_branch_label_rejected() {
+        let err = check_src(&composition_body(r#"
+          branch "dup" {
+            on      = "{{ x }}"
+            cases   = { ok = pipeline.yes }
+            default = pipeline.fallback
+          }
+          branch "dup" {
+            on      = "{{ x }}"
+            cases   = { ok = pipeline.no }
+            default = pipeline.fallback
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("duplicate `branch` block label `dup`"),
+            "duplicate-label detection should fire for branches; got: {err}");
+    }
+
+    #[test] fn loop_branch_pipeline_can_share_labels() {
+        // Different BlockKinds → disjoint namespaces.  `loop "foo"`
+        // + `branch "foo"` + `pipeline "foo"` all coexist.
+        check_src(&composition_body(r#"
+          loop "shared" {
+            body      = pipeline.body
+            condition = "{{ x }}"
+            max_iter  = 1
+          }
+          branch "shared" {
+            on      = "{{ x }}"
+            cases   = { ok = pipeline.yes }
+            default = pipeline.fallback
+          }
+          pipeline "shared" { steps = [agent.a] }
+        "#)).expect(
+            "loop + branch + pipeline sharing a label must be allowed \
              (different BlockKinds)");
     }
 }
