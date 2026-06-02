@@ -45,6 +45,7 @@ use opentelemetry::{
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
     error::OTelSdkResult,
+    propagation::TraceContextPropagator,
     trace::{SdkTracerProvider, Span as SdkSpan, SpanData, SpanExporter, SpanProcessor},
     Resource,
 };
@@ -365,6 +366,21 @@ pub fn init_tracer(service_name: &str) -> Result<(), TracingError> {
         .build();
 
     global::set_tracer_provider(provider.clone());
+
+    // v0.3 Week 18 Mon follow-up: install the W3C TraceContext
+    // propagator as the global text-map propagator so outbound
+    // HTTP requests can inject `traceparent` / `tracestate`
+    // headers tying downstream service spans to our parent span.
+    // LiteLLM's OTel callback honours W3C trace context — when it
+    // receives a request with `traceparent`, it makes its spans
+    // CHILDREN of ours.  Net effect in Jaeger: one trace per
+    // chat_turn spanning both aislang-mcp-serve AND litellm
+    // services (rather than two disjoint traces with no
+    // correlation handle other than wall-clock proximity).
+    // Concrete handle: see `litellm.rs::send_chat_full` which
+    // calls `global::get_text_map_propagator(...)` to inject
+    // into the reqwest header map before .send().
+    global::set_text_map_propagator(TraceContextPropagator::new());
 
     // First writer wins. If a parallel `init_tracer` raced us we
     // shutdown ours and let theirs stand — keeps the global provider

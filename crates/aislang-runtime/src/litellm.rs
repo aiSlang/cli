@@ -27,9 +27,11 @@ use thiserror::Error;
 // root span in the trace tree.
 use opentelemetry::{
     global,
-    trace::{Span, SpanKind, Tracer},
-    Array, KeyValue, StringValue, Value,
+    propagation::Injector,
+    trace::{Span, SpanKind, TraceContextExt, Tracer},
+    Array, Context, KeyValue, StringValue, Value,
 };
+use std::collections::HashMap;
 
 // ============================================================================
 // Wire types — OpenAI-compatible Chat Completions API
@@ -428,9 +430,35 @@ impl LiteLlmClient {
                 "aislang.chat.request_bytes_total", req_json.len() as i64));
         }
 
-        let response = self.http.post(&url)
-            .json(req)
-            .send().await
+        // v0.3 Week 18 Mon follow-up: inject W3C trace context into
+        // the outbound LiteLLM request so LiteLLM's OTel callback
+        // makes its spans CHILDREN of THIS `chat <model>` span.
+        // Net effect in Jaeger: one trace per chat_turn covers both
+        // aislang-mcp-serve AND litellm spans — directly correlated
+        // by trace_id instead of needing to match `chatcmpl-*` ↔
+        // `msg_*` IDs across service boundaries.
+        //
+        // We build a Context that explicitly contains OUR span
+        // (rather than relying on Context::current()) because the
+        // surrounding async function may not have our span attached
+        // as the thread-local current — we just started it via
+        // `span_builder.start()` without `Context::current_with_span`.
+        let mut carrier = HashMap::<String, String>::new();
+        let propagation_ctx = Context::current().with_remote_span_context(
+            span.span_context().clone());
+        global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&propagation_ctx,
+                &mut HeaderInjector(&mut carrier));
+        });
+
+        // Attach the propagation headers (typically `traceparent` +
+        // optionally `tracestate`) before .json/.send.  reqwest's
+        // RequestBuilder fluent chain just walks the carrier map.
+        let mut request = self.http.post(&url).json(req);
+        for (k, v) in &carrier {
+            request = request.header(k, v);
+        }
+        let response = request.send().await
             .map_err(|e| {
                 // Span ends on Drop with whatever attrs are set;
                 // status defaults to "Unset" — that's fine for v0.1.
@@ -504,6 +532,25 @@ pub fn one_turn_request(model: &str, system: &str, user: &str) -> ChatRequest {
         tools:      None,
         timeout:    None,
         max_tokens: None,
+    }
+}
+
+// ============================================================================
+// W3C trace-context propagation — outbound HTTP header injection
+// ============================================================================
+
+/// Adapter that lets `opentelemetry`'s `TextMapPropagator` write into
+/// a plain `HashMap<String, String>` (later copied into reqwest's
+/// `RequestBuilder::header`).  We can't inject directly into
+/// `reqwest::header::HeaderMap` because the trait bound conflicts
+/// (HeaderMap requires `HeaderName`/`HeaderValue` types, not plain
+/// strings), and we don't want to depend on the heavier
+/// `opentelemetry-http` crate just for one adapter.
+pub(crate) struct HeaderInjector<'a>(pub(crate) &'a mut HashMap<String, String>);
+
+impl<'a> Injector for HeaderInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
     }
 }
 
