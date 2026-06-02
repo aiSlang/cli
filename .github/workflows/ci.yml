@@ -347,7 +347,23 @@ jobs:
           cp target/release/aislang docker-ci/aislang
           cat > docker-ci/Dockerfile <<'DOCKERFILE'
           # syntax=docker/dockerfile:1.7
-          FROM gcr.io/distroless/cc-debian12 AS final
+          #
+          # v0.3 Week 18 Thu follow-up: base bumped cc-debian12 →
+          # cc-debian13 to fix the agent-runtime CrashLoopBackOff
+          # the k8s-smoke axes hit on every merge to main.  Root
+          # cause: ubuntu-latest = 24.04 (glibc 2.39) builds a
+          # binary that requires `GLIBC_2.38` / `GLIBC_2.39`
+          # symbols; cc-debian12 ships glibc 2.36 → at pod start
+          # `aislang` immediately exits with:
+          #   /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38'
+          #   not found (required by /usr/local/bin/aislang)
+          # Container crashes → kubelet restarts → BackOff → helm
+          # --wait times out → rollout never reaches 1/1 available.
+          # cc-debian13 ships glibc 2.41 which covers both required
+          # symbols (and is forward-compat with future ubuntu-26+
+          # runners).  Verified locally in kind — pod becomes
+          # Ready in <2s after the bump.
+          FROM gcr.io/distroless/cc-debian13 AS final
           COPY aislang /usr/local/bin/aislang
           USER nonroot:nonroot
           ENTRYPOINT ["/usr/local/bin/aislang"]
