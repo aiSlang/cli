@@ -1,0 +1,100 @@
+## v0.3 Week 18 Fri — worked Qwen-on-Ollama smoke demo.
+##
+## Pins the two new local-LLM catalog entries shipped Fri:
+##
+##   - `ollama.qwen3_8b`           → litellm tag `ollama/qwen3:8b`
+##   - `ollama.qwen2_5_coder_7b`   → litellm tag `ollama/qwen2.5-coder:7b`
+##
+## Both are FREE (local) — no API key needed; the Compose stack only
+## needs `OLLAMA_API_BASE` pointing at an Ollama daemon that's
+## already pulled the matching tag.  On the development rig this
+## resolves to `http://server.local:11434` (see `.env`); on a
+## laptop with `ollama` running locally it's `http://host.docker.
+## internal:11434`.
+##
+## ## Why Qwen3 8B and not 7B (per the PLAN row)
+##
+## Ollama publishes qwen3 in 0.6b / 1.7b / 4b / 8b / 14b / 32b
+## sizes — NO 7b tag.  The closest cousin still on a consumer-GPU
+## VRAM budget (q4_K_M ≈ 4.5 GB) is 8b.  Decision 44.8 notes
+## "Both fit on consumer GPUs (12-24 GB VRAM)"; 8b is well under
+## the lower end of that range so the spirit of the choice is
+## preserved.
+##
+## ## Two agents — same model class, different role
+##
+##   - `agent.thinker` uses `model.qwen3` — general-purpose
+##     analytical chat (reasoning-capable per the catalog entry).
+##   - `agent.coder`   uses `model.qwen2_5_coder` — coding-focused
+##     fine-tune of Qwen2.5 (HumanEval leader at the 7B scale per
+##     Decision 44.8).
+##
+## ## Run it
+##
+## ```
+## aislang apply examples/qwen-smoke/qwen-smoke.ais
+##
+## # Reasoning smoke against Qwen3:
+## aislang chat thinker examples/qwen-smoke/qwen-smoke.ais
+## > Say hello in 5 words.
+## > /exit
+##
+## # Coding smoke against Qwen2.5-Coder:
+## aislang chat coder examples/qwen-smoke/qwen-smoke.ais
+## > Write a Rust fn that returns the sum of integers from 1 to n.
+## > /exit
+##
+## aislang destroy examples/qwen-smoke/qwen-smoke.ais
+## ```
+
+project "qwen-smoke" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+
+  ## Qwen3 8B — general / reasoning.  `pin` locks resolution to
+  ## exactly this catalog entry; `prefer` is included for symmetry
+  ## with the multi-tier-fallback shape every other demo uses, but
+  ## with a single pinned entry both lists collapse to the same model.
+  model "qwen3" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.qwen3_8b]
+    pin         = ollama.qwen3_8b
+  }
+
+  ## Qwen2.5-Coder 7B — coding-focused.  Independent model alias
+  ## so the two agents below get their own LiteLLM-router slot
+  ## (and per-agent token accounting).
+  model "qwen2_5_coder" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.qwen2_5_coder_7b]
+    pin         = ollama.qwen2_5_coder_7b
+  }
+
+  prompt "qwen3_sys" {
+    file    = "./prompts/qwen3_sys.md"
+    version = "1.0.0"
+  }
+  prompt "coder_sys" {
+    file    = "./prompts/coder_sys.md"
+    version = "1.0.0"
+  }
+
+  agent "thinker" {
+    model         = model.qwen3
+    system_prompt = prompt.qwen3_sys
+    tools         = []
+  }
+  agent "coder" {
+    model         = model.qwen2_5_coder
+    system_prompt = prompt.coder_sys
+    tools         = []
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
