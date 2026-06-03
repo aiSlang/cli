@@ -140,6 +140,114 @@ impl Embedder for HashEmbedder {
     fn dimensions(&self) -> usize { self.dims }
 }
 
+/// v0.3 Week 19 Wed follow-up: production embedder that POSTs to
+/// LiteLLM's OpenAI-compatible `/v1/embeddings` endpoint.  Used by
+/// the `aislang rag query` CLI subcommand + the chat-time prepend
+/// hook (Phase 2).
+///
+/// `model_alias` is the .ais `embedding "<label>" { … }` block's
+/// label — LiteLLM's `model_list` (Tue's emitter delta) routes
+/// it to the right upstream provider.  `dims` is pinned at
+/// construction so `Embedder::dimensions()` returns a deterministic
+/// value without making a probe call.
+///
+/// Failures (transport error, non-200 status, malformed JSON,
+/// dimension mismatch) all surface as [`RagError::Embed`] with a
+/// caller-actionable cause message.
+pub struct LiteLlmEmbedder {
+    base_url:    String,
+    model_alias: String,
+    dims:        usize,
+}
+
+impl LiteLlmEmbedder {
+    /// `base_url` should be the LiteLLM root (e.g.
+    /// `http://localhost:4000`); the `/v1/embeddings` suffix is
+    /// appended internally.  `dims` MUST match the catalog
+    /// entry's `dimensions` field for the chosen embedding model
+    /// — caller is responsible for the lookup (typically via
+    /// `aislang_catalog::Catalog::find_embedding(...).dimensions`).
+    pub fn new(
+        base_url:    impl Into<String>,
+        model_alias: impl Into<String>,
+        dims:        usize,
+    ) -> Self {
+        Self {
+            base_url:    base_url.into(),
+            model_alias: model_alias.into(),
+            dims,
+        }
+    }
+}
+
+impl Embedder for LiteLlmEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, RagError> {
+        // Build the OpenAI-compatible request body.  LiteLLM's
+        // proxy translates this to the upstream provider's
+        // native shape transparently — we don't need to vary by
+        // provider here.
+        #[derive(serde::Serialize)]
+        struct ReqBody<'a> {
+            model: &'a str,
+            input: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct RespBody {
+            data: Vec<RespDatum>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RespDatum {
+            embedding: Vec<f32>,
+        }
+
+        let url = format!("{}/v1/embeddings", self.base_url);
+        // reqwest's async client requires a tokio reactor.  The CLI
+        // entry points that call `embed` (`aislang rag build` /
+        // `query`) run in plain sync code without a runtime;
+        // spinning up a per-call current-thread runtime is the
+        // simplest viable v0.3 wire (the alternative would be
+        // toggling the workspace reqwest dep's `blocking` feature,
+        // which touches every other reqwest caller).  Each call's
+        // runtime drops cleanly on return — no nested-runtime
+        // panic because we own this thread end-to-end here.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| RagError::Embed(format!("build tokio runtime: {e}")))?;
+        let body: RespBody = rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| RagError::Embed(format!("build http client: {e}")))?;
+            let resp = client.post(&url)
+                .json(&ReqBody { model: &self.model_alias, input: text })
+                .send().await
+                .map_err(|e| RagError::Embed(format!("POST {url}: {e}")))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RagError::Embed(format!(
+                    "POST {url} → HTTP {status}: {body}")));
+            }
+            resp.json::<RespBody>().await
+                .map_err(|e| RagError::Embed(format!("decode response: {e}")))
+        })?;
+        let vec = body.data.into_iter().next()
+            .ok_or_else(|| RagError::Embed(
+                "LiteLLM /v1/embeddings response had empty `data[]`".to_string()))?
+            .embedding;
+        if vec.len() != self.dims {
+            return Err(RagError::Embed(format!(
+                "embedding dim mismatch: expected {} (per catalog), got {} \
+                 (model `{}` may have rolled or catalog dims are stale)",
+                self.dims, vec.len(), self.model_alias)));
+        }
+        Ok(vec)
+    }
+
+    fn dimensions(&self) -> usize { self.dims }
+}
+
 // ============================================================================
 // Index — stored chunks + cosine search
 // ============================================================================

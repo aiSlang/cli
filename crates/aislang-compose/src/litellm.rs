@@ -1336,7 +1336,11 @@ mod tests {
         resolved.project.embeddings.push(Embedding {
             label:    "local_bge".into(),
             provider: "ollama".into(),
-            model:    "bge-small-en-v1.5".into(),
+            // v0.3 Week 19 Wed follow-up: catalog entry renamed
+            // bge-small-en-v1.5 → bge-m3:latest (Ollama doesn't
+            // publish a bge-small-en-v1.5 tag).  Test pinned to
+            // the catalog shape it tests against.
+            model:    "bge-m3:latest".into(),
         });
         let cat = aislang_catalog::bundled().expect("bundled");
         let cfg = build_config(&resolved, &cat).expect("build");
@@ -1357,7 +1361,7 @@ mod tests {
             .find(|e| e.model_name == "local_bge")
             .expect("local_bge entry must exist in model_list");
         assert_eq!(bge_entry.litellm_params.model,
-            "ollama/bge-small-en-v1.5");
+            "ollama/bge-m3:latest");
         assert!(bge_entry.litellm_params.api_key.is_none(),
             "ollama embeddings must NOT carry an API key");
         assert_eq!(bge_entry.litellm_params.api_base.as_deref(),

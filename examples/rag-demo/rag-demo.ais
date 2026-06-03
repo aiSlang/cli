@@ -1,0 +1,103 @@
+## v0.3 Week 19 Wed — worked RAG demo end-to-end against bge-m3.
+##
+## Pins the Mon→Tue→Wed Decision-44.6 chain via four pieces:
+##
+##   1. `embedding "local_bge"` — declares Ollama's bge-m3
+##      embedding model (1024-dim dense output, 8k ctx).
+##   2. `vector_store "aislang_docs"` — bind-mounts `./knowledge/`,
+##      chunks at 512 chars with 64-char overlap, embeds via
+##      embedding.local_bge.
+##   3. `agent "doc_helper"` — declares
+##      `knowledge = [vector_store.aislang_docs]` so Phase 2's
+##      chat-time prepend hook will auto-include retrieved chunks
+##      in the system prompt.
+##   4. (Today) `aislang rag query aislang_docs <demo> "<question>"`
+##      drives the build_index + query round-trip directly + prints
+##      the top-K matching chunks.
+##
+## ## Run it
+##
+## Prereqs: `ollama pull bge-m3:latest`; LiteLLM stack up
+## (`aislang apply examples/rag-demo/rag-demo.ais`).
+##
+## ```
+## # Build the index (chunks ./knowledge/, embeds each chunk via
+## # ollama/bge-m3 through LiteLLM, persists to .aislang/vector/
+## # aislang_docs.bin):
+## aislang rag build aislang_docs examples/rag-demo/rag-demo.ais
+##
+## # Query — embeds the question + returns top-3 chunks by cosine
+## # similarity:
+## aislang rag query aislang_docs examples/rag-demo/rag-demo.ais \
+##     "How does aislang ship RAG?"
+## # → [0] score=0.78  | # RAG resources (v0.3 Week 19) ...
+## # → [1] score=0.42  | ...
+## # → [2] score=0.31  | ...
+##
+## aislang rag query aislang_docs examples/rag-demo/rag-demo.ais \
+##     "What runs on Kubernetes?"
+## # → [0] score=0.71  | # Kubernetes deployment (v0.2 Phase 2) ...
+## ```
+##
+## ## v0.3 limitations exercised by this demo
+##
+##   - **chunk_size is CHARACTERS, not tokens** (v0.3
+##     simplification — see LANGUAGE-SPEC §4.15).  bge-m3's 8k
+##     context window is more than enough for our 512-char chunks.
+##   - **Brute-force cosine scan** instead of usearch (Decision
+##     44.4 deviation; documented in rag.rs module head).
+##     Performance is fine for this 4-doc corpus + would scale to
+##     thousands of chunks before the linear scan matters.
+##   - **No agent.knowledge wiring in chat path yet** — the
+##     `doc_helper` agent declares `knowledge = …` but the chat-
+##     time auto-prepend of retrieved chunks to the system prompt
+##     lands in Phase 2 alongside the dogfood agent inventory.
+##     For now, `aislang rag query` exposes the retrieval surface
+##     directly.
+
+project "rag-demo" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.01
+  }
+
+  ## Local-only embedding — no API key needed; just an Ollama
+  ## daemon with `bge-m3:latest` pulled.  Verified to match
+  ## what's in the dev rig's Ollama install.
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "aislang_docs" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 512
+    chunk_overlap = 64
+  }
+
+  ## The chat agent.  `knowledge` field declares the RAG store;
+  ## chat-time auto-prepend lands in Phase 2 (agent.knowledge
+  ## wiring through the session-build hop).  For today the
+  ## `aislang rag query` CLI exercises the retrieval directly.
+  model "thinker" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.llama_3_1_8b]
+  }
+  prompt "doc_helper_sys" {
+    file    = "./prompts/doc_helper.md"
+    version = "1.0.0"
+  }
+  agent "doc_helper" {
+    model         = model.thinker
+    system_prompt = prompt.doc_helper_sys
+    tools         = []
+    knowledge     = [vector_store.aislang_docs]
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}

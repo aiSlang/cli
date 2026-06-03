@@ -166,12 +166,12 @@
       "deprecated": false
     },
     {
-      "id": "ollama.bge_small_en_v1_5",
+      "id": "ollama.bge_m3",
       "provider": "ollama",
-      "litellm_name": "ollama/bge-small-en-v1.5",
-      "dimensions": 384,
+      "litellm_name": "ollama/bge-m3:latest",
+      "dimensions": 1024,
       "cost_per_1m_tokens": "$0",
-      "context_max": "512",
+      "context_max": "8k",
       "deprecated": false
     }
   ]
