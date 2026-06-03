@@ -22,10 +22,10 @@
 ## ## Chained with Architect + Reviewer
 ##
 ## Week 19 Fri ships Coder + Reviewer as standalone single-file
-## demos (matching Architect's pattern from Thu).  Week 20 Wed
+## demos (matching Architect's pattern from Thu).  Week 20 Mon
 ## lands the multi-module orchestrator that chains
-## architect → coder → reviewer → tester via cross-module
-## pipeline.steps.
+## architect → coder → reviewer via cross-module pipeline.steps;
+## Tue extends the chain to add the Tester leg.
 ##
 ## ## RAG context
 ##
