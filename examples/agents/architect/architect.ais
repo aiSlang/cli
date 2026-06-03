@@ -14,15 +14,17 @@
 ## ```
 ##
 ## Refine through dialogue; once happy, copy the design out for
-## downstream use.  Week 19 Fri adds `pipeline.from_locked_design`
-## so you can hand the design directly to Coder + Reviewer
-## without re-running Architect.
+## downstream use.  Week 19 Fri ships standalone Coder + Reviewer
+## agents (`examples/agents/coder/` + `code_reviewer/`); Week 20
+## Wed's orchestrator agent chains them via cross-module
+## pipeline.steps (Architect → Coder → Code-reviewer → Tester).
 ##
 ## ## End-to-end pipeline (one-shot)
 ##
-## Week 19 Thu ships the Architect alone — the `full_design`
-## pipeline is a single-step placeholder.  Week 19 Fri extends
-## it to architect → coder → reviewer.
+## Week 19 Thu/Fri ship each agent standalone — the `full_design`
+## pipeline below remains a single-step placeholder.  Week 20 Wed's
+## `examples/agents/orchestrator.ais` multi-module project wires
+## the full chain end-to-end.
 ##
 ## ## RAG context
 ##
