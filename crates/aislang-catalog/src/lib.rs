@@ -425,11 +425,18 @@ mod tests {
         assert_eq!(cohere.litellm_name, "cohere/embed-english-v3.0");
         assert_eq!(cohere.dimensions, 1024);
 
-        let bge = cat.find_embedding("ollama", "bge-small-en-v1.5")
-            .expect("ollama bge-small-en-v1.5 must be present");
-        assert_eq!(bge.id, "ollama.bge_small_en_v1_5");
-        assert_eq!(bge.litellm_name, "ollama/bge-small-en-v1.5");
-        assert_eq!(bge.dimensions, 384);
+        // v0.3 Week 19 Wed follow-up: Ollama doesn't publish a
+        // `bge-small-en-v1.5` tag (the PLAN row mentioned it but
+        // it's not in the registry).  Shipped `bge-m3:latest`
+        // instead — BAAI's multilingual successor, 1024-dim
+        // dense output, 8k context.  Still in the "free local
+        // embedding" slot the original Decision 44.6 sketch
+        // wanted.
+        let bge = cat.find_embedding("ollama", "bge-m3:latest")
+            .expect("ollama bge-m3:latest must be present");
+        assert_eq!(bge.id, "ollama.bge_m3");
+        assert_eq!(bge.litellm_name, "ollama/bge-m3:latest");
+        assert_eq!(bge.dimensions, 1024);
         // Local model → zero cost (same posture as the Ollama
         // chat-model entries).
         assert_eq!(bge.cost_per_1m,

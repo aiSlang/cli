@@ -257,6 +257,14 @@ enum Command {
         #[command(subcommand)]
         action: SkillCommand,
     },
+    /// RAG runtime operations against declared `vector_store`
+    /// blocks (Decision 44.6).  v0.3 Week 19 Wed follow-up —
+    /// gives `.ais` authors a CLI for end-to-end RAG testing
+    /// without writing Rust glue.
+    Rag {
+        #[command(subcommand)]
+        action: RagCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -276,6 +284,44 @@ enum SkillCommand {
         /// skills.  Defaults to `{}`.
         #[arg(long, value_name = "JSON", default_value = "{}")]
         args: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RagCommand {
+    /// Build the RAG index for one `vector_store` block from its
+    /// declared `source` URI, embed every chunk via the
+    /// referenced `embedding` block (POSTs through LiteLLM at
+    /// `--litellm-url`), and persist to
+    /// `<project>/.aislang/vector/<label>.bin`.  Subsequent
+    /// `rag query` calls use the cached index.
+    Build {
+        /// `vector_store` label as declared in the .ais file.
+        label: String,
+        /// Path to the .ais project file or project root dir.
+        project: PathBuf,
+        /// LiteLLM proxy base URL (default: localhost:4000 — the
+        /// `aislang apply`-spun Compose stack default).
+        #[arg(long, value_name = "URL", default_value = "http://localhost:4000")]
+        litellm_url: String,
+    },
+    /// Embed `<query>` via the vector_store's embedding model + return
+    /// the top-K matching chunks (default 3) by cosine similarity.
+    /// Builds the index on first call if `<project>/.aislang/vector/
+    /// <label>.bin` doesn't exist yet.
+    Query {
+        /// `vector_store` label.
+        label: String,
+        /// Path to the .ais project file or project root dir.
+        project: PathBuf,
+        /// Query text.
+        query: String,
+        /// Top-K results to return (default 3).
+        #[arg(long, value_name = "N", default_value_t = 3)]
+        top_k: usize,
+        /// LiteLLM proxy base URL (default: localhost:4000).
+        #[arg(long, value_name = "URL", default_value = "http://localhost:4000")]
+        litellm_url: String,
     },
 }
 
@@ -320,6 +366,13 @@ fn run() -> Result<ExitCode> {
         Command::Skill { action } => match action {
             SkillCommand::Run { label, project, args } =>
                 run_skill(label, project, args).map(|_| ExitCode::SUCCESS)?,
+        },
+        Command::Rag { action } => match action {
+            RagCommand::Build { label, project, litellm_url } =>
+                run_rag_build(label, project, litellm_url).map(|_| ExitCode::SUCCESS)?,
+            RagCommand::Query { label, project, query, top_k, litellm_url } =>
+                run_rag_query(label, project, query, top_k, litellm_url)
+                    .map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -1539,6 +1592,29 @@ fn run_apply(file: PathBuf) -> Result<()> {
             "docker compose up -d exited {:?}", status.code()));
     }
 
+    // v0.3 Week 19 Wed follow-up: `docker compose up -d` returns
+    // as soon as each container has STARTED — but LiteLLM's
+    // python process inside takes ~5-10s MORE to bind :4000 +
+    // load model_list + accept HTTP.  Running `aislang chat` /
+    // `aislang rag build` immediately after apply surfaced as
+    // "error sending request" (connection refused) — the user
+    // had to retry to make their next command work.
+    //
+    // Reuse the smoke-test path's `wait_for_litellm_ready` helper
+    // (polls /health/liveness via curl; 200-on-fully-up).  Apply
+    // here is fail-soft on timeout: log + continue.  Forcing apply
+    // to fail would be worse UX than letting the user retry their
+    // next command if LiteLLM is genuinely slow to come up.
+    match wait_for_litellm_ready(
+        "http://127.0.0.1:4000",
+        std::time::Duration::from_secs(30),
+    ) {
+        Ok(()) => eprintln!("  litellm ready:    ✓ /health/liveness 200"),
+        Err(e) => eprintln!(
+            "  warning: LiteLLM not ready within 30s ({e}); \
+             retry your next command in a few seconds"),
+    }
+
     // ── Write `.aislang/state.json` (week 10 Tue, Decision 26) ──
     // Recorded after the stack is confirmed up so a failed
     // `docker compose up -d` doesn't leave behind a misleading
@@ -1983,6 +2059,7 @@ fn docker_on_path() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
 
 /// Phase 2 Week 14 Thu — `helm` CLI presence check, mirror of
 /// `docker_on_path` for the K8s deploy target.  Used by the
@@ -2988,6 +3065,200 @@ fn qualify_pipeline_steps(
 /// for their `tools = [mcp_server.<x>]` list), the tool is
 /// called with the supplied JSON args, and the child is shut
 /// down cleanly before returning.  Requires Docker on PATH.
+/// `aislang rag build <label> <project> [--litellm-url …]` —
+/// v0.3 Week 19 Wed follow-up.  Chunks the vector_store's source
+/// content, embeds every chunk via the referenced embedding
+/// block (POSTs to LiteLLM at `--litellm-url`), persists to
+/// `<project>/.aislang/vector/<label>.bin`.
+fn run_rag_build(
+    vs_label:    String,
+    project:     PathBuf,
+    litellm_url: String,
+) -> Result<()> {
+    let (built, idx_path) = build_rag_index_for(&vs_label, &project, &litellm_url)?;
+    let written = built.save(&idx_path)
+        .map_err(|e| anyhow::anyhow!("save index: {e}"))?;
+    eprintln!("aislang rag: built `{vs_label}` index with {} chunks ({written} bytes) at {}",
+        built.chunks.len(), idx_path.display());
+    Ok(())
+}
+
+/// `aislang rag query <label> <project> "<text>" [--top-k N] [--litellm-url …]` —
+/// v0.3 Week 19 Wed follow-up.  Loads the cached index (building
+/// it on-demand if missing), embeds the query text via the same
+/// embedding model the index was built with, returns the top-K
+/// most-similar chunks ordered by cosine score.
+fn run_rag_query(
+    vs_label:    String,
+    project:     PathBuf,
+    query:       String,
+    top_k:       usize,
+    litellm_url: String,
+) -> Result<()> {
+    use aislang_runtime::rag::{Index, LiteLlmEmbedder, Embedder};
+
+    let loaded = load_project_input(&project)?;
+    let proj = &loaded.resolved.project;
+    let vs = proj.vector_stores.iter()
+        .find(|v| v.label == vs_label)
+        .ok_or_else(|| anyhow::anyhow!(
+            "no vector_store named `{vs_label}` in {}", project.display()))?;
+
+    let project_root = std::fs::canonicalize(&loaded.project_root)
+        .map_err(|e| anyhow::anyhow!("project root not readable: {e}"))?;
+    let idx_path = project_root.join(".aislang").join("vector")
+        .join(format!("{vs_label}.bin"));
+
+    // Build on first call if missing — same posture as
+    // `aislang skill run` (no separate "prepare" step needed for
+    // the demo path).
+    let index = if idx_path.exists() {
+        eprintln!("aislang rag: using cached index at {}", idx_path.display());
+        Index::load(&idx_path)
+            .map_err(|e| anyhow::anyhow!("load index: {e}"))?
+    } else {
+        eprintln!("aislang rag: index missing — building now");
+        let (built, _) = build_rag_index_for(&vs_label, &project, &litellm_url)?;
+        built.save(&idx_path)
+            .map_err(|e| anyhow::anyhow!("save index: {e}"))?;
+        built
+    };
+
+    // Look up the embedding-block referenced by the vector_store
+    // so we can stand up a LiteLlmEmbedder with matching dims.
+    let emb_block = proj.embeddings.iter()
+        .find(|e| e.label == vs.embedding.label)
+        .ok_or_else(|| anyhow::anyhow!(
+            "vector_store `{vs_label}` references embedding `{}` \
+             which doesn't exist in the project",
+             vs.embedding.label))?;
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
+    let catalog_entry = catalog
+        .find_embedding(&emb_block.provider, &emb_block.model)
+        .ok_or_else(|| anyhow::anyhow!(
+            "embedding `{}` ({} / {}) not in bundled catalog",
+            emb_block.label, emb_block.provider, emb_block.model))?;
+    let embedder = LiteLlmEmbedder::new(
+        &litellm_url, &emb_block.label,
+        catalog_entry.dimensions as usize);
+
+    let query_vec = embedder.embed(&query)
+        .map_err(|e| anyhow::anyhow!("embed query: {e}"))?;
+    let results = index.query(&query_vec, top_k)
+        .map_err(|e| anyhow::anyhow!("query: {e}"))?;
+
+    eprintln!("aislang rag: top {} results for `{}`:", results.len(), query);
+    for (i, (text, score)) in results.iter().enumerate() {
+        // Stdout: machine-readable shape `[<idx>] <score> | <text>`.
+        let preview = if text.len() > 200 { &text[..200] } else { text.as_str() };
+        println!("[{i}] score={:.4} | {}", score,
+            preview.replace('\n', " ⏎ "));
+    }
+    Ok(())
+}
+
+/// Shared helper: resolve project → find vector_store →
+/// read+chunk source → embed via LiteLLM → return the built
+/// `Index` + its on-disk path.  Used by both `rag build` (which
+/// just saves) and `rag query`'s on-first-call build path.
+fn build_rag_index_for(
+    vs_label:    &str,
+    project:     &Path,
+    litellm_url: &str,
+) -> Result<(aislang_runtime::rag::Index, PathBuf)> {
+    use aislang_core::ast::SourceUri;
+    use aislang_runtime::rag::{build_index, LiteLlmEmbedder};
+
+    let loaded = load_project_input(project)?;
+    let proj = &loaded.resolved.project;
+    let vs = proj.vector_stores.iter()
+        .find(|v| v.label == vs_label)
+        .ok_or_else(|| anyhow::anyhow!(
+            "no vector_store named `{vs_label}` in {}", project.display()))?;
+    let project_root = std::fs::canonicalize(&loaded.project_root)
+        .map_err(|e| anyhow::anyhow!("project root not readable: {e}"))?;
+
+    // v0.3: only the Path source variant is wired in the CLI build.
+    // Url / Crawl variants would need an HTTP fetcher (+ for crawl
+    // a recursive walker); both deferred to v0.5+.
+    let source_text = match &vs.source {
+        SourceUri::Path { path } => {
+            let abs = if path.is_absolute() { path.clone() }
+                      else { project_root.join(path) };
+            // Single file → read directly; directory → concatenate
+            // every readable file under it (lexicographic order)
+            // with a separator marker so chunks don't span file
+            // boundaries opaquely.
+            if abs.is_file() {
+                std::fs::read_to_string(&abs)
+                    .map_err(|e| anyhow::anyhow!("read {}: {e}", abs.display()))?
+            } else if abs.is_dir() {
+                let mut entries: Vec<_> = std::fs::read_dir(&abs)
+                    .map_err(|e| anyhow::anyhow!("read dir {}: {e}", abs.display()))?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_file())
+                    .collect();
+                entries.sort();
+                let mut combined = String::new();
+                for entry in entries {
+                    if let Ok(body) = std::fs::read_to_string(&entry) {
+                        if !combined.is_empty() {
+                            combined.push_str(&format!("\n\n--- {} ---\n\n",
+                                entry.file_name().unwrap_or_default().to_string_lossy()));
+                        }
+                        combined.push_str(&body);
+                    }
+                }
+                combined
+            } else {
+                return Err(anyhow::anyhow!(
+                    "vector_store `{vs_label}` source `{}` is neither file nor directory",
+                    abs.display()));
+            }
+        }
+        SourceUri::Url { .. } | SourceUri::Crawl { .. } => {
+            return Err(anyhow::anyhow!(
+                "v0.3 CLI `rag build` only supports `Path` source URIs; \
+                 url/crawl variants need an HTTP fetcher (deferred to v0.5+)"));
+        }
+    };
+
+    let emb_block = proj.embeddings.iter()
+        .find(|e| e.label == vs.embedding.label)
+        .ok_or_else(|| anyhow::anyhow!(
+            "vector_store `{vs_label}` references embedding `{}` \
+             which doesn't exist in the project",
+            vs.embedding.label))?;
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
+    let catalog_entry = catalog
+        .find_embedding(&emb_block.provider, &emb_block.model)
+        .ok_or_else(|| anyhow::anyhow!(
+            "embedding `{}` ({} / {}) not in bundled catalog",
+            emb_block.label, emb_block.provider, emb_block.model))?;
+    let embedder = LiteLlmEmbedder::new(
+        litellm_url, &emb_block.label,
+        catalog_entry.dimensions as usize);
+
+    eprintln!("aislang rag: building `{vs_label}` index ({} chars source, \
+               chunk_size={} chunk_overlap={}, embedder=`{}` dims={})",
+        source_text.len(), vs.chunk_size.units, vs.chunk_overlap.units,
+        emb_block.label, catalog_entry.dimensions);
+
+    let index = build_index(
+        vs_label.to_string(),
+        &source_text,
+        vs.chunk_size.units    as usize,
+        vs.chunk_overlap.units as usize,
+        &embedder,
+    ).map_err(|e| anyhow::anyhow!("build index: {e}"))?;
+
+    let idx_path = project_root.join(".aislang").join("vector")
+        .join(format!("{vs_label}.bin"));
+    Ok((index, idx_path))
+}
+
 fn run_skill(
     skill_label: String,
     project:     PathBuf,

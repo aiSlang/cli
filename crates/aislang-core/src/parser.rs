@@ -1134,6 +1134,7 @@ fn to_agent(raw: RawBlock) -> Result<Agent, String> {
     let mut model:         Option<Ref>      = None;
     let mut system_prompt: Option<Ref>      = None;
     let mut tools:         Option<Vec<Ref>> = None;
+    let mut knowledge:     Option<Vec<Ref>> = None;
 
     for item in raw.body {
         let attr = expect_attr_only("agent", item)?;
@@ -1144,9 +1145,14 @@ fn to_agent(raw: RawBlock) -> Result<Agent, String> {
                 &attr.name, RefKind::Prompt, attr.value)?),
             "tools"         => tools         = Some(expect_list_of_refs(
                 &attr.name, RefKind::McpServer, attr.value)?),
+            // v0.3 Week 19 Wed: agent.knowledge = [vector_store.<l>]
+            // — chat-time RAG context.  Same shape as tools (list of
+            // refs); each ref MUST resolve to a `vector_store` block.
+            "knowledge"     => knowledge     = Some(expect_list_of_refs(
+                &attr.name, RefKind::VectorStore, attr.value)?),
             other => return Err(format!(
                 "unknown attribute `{other}` in agent block; \
-                 allowed: model, system_prompt, tools"
+                 allowed: model, system_prompt, tools, knowledge"
             )),
         }
     }
@@ -1160,6 +1166,7 @@ fn to_agent(raw: RawBlock) -> Result<Agent, String> {
         // tools defaults to empty if absent — an agent with no tools is a
         // valid pure-chat agent.
         tools: tools.unwrap_or_default(),
+        knowledge,
     })
 }
 
@@ -2073,11 +2080,15 @@ fn parse_ref_from_access(path: &[String]) -> Result<Ref, String> {
         // until then ref RESOLUTION fails (no embedding node in the
         // graph) but the ref PARSES + tracks the kind for the
         // future checker dispatch.
-        "embedding"  => RefKind::Embedding,
+        "embedding"    => RefKind::Embedding,
+        // v0.3 Week 19 Wed: vector_store refs in agent.knowledge.
+        // The `vector_store "<label>" { … }` block landed Mon;
+        // Wed wires the agent-side ref.
+        "vector_store" => RefKind::VectorStore,
         other => return Err(format!(
             "unknown resource kind `{other}` in reference `{}`; \
              expected one of: model, prompt, mcp_server, agent, secret, \
-             pipeline, embedding",
+             pipeline, embedding, vector_store",
             path.join(".")
         )),
     };
@@ -2089,13 +2100,14 @@ fn parse_ref_from_access(path: &[String]) -> Result<Ref, String> {
 
 fn ref_kind_str(k: RefKind) -> &'static str {
     match k {
-        RefKind::Model     => "model",
-        RefKind::Prompt    => "prompt",
-        RefKind::McpServer => "mcp_server",
-        RefKind::Agent     => "agent",
-        RefKind::Secret    => "secret",
-        RefKind::Pipeline  => "pipeline",
-        RefKind::Embedding => "embedding",
+        RefKind::Model       => "model",
+        RefKind::Prompt      => "prompt",
+        RefKind::McpServer   => "mcp_server",
+        RefKind::Agent       => "agent",
+        RefKind::Secret      => "secret",
+        RefKind::Pipeline    => "pipeline",
+        RefKind::Embedding   => "embedding",
+        RefKind::VectorStore => "vector_store",
     }
 }
 
@@ -4541,5 +4553,66 @@ mod project_tests {
         "#);
         assert_parse_err_contains(&src,
             "embedding `model` must be a non-empty string");
+    }
+
+    // ---- agent.knowledge (v0.3 Week 19 Wed) -------------------- //
+
+    #[test] fn agent_knowledge_field_parses_as_list_of_vector_store_refs() {
+        let src = project_with_composition_body(r#"
+          embedding "e" { provider = openai  model = "text-embedding-3-small" }
+          vector_store "docs" {
+            embedding  = embedding.e
+            source     = "./k/"
+            chunk_size = 1k
+          }
+          vector_store "logs" {
+            embedding  = embedding.e
+            source     = "./logs/"
+            chunk_size = 1k
+          }
+          model "m" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          prompt "sys" { file = "./s.md"  version = "1.0.0" }
+          agent "rag_agent" {
+            model         = model.m
+            system_prompt = prompt.sys
+            tools         = []
+            knowledge     = [vector_store.docs, vector_store.logs]
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        let agent = p.agents.iter().find(|a| a.label == "rag_agent")
+            .expect("rag_agent declared");
+        let knowledge = agent.knowledge.as_ref()
+            .expect("knowledge field must be Some");
+        assert_eq!(knowledge.len(), 2);
+        assert_eq!(knowledge[0].label, "docs");
+        assert_eq!(knowledge[0].kind,  RefKind::VectorStore);
+        assert_eq!(knowledge[1].label, "logs");
+    }
+
+    #[test] fn agent_without_knowledge_field_defaults_to_none() {
+        let src = project_with_composition_body(r#"
+          model "m" {
+            requires    = [chat]
+            context_min = 32k
+            prefer      = [ollama.llama_3_1_8b]
+            pin         = ollama.llama_3_1_8b
+          }
+          prompt "sys" { file = "./s.md"  version = "1.0.0" }
+          agent "plain" {
+            model         = model.m
+            system_prompt = prompt.sys
+            tools         = []
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        let agent = p.agents.iter().find(|a| a.label == "plain").unwrap();
+        assert!(agent.knowledge.is_none(),
+            "absent knowledge field MUST default to None (v0.2 byte-stable)");
     }
 }
