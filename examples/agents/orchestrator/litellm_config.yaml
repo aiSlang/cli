@@ -1,0 +1,36 @@
+model_list:
+- model_name: architect.architect_brain
+  litellm_params:
+    model: ollama/qwen3:8b
+    api_base: os.environ/OLLAMA_API_BASE
+- model_name: architect.architect_brain-fb-anthropic-claude-haiku-4-5
+  litellm_params:
+    model: anthropic/claude-haiku-4-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+- model_name: code_reviewer.reviewer_brain
+  litellm_params:
+    model: ollama/qwen3:8b
+    api_base: os.environ/OLLAMA_API_BASE
+- model_name: code_reviewer.reviewer_brain-fb-anthropic-claude-haiku-4-5
+  litellm_params:
+    model: anthropic/claude-haiku-4-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+- model_name: coder.coder_brain
+  litellm_params:
+    model: ollama/qwen2.5-coder:7b
+    api_base: os.environ/OLLAMA_API_BASE
+- model_name: coder.coder_brain-fb-anthropic-claude-haiku-4-5
+  litellm_params:
+    model: anthropic/claude-haiku-4-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+router_settings:
+  fallbacks:
+  - architect.architect_brain:
+    - architect.architect_brain-fb-anthropic-claude-haiku-4-5
+  - code_reviewer.reviewer_brain:
+    - code_reviewer.reviewer_brain-fb-anthropic-claude-haiku-4-5
+  - coder.coder_brain:
+    - coder.coder_brain-fb-anthropic-claude-haiku-4-5
+litellm_settings:
+  callbacks:
+  - otel

@@ -1,0 +1,19 @@
+# v0.3 Week 20 Mon — multi-module orchestrator manifest.
+#
+# Decision 44.1: aislang.toml declares the project root + the
+# [modules] table mapping module names to relative .ais file paths.
+# The Week 19 single-file agents under ../architect/, ../coder/,
+# ../code_reviewer/ are reused as modules (each is self-contained
+# project { … } block — same multi-module-demo pattern as Week 16
+# Mon's fixture).  The orchestrator module ITSELF (this dir's
+# orchestrator.ais) holds the cross-module pipeline + loop blocks.
+
+[project]
+name    = "orchestrator-agent"
+version = "0.1.0"
+
+[modules]
+architect     = "../architect/architect.ais"
+coder         = "../coder/coder.ais"
+code_reviewer = "../code_reviewer/code_reviewer.ais"
+orchestrator  = "orchestrator.ais"

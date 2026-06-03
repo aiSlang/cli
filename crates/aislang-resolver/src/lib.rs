@@ -21,7 +21,8 @@ pub use lockfile::{Lockfile, LockfileDiff, LockfileError};
 
 use aislang_catalog::{Catalog, CatalogModel};
 use aislang_core::ast::{
-    Agent, Deploy, Eval, Main, McpServer, Model, ModelId, Project, Prompt, Secret,
+    Agent, Branch, Deploy, Embedding, Eval, Loop, Main, McpServer, Model, ModelId,
+    Pipeline, Project, Prompt, Secret, Skill, VectorStore,
 };
 use aislang_core::types::OptimizeFor;
 use aislang_core::Warning;
@@ -336,6 +337,44 @@ pub fn resolve_multi(
             input.project.mains.iter().cloned().map(|m| Main {
                 label: format!("{mod_name}.{}", m.label),
                 ..m
+            }));
+
+        // v0.3 Week 20 Mon — composition primitives + RAG + skill
+        // blocks: same module-qualification discipline as the older
+        // resource kinds.  Without these, a multi-module orchestrator
+        // project that declares `pipeline.full_design = [use
+        // architect.architect, …]` silently drops its pipelines at
+        // merge time — discovered while writing the orchestrator
+        // integration test.
+        merged_project.pipelines.extend(
+            input.project.pipelines.iter().cloned().map(|p| Pipeline {
+                label: format!("{mod_name}.{}", p.label),
+                ..p
+            }));
+        merged_project.loops.extend(
+            input.project.loops.iter().cloned().map(|l| Loop {
+                label: format!("{mod_name}.{}", l.label),
+                ..l
+            }));
+        merged_project.branches.extend(
+            input.project.branches.iter().cloned().map(|b| Branch {
+                label: format!("{mod_name}.{}", b.label),
+                ..b
+            }));
+        merged_project.skills.extend(
+            input.project.skills.iter().cloned().map(|s| Skill {
+                label: format!("{mod_name}.{}", s.label),
+                ..s
+            }));
+        merged_project.vector_stores.extend(
+            input.project.vector_stores.iter().cloned().map(|v| VectorStore {
+                label: format!("{mod_name}.{}", v.label),
+                ..v
+            }));
+        merged_project.embeddings.extend(
+            input.project.embeddings.iter().cloned().map(|e| Embedding {
+                label: format!("{mod_name}.{}", e.label),
+                ..e
             }));
 
         // Budget: first module's budget wins (matches `aislang.toml`'s

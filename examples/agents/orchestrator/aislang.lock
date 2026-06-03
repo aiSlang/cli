@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-05-25",
+  "source_hash": "",
+  "model_bindings": {
+    "architect.architect_brain": {
+      "provider": "ollama",
+      "name": "qwen3_8b"
+    },
+    "code_reviewer.reviewer_brain": {
+      "provider": "ollama",
+      "name": "qwen3_8b"
+    },
+    "coder.coder_brain": {
+      "provider": "ollama",
+      "name": "qwen2_5_coder_7b"
+    }
+  },
+  "prompt_hashes": {
+    "architect.architect_sys": "a47d003b195377f8e2a83c377372ffbad9f974673bebd4ffcb488788e3fe7fe2",
+    "code_reviewer.reviewer_sys": "f9c382e0951305f6a0b8d05a03c8ae3e837922d6c56b3831cc1f8442aa1c31bc",
+    "coder.coder_sys": "e0d90d26f534272da0ea314a0caf03183b5ec61cadc888ec5e88dfef60009097"
+  },
+  "oci_digests": {},
+  "modules": {
+    "architect": "087b721409601d47e72b9dc3b43bed6cfcc8f665cdc3955c5049de5d3b985dc2",
+    "code_reviewer": "f08e03e0660d9b95ec5ab538546edb402cd71f016d9275351d87dedd2c460932",
+    "coder": "d7df708c3e4a8fe72f96716bb49f98f8bb030679aab731ef51764dec709b619f",
+    "orchestrator": "22054763f8be4ee33e77cd177d17c32ecca2eb33d498e0aa9277623e16fbb377"
+  }
+}
