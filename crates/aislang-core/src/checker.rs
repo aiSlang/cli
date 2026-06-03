@@ -230,6 +230,15 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
     for v in &project.vector_stores {
         add_block(&mut graph, &mut nodes, BlockKind::VectorStore, &v.label)?;
     }
+    // v0.3 Week 19 Tue: embedding blocks now exist as a real
+    // grammar surface.  Adding them to the graph turns Mon's
+    // "undeclared embedding `X`" diagnostic into "resolves OK"
+    // for any vector_store that references a declared embedding,
+    // without any change to `check_refs` itself — the existing
+    // dispatch_ref handles it via BlockKind::Embedding.
+    for e in &project.embeddings {
+        add_block(&mut graph, &mut nodes, BlockKind::Embedding, &e.label)?;
+    }
 
     Ok(ResourceGraph { graph, nodes })
 }
@@ -389,7 +398,36 @@ fn check_refs(
         dispatch_ref(graph, multi, &vs.embedding,
             "vector_store", &vs.label, "embedding")?;
     }
+    // v0.3 Week 19 Tue: embedding-block sanity — provider must be
+    // a known identifier (parser is permissive; checker enforces
+    // the closed set).  Catalog-side resolution (i.e. the
+    // `(provider, model)` pair actually existing in
+    // `aislang-catalog::embeddings`) is the RESOLVER's job — out
+    // of scope for the parser/checker layer, which only operates
+    // on the AST.  Tue's resolver wiring is a separate
+    // commit if needed; the catalog validation today happens in
+    // `aislang-resolver::resolve_against_bundled_catalog`.
+    for e in &project.embeddings {
+        if !is_known_embedding_provider(&e.provider) {
+            return Err(format!(
+                "embedding `{}` has unknown provider `{}`; v0.3 supports: \
+                 openai, cohere, ollama",
+                e.label, e.provider));
+        }
+        if e.model.trim().is_empty() {
+            return Err(format!(
+                "embedding `{}` has empty model name", e.label));
+        }
+    }
     Ok(())
+}
+
+/// Closed set of providers the v0.3 catalog ships embeddings for.
+/// Adding a new provider here also requires a catalog entry under
+/// `aislang-catalog::embeddings` + a litellm-config emitter update
+/// (`/embeddings` route shape).
+fn is_known_embedding_provider(p: &str) -> bool {
+    matches!(p, "openai" | "cohere" | "ollama")
 }
 
 /// v0.3 Week 16 Tue — picks the lookup graph for one ref based on
@@ -1769,5 +1807,61 @@ mod tests {
         assert!(err.contains("undeclared embedding"),
             "should fail only on the embedding ref, not on the \
              shared label; got: {err}");
+    }
+
+    // ---- embedding block (v0.3 Week 19 Tue) --------------------- //
+
+    #[test] fn embedding_with_known_provider_passes() {
+        check_src(&composition_body(r#"
+          embedding "openai_small" {
+            provider = openai
+            model    = "text-embedding-3-small"
+          }
+        "#)).expect("declared embedding with known provider must check");
+    }
+
+    #[test] fn embedding_with_unknown_provider_fails() {
+        let err = check_src(&composition_body(r#"
+          embedding "broken" {
+            provider = some_made_up_provider
+            model    = "x"
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("embedding `broken`"),
+            "error must name the source embedding; got: {err}");
+        assert!(err.contains("unknown provider `some_made_up_provider`"),
+            "error must name the bad provider; got: {err}");
+        assert!(err.contains("openai") && err.contains("cohere")
+                && err.contains("ollama"),
+            "error must enumerate the supported set; got: {err}");
+    }
+
+    #[test] fn vector_store_to_declared_embedding_now_resolves() {
+        // Mon→Tue contract: once an embedding block exists,
+        // the vector_store.embedding ref RESOLVES instead of
+        // failing as "undeclared embedding".  This is the
+        // green-light test that pins the Mon→Tue handoff.
+        check_src(&composition_body(r#"
+          embedding "openai_small" {
+            provider = openai
+            model    = "text-embedding-3-small"
+          }
+          vector_store "docs" {
+            embedding     = embedding.openai_small
+            source        = "./k/"
+            chunk_size    = 1k
+            chunk_overlap = 128
+          }
+        "#)).expect(
+            "vector_store referencing a declared embedding must resolve cleanly");
+    }
+
+    #[test] fn duplicate_embedding_label_rejected() {
+        let err = check_src(&composition_body(r#"
+          embedding "dup" { provider = openai  model = "text-embedding-3-small" }
+          embedding "dup" { provider = cohere  model = "embed-english-v3.0" }
+        "#)).unwrap_err();
+        assert!(err.contains("duplicate `embedding` block label `dup`"),
+            "duplicate-label detection must fire for embeddings; got: {err}");
     }
 }

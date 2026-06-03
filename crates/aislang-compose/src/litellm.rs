@@ -123,6 +123,20 @@ pub enum ConfigError {
 
     #[error("YAML serialization failed: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    /// v0.3 Week 19 Tue: an `embedding "<label>" { provider = X
+    /// model = "Y" }` block references a (provider, model) pair
+    /// that the bundled catalog's `embeddings` section doesn't
+    /// know about.  Same posture as `MissingCatalogEntry` for
+    /// chat models.
+    #[error("embedding `{label}` references unknown ({provider}, \"{model}\") — \
+             no matching catalog entry under embeddings[]; \
+             check the catalog version + the model name spelling")]
+    UnknownEmbedding {
+        label:    String,
+        provider: String,
+        model:    String,
+    },
 }
 
 // ============================================================================
@@ -220,6 +234,45 @@ pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
         }
     }
 
+    // v0.3 Week 19 Tue (Decision 44.6): emit one `model_list` entry
+    // per declared `embedding "<label>" { … }` block.  LiteLLM's
+    // proxy multiplexes both chat-completion AND embeddings routes
+    // off the same model_list — the model's catalog entry decides
+    // which provider endpoint gets called (`/embeddings` for
+    // CatalogEmbedding entries, `/chat/completions` for
+    // CatalogModel).  The `model_name` on the LiteLLM side becomes
+    // the .ais `embedding` block label so RAG runtime callers
+    // (Wed) dial LiteLLM with `model = "<label>"` exactly like
+    // chat does.
+    //
+    // No fallback chains for embeddings in v0.3 — each `embedding`
+    // block resolves to exactly one upstream model.  v0.5+ may
+    // revisit (e.g. cohere primary → openai fallback).
+    for emb in &resolved.project.embeddings {
+        let catalog_entry = catalog
+            .find_embedding(&emb.provider, &emb.model)
+            .ok_or_else(|| ConfigError::UnknownEmbedding {
+                label:    emb.label.clone(),
+                provider: emb.provider.clone(),
+                model:    emb.model.clone(),
+            })?;
+        // Embedding entries reuse the same provider_creds table as
+        // chat models — `OPENAI_API_KEY` / `COHERE_API_KEY` /
+        // `OLLAMA_API_BASE` get forwarded into the container env
+        // via the existing `referenced_env_vars` walk (which
+        // already iterates `model_list` regardless of whether the
+        // entry is chat or embedding).
+        let creds = provider_creds(&emb.provider);
+        model_list.push(ModelEntry {
+            model_name: emb.label.clone(),
+            litellm_params: LiteLlmParams {
+                model:    catalog_entry.litellm_name.clone(),
+                api_key:  creds.api_key.map(|v|  format!("os.environ/{v}")),
+                api_base: creds.api_base.map(|v| format!("os.environ/{v}")),
+            },
+        });
+    }
+
     let router_settings = if fallback_pairs.is_empty() {
         None
     } else {
@@ -315,12 +368,17 @@ fn provider_creds(provider: &str) -> ProviderCreds {
         "anthropic" => ProviderCreds { api_key: Some("ANTHROPIC_API_KEY"), api_base: None },
         "openai"    => ProviderCreds { api_key: Some("OPENAI_API_KEY"),    api_base: None },
         "google"    => ProviderCreds { api_key: Some("GOOGLE_API_KEY"),    api_base: None },
+        // v0.3 Week 19 Tue: cohere lands as a v0.3 provider via the
+        // embedding catalog (no chat-model entries yet).  Same
+        // bare-API-KEY shape as openai/anthropic.
+        "cohere"    => ProviderCreds { api_key: Some("COHERE_API_KEY"),    api_base: None },
         "ollama"    => ProviderCreds { api_key: None,                       api_base: Some("OLLAMA_API_BASE") },
         // Unknown provider — no credentials emitted. LiteLLM will surface
         // a clear "no API key" error at runtime if the provider needs one.
         _           => ProviderCreds { api_key: None,                       api_base: None },
     }
 }
+
 
 // ============================================================================
 // `.env.example` generator
@@ -1252,6 +1310,107 @@ mod tests {
         let router_pos = yaml.find("router_settings:").expect("router_settings");
         assert!(ml_pos < router_pos,
             "model_list must precede router_settings; got model_list@{ml_pos}, router_settings@{router_pos}");
+    }
+
+    // ── v0.3 Week 19 Tue — embedding block emission ──
+
+    #[test] fn embedding_block_emits_model_list_entry() {
+        // PLAN DoD: "LiteLLM router config gets an `/embeddings`
+        // route per declared embedding model".  LiteLLM's proxy
+        // multiplexes /chat/completions AND /embeddings off the
+        // same model_list; verifying the entry shape + that the
+        // catalog's litellm_name maps through is the test.
+        use aislang_core::ast::{Embedding, Project};
+        let mut resolved = aislang_resolver::ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
+        };
+        resolved.project.embeddings.push(Embedding {
+            label:    "openai_small".into(),
+            provider: "openai".into(),
+            model:    "text-embedding-3-small".into(),
+        });
+        resolved.project.embeddings.push(Embedding {
+            label:    "local_bge".into(),
+            provider: "ollama".into(),
+            model:    "bge-small-en-v1.5".into(),
+        });
+        let cat = aislang_catalog::bundled().expect("bundled");
+        let cfg = build_config(&resolved, &cat).expect("build");
+
+        // openai entry: API key forwarded; api_base None.
+        let openai_entry = cfg.model_list.iter()
+            .find(|e| e.model_name == "openai_small")
+            .expect("openai_small entry must exist in model_list");
+        assert_eq!(openai_entry.litellm_params.model,
+            "openai/text-embedding-3-small");
+        assert_eq!(openai_entry.litellm_params.api_key.as_deref(),
+            Some("os.environ/OPENAI_API_KEY"),
+            "openai embedding entries must reference OPENAI_API_KEY");
+        assert!(openai_entry.litellm_params.api_base.is_none());
+
+        // ollama entry: no API key; api_base points at OLLAMA_API_BASE.
+        let bge_entry = cfg.model_list.iter()
+            .find(|e| e.model_name == "local_bge")
+            .expect("local_bge entry must exist in model_list");
+        assert_eq!(bge_entry.litellm_params.model,
+            "ollama/bge-small-en-v1.5");
+        assert!(bge_entry.litellm_params.api_key.is_none(),
+            "ollama embeddings must NOT carry an API key");
+        assert_eq!(bge_entry.litellm_params.api_base.as_deref(),
+            Some("os.environ/OLLAMA_API_BASE"));
+    }
+
+    #[test] fn embedding_block_with_unknown_pair_fails() {
+        use aislang_core::ast::{Embedding, Project};
+        let mut resolved = aislang_resolver::ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
+        };
+        resolved.project.embeddings.push(Embedding {
+            label:    "bad".into(),
+            provider: "openai".into(),
+            model:    "nonexistent-model-vNNN".into(),
+        });
+        let cat = aislang_catalog::bundled().expect("bundled");
+        let err = build_config(&resolved, &cat).unwrap_err();
+        match err {
+            ConfigError::UnknownEmbedding { label, provider, model } => {
+                assert_eq!(label,    "bad");
+                assert_eq!(provider, "openai");
+                assert_eq!(model,    "nonexistent-model-vNNN");
+            }
+            other => panic!("expected UnknownEmbedding; got {other:?}"),
+        }
+    }
+
+    #[test] fn cohere_provider_carries_api_key_env_var() {
+        // Same posture as openai/anthropic — `COHERE_API_KEY`.
+        use aislang_core::ast::{Embedding, Project};
+        let mut resolved = aislang_resolver::ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
+        };
+        resolved.project.embeddings.push(Embedding {
+            label:    "cohere_en".into(),
+            provider: "cohere".into(),
+            model:    "embed-english-v3.0".into(),
+        });
+        let cat = aislang_catalog::bundled().expect("bundled");
+        let cfg = build_config(&resolved, &cat).expect("build");
+        let entry = cfg.model_list.iter()
+            .find(|e| e.model_name == "cohere_en").expect("entry");
+        assert_eq!(entry.litellm_params.api_key.as_deref(),
+            Some("os.environ/COHERE_API_KEY"));
     }
 
     // ── Phase 2 Week 15 Tue follow-up — LiteLLM OTel callback ──

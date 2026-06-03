@@ -685,12 +685,19 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
             // referenced `embedding "<label>" { … }` block; Wed
             // wires the usearch index-build + query runtime.
             "vector_store" => project.vector_stores.push(to_vector_store(block)?),
+            // v0.3 Week 19 Tue (Decision 44.6): `embedding { … }`
+            // grammar — provider + upstream model name.  The
+            // resolver maps `(provider, model)` to a catalog
+            // entry; the compose emitter adds a `/embeddings`
+            // route per declared block to the generated
+            // `litellm_config.yaml`.
+            "embedding"  => project.embeddings.push(to_embedding(block)?),
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
                      v0.3 supports: budget, model, prompt, mcp_server, \
                      agent, eval, secret, deploy, main, pipeline, loop, \
-                     branch, skill, vector_store"
+                     branch, skill, vector_store, embedding"
                 ));
             }
         }
@@ -1678,6 +1685,58 @@ fn expect_source_uri(field: &str, v: RawValue) -> Result<SourceUri, String> {
         Ok(SourceUri::Url { url: s })
     } else {
         Ok(SourceUri::Path { path: PathBuf::from(s) })
+    }
+}
+
+// ============================================================================
+// `embedding` block converter — v0.3 Week 19 Tue (Decision 44.6)
+// ============================================================================
+
+fn to_embedding(raw: RawBlock) -> Result<Embedding, String> {
+    let label = require_single_label("embedding", raw.labels)?;
+    let mut provider: Option<String> = None;
+    let mut model:    Option<String> = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("embedding", item)?;
+        match attr.name.as_str() {
+            // Provider is a bare identifier (`openai` / `cohere` /
+            // `ollama`); bare idents parse as `RawValue::EnumMember`
+            // (see `expect_output_type` for the same shape).  Quoted
+            // string form is also accepted for author-friendliness.
+            "provider" => provider = Some(expect_provider_ident(&attr.name, attr.value)?),
+            "model"    => model    = Some(expect_string(&attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in embedding block; \
+                 allowed: provider, model"
+            )),
+        }
+    }
+
+    let provider = provider.ok_or_else(||
+        "embedding missing required attribute `provider` \
+         (one of: openai, cohere, ollama)".to_string())?;
+    let model = model.ok_or_else(||
+        "embedding missing required attribute `model` \
+         (the upstream model name, e.g. \"text-embedding-3-small\")".to_string())?;
+    if model.trim().is_empty() {
+        return Err(
+            "embedding `model` must be a non-empty string".to_string());
+    }
+    Ok(Embedding { label, provider, model })
+}
+
+/// Provider identifier — accepts bare-ident OR quoted-string form,
+/// same dual-shape posture `expect_output_type` (Week 18 Wed) uses.
+fn expect_provider_ident(field: &str, v: RawValue) -> Result<String, String> {
+    match v {
+        RawValue::String(s)     => Ok(s),
+        RawValue::EnumMember(s) => Ok(s),
+        RawValue::AttributeAccess(p) if p.len() == 1 => Ok(p[0].clone()),
+        other => Err(format!(
+            "`{field}` expects a provider identifier \
+             (e.g. `openai`, `cohere`, `ollama`); got {other:?}"
+        )),
     }
 }
 
@@ -4414,5 +4473,73 @@ mod project_tests {
         "#);
         assert_parse_err_contains(&src,
             "`crawl:` only supports http(s) seeds");
+    }
+
+    // ---- embedding block (v0.3 Week 19 Tue) --------------------- //
+
+    #[test] fn embedding_block_parses_with_bare_provider_ident() {
+        let src = project_with_composition_body(r#"
+          embedding "openai_small" {
+            provider = openai
+            model    = "text-embedding-3-small"
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.embeddings.len(), 1);
+        let e = &p.embeddings[0];
+        assert_eq!(e.label,    "openai_small");
+        assert_eq!(e.provider, "openai");
+        assert_eq!(e.model,    "text-embedding-3-small");
+    }
+
+    #[test] fn embedding_block_parses_with_quoted_provider() {
+        // Author-friendliness: `provider = "openai"` parses the same
+        // as the bare-ident form (mirrors `expect_output_type`'s
+        // dual-shape acceptance).
+        let src = project_with_composition_body(r#"
+          embedding "cohere_en" {
+            provider = "cohere"
+            model    = "embed-english-v3.0"
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.embeddings[0].provider, "cohere");
+        assert_eq!(p.embeddings[0].model,    "embed-english-v3.0");
+    }
+
+    #[test] fn embedding_missing_provider_or_model_fails() {
+        let no_provider = project_with_composition_body(r#"
+          embedding "e" { model = "x" }
+        "#);
+        assert_parse_err_contains(&no_provider,
+            "missing required attribute `provider`");
+        let no_model = project_with_composition_body(r#"
+          embedding "e" { provider = openai }
+        "#);
+        assert_parse_err_contains(&no_model,
+            "missing required attribute `model`");
+    }
+
+    #[test] fn embedding_rejects_unknown_attribute() {
+        let src = project_with_composition_body(r#"
+          embedding "e" {
+            provider = openai
+            model    = "text-embedding-3-small"
+            extra    = "nope"
+          }
+        "#);
+        assert_parse_err_contains(&src,
+            "allowed: provider, model");
+    }
+
+    #[test] fn embedding_rejects_empty_model_string() {
+        let src = project_with_composition_body(r#"
+          embedding "e" {
+            provider = openai
+            model    = ""
+          }
+        "#);
+        assert_parse_err_contains(&src,
+            "embedding `model` must be a non-empty string");
     }
 }
