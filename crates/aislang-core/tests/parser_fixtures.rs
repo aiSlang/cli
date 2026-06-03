@@ -108,6 +108,11 @@ fn expected_support_agent() -> Project {
         model:         Ref { kind: RefKind::Model,     label: "fast".into(),   module: None },
         system_prompt: Ref { kind: RefKind::Prompt,    label: "system".into(), module: None },
         tools:         vec![Ref { kind: RefKind::McpServer, label: "docs".into(), module: None }],
+        // v0.3 Week 19 Wed: support-agent demo has no `knowledge`
+        // declaration; forward-compat None — same byte-stable JSON
+        // round-trip via `serde(default, skip_serializing_if =
+        // Option::is_none)`.
+        knowledge:     None,
     };
 
     let eval_accuracy = Eval {

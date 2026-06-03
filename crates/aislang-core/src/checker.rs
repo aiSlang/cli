@@ -151,13 +151,14 @@ impl BlockKind {
     #[allow(dead_code)]
     pub(crate) fn from_ref_kind(k: RefKind) -> Self {
         match k {
-            RefKind::Model     => Self::Model,
-            RefKind::Prompt    => Self::Prompt,
-            RefKind::McpServer => Self::McpServer,
-            RefKind::Agent     => Self::Agent,
-            RefKind::Secret    => Self::Secret,
-            RefKind::Pipeline  => Self::Pipeline,
-            RefKind::Embedding => Self::Embedding,
+            RefKind::Model       => Self::Model,
+            RefKind::Prompt      => Self::Prompt,
+            RefKind::McpServer   => Self::McpServer,
+            RefKind::Agent       => Self::Agent,
+            RefKind::Secret      => Self::Secret,
+            RefKind::Pipeline    => Self::Pipeline,
+            RefKind::Embedding   => Self::Embedding,
+            RefKind::VectorStore => Self::VectorStore,
         }
     }
 }
@@ -297,6 +298,15 @@ fn check_refs(
         for (i, tool) in agent.tools.iter().enumerate() {
             dispatch_ref(graph, multi, tool,
                 "agent", &agent.label, &format!("tools[{i}]"))?;
+        }
+        // v0.3 Week 19 Wed: agent.knowledge = [vector_store.<l>] —
+        // RAG context refs.  Same dispatch_ref machinery as tools;
+        // each entry must resolve to a vector_store block.
+        if let Some(knowledge) = &agent.knowledge {
+            for (i, vs_ref) in knowledge.iter().enumerate() {
+                dispatch_ref(graph, multi, vs_ref,
+                    "agent", &agent.label, &format!("knowledge[{i}]"))?;
+            }
         }
     }
     // v0.2 Fri: `main` block ref validation.  Same shape as agent —
@@ -1863,5 +1873,45 @@ mod tests {
         "#)).unwrap_err();
         assert!(err.contains("duplicate `embedding` block label `dup`"),
             "duplicate-label detection must fire for embeddings; got: {err}");
+    }
+
+    // ---- agent.knowledge (v0.3 Week 19 Wed) -------------------- //
+
+    #[test] fn agent_knowledge_with_declared_vector_store_passes() {
+        // Tue's contract: vector_store.embedding → declared
+        // embedding resolves.  Wed's contract: agent.knowledge →
+        // declared vector_store resolves.  Both chains exercised
+        // here end-to-end through `check_src`.
+        check_src(&composition_body(r#"
+          embedding "e" { provider = openai  model = "text-embedding-3-small" }
+          vector_store "docs" {
+            embedding  = embedding.e
+            source     = "./k/"
+            chunk_size = 1k
+          }
+          agent "rag_a" {
+            model         = model.m
+            system_prompt = prompt.sys
+            tools         = []
+            knowledge     = [vector_store.docs]
+          }
+        "#)).expect("agent with declared knowledge ref must check cleanly");
+    }
+
+    #[test] fn agent_knowledge_referencing_undeclared_vector_store_fails() {
+        let err = check_src(&composition_body(r#"
+          agent "broken" {
+            model         = model.m
+            system_prompt = prompt.sys
+            tools         = []
+            knowledge     = [vector_store.ghost]
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("agent `broken`"),
+            "error must name the source agent; got: {err}");
+        assert!(err.contains("knowledge[0]"),
+            "error must name the failing knowledge slot; got: {err}");
+        assert!(err.contains("undeclared vector_store `ghost`"),
+            "error must name the missing label + kind; got: {err}");
     }
 }

@@ -61,6 +61,9 @@ pub mod templates;
 // delegate, typed output, sandboxed.  See `skills::run_shell_skill`
 // / `run_mcp_skill`.
 pub mod skills;
+// v0.3 Week 19 Wed: RAG runtime — chunk, embed, store, query.
+// See `rag::{build_index, Index::query, Index::save/load}`.
+pub mod rag;
 
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,

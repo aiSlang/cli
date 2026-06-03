@@ -53,6 +53,11 @@ pub enum RefKind {
     /// "undeclared embedding" — expected, since no embedding blocks
     /// can parse this week).
     Embedding,
+    /// v0.3 Week 19 Wed (Decision 44.6).  `agent.knowledge =
+    /// [vector_store.<l>]` references a `vector_store` block —
+    /// chat-time RAG context.  Resolves through `dispatch_ref` to
+    /// `BlockKind::VectorStore` nodes that Mon's parser registers.
+    VectorStore,
 }
 
 /// `anthropic.claude_haiku_4_5` etc. — resolved against the catalog.
@@ -517,6 +522,15 @@ pub struct Agent {
     pub model:         Ref,
     pub system_prompt: Ref,
     pub tools:         Vec<Ref>,
+    /// v0.3 Week 19 Wed (Decision 44.6) — vector_store refs that
+    /// back this agent's RAG context.  At chat time the runtime
+    /// queries each declared store with the user input + prepends
+    /// the top-K retrieved chunks to the agent's system prompt
+    /// before dispatching the LLM call.  Empty / absent → no RAG
+    /// (v0.2 byte-stable: every existing `agent` block parses to
+    /// `knowledge: None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge:     Option<Vec<Ref>>,
 }
 
 /// v0.2 Week-12 Fri.  Declares the user-facing LLM as the explicit

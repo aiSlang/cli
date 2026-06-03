@@ -476,6 +476,31 @@ The companion block to §4.13's `vector_store`.  Declares an embedding model the
 
 See `crates/aislang-core/src/ast.rs::Embedding` + `parser.rs::to_embedding` + `crates/aislang-catalog/src/lib.rs::{CatalogEmbedding, find_embedding}` + `crates/aislang-compose/src/litellm.rs` for the build-config delta.
 
+### 4.15 `agent.knowledge` + RAG runtime (v0.3, Week 19 Wed)
+
+```
+agent "<identifier>" {
+  …
+  knowledge : List<Ref<VectorStore>>?      # optional; defaults to None
+}
+```
+
+**Grammar** — agents gain an optional `knowledge` list of vector_store refs (Decision 44.6). Same shape as the existing `tools` list; absent / empty → no RAG (v0.2 byte-stable: every existing agent block parses to `knowledge: None`).
+
+**Runtime** (`aislang-runtime::rag`):
+
+- `Embedder` trait — pluggable embedding source. Production = `LiteLlmEmbedder` (POSTs to `/v1/embeddings`); tests inject `HashEmbedder` for deterministic round-trips.
+- `chunk_text(text, size, overlap)` — UTF-8-boundary-safe character-window chunker. **v0.3 simplification: chunk_size + chunk_overlap are CHARACTER counts, not tokens** — tokenizer integration is v0.5+ work once a per-embedding tokenizer dependency is justified.
+- `build_index(label, source, chunk_size, overlap, embedder) → Index` — chunks the source body, embeds each chunk, stores `(chunk_text, vector)` pairs.
+- `Index::query(query_vec, top_k) → Vec<(text, score)>` — cosine similarity ranking; results descending by score.
+- `Index::save(path)` / `Index::load(path)` — bincode-style persistence to `<source_dir>/.aislang/vector/<store-label>.bin`. `aislang destroy -v` wipes that subtree (existing behaviour; no emitter change needed).
+
+**v0.3 backend deviation from Decision 44.4 (documented)**: Decision 44.4 locked usearch as the embedded vector DB. v0.3 Wed deliberately uses a brute-force cosine scan over `Vec<Chunk>` because (a) usearch adds a C++ build dep, (b) typical .ais project corpus sizes (hundreds of chunks) don't justify HNSW indexing — linear scan is ~µs per query at n ≤ 1k. The `Index` public API is shaped to be swap-compatible with usearch's surface; v0.5+ can drop in usearch without breaking callers.
+
+**Chat-time wiring** (the prepend-Top-K-chunks-to-system-prompt hook) lands in Phase 2 alongside the agent inventory (Week 19 Thu+) — the runtime exists today, the apply-time index-build + per-turn retrieval glue is Phase-2 scope.
+
+See `crates/aislang-runtime/src/rag.rs` for the full implementation + test coverage (12 unit tests covering chunking edges, deterministic embedder, build/query round-trip, save/load persistence, dimension-mismatch handling).
+
 ---
 
 ## 5. Model catalog
