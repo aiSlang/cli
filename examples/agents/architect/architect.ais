@@ -1,0 +1,111 @@
+## v0.3 Week 19 Thu — Architect agent.
+##
+## Reads a natural-language feature spec + emits a structured
+## aiSlang resource-block design (5-section markdown — see
+## prompts/architect.md for the contract).  Downstream agents
+## (Coder, Reviewer — Fri) consume the markdown directly.
+##
+## ## Direct chat (iterate on the design)
+##
+## ```
+## aislang chat architect examples/agents/architect/architect.ais
+## > Design a `dataset` block for declaring training data
+##   (path + format fields, fits the existing v0.3 grammar).
+## ```
+##
+## Refine through dialogue; once happy, copy the design out for
+## downstream use.  Week 19 Fri adds `pipeline.from_locked_design`
+## so you can hand the design directly to Coder + Reviewer
+## without re-running Architect.
+##
+## ## End-to-end pipeline (one-shot)
+##
+## Week 19 Thu ships the Architect alone — the `full_design`
+## pipeline is a single-step placeholder.  Week 19 Fri extends
+## it to architect → coder → reviewer.
+##
+## ## RAG context
+##
+## The agent declares `knowledge = [vector_store.architect_kb]`.
+## `aislang apply` builds the index from `./knowledge/` (LANGUAGE-
+## SPEC excerpts + Decisions 44.x + AST shapes + exemplar .ais);
+## chat-time each user message embeds via bge-m3 + top-4 chunks
+## prepend to the system prompt.  Verifiable in Jaeger: the
+## `aislang.system_prompt` span attribute shows the retrieved
+## context inline.
+##
+## ## Model choice (deviates from Decision 44.8)
+##
+## PLAN row 19-Thu locked Qwen2.5-Coder.  Amended at Thu planning
+## review: Architect designs (not code-generates), so reasoning-
+## capable Qwen3 8B is better suited.  Qwen2.5-Coder reserved for
+## Fri's Coder agent which actually emits Rust.  anthropic.haiku
+## fallback when Ollama is unavailable.
+
+project "architect-agent" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.10
+  }
+
+  ## Reasoning-tier local LLM for design work.  bge-m3 ships
+  ## reasoning capability per the catalog; haiku fallback for
+  ## CI / cloud runs without Ollama.
+  model "architect_brain" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.qwen3_8b]
+    fallback    = [anthropic.claude_haiku_4_5]
+  }
+
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "architect_kb" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 768
+    chunk_overlap = 96
+  }
+
+  prompt "architect_sys" {
+    file    = "./prompts/architect.md"
+    version = "1.0.0"
+  }
+
+  agent "architect" {
+    model         = model.architect_brain
+    system_prompt = prompt.architect_sys
+    tools         = []
+    knowledge     = [vector_store.architect_kb]
+  }
+
+  ## Placeholder pipeline — Thu ships Architect alone; Fri's
+  ## Coder + Reviewer agents extend `steps = [agent.architect,
+  ## agent.coder, agent.reviewer]`.  Keeping the pipeline label
+  ## stable across the Thu→Fri commits means users' command
+  ## history (`aislang chat full_design ...`) doesn't break.
+  pipeline "full_design" {
+    steps  = [agent.architect]
+    input  = "natural-language feature spec for a new resource block"
+    output = "5-section markdown design (Block name / Purpose / Fields / Grammar example / LANGUAGE-SPEC snippet / Decision implications)"
+  }
+
+  ## Heuristic eval — 3 synthetic specs check that the Architect
+  ## emits the 5-section structure + a fenced grammar block.
+  ## Real quality-of-implementation eval (SonarQube-driven, per
+  ## Thu planning review Q7) lands Fri+ once Coder produces real
+  ## code worth scanning.
+  eval "structured_output" {
+    dataset   = "./evals/architect_specs.jsonl"
+    metric    = f1
+    threshold = 80%
+    agent     = agent.architect
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}

@@ -1017,6 +1017,13 @@ impl AislangServer {
         // routes through `build_session_for_agent_multi_module`,
         // which reads each module via `load_project_input` —
         // the empty `source` string is unused on that path.
+        // v0.3 Week 19 Thu: capture the original source_path for the
+        // RAG prepend helper before resolve_source consumes p.source_path.
+        // Empty-string fallback so load_project_input gets a clear
+        // hint when the caller only supplied source_dir.
+        let original_source_path_for_rag: PathBuf =
+            p.source_path.as_deref().map(PathBuf::from).unwrap_or_default();
+
         let dir_input: Option<PathBuf> = p.source_path.as_deref()
             .map(std::path::Path::new)
             .filter(|p| p.is_dir())
@@ -1100,6 +1107,48 @@ impl AislangServer {
         let user_input = p.user_input.clone();
         let progress_token = meta.get_progress_token();
 
+        // v0.3 Week 19 Thu: RAG prepend.  When the agent declares
+        // `knowledge = [vector_store.<l>, …]`, retrieve top-K chunks
+        // from each declared store + prepend them to the system
+        // prompt for THIS TURN ONLY (via Session::turn_with_progress_
+        // and_extra_system_prefix; the cached Session itself isn't
+        // mutated so non-RAG callers stay byte-stable).
+        //
+        // Cost: per-turn index reload from disk + per-turn embedding
+        // HTTP round-trip.  Acceptable for v0.3 prototypes (~few ms
+        // for index parse, ~50-200ms for the embedding call).
+        // v0.5+ should cache indexes on AislangServer keyed by
+        // (source_dir, vs_label) so each turn pays only the embedder.
+        //
+        // Input shape: pass `source_dir` (already resolved to either
+        // the multi-module project root OR the single-file .ais
+        // file's parent above); `build_rag_prefix_for_turn` invokes
+        // `load_project_input` which handles both shapes.  For
+        // single-file projects the parent dir works because we walk
+        // upward to find `*.ais` siblings.
+        //
+        // Why `spawn_blocking`: the helper calls
+        // `LiteLlmEmbedder::embed` which spins up its own
+        // current-thread tokio runtime for the reqwest HTTP call.
+        // Calling that from within chat_turn's outer tokio runtime
+        // would panic ("Cannot start a runtime from within a
+        // runtime") — spawn_blocking moves to a non-runtime
+        // thread where the nested block_on works.  Same posture
+        // session.turn uses for the same reason.
+        let rag_src_path = original_source_path_for_rag.clone();
+        let rag_src_dir  = source_dir.clone();
+        let rag_agent    = p.agent_label.clone();
+        let rag_input    = user_input.clone();
+        let rag_prefix = tokio::task::spawn_blocking(move || {
+            build_rag_prefix_for_turn(
+                &rag_src_path, &rag_src_dir, &rag_agent, &rag_input,
+            ).unwrap_or_default()
+        }).await.unwrap_or_default();
+        if !rag_prefix.is_empty() {
+            eprintln!("  chat_turn: RAG prepend ({}B retrieved context)",
+                rag_prefix.len());
+        }
+
         // Channel cap: unbounded.  Per-turn progress event count is
         // bounded by `MAX_TOOL_ITERS * (1 + 2 * tool_calls_per_iter)
         // + 1` ≈ tens of events; the mpsc allocator dominates so
@@ -1144,7 +1193,8 @@ impl AislangServer {
                 .enable_all()
                 .build()
                 .map_err(|e| format!("build inner runtime: {e}"))?;
-            rt.block_on(session.turn_with_progress(
+            rt.block_on(session.turn_with_progress_and_extra_system_prefix(
+                &rag_prefix,
                 &user_input,
                 move |ev| {
                     // Best-effort send: if the forwarder task panicked
@@ -1551,6 +1601,138 @@ fn resolve_mcp_secrets_for_agent(
 ///
 /// Used by both `chat_turn` (cached via the SessionKey-keyed map)
 /// and `eval` (fresh per eval run, never cached).
+/// v0.3 Week 19 Thu — RAG prepend for chat_turn.
+///
+/// Given the agent + user_input, retrieve the top-K most-relevant
+/// chunks from EVERY `vector_store` the agent's `knowledge` list
+/// declares + return a markdown-formatted prefix string ready to
+/// concatenate in front of the agent's system prompt.
+///
+/// Returns `Ok(String::new())` when the agent has no knowledge
+/// declared (the cheap no-op path) — callers can treat empty
+/// prefix as "no RAG happened" without checking Option.
+///
+/// Failure modes (all fail-soft per caller — empty prefix on Err):
+///   - source_path / source_dir read errors
+///   - agent label not found
+///   - embedding catalog miss (provider/model mismatch)
+///   - index file missing (`aislang apply` not run for the
+///     vector_store), corrupt, or dim-mismatched
+///   - LiteLLM /v1/embeddings down or non-200
+fn build_rag_prefix_for_turn(
+    source_path: &std::path::Path,
+    source_dir:  &std::path::Path,
+    agent_label: &str,
+    user_input:  &str,
+) -> std::io::Result<String> {
+    use crate::project_loader::load_project_input;
+    use crate::rag::{Index, LiteLlmEmbedder, Embedder};
+
+    // 1. Load project + locate the agent.  Prefer the explicit
+    //    source_path when supplied + valid (single-file path);
+    //    fall back to source_dir (multi-module project root).
+    //    The empty default in the caller is a sentinel meaning
+    //    "no source_path supplied — use source_dir".
+    let project_input = if source_path.as_os_str().is_empty()
+        || !source_path.exists() {
+        source_dir.to_path_buf()
+    } else {
+        source_path.to_path_buf()
+    };
+    let loaded = load_project_input(&project_input)
+        .map_err(|e| std::io::Error::new(
+            std::io::ErrorKind::Other, format!("{e:?}")))?;
+    let project = &loaded.resolved.project;
+    let agent = project.agents.iter()
+        .find(|a| a.label == agent_label)
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("agent `{agent_label}` not in resolved project")))?;
+    let knowledge = match &agent.knowledge {
+        Some(k) if !k.is_empty() => k,
+        _ => return Ok(String::new()),   // no RAG declared
+    };
+
+    // 2. For each knowledge ref → resolve the vector_store + its
+    //    embedding + the catalog entry's dims + load the on-disk
+    //    index + embed the user_input + take top-K matches.
+    //    Default top-K = 4 per store (modest; v0.5+ may make
+    //    configurable via `agent.knowledge_top_k`).
+    let catalog = aislang_catalog::bundled()
+        .map_err(|e| std::io::Error::new(
+            std::io::ErrorKind::Other, format!("catalog: {e:?}")))?;
+    let project_root = source_dir.canonicalize()
+        .unwrap_or_else(|_| source_dir.to_path_buf());
+    const TOP_K_PER_STORE: usize = 4;
+    // LiteLLM URL: chat_turn lives inside mcp-serve, which the CLI
+    // spawned as a child; LiteLLM runs in the user's Compose stack
+    // at the conventional 4000.  v0.5+ will read this from a
+    // project-level env / config knob.
+    const LITELLM_URL: &str = "http://localhost:4000";
+
+    let mut chunks_collected: Vec<(String, String, f32)> = Vec::new();
+    //                              ^vs_label ^text     ^score
+
+    for vs_ref in knowledge {
+        let vs = project.vector_stores.iter()
+            .find(|v| v.label == vs_ref.label)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("vector_store `{}` not declared", vs_ref.label)))?;
+        let emb_block = project.embeddings.iter()
+            .find(|e| e.label == vs.embedding.label)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("embedding `{}` not declared", vs.embedding.label)))?;
+        let cat_entry = catalog.find_embedding(&emb_block.provider, &emb_block.model)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("embedding ({}, {}) not in catalog",
+                    emb_block.provider, emb_block.model)))?;
+        let idx_path = project_root.join(".aislang").join("vector")
+            .join(format!("{}.bin", vs.label));
+        let index = Index::load(&idx_path)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("index `{}` not loaded (run `aislang apply` to build): {e:?}",
+                    idx_path.display())))?;
+        let embedder = LiteLlmEmbedder::new(
+            LITELLM_URL, &emb_block.label, cat_entry.dimensions as usize);
+        let query_vec = embedder.embed(user_input)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("embed user_input: {e:?}")))?;
+        let hits = index.query(&query_vec, TOP_K_PER_STORE)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other, format!("query: {e:?}")))?;
+        for (text, score) in hits {
+            chunks_collected.push((vs.label.clone(), text, score));
+        }
+    }
+
+    if chunks_collected.is_empty() { return Ok(String::new()); }
+
+    // 3. Sort all chunks globally by score descending so the
+    //    LLM sees the most-relevant context first.
+    chunks_collected.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(
+        std::cmp::Ordering::Equal));
+
+    // 4. Format the prefix — markdown with one section per chunk.
+    //    Score is included in a small caption so downstream debug
+    //    runs can see how "confident" the retrieval was.
+    let mut out = String::from("## Retrieved context\n\n");
+    out.push_str("The following chunks were retrieved from this \
+                  agent's knowledge base via cosine similarity \
+                  against the user's last message.  Use them to \
+                  ground your reply.\n\n");
+    for (i, (vs_label, text, score)) in chunks_collected.iter().enumerate() {
+        out.push_str(&format!(
+            "### Chunk {} (vector_store=`{vs_label}`, score={:.3})\n\n{}\n\n",
+            i + 1, score, text));
+    }
+    Ok(out)
+}
+
 async fn build_session_for_agent(
     source:      &str,
     source_dir:  &Path,

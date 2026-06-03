@@ -1,0 +1,20 @@
+model_list:
+- model_name: architect_brain
+  litellm_params:
+    model: ollama/qwen3:8b
+    api_base: os.environ/OLLAMA_API_BASE
+- model_name: architect_brain-fb-anthropic-claude-haiku-4-5
+  litellm_params:
+    model: anthropic/claude-haiku-4-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+- model_name: local_bge
+  litellm_params:
+    model: ollama/bge-m3:latest
+    api_base: os.environ/OLLAMA_API_BASE
+router_settings:
+  fallbacks:
+  - architect_brain:
+    - architect_brain-fb-anthropic-claude-haiku-4-5
+litellm_settings:
+  callbacks:
+  - otel
