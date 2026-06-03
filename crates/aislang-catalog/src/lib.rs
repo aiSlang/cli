@@ -271,4 +271,55 @@ mod tests {
         assert!(err.to_string().contains("Duration"),
             "error must mention Duration, got: {err}");
     }
+
+    // ---- Qwen catalog entries (v0.3 Week 18 Fri) ---------------- //
+
+    #[test] fn ollama_qwen3_8b_entry_carries_expected_shape() {
+        // PLAN DoD: "catalog ships both Qwen3 + Qwen2.5-Coder
+        // entries with correct litellm_name mapping".  This pins
+        // the Qwen3 entry's litellm_name (the exact slug LiteLLM
+        // forwards to Ollama's `/api/chat`).  Ollama publishes
+        // qwen3 in 0.6b / 1.7b / 4b / 8b / 14b / 32b sizes; PLAN
+        // wrote "7b" but no Qwen3-7b tag exists — we ship 8b as
+        // the closest cousin (still on consumer-GPU VRAM
+        // budget at q4_K_M).
+        let cat = bundled().expect("bundled");
+        let qwen = cat.models.iter()
+            .find(|m| m.id == "ollama.qwen3_8b")
+            .expect("ollama.qwen3_8b must exist in bundled catalog");
+        assert_eq!(qwen.provider, "ollama");
+        assert_eq!(qwen.litellm_name, "ollama/qwen3:8b",
+            "litellm_name must match the upstream Ollama tag exactly");
+        assert!(qwen.capabilities.contains(&Capability::Chat));
+        assert!(qwen.capabilities.contains(&Capability::ToolUse));
+        assert!(qwen.capabilities.contains(&Capability::Reasoning),
+            "qwen3 ships with reasoning-mode toggle — capability must reflect");
+        // Local model → free.
+        assert_eq!(qwen.cost_input,
+            Money::Capped { currency: Currency::Usd, micro_units: 0 });
+        assert_eq!(qwen.cost_output,
+            Money::Capped { currency: Currency::Usd, micro_units: 0 });
+    }
+
+    #[test] fn ollama_qwen2_5_coder_7b_entry_carries_expected_shape() {
+        // PLAN DoD: same as above for Qwen2.5-Coder.  The coder
+        // variant exists in 1.5b / 3b / 7b / 14b / 32b; we ship
+        // 7b as the consumer-GPU-friendly choice that matches the
+        // open-source coding leader (better than CodeLlama /
+        // DeepSeek-Coder per HumanEval, per Decision 44.8).
+        let cat = bundled().expect("bundled");
+        let coder = cat.models.iter()
+            .find(|m| m.id == "ollama.qwen2_5_coder_7b")
+            .expect("ollama.qwen2_5_coder_7b must exist in bundled catalog");
+        assert_eq!(coder.provider, "ollama");
+        assert_eq!(coder.litellm_name, "ollama/qwen2.5-coder:7b",
+            "litellm_name must match the upstream Ollama tag exactly \
+             (note the `2.5` decimal + `-coder` infix)");
+        assert!(coder.capabilities.contains(&Capability::Chat));
+        assert!(coder.capabilities.contains(&Capability::ToolUse));
+        assert_eq!(coder.cost_input,
+            Money::Capped { currency: Currency::Usd, micro_units: 0 });
+        assert_eq!(coder.cost_output,
+            Money::Capped { currency: Currency::Usd, micro_units: 0 });
+    }
 }

@@ -120,6 +120,30 @@
       "latency_p95": "5s",
       "residency": ["us", "eu", "uk", "apac"],
       "deprecated": false
+    },
+    {
+      "id": "ollama.qwen3_8b",
+      "provider": "ollama",
+      "litellm_name": "ollama/qwen3:8b",
+      "capabilities": ["chat", "tool_use", "structured_output", "reasoning"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0",
+      "cost_output_per_1k_tokens": "$0",
+      "latency_p95": "3s",
+      "residency": ["us", "eu", "uk", "apac"],
+      "deprecated": false
+    },
+    {
+      "id": "ollama.qwen2_5_coder_7b",
+      "provider": "ollama",
+      "litellm_name": "ollama/qwen2.5-coder:7b",
+      "capabilities": ["chat", "tool_use", "structured_output"],
+      "context_max": "128k",
+      "cost_input_per_1k_tokens": "$0",
+      "cost_output_per_1k_tokens": "$0",
+      "latency_p95": "3s",
+      "residency": ["us", "eu", "uk", "apac"],
+      "deprecated": false
     }
   ]
 }
