@@ -31,6 +31,15 @@ pub struct Catalog {
     /// Catalog version (ISO-8601 date, e.g. `"2026-05-25"`).
     pub version: String,
     pub models:  Vec<CatalogModel>,
+    /// v0.3 Week 19 Tue (Decision 44.6) — embedding models the
+    /// `embedding "<label>" { provider = X  model = "Y" }` block
+    /// can resolve against.  Disjoint from `models` (chat models)
+    /// because the field set differs (no input/output cost split,
+    /// no `latency_p95`, no `capabilities` — embeddings only do
+    /// one thing).  `serde(default)` keeps old catalog files
+    /// loadable when this field is absent.
+    #[serde(default)]
+    pub embeddings: Vec<CatalogEmbedding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +83,53 @@ pub struct CatalogModel {
     pub deprecated: bool,
 }
 
+/// v0.3 Week 19 Tue (Decision 44.6) — catalog entry for an embedding
+/// model.  Schema is deliberately narrower than [`CatalogModel`]:
+///   - One cost number (`cost_per_1m_tokens`), not input/output split
+///     — embeddings are unidirectional.
+///   - `dimensions` is the output vector size; used by the RAG runtime
+///     (Wed) to pre-size the usearch index.
+///   - No `capabilities` / `latency_p95` — embeddings have one
+///     capability (embed) + roundtrip is fast (10s of ms).
+///   - `provider` + `litellm_name` mirror the model-entry shape so
+///     the litellm-config emitter logic can be reused.
+///
+/// Per LANGUAGE-SPEC §5.5 the value strings (Money, Size) route
+/// through the same literal parsers the .ais source uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEmbedding {
+    /// Canonical aiSlang ID, e.g. `"openai.text_embedding_3_small"`.
+    /// The `embedding "<l>" { provider = openai  model = "..." }`
+    /// block resolves to this entry via the `(provider, name)`
+    /// pair where `name` is `id` minus the `<provider>.` prefix.
+    pub id: String,
+
+    /// Provider identifier, e.g. `"openai"`.
+    pub provider: String,
+
+    /// The string passed to LiteLLM's `/embeddings` endpoint at
+    /// runtime, e.g. `"openai/text-embedding-3-small"`.
+    pub litellm_name: String,
+
+    /// Output vector size — the RAG runtime (Wed) pre-sizes the
+    /// usearch index from this.
+    pub dimensions: u32,
+
+    /// Cost per 1M input tokens.  Most embedding APIs are billed
+    /// per-token at a flat rate; `cost_per_1m_tokens` is the
+    /// commercial-spec form (multiply by 1e-6 for per-token).
+    #[serde(rename = "cost_per_1m_tokens")]
+    #[serde(deserialize_with = "shims::deserialize_money", serialize_with = "shims::serialize_money")]
+    pub cost_per_1m: Money,
+
+    /// Max tokens per single `/embeddings` request.
+    #[serde(deserialize_with = "shims::deserialize_size", serialize_with = "shims::serialize_size")]
+    pub context_max: Size,
+
+    #[serde(default)]
+    pub deprecated: bool,
+}
+
 /// Load and parse the catalog bundled with this binary.
 pub fn bundled() -> Result<Catalog, CatalogError> {
     let cat: Catalog = serde_json::from_str(BUNDLED_CATALOG_JSON)?;
@@ -91,6 +147,29 @@ impl Catalog {
     pub fn find(&self, id: &ModelId) -> Option<&CatalogModel> {
         let dotted = format!("{}.{}", id.provider, id.name);
         self.models.iter().find(|m| m.id == dotted)
+    }
+
+    /// v0.3 Week 19 Tue: same `find`-shape lookup for the embeddings
+    /// section.  `provider` matches the catalog entry's `provider`
+    /// field; `model` is matched against the catalog entry's
+    /// `id` AFTER stripping the leading `<provider>.` prefix —
+    /// embedding-block authors write the upstream model name
+    /// (`"text-embedding-3-small"`) verbatim, not the snake-cased
+    /// catalog ID slug.
+    pub fn find_embedding(&self, provider: &str, model: &str)
+        -> Option<&CatalogEmbedding>
+    {
+        self.embeddings.iter().find(|e| {
+            e.provider == provider
+                && (
+                    // Match against the litellm_name's model-part
+                    // (everything after the first `/`) — that's the
+                    // exact upstream name authors write.
+                    e.litellm_name.split_once('/')
+                        .map(|(_, name)| name == model)
+                        .unwrap_or(false)
+                )
+        })
     }
 }
 
@@ -321,5 +400,47 @@ mod tests {
             Money::Capped { currency: Currency::Usd, micro_units: 0 });
         assert_eq!(coder.cost_output,
             Money::Capped { currency: Currency::Usd, micro_units: 0 });
+    }
+
+    // ---- Embedding entries (v0.3 Week 19 Tue) ------------------- //
+
+    #[test] fn bundled_catalog_ships_three_embeddings() {
+        // PLAN DoD: "3 catalog entries land" — pin both the count
+        // and each individual entry's provider + litellm_name +
+        // dimensions.
+        let cat = bundled().expect("bundled");
+        assert_eq!(cat.embeddings.len(), 3,
+            "bundled catalog must ship 3 embeddings; got: {}",
+            cat.embeddings.len());
+
+        let openai = cat.find_embedding("openai", "text-embedding-3-small")
+            .expect("openai text-embedding-3-small must be present");
+        assert_eq!(openai.id, "openai.text_embedding_3_small");
+        assert_eq!(openai.litellm_name, "openai/text-embedding-3-small");
+        assert_eq!(openai.dimensions, 1536);
+
+        let cohere = cat.find_embedding("cohere", "embed-english-v3.0")
+            .expect("cohere embed-english-v3.0 must be present");
+        assert_eq!(cohere.id, "cohere.embed_english_v3_0");
+        assert_eq!(cohere.litellm_name, "cohere/embed-english-v3.0");
+        assert_eq!(cohere.dimensions, 1024);
+
+        let bge = cat.find_embedding("ollama", "bge-small-en-v1.5")
+            .expect("ollama bge-small-en-v1.5 must be present");
+        assert_eq!(bge.id, "ollama.bge_small_en_v1_5");
+        assert_eq!(bge.litellm_name, "ollama/bge-small-en-v1.5");
+        assert_eq!(bge.dimensions, 384);
+        // Local model → zero cost (same posture as the Ollama
+        // chat-model entries).
+        assert_eq!(bge.cost_per_1m,
+            Money::Capped { currency: Currency::Usd, micro_units: 0 });
+    }
+
+    #[test] fn find_embedding_returns_none_for_unknown_pair() {
+        let cat = bundled().expect("bundled");
+        assert!(cat.find_embedding("openai", "nonexistent").is_none(),
+            "unknown model under known provider must miss");
+        assert!(cat.find_embedding("ghost", "text-embedding-3-small").is_none(),
+            "known model under wrong provider must miss");
     }
 }

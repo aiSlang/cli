@@ -678,6 +678,10 @@ mod tests {
                     deprecated: true,
                 },
             ],
+            // v0.3 Week 19 Tue: synthetic catalogs in resolver
+            // tests don't exercise the embeddings surface; empty
+            // vec preserves byte-stable test behaviour.
+            embeddings: vec![],
         }
     }
 
@@ -893,6 +897,7 @@ mod tests {
                     deprecated: false,
                 },
             ],
+            embeddings: vec![],
         }
     }
 

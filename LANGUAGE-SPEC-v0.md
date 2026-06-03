@@ -449,6 +449,33 @@ A `vector_store` block declares a RAG-indexable corpus (Decision 44.6). The bloc
 
 See `crates/aislang-core/src/ast.rs::{VectorStore, SourceUri}` + `parser.rs::to_vector_store` + `checker.rs` for the source-aware diagnostics + duplicate-label detection + chunk-overlap invariant.
 
+### 4.14 `embedding` (v0.3, Week 19 Tue)
+
+```
+embedding "<identifier>" {
+  provider : "openai" | "cohere" | "ollama"   # bare ident or quoted string
+  model    : String                            # upstream model name verbatim
+}
+```
+
+The companion block to §4.13's `vector_store`.  Declares an embedding model the RAG runtime uses to vectorise chunks at index-build time + queries at chat time (Decision 44.6).
+
+**Provider set** (v0.3) — `openai` (e.g. `"text-embedding-3-small"`), `cohere` (e.g. `"embed-english-v3.0"`), `ollama` (e.g. `"bge-small-en-v1.5"`).  The checker rejects unknown providers at parse time; the resolver rejects unknown `(provider, model)` pairs against the bundled catalog's `embeddings` section.
+
+**Catalog** ships three entries (`aislang-catalog::CatalogEmbedding`):
+
+| id | provider | litellm_name | dimensions | cost (per 1M tok) |
+|---|---|---|---|---|
+| `openai.text_embedding_3_small` | openai | `openai/text-embedding-3-small` | 1536 | $0.02 |
+| `cohere.embed_english_v3_0` | cohere | `cohere/embed-english-v3.0` | 1024 | $0.10 |
+| `ollama.bge_small_en_v1_5` | ollama | `ollama/bge-small-en-v1.5` | 384 | $0 |
+
+**LiteLLM wire** — every declared `embedding` block emits a `model_list` entry into the generated `litellm_config.yaml`.  LiteLLM's proxy multiplexes `/chat/completions` AND `/embeddings` requests off the same `model_list` (the catalog entry determines which upstream endpoint gets called), so the RAG runtime (Wed) just sends `model = "<embedding-label>"` to LiteLLM and gets the right behaviour.  Provider creds reuse the `provider_creds` table that chat models use (`OPENAI_API_KEY` / `COHERE_API_KEY` / `OLLAMA_API_BASE`).
+
+**Tue ships AST + parser + checker + 3 catalog entries + LiteLLM emitter wiring.** Wed wires the RAG index-build + query runtime (`aislang-runtime::rag`) — until then `embedding` blocks parse + emit the LiteLLM config but no on-disk index gets built.
+
+See `crates/aislang-core/src/ast.rs::Embedding` + `parser.rs::to_embedding` + `crates/aislang-catalog/src/lib.rs::{CatalogEmbedding, find_embedding}` + `crates/aislang-compose/src/litellm.rs` for the build-config delta.
+
 ---
 
 ## 5. Model catalog

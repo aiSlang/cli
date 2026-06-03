@@ -138,6 +138,15 @@ pub struct Project {
     /// stability discipline as `skills`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector_stores: Vec<VectorStore>,
+
+    /// v0.3 Week 19 Tue — `embedding "<label>" { … }` first-class
+    /// blocks (Decision 44.6).  Declares an embedding model the
+    /// RAG runtime uses to vectorise chunks at index-build time +
+    /// queries at chat time.  Referenced by `vector_store.embedding`
+    /// (Mon's block).  Same byte-stability discipline as
+    /// `vector_stores` / `skills`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embeddings: Vec<Embedding>,
 }
 
 /// v0.3 Week 17 Mon — composition primitive #1.
@@ -395,6 +404,46 @@ pub enum SourceUri {
     Path  { path: PathBuf },
     Url   { url:  String  },
     Crawl { url:  String  },
+}
+
+/// v0.3 Week 19 Tue — first-class `embedding` block (Decision 44.6).
+///
+/// Grammar (matches the Decision 44.6 sketch):
+///
+/// ```hcl
+/// embedding "<label>" {
+///   provider = openai                     # identifier (openai | cohere | ollama)
+///   model    = "text-embedding-3-small"   # exact upstream model name
+/// }
+/// ```
+///
+/// **Resolution** (Tue's contract): the catalog's `embeddings`
+/// section is keyed by `<provider>.<sanitised-name>` (same shape
+/// as model catalog entries — see
+/// `crates/aislang-catalog/catalog.json::embeddings`).  The
+/// checker resolves `(provider, model)` to a catalog entry +
+/// reports "unknown embedding model" if absent.
+///
+/// **LiteLLM wire** (Tue's emitter delta): every declared embedding
+/// block gets a `/embeddings` route in the generated
+/// `litellm_config.yaml` so chat-time queries reach the right
+/// upstream provider via LiteLLM's OpenAI-compatible
+/// `/v1/embeddings` surface.
+///
+/// **Runtime** (Wed): the RAG indexer uses these to vectorise
+/// chunks at `aislang apply` time.  Chat-time queries embed the
+/// user input through the same model to keep query/key spaces
+/// aligned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Embedding {
+    pub label:    String,
+    /// Identifier (`openai` / `cohere` / `ollama` / future).  The
+    /// checker validates against the catalog's known-provider set.
+    pub provider: String,
+    /// Exact upstream model name (`"text-embedding-3-small"` /
+    /// `"embed-english-v3.0"` / `"bge-small-en-v1.5"`).  Catalog
+    /// entries map this verbatim to a `litellm_name` string.
+    pub model:    String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
