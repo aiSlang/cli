@@ -31,6 +31,41 @@ pub struct Ref {
     pub module: Option<String>,
 }
 
+impl Ref {
+    /// Resolve this ref to a merged-project lookup key given the
+    /// label of its containing block.
+    ///
+    /// In a multi-module project, every block label after merge
+    /// carries a `<module>.` prefix (`architect.architect_kb`,
+    /// `orchestrator.full_design`, …) while the refs INSIDE the
+    /// block still carry the parser-produced shape — either
+    /// cross-module (`use coder.coder` → `Ref { module: Some("coder"),
+    /// label: "coder" }`) or same-module (`embedding.local_bge` →
+    /// `Ref { module: None, label: "local_bge" }`).
+    ///
+    /// `qualified_in` produces the merged-project lookup key for both
+    /// shapes: cross-module passes the explicit module through;
+    /// same-module mirrors the containing block's module prefix
+    /// (extracted as the substring before the first `.` of
+    /// `containing_block_label`); single-file projects (no `.` in
+    /// the containing label) return the bare ref label.
+    ///
+    /// v0.3 Week 20 Mon — hoisted from the four duplicated `qualified`
+    /// closures across `mcp_server.rs` (build_session + RAG prepend)
+    /// and `main.rs` (RAG build + query) once the multi-module
+    /// orchestrator surfaced the same lookup-by-bare-label bug at
+    /// every embedding lookup site.
+    pub fn qualified_in(&self, containing_block_label: &str) -> String {
+        let containing_module = containing_block_label
+            .split_once('.').map(|(m, _)| m);
+        match (&self.module, containing_module) {
+            (Some(m), _)    => format!("{m}.{}", self.label),
+            (None, Some(c)) => format!("{c}.{}", self.label),
+            (None, None)    => self.label.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefKind {
@@ -643,4 +678,60 @@ pub struct Expose {
     /// because the field is `Option<String>` skipped when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(label: &str, module: Option<&str>) -> Ref {
+        Ref {
+            kind:   RefKind::Embedding,
+            label:  label.to_string(),
+            module: module.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn qualified_in_passes_through_explicit_cross_module_ref() {
+        // `use coder.coder` inside an orchestrator module → must
+        // resolve to `coder.coder` regardless of the containing
+        // block's module prefix.
+        let ref_ = r("coder", Some("coder"));
+        assert_eq!(ref_.qualified_in("orchestrator.full_design"),
+            "coder.coder");
+    }
+
+    #[test]
+    fn qualified_in_mirrors_containing_module_for_same_module_ref() {
+        // `embedding.local_bge` inside `vector_store.architect_kb`
+        // (which post-merge is `architect.architect_kb`) → must
+        // resolve to `architect.local_bge` so the lookup against the
+        // merged-project embeddings vec finds the qualified entry.
+        // This is the W20 Mon orchestrator bug that broke the
+        // apply-time RAG index build.
+        let ref_ = r("local_bge", None);
+        assert_eq!(ref_.qualified_in("architect.architect_kb"),
+            "architect.local_bge");
+    }
+
+    #[test]
+    fn qualified_in_returns_bare_label_for_single_file_project() {
+        // No `.` in the containing label → single-file project →
+        // no module to mirror.  Refs stay bare.
+        let ref_ = r("local_bge", None);
+        assert_eq!(ref_.qualified_in("architect_kb"), "local_bge");
+    }
+
+    #[test]
+    fn qualified_in_handles_multiple_dots_in_containing_label() {
+        // Defensive: a hypothetical resource label with multiple
+        // dots should still split on the FIRST `.` for the module
+        // prefix (consistent with `qualified_step_labels` +
+        // `build_session_for_agent_multi_module`).  v0.3 doesn't
+        // produce such labels but the helper should be robust.
+        let ref_ = r("local_bge", None);
+        assert_eq!(ref_.qualified_in("architect.architect_kb.shadow"),
+            "architect.local_bge");
+    }
 }

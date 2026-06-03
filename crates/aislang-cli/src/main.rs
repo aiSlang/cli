@@ -2488,20 +2488,21 @@ fn run_cost(file: PathBuf) -> Result<()> {
 //   2  docker unavailable when a stack check was attempted
 
 fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>, main_spend: bool) -> Result<ExitCode> {
-    // Validate so the user sees the same diagnostics as `aislang validate`
-    // when the source is broken. Status is rare; the parse cost is
-    // immaterial.
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-    let (project, _warnings) = match aislang_core::validate(&source) {
-        Ok(v) => v,
-        Err(err) => {
-            render_validate_error(&source, &err);
-            return Err(anyhow::anyhow!("(see error above)"));
-        }
-    };
+    // v0.3 Week 20 Mon follow-up: dir-vs-file dispatch via
+    // load_project_input.  Single-file input → source_dir = file
+    // parent; multi-module dir input → source_dir = the dir itself.
+    // Status got left out of the Week 17 Tue dir-input wave because
+    // it was rarely exercised; the W20 multi-module orchestrator
+    // surfaced the gap when `aislang status <project-dir>/` failed
+    // with `Is a directory (os error 21)`.
+    let loaded = load_project_input(&file)?;
+    let project = &loaded.resolved.project;
 
-    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let source_dir = if file.is_dir() {
+        file.as_path()
+    } else {
+        file.parent().unwrap_or_else(|| Path::new("."))
+    };
     // canonicalize() fails on a missing dir; degrade to the raw path
     // so the diagnostic still mentions a useful location.
     let output_dir = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.to_path_buf());
@@ -3173,12 +3174,15 @@ fn run_rag_query(
 
     // Look up the embedding-block referenced by the vector_store
     // so we can stand up a LiteLlmEmbedder with matching dims.
+    // Multi-module discipline: `vs.embedding` is a parser-produced
+    // ref (cross-module or same-module-bare); resolve to the merged-
+    // project lookup key via Ref::qualified_in against vs.label.
+    let emb_key = vs.embedding.qualified_in(&vs.label);
     let emb_block = proj.embeddings.iter()
-        .find(|e| e.label == vs.embedding.label)
+        .find(|e| e.label == emb_key)
         .ok_or_else(|| anyhow::anyhow!(
-            "vector_store `{vs_label}` references embedding `{}` \
-             which doesn't exist in the project",
-             vs.embedding.label))?;
+            "vector_store `{vs_label}` references embedding `{emb_key}` \
+             which doesn't exist in the project"))?;
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
     let catalog_entry = catalog
@@ -3271,12 +3275,12 @@ fn build_rag_index_for(
         }
     };
 
+    let emb_key = vs.embedding.qualified_in(&vs.label);
     let emb_block = proj.embeddings.iter()
-        .find(|e| e.label == vs.embedding.label)
+        .find(|e| e.label == emb_key)
         .ok_or_else(|| anyhow::anyhow!(
-            "vector_store `{vs_label}` references embedding `{}` \
-             which doesn't exist in the project",
-            vs.embedding.label))?;
+            "vector_store `{vs_label}` references embedding `{emb_key}` \
+             which doesn't exist in the project"))?;
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
     let catalog_entry = catalog

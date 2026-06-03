@@ -1674,16 +1674,22 @@ fn build_rag_prefix_for_turn(
     //                              ^vs_label ^text     ^score
 
     for vs_ref in knowledge {
+        // Multi-module discipline: knowledge refs (agent → vector_store)
+        // and the vector_store's embedding ref are parser-shape; resolve
+        // both via Ref::qualified_in against the containing block's
+        // merged label.
+        let vs_key = vs_ref.qualified_in(&agent.label);
         let vs = project.vector_stores.iter()
-            .find(|v| v.label == vs_ref.label)
+            .find(|v| v.label == vs_key)
             .ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("vector_store `{}` not declared", vs_ref.label)))?;
+                format!("vector_store `{vs_key}` not declared")))?;
+        let emb_key = vs.embedding.qualified_in(&vs.label);
         let emb_block = project.embeddings.iter()
-            .find(|e| e.label == vs.embedding.label)
+            .find(|e| e.label == emb_key)
             .ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("embedding `{}` not declared", vs.embedding.label)))?;
+                format!("embedding `{emb_key}` not declared")))?;
         let cat_entry = catalog.find_embedding(&emb_block.provider, &emb_block.model)
             .ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1900,23 +1906,11 @@ async fn build_session_for_agent_multi_module(
                 else { labels.join(", ") })
         })?;
 
-    // The agent's containing module = prefix before the FIRST `.`.
-    // E.g. `coder.coder` → containing = `coder`.
-    let containing_module = agent.label.split_once('.').map(|(m, _)| m);
-
-    // Inner-ref resolver: qualify a same-module ref against the
-    // agent's containing module; pass-through a cross-module ref's
-    // explicit module.  Returns the merged-project lookup key.
-    let qualified = |r: &aislang_core::ast::Ref| -> String {
-        match (&r.module, containing_module) {
-            (Some(m), _)     => format!("{m}.{}", r.label),
-            (None, Some(c))  => format!("{c}.{}", r.label),
-            (None, None)     => r.label.clone(),
-        }
-    };
-
-    let model_key  = qualified(&agent.model);
-    let prompt_key = qualified(&agent.system_prompt);
+    // Inner-ref resolver: see Ref::qualified_in for the rules
+    // (cross-module passthrough; same-module mirrors the agent's
+    // containing-module prefix; single-file returns the bare label).
+    let model_key  = agent.model.qualified_in(&agent.label);
+    let prompt_key = agent.system_prompt.qualified_in(&agent.label);
 
     // ── 2. load system prompt body (pre-loaded by load_project_input).
     let system_prompt = loaded.prompt_bodies.get(&prompt_key)
@@ -1967,7 +1961,7 @@ async fn build_session_for_agent_multi_module(
                 "agent `{}.tools` ref `{}` is not an mcp_server ref",
                 agent.label, tool_ref.label));
         }
-        let tool_key = qualified(tool_ref);
+        let tool_key = tool_ref.qualified_in(&agent.label);
         let mcp = project.mcp_servers.iter()
             .find(|m| m.label == tool_key)
             .ok_or_else(|| format!(
