@@ -19,7 +19,7 @@
 ##
 ## Week 19 Fri ships the reviewer agent + a runtime test that
 ## exercises the reflector pattern with this agent as critic.
-## Week 20 Wed's multi-module orchestrator wires the loop at
+## Week 20 Mon's multi-module orchestrator wires the loop at
 ## the .ais grammar layer via `loop { body = pipeline.<p>, … }`.
 ##
 ## ## RAG context
