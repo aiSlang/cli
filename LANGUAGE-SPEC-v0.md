@@ -424,6 +424,31 @@ A `skill` block declares a named, typed operation an agent can invoke — either
 
 See `crates/aislang-core/src/parser.rs` + `checker.rs` for the source-aware diagnostics + duplicate-label detection; `crates/aislang-runtime/src/skills.rs` for the runtime executor + sandbox policy.
 
+### 4.13 `vector_store` (v0.3, Week 19 Mon)
+
+```
+vector_store "<identifier>" {
+  embedding     : Ref<Embedding>
+  source        : String                  # path | URL | crawl:URL
+  chunk_size    : Size                    # 256..=8192 tokens
+  chunk_overlap : Size?                   # default 0; must be < chunk_size
+}
+```
+
+A `vector_store` block declares a RAG-indexable corpus (Decision 44.6). The block carries:
+
+- **`embedding`** — ref into an `embedding "<label>" { … }` block (the embedding model + provider; landing Week 19 Tue). Cross-module form `embedding = use other.docs` follows the standard `use <module>.<label>` convention.
+- **`source`** — a string URI disambiguated by prefix at parse time:
+    - `"./docs/"` / `"/abs/path"` → `SourceUri::Path` (filesystem; single file OR directory walk).
+    - `"https://x.com/y"` / `"http://x.com/y"` → `SourceUri::Url` (single-URL fetch + text extraction; no recursion).
+    - `"crawl:https://x.com"` → `SourceUri::Crawl` (recursive crawl from the seed; depth/politeness limits are runtime concerns). Non-http(s) crawl schemes are rejected at parse time.
+- **`chunk_size`** — token count per chunk; parser enforces 256..=8192 to keep retrieval relevance reasonable (too small loses context; too large dilutes match quality).
+- **`chunk_overlap`** — tokens of overlap between adjacent chunks; defaults to 0 when omitted; checker enforces `chunk_overlap < chunk_size` (equal overlap = zero-progress chunker).
+
+**Mon (this block) ships AST + parser + checker.** Tue lands the `embedding` block — until then any `vector_store.embedding` ref correctly fails the checker with "undeclared embedding `X`" (vector_store can't be used without an embedding anyway). Wed wires the embedded usearch index-build + query runtime under `aislang-runtime::rag`; the index file persists at `<source_dir>/.aislang/vector/<label>.usearch` and `aislang destroy -v` wipes it alongside other state. Phase 2 then wires `agent.knowledge = [vector_store.<label>]` for RAG-aware system prompts.
+
+See `crates/aislang-core/src/ast.rs::{VectorStore, SourceUri}` + `parser.rs::to_vector_store` + `checker.rs` for the source-aware diagnostics + duplicate-label detection + chunk-overlap invariant.
+
 ---
 
 ## 5. Model catalog

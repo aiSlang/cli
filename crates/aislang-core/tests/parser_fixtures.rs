@@ -166,6 +166,9 @@ fn expected_support_agent() -> Project {
         // forward-compat empty Vec — same serde discipline as
         // `loops` / `branches`.
         skills:      vec![],
+        // v0.3 Week 19 Mon: support-agent demo has no `vector_store`
+        // block; same forward-compat empty Vec.
+        vector_stores: vec![],
     }
 }
 

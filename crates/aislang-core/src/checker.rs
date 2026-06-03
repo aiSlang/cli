@@ -118,10 +118,12 @@ pub(crate) enum BlockKind {
     Secret,
     Deploy,
     Main,      // v0.2 Fri
-    Pipeline,  // v0.3 Week 17 Mon (Decision 44.5)
-    Loop,      // v0.3 Week 17 Wed (Decision 44.5 #2)
-    Branch,    // v0.3 Week 17 Wed (Decision 44.5 #3)
-    Skill,     // v0.3 Week 18 Wed (Decision 44.x)
+    Pipeline,    // v0.3 Week 17 Mon (Decision 44.5)
+    Loop,        // v0.3 Week 17 Wed (Decision 44.5 #2)
+    Branch,      // v0.3 Week 17 Wed (Decision 44.5 #3)
+    Skill,       // v0.3 Week 18 Wed (Decision 44.x)
+    VectorStore, // v0.3 Week 19 Mon (Decision 44.6)
+    Embedding,   // v0.3 Week 19 Mon (kind only; grammar lands Tue)
 }
 
 impl BlockKind {
@@ -135,10 +137,12 @@ impl BlockKind {
             Self::Secret    => "secret",
             Self::Deploy    => "deploy",
             Self::Main      => "main",
-            Self::Pipeline  => "pipeline",
-            Self::Loop      => "loop",
-            Self::Branch    => "branch",
-            Self::Skill     => "skill",
+            Self::Pipeline    => "pipeline",
+            Self::Loop        => "loop",
+            Self::Branch      => "branch",
+            Self::Skill       => "skill",
+            Self::VectorStore => "vector_store",
+            Self::Embedding   => "embedding",
         }
     }
 
@@ -153,6 +157,7 @@ impl BlockKind {
             RefKind::Agent     => Self::Agent,
             RefKind::Secret    => Self::Secret,
             RefKind::Pipeline  => Self::Pipeline,
+            RefKind::Embedding => Self::Embedding,
         }
     }
 }
@@ -218,6 +223,13 @@ pub(crate) fn build_resource_graph(project: &Project) -> Result<ResourceGraph, S
     // other block kind references a skill yet (agent.skills wiring
     // is Phase-2 work).
     for s in &project.skills      { add_block(&mut graph, &mut nodes, BlockKind::Skill,     &s.label)?; }
+    // v0.3 Week 19 Mon: vector_store blocks join the graph for
+    // duplicate-label detection + as targets for future agent.
+    // knowledge refs (Phase 2).  The embedding-ref edge into Tue's
+    // embedding block is wired in `check_refs` below.
+    for v in &project.vector_stores {
+        add_block(&mut graph, &mut nodes, BlockKind::VectorStore, &v.label)?;
+    }
 
     Ok(ResourceGraph { graph, nodes })
 }
@@ -347,6 +359,35 @@ fn check_refs(
             dispatch_ref(graph, multi, server,
                 "skill", &sk.label, "mcp.server")?;
         }
+    }
+    // v0.3 Week 19 Mon: vector_store.embedding is a Ref<Embedding>.
+    // The actual `embedding "<label>" { … }` block lands Tue — until
+    // then this edge will report "undeclared embedding `X`" for
+    // every vector_store, which is the correct behaviour
+    // (vector_store can't be used without an embedding).  Same
+    // dispatch_ref machinery as agent.tools / skill.mcp.server.
+    //
+    // **Check order**: structural invariants (chunk_overlap <
+    // chunk_size) run BEFORE the embedding-ref check so the
+    // ref-resolution failure doesn't shadow a malformed
+    // chunk_overlap value — gives the caller the better diagnostic
+    // when both are wrong.
+    for vs in &project.vector_stores {
+        // (a) Structural: chunk_overlap must be strictly less than
+        //     chunk_size.  Parser enforces the 256..=8192 range on
+        //     chunk_size; this invariant is the chunker's correctness
+        //     contract — equal overlap means every chunk is identical
+        //     to its predecessor (zero-progress; can't index).
+        if vs.chunk_overlap.units >= vs.chunk_size.units {
+            return Err(format!(
+                "vector_store `{}` has chunk_overlap ({} units) ≥ \
+                 chunk_size ({} units); overlap must be strictly less \
+                 (a zero-progress chunker can't index anything)",
+                vs.label, vs.chunk_overlap.units, vs.chunk_size.units));
+        }
+        // (b) Reference: embedding must resolve to a declared block.
+        dispatch_ref(graph, multi, &vs.embedding,
+            "vector_store", &vs.label, "embedding")?;
     }
     Ok(())
 }
@@ -1639,5 +1680,94 @@ mod tests {
           pipeline "shared" { steps = [agent.a] }
         "#)).expect(
             "skill + pipeline + mcp_server sharing a label must be allowed");
+    }
+
+    // ---- vector_store block (v0.3 Week 19 Mon) ------------------ //
+
+    #[test] fn vector_store_with_undeclared_embedding_ref_fails() {
+        // Tue lands the `embedding "<label>" { … }` block; Mon's
+        // checker treats vector_store.embedding refs as already
+        // resolvable through the existing graph machinery, so an
+        // unknown embedding label correctly errors as "undeclared
+        // embedding `X`".  Once Tue lands the block, declared
+        // embeddings will resolve normally — no checker code change
+        // needed.
+        let err = check_src(&composition_body(r#"
+          vector_store "docs" {
+            embedding     = embedding.ghost
+            source        = "./k/"
+            chunk_size    = 1k
+            chunk_overlap = 128
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("vector_store `docs`"),
+            "error must name the source vector_store; got: {err}");
+        assert!(err.contains("embedding"),
+            "error must name the failing field; got: {err}");
+        assert!(err.contains("undeclared embedding `ghost`"),
+            "error must name the missing label + kind; got: {err}");
+    }
+
+    #[test] fn vector_store_with_overlap_ge_chunk_size_fails() {
+        // Parser allows it (chunk_overlap is just a Size, no
+        // independent range check); checker catches the semantic
+        // invariant that overlap < chunk_size (zero-progress
+        // chunker can't index).
+        let err = check_src(&composition_body(r#"
+          vector_store "bad" {
+            embedding     = embedding.e
+            source        = "./k/"
+            chunk_size    = 1k
+            chunk_overlap = 1k
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("vector_store `bad`"),
+            "error must name the vector_store; got: {err}");
+        assert!(err.contains("chunk_overlap")
+                && err.contains("chunk_size"),
+            "error must name both fields; got: {err}");
+        assert!(err.contains("strictly less"),
+            "error must explain the invariant; got: {err}");
+    }
+
+    #[test] fn duplicate_vector_store_label_rejected() {
+        let err = check_src(&composition_body(r#"
+          vector_store "dup" {
+            embedding  = embedding.e
+            source     = "./k/"
+            chunk_size = 1k
+          }
+          vector_store "dup" {
+            embedding  = embedding.e
+            source     = "./k2/"
+            chunk_size = 1k
+          }
+        "#)).unwrap_err();
+        assert!(err.contains("duplicate `vector_store` block label `dup`"),
+            "duplicate-label detection must fire; got: {err}");
+    }
+
+    #[test] fn vector_store_label_can_collide_with_other_block_kinds() {
+        // VectorStore is its own BlockKind — independent namespace
+        // from pipeline / agent / etc.  The reference here is
+        // expected to fail (no embedding block yet) so this test
+        // asserts the DUPLICATE-LABEL machinery accepts the
+        // shared label by inspecting the diagnostic — if duplicates
+        // were the problem we'd see that error; instead we see the
+        // unrelated embedding-ref error.
+        let err = check_src(&composition_body(r#"
+          pipeline "shared" { steps = [agent.a] }
+          vector_store "shared" {
+            embedding  = embedding.e
+            source     = "./k/"
+            chunk_size = 1k
+          }
+        "#)).unwrap_err();
+        assert!(!err.contains("duplicate"),
+            "shared labels across BlockKinds must NOT trigger \
+             duplicate-label; got: {err}");
+        assert!(err.contains("undeclared embedding"),
+            "should fail only on the embedding ref, not on the \
+             shared label; got: {err}");
     }
 }
