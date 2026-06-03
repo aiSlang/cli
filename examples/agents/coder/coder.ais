@@ -1,0 +1,110 @@
+## v0.3 Week 19 Fri — Coder agent.
+##
+## Reads an aiSlang resource-block DESIGN (5-section markdown
+## emitted by the Architect, Thu) + emits a Rust patch wiring
+## the new block into the codebase (AST struct + parser hook +
+## checker assertion + unit tests).  Downstream Reviewer
+## evaluates the patch and either ACCEPTs or returns
+## actionable revision feedback (paired via the reflector
+## runtime pattern from Week 17 Fri).
+##
+## ## Direct chat (iterate on the implementation)
+##
+## ```
+## aislang chat coder examples/agents/coder/coder.ais
+## > <paste the Architect's 5-section markdown design>
+## ```
+##
+## Coder emits the implementation as a single fenced ```rust
+## diff block followed by a "Test coverage" bullet list.  The
+## reviewer parses both.
+##
+## ## Chained with Architect + Reviewer
+##
+## Week 19 Fri ships Coder + Reviewer as standalone single-file
+## demos (matching Architect's pattern from Thu).  Week 20 Wed
+## lands the multi-module orchestrator that chains
+## architect → coder → reviewer → tester via cross-module
+## pipeline.steps.
+##
+## ## RAG context
+##
+## The agent declares `knowledge = [vector_store.coder_kb]`.
+## `aislang apply` builds the index from `./knowledge/` (in-repo
+## Rust patterns: `aislang-core` AST conventions, parser test
+## fixtures, checker invariant style, exemplar PR diffs); chat-
+## time each user message embeds via bge-m3 + top-4 chunks
+## prepend to the system prompt.
+##
+## ## Model choice
+##
+## Qwen2.5-Coder 7B as primary — code-fine-tuned per Decision 44.8,
+## ideal for Rust patch emission.  Architect (Thu) reserved the
+## reasoning-tier Qwen3 8B for design work; Coder gets the
+## code-tier model.  anthropic.claude_haiku_4_5 fallback for
+## CI / offline.
+
+project "coder-agent" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.10
+  }
+
+  ## Code-tier local LLM for Rust emission.  Qwen2.5-Coder 7B
+  ## is the Decision-44.8 "saved for Coder" model; haiku fallback
+  ## for CI / cloud runs without Ollama.
+  model "coder_brain" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [ollama.qwen2_5_coder_7b]
+    fallback    = [anthropic.claude_haiku_4_5]
+  }
+
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "coder_kb" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 768
+    chunk_overlap = 96
+  }
+
+  prompt "coder_sys" {
+    file    = "./prompts/coder.md"
+    version = "1.0.0"
+  }
+
+  agent "coder" {
+    model         = model.coder_brain
+    system_prompt = prompt.coder_sys
+    tools         = []
+    knowledge     = [vector_store.coder_kb]
+  }
+
+  ## Placeholder pipeline — Fri ships Coder standalone; Week 20
+  ## Wed's orchestrator multi-module project chains Architect →
+  ## Coder → Reviewer via cross-module pipeline.steps.
+  pipeline "from_locked_design" {
+    steps  = [agent.coder]
+    input  = "5-section markdown design (Architect's output)"
+    output = "fenced Rust patch + test coverage bullets"
+  }
+
+  ## Heuristic eval — 3 synthetic designs check that the Coder
+  ## emits a fenced rust block + a "Test coverage" section.
+  ## Real correctness eval (`cargo test` against the patched tree
+  ## via SonarQube-MCP) lands v0.5+.
+  eval "rust_patch_format" {
+    dataset   = "./evals/coder_designs.jsonl"
+    metric    = f1
+    threshold = 80%
+    agent     = agent.coder
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}

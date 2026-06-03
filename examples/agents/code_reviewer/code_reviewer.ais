@@ -1,0 +1,101 @@
+## v0.3 Week 19 Fri — Code-reviewer agent.
+##
+## Reads a Coder-emitted Rust patch + emits a verdict starting
+## with either `ACCEPT` (good to merge) or specific revision
+## feedback (do NOT start with ACCEPT).  Pairs with the
+## `reflector` runtime pattern from Week 17 Fri: when invoked
+## via `patterns::reflector::run(coder, code_reviewer, …)`,
+## a non-ACCEPT verdict triggers a retry round where the Coder
+## sees the reviewer's feedback as revision instructions.
+##
+## ## Direct chat (one-shot review)
+##
+## ```
+## aislang chat code_reviewer examples/agents/code_reviewer/code_reviewer.ais
+## > <paste the Coder's Patch + Test coverage sections>
+## ```
+##
+## ## Paired with Coder (reflector loop)
+##
+## Week 19 Fri ships the reviewer agent + a runtime test that
+## exercises the reflector pattern with this agent as critic.
+## Week 20 Wed's multi-module orchestrator wires the loop at
+## the .ais grammar layer via `loop { body = pipeline.<p>, … }`.
+##
+## ## RAG context
+##
+## `knowledge = [vector_store.reviewer_kb]` — the index covers
+## the Rust review checklist + serde byte-stability discipline
+## + the Decision-44.x invariants the reviewer must catch.
+##
+## ## Model choice
+##
+## Reasoning-tier Qwen3 8B as primary — code review is judgement
+## work (does the patch match Decisions 44.x?  does the test
+## coverage adequately exercise the new fields?), the same
+## reasoning regime that Architect (Thu) used.  Qwen2.5-Coder
+## stays reserved for the Coder agent which emits code.
+## anthropic.claude_haiku_4_5 fallback for CI / offline.
+
+project "code-reviewer-agent" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.10
+  }
+
+  ## Reasoning-tier model for review work (mirrors Architect's
+  ## choice from Thu).  Qwen2.5-Coder is for code emission,
+  ## not code review.
+  model "reviewer_brain" {
+    requires    = [chat, reasoning]
+    context_min = 32k
+    prefer      = [ollama.qwen3_8b]
+    fallback    = [anthropic.claude_haiku_4_5]
+  }
+
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "reviewer_kb" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 768
+    chunk_overlap = 96
+  }
+
+  prompt "reviewer_sys" {
+    file    = "./prompts/code_reviewer.md"
+    version = "1.0.0"
+  }
+
+  agent "code_reviewer" {
+    model         = model.reviewer_brain
+    system_prompt = prompt.reviewer_sys
+    tools         = []
+    knowledge     = [vector_store.reviewer_kb]
+  }
+
+  ## Single-step pipeline — one review pass.  The retry-with-
+  ## feedback loop lives at the runtime layer (`patterns::
+  ## reflector::run`), invoked from the orchestrator (Week 20).
+  pipeline "review_once" {
+    steps  = [agent.code_reviewer]
+    input  = "Coder-emitted Patch + Test coverage markdown"
+    output = "ACCEPT or specific revision feedback"
+  }
+
+  ## Heuristic eval — 3 synthetic patches check that the
+  ## reviewer's verdict matches the well-known good/bad shapes.
+  eval "verdict_shape" {
+    dataset   = "./evals/reviewer_patches.jsonl"
+    metric    = f1
+    threshold = 80%
+    agent     = agent.code_reviewer
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}

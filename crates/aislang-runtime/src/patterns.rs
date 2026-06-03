@@ -1417,6 +1417,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflector_coder_reviewer_shape_retries_on_missing_serde_attrs() {
+        // v0.3 Week 19 Fri — pins the reflector contract for the
+        // Coder + Code-reviewer agents that ship under
+        // `examples/agents/coder/` + `examples/agents/code_reviewer/`.
+        // Coder emits a patch missing the Decision-44.4 serde attrs;
+        // Reviewer rejects with a feedback hint that includes the
+        // verbatim phrase "skip_serializing_if" (per reviewer prompt
+        // contract); Coder revises; Reviewer ACCEPTs.
+        let coder_inputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let coder_inputs_clone = coder_inputs.clone();
+        let coder_call = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let coder_call_clone = coder_call.clone();
+        let reviewer_call = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let reviewer_call_clone = reviewer_call.clone();
+        let dispatch = move |agent: String, input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "coder" => {
+                    coder_inputs_clone.lock().unwrap().push(input);
+                    let mut c = coder_call_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        if n == 1 {
+                            // v1: missing serde attrs (Decision 44.4 violation)
+                            Ok("## Patch\n```rust\npub datasets: Vec<Dataset>,\n```\n\
+                                ## Test coverage\n- parser_accepts_dataset_block\n\
+                                ## Notes\n".into())
+                        } else {
+                            // v2: serde attrs added
+                            Ok("## Patch\n```rust\n\
+                                #[serde(default, skip_serializing_if = \"Vec::is_empty\")]\n\
+                                pub datasets: Vec<Dataset>,\n```\n\
+                                ## Test coverage\n- parser_accepts_dataset_block\n\
+                                - roundtrip_dataset_block_is_byte_stable\n\
+                                ## Notes\n".into())
+                        }
+                    })
+                }
+                "code_reviewer" => {
+                    let mut c = reviewer_call_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        if n == 1 {
+                            // Per knowledge/01_review_checklist.md, the
+                            // missing serde attrs are the canonical
+                            // reject-with-feedback case.
+                            Ok("Missing serde byte-stability attrs.\n\
+                                \nIssues:\n\
+                                - `pub datasets: Vec<Dataset>` in `Project` — \
+                                add `#[serde(default, skip_serializing_if = \
+                                \"Vec::is_empty\")]` so v0.2 projects \
+                                round-trip unchanged (Decision 44.4).".into())
+                        } else {
+                            Ok("ACCEPT\npatch now byte-stable; coverage adequate.".into())
+                        }
+                    })
+                }
+                _ => unreachable!(),
+            }
+        };
+        let architect_design = "## Block name\n`dataset`\n\n## Fields\n- path: Path\n- format: DatasetFormat\n";
+        let out = reflector::run("coder".into(), "code_reviewer".into(),
+            architect_design, /* max_retries = */ 3, dispatch).await.expect("run");
+        match out {
+            ReflectorOutcome::Accepted { draft, retry_count } => {
+                assert_eq!(retry_count, 1,
+                    "exactly one revision before reviewer accepts");
+                assert!(draft.contains("skip_serializing_if"),
+                    "accepted draft must be the revised one with serde attrs");
+            }
+            ReflectorOutcome::MaxRetries { .. } => panic!("expected Accepted"),
+        }
+        // Pin that the reviewer's feedback flowed back to the Coder's
+        // second invocation verbatim — the runtime's revision-prompt
+        // builder must include the reviewer's "skip_serializing_if"
+        // hint in the next-turn input.
+        let inputs = coder_inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2,
+            "coder invoked twice: initial + one revision");
+        assert!(inputs[0].contains("## Block name"),
+            "first coder input is the Architect's design verbatim");
+        assert!(inputs[1].contains("skip_serializing_if"),
+            "second coder input must thread the reviewer's feedback; got:\n{}",
+            inputs[1]);
+    }
+
+    #[tokio::test]
     async fn reflector_bubbles_critic_session_error_with_context() {
         let dispatch = |agent: String, _input: String| -> DispatchFuture {
             match agent.as_str() {

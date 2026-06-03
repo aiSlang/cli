@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-05-25",
+  "source_hash": "f08e03e0660d9b95ec5ab538546edb402cd71f016d9275351d87dedd2c460932",
+  "model_bindings": {
+    "reviewer_brain": {
+      "provider": "ollama",
+      "name": "qwen3_8b"
+    }
+  },
+  "prompt_hashes": {
+    "reviewer_sys": "f9c382e0951305f6a0b8d05a03c8ae3e837922d6c56b3831cc1f8442aa1c31bc"
+  },
+  "oci_digests": {}
+}
