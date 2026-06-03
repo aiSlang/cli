@@ -597,8 +597,43 @@ impl Session {
     where
         F: Fn(SessionProgress) + Send + Sync + 'static,
     {
+        // v0.3 Week 19 Thu: existing callers (chat_turn happy path)
+        // get the empty-prefix shape; the RAG-aware chat path uses
+        // `turn_with_progress_and_extra_system_prefix` directly.
+        self.turn_with_progress_and_extra_system_prefix(
+            "", user_input, on_progress).await
+    }
+
+    /// v0.3 Week 19 Thu — RAG-aware turn dispatch.  Prepends
+    /// `extra_system_prefix` (e.g. retrieved-context block from
+    /// `agent.knowledge`) to the stored `system_prompt` for THIS
+    /// CALL ONLY — Session state isn't mutated, so cached sessions
+    /// stay reusable across non-RAG callers.
+    ///
+    /// Empty `extra_system_prefix` is exactly equivalent to
+    /// [`turn_with_progress`] — keeps the v0.2 hot path byte-stable.
+    pub async fn turn_with_progress_and_extra_system_prefix<F>(
+        &self,
+        extra_system_prefix: &str,
+        user_input:          &str,
+        on_progress:         F,
+    ) -> Result<String, SessionError>
+    where
+        F: Fn(SessionProgress) + Send + Sync + 'static,
+    {
+        // Build the effective system prompt for this turn: prefix
+        // (if any) + "\n\n---\n\n" separator + stored system_prompt.
+        // Separator is markdown-friendly so RAG-fed chunks visually
+        // distinguish from the agent's own instructions; LLMs that
+        // see this convention follow it reliably without explicit
+        // prompting.
+        let effective_system_prompt: String = if extra_system_prefix.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            format!("{extra_system_prefix}\n\n---\n\n{}", self.system_prompt)
+        };
         let mut messages: Vec<ChatMessage> = vec![
-            ChatMessage::text(Role::System, &self.system_prompt),
+            ChatMessage::text(Role::System, &effective_system_prompt),
             ChatMessage::text(Role::User,   user_input),
         ];
         // Monotonic step counter for SessionProgress events — passed
@@ -627,10 +662,15 @@ impl Session {
                     truncate_for_span_attr(user_input, 4096)),
                 KeyValue::new("aislang.user_input.bytes_total",
                     user_input.len() as i64),
+                // v0.3 Week 19 Thu: stamp the EFFECTIVE system
+                // prompt (post-RAG-prefix) so Jaeger shows what the
+                // LLM actually saw, not the static stored prompt.
+                // For non-RAG paths effective == stored; the attr
+                // is byte-stable.
                 KeyValue::new("aislang.system_prompt",
-                    truncate_for_span_attr(&self.system_prompt, 4096)),
+                    truncate_for_span_attr(&effective_system_prompt, 4096)),
                 KeyValue::new("aislang.system_prompt.bytes_total",
-                    self.system_prompt.len() as i64),
+                    effective_system_prompt.len() as i64),
                 KeyValue::new("aislang.tools.count",
                     self.tools.len() as i64),
             ])

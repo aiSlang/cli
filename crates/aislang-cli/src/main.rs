@@ -1640,6 +1640,14 @@ fn run_apply(file: PathBuf) -> Result<()> {
         }
     }
 
+    // v0.3 Week 19 Thu: auto-build RAG indexes for every declared
+    // `vector_store` block.  Skipped silently when the project has
+    // no vector_stores (the common single-agent v0.2 case).  Per-
+    // store failures log + continue (don't abort apply — the
+    // stack IS up; user can rebuild missing indexes manually via
+    // `aislang rag build <label> <project>`).
+    auto_build_rag_indexes(&file);
+
     eprintln!();
     eprintln!("stack is up. next steps:");
     if let Some(agent) = first_agent_label_in_file(&file) {
@@ -3070,6 +3078,45 @@ fn qualify_pipeline_steps(
 /// content, embeds every chunk via the referenced embedding
 /// block (POSTs to LiteLLM at `--litellm-url`), persists to
 /// `<project>/.aislang/vector/<label>.bin`.
+/// v0.3 Week 19 Thu: auto-build RAG indexes at `aislang apply`
+/// time.  Iterates every declared `vector_store` block + builds +
+/// persists its index to `<project>/.aislang/vector/<label>.bin`.
+/// Logs per-store progress to stderr; per-store failures DON'T
+/// abort apply (stack is up either way + user can rebuild via
+/// `aislang rag build <label> <project>` manually).
+fn auto_build_rag_indexes(project: &Path) {
+    let loaded = match load_project_input(project) {
+        Ok(l) => l,
+        Err(_) => return,   // load already errored above — skip
+    };
+    let proj = &loaded.resolved.project;
+    if proj.vector_stores.is_empty() {
+        return;   // common single-agent v0.2 case: no RAG declared
+    }
+    eprintln!();
+    eprintln!("building RAG indexes for {} declared vector_store(s):",
+        proj.vector_stores.len());
+    // LiteLLM is up at localhost:4000 — wait_for_litellm_ready above
+    // already proved it.  Match the same convention `rag build`
+    // uses (the literal `http://localhost:4000`); v0.5+ may read
+    // this from a project knob.
+    let litellm_url = "http://localhost:4000".to_string();
+    for vs in &proj.vector_stores {
+        eprint!("  - `{}` … ", vs.label);
+        match build_rag_index_for(&vs.label, project, &litellm_url) {
+            Ok((built, idx_path)) => {
+                match built.save(&idx_path) {
+                    Ok(bytes) => eprintln!(
+                        "{} chunks ({} bytes) → {}",
+                        built.chunks.len(), bytes, idx_path.display()),
+                    Err(e) => eprintln!("FAILED at save: {e}"),
+                }
+            }
+            Err(e) => eprintln!("FAILED at build: {e}"),
+        }
+    }
+}
+
 fn run_rag_build(
     vs_label:    String,
     project:     PathBuf,
