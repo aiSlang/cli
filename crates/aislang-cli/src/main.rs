@@ -233,6 +233,50 @@ enum Command {
         #[arg(long, value_name = "ADDR", conflicts_with = "stdio")]
         http: Option<SocketAddr>,
     },
+    /// Run a declared `skill { … }` block against the runtime.
+    /// v0.3 Week 18 Thu follow-up — gives `.ais` authors a CLI
+    /// for end-to-end skill testing without writing Rust glue.
+    ///
+    /// Shell-exec skills (`exec = "<cmd>"`) run directly through
+    /// `aislang-runtime::skills::run_shell_skill` against the
+    /// per-skill sandbox (per-skill cwd + scrubbed PATH +
+    /// command denylist).
+    ///
+    /// MCP-delegate skills (`mcp = mcp_server.<s>.tool.<t>`)
+    /// spawn the referenced `mcp_server` block's container via
+    /// `docker run -i`, route the call through
+    /// `run_mcp_skill`, then shut down the child cleanly.
+    /// Requires Docker on PATH.
+    ///
+    /// Prints the typed [`SkillOutput`] as text on stdout
+    /// (variant-specific formatting via `SkillOutput::to_text`).
+    /// Exit 0 on success; exit 1 with the rendered error on
+    /// any `SkillError` (denylist, non-zero exit, MCP failure,
+    /// etc.).
+    Skill {
+        #[command(subcommand)]
+        action: SkillCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommand {
+    /// Run one skill block end-to-end.
+    Run {
+        /// Skill label as declared in the .ais file
+        /// (e.g. `list_files`).
+        label: String,
+        /// Path to the .ais project file (single-file) OR the
+        /// project root dir (multi-module).  Same dispatch rules
+        /// as `aislang chat`.
+        project: PathBuf,
+        /// JSON args for MCP-delegate skills.  Required when the
+        /// referenced MCP tool needs structured input (e.g.
+        /// `{"path":"/data/hello.txt"}`); ignored for shell-exec
+        /// skills.  Defaults to `{}`.
+        #[arg(long, value_name = "JSON", default_value = "{}")]
+        args: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -273,6 +317,10 @@ fn run() -> Result<ExitCode> {
         Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
         Command::McpServe { stdio, http } =>
             run_mcp_serve(stdio, http).map(|_| ExitCode::SUCCESS)?,
+        Command::Skill { action } => match action {
+            SkillCommand::Run { label, project, args } =>
+                run_skill(label, project, args).map(|_| ExitCode::SUCCESS)?,
+        },
     };
     Ok(code)
 }
@@ -2926,6 +2974,129 @@ fn qualify_pipeline_steps(
         (None, Some(c)) => format!("{c}.{}", r.label),
         (None, None)    => r.label.clone(),
     }).collect()
+}
+
+/// `aislang skill run <label> <project> [--args '<json>']` —
+/// v0.3 Week 18 Thu follow-up.  Resolves the project, finds the
+/// skill block by label, dispatches to the appropriate runtime
+/// entry point (`run_shell_skill` for `exec = "<cmd>"`,
+/// `run_mcp_skill` for `mcp = mcp_server.<s>.tool.<t>`), prints
+/// the typed output as text on stdout.
+///
+/// For MCP-delegate skills the referenced `mcp_server` block is
+/// spawned via `docker run -i` (same StdioChild path agents use
+/// for their `tools = [mcp_server.<x>]` list), the tool is
+/// called with the supplied JSON args, and the child is shut
+/// down cleanly before returning.  Requires Docker on PATH.
+fn run_skill(
+    skill_label: String,
+    project:     PathBuf,
+    args_json:   String,
+) -> Result<()> {
+    use aislang_core::ast::SkillExec;
+    use aislang_runtime::skills::{run_shell_skill, run_mcp_skill, SkillOutput};
+
+    // 1. Load + parse the project (same dir-vs-file dispatch as chat).
+    let loaded = load_project_input(&project)?;
+    let proj = &loaded.resolved.project;
+
+    // 2. Find the skill block by label.
+    let skill = proj.skills.iter()
+        .find(|s| s.label == skill_label)
+        .ok_or_else(|| {
+            let available: Vec<&str> = proj.skills.iter()
+                .map(|s| s.label.as_str()).collect();
+            let avail_line = if available.is_empty() {
+                "  (no skill blocks declared in this project)".to_string()
+            } else {
+                format!("  available skills: {}", available.join(", "))
+            };
+            anyhow::anyhow!(
+                "no skill named `{skill_label}` in {}\n{avail_line}",
+                project.display())
+        })?;
+
+    // 3. Project root for the per-skill cwd (`<root>/.aislang/
+    //    skills/<label>/`).
+    let project_root = std::fs::canonicalize(&loaded.project_root)
+        .map_err(|e| anyhow::anyhow!(
+            "project root `{}` not readable: {e}",
+            loaded.project_root.display()))?;
+
+    // 4. Dispatch on exec variant.
+    let outcome: Result<SkillOutput> = match &skill.exec {
+        SkillExec::Shell { command } => {
+            eprintln!("aislang skill: running shell-exec skill `{skill_label}` \
+                       in sandbox `{}/.aislang/skills/{skill_label}/`",
+                project_root.display());
+            run_shell_skill(
+                &skill.label, command, &project_root, skill.output_type,
+            ).map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        SkillExec::Mcp { server, tool } => {
+            // Look up the referenced mcp_server block to get image
+            // + mount.  Build a StdioChild via the same machinery
+            // agents use for tool fleets.
+            let server_block = proj.mcp_servers.iter()
+                .find(|m| m.label == server.label)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "skill `{skill_label}` references unknown mcp_server \
+                     `{}`", server.label))?;
+            let args_value: serde_json::Value = serde_json::from_str(&args_json)
+                .map_err(|e| anyhow::anyhow!(
+                    "--args is not valid JSON: {e}"))?;
+            eprintln!("aislang skill: spawning mcp_server `{}` \
+                       (image={}/{}) to delegate skill \
+                       `{skill_label}`.tool=`{tool}`",
+                server.label,
+                server_block.image.registry, server_block.image.repository);
+            // tokio runtime + StdioChild spawn — same shape as
+            // chat_turn's MCP path; teardown on Drop.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+            let label_ref  = skill.label.clone();
+            let tool_ref   = tool.clone();
+            let out_type   = skill.output_type;
+            let mount_abs  = server_block.mount.as_ref()
+                .map(|m| if m.is_absolute() { m.clone() }
+                         else { project_root.join(m) });
+            // Stringify the OciImage same way mcp_server's
+            // `format_image` does (registry/repository[:tag][@digest]).
+            let img = &server_block.image;
+            let image = match (&img.tag, &img.digest) {
+                (Some(t), Some(d)) => format!("{}/{}:{t}@{d}",
+                    img.registry, img.repository),
+                (Some(t), None)    => format!("{}/{}:{t}",
+                    img.registry, img.repository),
+                (None,    Some(d)) => format!("{}/{}@{d}",
+                    img.registry, img.repository),
+                (None,    None)    => format!("{}/{}",
+                    img.registry, img.repository),
+            };
+            rt.block_on(async move {
+                use aislang_runtime::mcp::{config, StdioChild};
+                let cfg = config(&image, &[],
+                    mount_abs.as_deref());
+                let child = StdioChild::spawn(&cfg).await
+                    .map_err(|e| anyhow::anyhow!("spawn mcp_server: {e}"))?;
+                let result = run_mcp_skill(
+                    &label_ref, &child, &tool_ref, args_value, out_type,
+                ).await.map_err(|e| anyhow::anyhow!("{e}"));
+                child.shutdown().await.ok();
+                result
+            })
+        }
+    };
+
+    // 5. Print the typed output to stdout (pipe-clean) + summary
+    //    to stderr.
+    let output = outcome?;
+    eprintln!("aislang skill: completed `{skill_label}` (output_type = {:?})",
+        skill.output_type);
+    println!("{}", output.to_text());
+    Ok(())
 }
 
 fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
