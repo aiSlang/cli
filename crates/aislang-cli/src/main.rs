@@ -1592,6 +1592,29 @@ fn run_apply(file: PathBuf) -> Result<()> {
             "docker compose up -d exited {:?}", status.code()));
     }
 
+    // v0.3 Week 19 Wed follow-up: `docker compose up -d` returns
+    // as soon as each container has STARTED — but LiteLLM's
+    // python process inside takes ~5-10s MORE to bind :4000 +
+    // load model_list + accept HTTP.  Running `aislang chat` /
+    // `aislang rag build` immediately after apply surfaced as
+    // "error sending request" (connection refused) — the user
+    // had to retry to make their next command work.
+    //
+    // Reuse the smoke-test path's `wait_for_litellm_ready` helper
+    // (polls /health/liveness via curl; 200-on-fully-up).  Apply
+    // here is fail-soft on timeout: log + continue.  Forcing apply
+    // to fail would be worse UX than letting the user retry their
+    // next command if LiteLLM is genuinely slow to come up.
+    match wait_for_litellm_ready(
+        "http://127.0.0.1:4000",
+        std::time::Duration::from_secs(30),
+    ) {
+        Ok(()) => eprintln!("  litellm ready:    ✓ /health/liveness 200"),
+        Err(e) => eprintln!(
+            "  warning: LiteLLM not ready within 30s ({e}); \
+             retry your next command in a few seconds"),
+    }
+
     // ── Write `.aislang/state.json` (week 10 Tue, Decision 26) ──
     // Recorded after the stack is confirmed up so a failed
     // `docker compose up -d` doesn't leave behind a misleading
@@ -2036,6 +2059,7 @@ fn docker_on_path() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
 
 /// Phase 2 Week 14 Thu — `helm` CLI presence check, mirror of
 /// `docker_on_path` for the K8s deploy target.  Used by the
