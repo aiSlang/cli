@@ -247,7 +247,7 @@ impl Duration {
 // Size — bytes for storage, tokens-as-units for context windows
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Size {
     /// Value in base units. For `Size` used as token counts, this is tokens;
     /// for `Size` used as bytes, this is bytes. The suffix (`k`, `MB`, `GB`)
@@ -256,6 +256,13 @@ pub struct Size {
 }
 
 impl Size {
+    /// v0.3 Week 19 Mon: predicate used by `serde(skip_serializing_if
+    /// = …)` on fields that default to zero — same posture as
+    /// `Money::is_default` / `ModelSource::is_default`.  Keeps JSON
+    /// fixtures byte-stable when an optional Size field is omitted
+    /// in the source.
+    pub fn is_zero(&self) -> bool { self.units == 0 }
+
     /// Parse a `Size` literal of the form `<integer>[<unit>]`, where
     /// `<unit>` is one of `k`, `K`, `KB`, `MB`, `GB` (all 1024-based per
     /// LANGUAGE-SPEC-v0.md §3.2). No suffix means base units.

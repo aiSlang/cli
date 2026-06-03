@@ -44,6 +44,15 @@ pub enum RefKind {
     /// Composition primitive #2 + #3 — Mon's `pipeline` block is the
     /// only kind that produces Pipeline refs today; v0.5+ may extend.
     Pipeline,
+    /// v0.3 Week 19 Mon (Decision 44.6).  `vector_store.embedding`
+    /// references an `embedding` block.  Mon adds the ref kind +
+    /// the BlockKind so duplicate-label detection works; Tue lands
+    /// the `embedding "<label>" { … }` block itself + the checker
+    /// dispatch_ref edge for vector_store.embedding (until then
+    /// the checker WILL flag any vector_store.embedding ref as
+    /// "undeclared embedding" — expected, since no embedding blocks
+    /// can parse this week).
+    Embedding,
 }
 
 /// `anthropic.claude_haiku_4_5` etc. — resolved against the catalog.
@@ -118,6 +127,17 @@ pub struct Project {
     /// `loops` / `branches`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<Skill>,
+
+    /// v0.3 Week 19 Mon — `vector_store "<label>" { … }` first-
+    /// class blocks (Decision 44.6).  Backs Phase 2's RAG runtime
+    /// (Wed): each vector_store declares an embedding model ref +
+    /// a source URI + chunking parameters.  Mon ships AST + parser
+    /// + checker; Tue adds the `embedding` block (currently a
+    /// dangling ref kind — see `RefKind::Embedding` doc); Wed
+    /// wires the usearch index at `aislang plan` time.  Same byte-
+    /// stability discipline as `skills`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector_stores: Vec<VectorStore>,
 }
 
 /// v0.3 Week 17 Mon — composition primitive #1.
@@ -305,6 +325,76 @@ pub enum OutputType {
     /// trailing line dropped.  Useful for tools whose stdout is
     /// one-item-per-line (`ls`, `git ls-files`, etc.).
     ListString,
+}
+
+/// v0.3 Week 19 Mon — first-class `vector_store` block (Decision 44.6).
+///
+/// Grammar:
+///
+/// ```hcl
+/// vector_store "<label>" {
+///   embedding     = embedding.<label>       # ref into Tue's embedding block
+///   source        = "<path | URL | crawl:URL>"
+///   chunk_size    = 1k                       # 256..=8192 tokens, enforced at parse
+///   chunk_overlap = 128                      # 0..=chunk_size; defaults to 0
+/// }
+/// ```
+///
+/// **Semantics** (Wed runtime — `aislang-runtime::rag`):
+///   - `aislang plan`/`aislang apply` builds an embedded usearch
+///     index at `<source_dir>/.aislang/vector/<label>.usearch`
+///     by reading from `source`, chunking with the supplied
+///     `chunk_size` (token count) + `chunk_overlap`, embedding
+///     each chunk via the referenced `embedding` block's model.
+///   - Agent system prompts that declare
+///     `agent.knowledge = [vector_store.<label>]` auto-prepend
+///     `Top-K retrieved chunks:\n<chunks>` to every chat turn.
+///
+/// **Mon (this block) ships AST + parser + checker.** Tue lands
+/// the `embedding` block; Wed wires the index-build + query
+/// runtime.  Cross-module `embedding = use other.docs` refs
+/// follow Week 16 Tue's `module: Option<String>` convention —
+/// no extra work needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorStore {
+    pub label:         String,
+    /// Ref into an `embedding` block (Tue's deliverable; Mon
+    /// validates label uniqueness against [`RefKind::Embedding`]).
+    pub embedding:     Ref,
+    /// Where the chunkable content lives — see [`SourceUri`].
+    pub source:        SourceUri,
+    /// Tokens per chunk; parser enforces 256..=8192 range to
+    /// keep retrieval relevance reasonable (too small loses
+    /// context; too large dilutes match quality).
+    pub chunk_size:    Size,
+    /// Tokens of overlap between adjacent chunks; defaults to 0
+    /// when omitted (parser fills the default).  Must be strictly
+    /// less than `chunk_size` (enforced by the checker).
+    #[serde(default, skip_serializing_if = "Size::is_zero")]
+    pub chunk_overlap: Size,
+}
+
+/// `source = …` value on a `vector_store` block.  Three tagged
+/// variants disambiguate at parse time:
+///
+///   - **Path** — bare filesystem path (relative to the .ais file
+///     or absolute).  Indexer reads files under the path (single
+///     file OR directory walk).
+///   - **Url** — `http://…` or `https://…`.  Indexer fetches the
+///     single URL + extracts text.  No recursion.
+///   - **Crawl** — `crawl:http://…` or `crawl:https://…`.  Indexer
+///     recursively crawls from the seed URL within the same host;
+///     depth + politeness limits are runtime concerns (Wed/v0.5).
+///
+/// Tagged enum so JSON round-trip is unambiguous; serde
+/// `#[serde(tag = "kind", rename_all = "snake_case")]` mirrors the
+/// `SkillExec` shape established Week 18 Wed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceUri {
+    Path  { path: PathBuf },
+    Url   { url:  String  },
+    Crawl { url:  String  },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

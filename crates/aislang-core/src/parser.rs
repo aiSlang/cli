@@ -679,11 +679,18 @@ fn to_project(raw: RawBlock) -> Result<Project, String> {
             // shape.  Wed lands AST + parser + checker only; runtime
             // executor + sandboxing land Thu.
             "skill"      => project.skills.push(to_skill(block)?),
+            // v0.3 Week 19 Mon (Decision 44.6): `vector_store { … }`
+            // grammar — embedding ref + source URI + chunk params.
+            // Mon ships AST + parser + checker.  Tue adds the
+            // referenced `embedding "<label>" { … }` block; Wed
+            // wires the usearch index-build + query runtime.
+            "vector_store" => project.vector_stores.push(to_vector_store(block)?),
             other => {
                 return Err(format!(
                     "unknown block_type `{other}` inside project; \
                      v0.3 supports: budget, model, prompt, mcp_server, \
-                     agent, eval, secret, deploy, main, pipeline, loop, branch, skill"
+                     agent, eval, secret, deploy, main, pipeline, loop, \
+                     branch, skill, vector_store"
                 ));
             }
         }
@@ -1570,6 +1577,111 @@ fn expect_output_type(field: &str, v: RawValue) -> Result<OutputType, String> {
 }
 
 // ============================================================================
+// `vector_store` block converter — v0.3 Week 19 Mon (Decision 44.6)
+// ============================================================================
+
+fn to_vector_store(raw: RawBlock) -> Result<VectorStore, String> {
+    let label = require_single_label("vector_store", raw.labels)?;
+    let mut embedding:     Option<Ref>       = None;
+    let mut source:        Option<SourceUri> = None;
+    let mut chunk_size:    Option<Size>      = None;
+    let mut chunk_overlap: Option<Size>      = None;
+
+    for item in raw.body {
+        let attr = expect_attr_only("vector_store", item)?;
+        match attr.name.as_str() {
+            "embedding"     => embedding     = Some(expect_ref(
+                &attr.name, RefKind::Embedding, attr.value)?),
+            "source"        => source        = Some(expect_source_uri(
+                &attr.name, attr.value)?),
+            "chunk_size"    => chunk_size    = Some(expect_chunk_size(
+                &attr.name, attr.value)?),
+            "chunk_overlap" => chunk_overlap = Some(expect_size(
+                &attr.name, attr.value)?),
+            other => return Err(format!(
+                "unknown attribute `{other}` in vector_store block; \
+                 allowed: embedding, source, chunk_size, chunk_overlap"
+            )),
+        }
+    }
+
+    Ok(VectorStore {
+        label,
+        embedding: embedding.ok_or_else(||
+            "vector_store missing required attribute `embedding` \
+             (a ref to an `embedding` block, e.g. `embedding = embedding.openai_small`)".to_string())?,
+        source: source.ok_or_else(||
+            "vector_store missing required attribute `source` \
+             (a path like `\"./docs/\"`, a URL like `\"https://x.com/y\"`, \
+             or `\"crawl:https://x.com\"` for recursive crawl)".to_string())?,
+        chunk_size: chunk_size.ok_or_else(||
+            "vector_store missing required attribute `chunk_size` \
+             (token count per chunk, 256..=8192)".to_string())?,
+        // Default 0 when omitted — `serde(default)` already would handle
+        // round-tripping, but the parser path also needs an explicit
+        // default so `Default::default()` doesn't fail at construction.
+        chunk_overlap: chunk_overlap.unwrap_or_default(),
+    })
+}
+
+/// `chunk_size = <Size>` with the 256..=8192 token range enforced.
+/// Same shape as `expect_max_iter` (Week 17 Wed's `loop.max_iter`
+/// helper).
+fn expect_chunk_size(field: &str, v: RawValue) -> Result<Size, String> {
+    let size = expect_size(field, v)?;
+    if !(256..=8192).contains(&size.units) {
+        return Err(format!(
+            "`{field}` must be in 256..=8192 tokens; got {} \
+             (too small loses context; too large dilutes retrieval relevance)",
+            size.units));
+    }
+    Ok(size)
+}
+
+/// `source = "<path | URL | crawl:URL>"`.  Disambiguates by string
+/// prefix:
+///   - starts with `http://` or `https://` → [`SourceUri::Url`]
+///   - starts with `crawl:` → [`SourceUri::Crawl`] (strips prefix)
+///   - anything else → [`SourceUri::Path`]
+///
+/// Empty strings are rejected.  Crawl/URL syntactic validity beyond
+/// the scheme prefix is a runtime concern (Wed); the parser is
+/// permissive on the URL body.
+fn expect_source_uri(field: &str, v: RawValue) -> Result<SourceUri, String> {
+    let s = match v {
+        RawValue::String(s) => s,
+        // Path-shaped sources can also parse as RawValue::Path (e.g.
+        // `source = "./docs/"` would parse to String — but bare-path
+        // identifiers don't apply here, so we only accept String).
+        other => return Err(format!(
+            "`{field}` expects a string source URI \
+             (e.g. `\"./docs/\"`, `\"https://x.com\"`, or `\"crawl:https://x.com\"`); \
+             got {other:?}"
+        )),
+    };
+    if s.trim().is_empty() {
+        return Err(format!(
+            "`{field}` source URI must be non-empty"));
+    }
+    if let Some(rest) = s.strip_prefix("crawl:") {
+        if rest.trim().is_empty() {
+            return Err(format!(
+                "`{field}` `crawl:` prefix must be followed by a URL"));
+        }
+        if !rest.starts_with("http://") && !rest.starts_with("https://") {
+            return Err(format!(
+                "`{field}` `crawl:` only supports http(s) seeds today; \
+                 got `crawl:{rest}`"));
+        }
+        Ok(SourceUri::Crawl { url: rest.to_string() })
+    } else if s.starts_with("http://") || s.starts_with("https://") {
+        Ok(SourceUri::Url { url: s })
+    } else {
+        Ok(SourceUri::Path { path: PathBuf::from(s) })
+    }
+}
+
+// ============================================================================
 // Model-specific value helpers
 // ============================================================================
 
@@ -1897,9 +2009,16 @@ fn parse_ref_from_access(path: &[String]) -> Result<Ref, String> {
         // v0.3 Week 17 Wed: pipeline refs in loop.body /
         // branch.cases / branch.default attribute values.
         "pipeline"   => RefKind::Pipeline,
+        // v0.3 Week 19 Mon: embedding refs in vector_store.embedding.
+        // The `embedding "<label>" { … }` block grammar lands Tue;
+        // until then ref RESOLUTION fails (no embedding node in the
+        // graph) but the ref PARSES + tracks the kind for the
+        // future checker dispatch.
+        "embedding"  => RefKind::Embedding,
         other => return Err(format!(
             "unknown resource kind `{other}` in reference `{}`; \
-             expected one of: model, prompt, mcp_server, agent, secret, pipeline",
+             expected one of: model, prompt, mcp_server, agent, secret, \
+             pipeline, embedding",
             path.join(".")
         )),
     };
@@ -1917,6 +2036,7 @@ fn ref_kind_str(k: RefKind) -> &'static str {
         RefKind::Agent     => "agent",
         RefKind::Secret    => "secret",
         RefKind::Pipeline  => "pipeline",
+        RefKind::Embedding => "embedding",
     }
 }
 
@@ -4173,5 +4293,126 @@ mod project_tests {
           budget {{ hard_cap_per_day = $1  hard_cap_per_run = $0.01 }}
           {extra}
         }}"#)
+    }
+
+    // ---- vector_store block (v0.3 Week 19 Mon) ------------------ //
+
+    #[test] fn vector_store_block_parses_with_path_source() {
+        let src = project_with_composition_body(r#"
+          vector_store "docs" {
+            embedding     = embedding.openai_small
+            source        = "./knowledge/"
+            chunk_size    = 1k
+            chunk_overlap = 128
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        assert_eq!(p.vector_stores.len(), 1);
+        let vs = &p.vector_stores[0];
+        assert_eq!(vs.label, "docs");
+        assert_eq!(vs.embedding.label, "openai_small");
+        assert_eq!(vs.embedding.kind,  RefKind::Embedding);
+        assert!(matches!(&vs.source,
+            SourceUri::Path { path } if path.to_str() == Some("./knowledge/")));
+        assert_eq!(vs.chunk_size.units,    1024);
+        assert_eq!(vs.chunk_overlap.units, 128);
+    }
+
+    #[test] fn vector_store_block_parses_with_url_source() {
+        let src = project_with_composition_body(r#"
+          vector_store "remote" {
+            embedding  = embedding.openai_small
+            source     = "https://example.com/docs/handbook.md"
+            chunk_size = 512
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        let vs = &p.vector_stores[0];
+        assert!(matches!(&vs.source,
+            SourceUri::Url { url } if url.contains("example.com")));
+        // chunk_overlap defaults to 0 when omitted.
+        assert_eq!(vs.chunk_overlap.units, 0);
+    }
+
+    #[test] fn vector_store_block_parses_with_crawl_source() {
+        let src = project_with_composition_body(r#"
+          vector_store "site" {
+            embedding  = embedding.openai_small
+            source     = "crawl:https://example.com"
+            chunk_size = 2k
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        let vs = &p.vector_stores[0];
+        // The `crawl:` prefix is stripped — only the URL body is kept.
+        assert!(matches!(&vs.source,
+            SourceUri::Crawl { url } if url == "https://example.com"),
+            "got: {:?}", vs.source);
+    }
+
+    #[test] fn vector_store_chunk_size_below_range_fails() {
+        let src = project_with_composition_body(r#"
+          vector_store "tiny" {
+            embedding  = embedding.openai_small
+            source     = "./d/"
+            chunk_size = 100
+          }
+        "#);
+        assert_parse_err_contains(&src, "256..=8192 tokens");
+    }
+
+    #[test] fn vector_store_chunk_size_above_range_fails() {
+        let src = project_with_composition_body(r#"
+          vector_store "huge" {
+            embedding  = embedding.openai_small
+            source     = "./d/"
+            chunk_size = 16k
+          }
+        "#);
+        assert_parse_err_contains(&src, "256..=8192 tokens");
+    }
+
+    #[test] fn vector_store_missing_required_field_fails() {
+        // Pin all three required-field errors via shared sentinel.
+        let no_embedding = project_with_composition_body(r#"
+          vector_store "v" { source = "./d/"  chunk_size = 1k }
+        "#);
+        assert_parse_err_contains(&no_embedding,
+            "missing required attribute `embedding`");
+        let no_source = project_with_composition_body(r#"
+          vector_store "v" { embedding = embedding.e  chunk_size = 1k }
+        "#);
+        assert_parse_err_contains(&no_source,
+            "missing required attribute `source`");
+        let no_chunk = project_with_composition_body(r#"
+          vector_store "v" { embedding = embedding.e  source = "./d/" }
+        "#);
+        assert_parse_err_contains(&no_chunk,
+            "missing required attribute `chunk_size`");
+    }
+
+    #[test] fn vector_store_rejects_unknown_attribute() {
+        let src = project_with_composition_body(r#"
+          vector_store "v" {
+            embedding  = embedding.e
+            source     = "./d/"
+            chunk_size = 1k
+            bogus      = true
+          }
+        "#);
+        assert_parse_err_contains(&src,
+            "allowed: embedding, source, chunk_size, chunk_overlap");
+    }
+
+    #[test] fn vector_store_rejects_non_http_crawl_seed() {
+        let src = project_with_composition_body(r#"
+          vector_store "v" {
+            embedding  = embedding.e
+            source     = "crawl:ftp://example.com"
+            chunk_size = 1k
+          }
+        "#);
+        assert_parse_err_contains(&src,
+            "`crawl:` only supports http(s) seeds");
     }
 }
