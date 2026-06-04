@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-05-25",
+  "source_hash": "",
+  "model_bindings": {
+    "architect.architect_brain": {
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
+    },
+    "code_reviewer.reviewer_brain": {
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
+    },
+    "coder.coder_brain": {
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
+    }
+  },
+  "prompt_hashes": {
+    "architect.architect_sys": "04566cc9297a7ee124c96813c0edd6ea93b9dc7a25629a1716fdf0cda7a19cda",
+    "code_reviewer.reviewer_sys": "f9c382e0951305f6a0b8d05a03c8ae3e837922d6c56b3831cc1f8442aa1c31bc",
+    "coder.coder_sys": "e0d90d26f534272da0ea314a0caf03183b5ec61cadc888ec5e88dfef60009097"
+  },
+  "oci_digests": {},
+  "modules": {
+    "architect": "5ea0e6bf58e3cd70994b65284b661b3960ee61fbee4166634a1e6adb69fd5c42",
+    "code_reviewer": "198ae25ab9f0143ff51d782ec6c8e7829cb4edf0d48df76122ab53481d3be339",
+    "coder": "2df4ac1abad90b36e35af34c4f3685d8084577a8e48c10f8d82a2455ca272afb",
+    "orchestrator": "22054763f8be4ee33e77cd177d17c32ecca2eb33d498e0aa9277623e16fbb377"
+  }
+}

@@ -51,6 +51,18 @@ A paragraph + the `Type?` field-table that would land verbatim
 as §4.<N> in LANGUAGE-SPEC-v0.md.  Mirror the prose style of the
 existing §4.X sections in the retrieved context.
 
+**Section number discipline (REQUIRED for consistent output):**
+Always emit the LITERAL token `§4.<N>` (with the angle-bracket
+placeholder) in BOTH the header (`## LANGUAGE-SPEC §4.<N>
+snippet`) and any in-paragraph references.  Do NOT guess a
+concrete number (no `§4.16`, no `§4.22`, no `§4.N`).  The human
+maintainer assigns the actual section number when integrating
+the design into LANGUAGE-SPEC-v0.md — knowing the next-available
+number requires reading the full current spec, which is outside
+this agent's scope.  This rule makes the design idempotent
+across runs: every invocation against the same input MUST
+produce the same `§4.<N>` token.
+
 ## Decision implications
 - New `RefKind` needed? (yes/no — and which)
 - Checker invariants beyond duplicate-label? (range checks,

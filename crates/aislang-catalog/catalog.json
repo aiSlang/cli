@@ -29,7 +29,7 @@
       "id": "anthropic.claude_haiku_4_5",
       "provider": "anthropic",
       "litellm_name": "anthropic/claude-haiku-4-5",
-      "capabilities": ["chat", "tool_use", "structured_output"],
+      "capabilities": ["chat", "tool_use", "structured_output", "reasoning"],
       "context_max": "200k",
       "cost_input_per_1k_tokens": "$0.0008",
       "cost_output_per_1k_tokens": "$0.004",

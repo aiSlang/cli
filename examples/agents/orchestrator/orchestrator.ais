@@ -1,0 +1,82 @@
+## v0.3 Week 20 Mon — Orchestrator agent (multi-module project).
+##
+## Top-level entry-point that takes a natural-language feature
+## spec + runs the full Architect → Coder → Code-reviewer chain
+## end-to-end.  This is the v0.3 headline demo: a single
+## `aislang chat full_design examples/agents/orchestrator/`
+## invocation drives a 3-agent pipeline against the user's
+## local Ollama (qwen3:8b + qwen2.5-coder:7b) + emits a
+## structured design + Rust patch + reviewer verdict.
+##
+## ## Direct chat
+##
+## ```
+## aislang chat full_design examples/agents/orchestrator/
+## > Design a `dataset` block for declaring training data
+##   (path + format fields, fits the existing v0.3 grammar).
+## ```
+##
+## The CLI's pipeline-label dispatch (Week 17 Thu) drives the
+## runtime patterns::orchestrator::run — each step's output
+## feeds the next step's input verbatim.
+##
+## ## Coder ↔ Reviewer reflector loop (grammar layer)
+##
+## `loop.review_cycle` wraps `pipeline.coder_review_cycle` with a
+## `condition` that re-runs the pipeline while the reviewer's
+## verdict does NOT start with `ACCEPT`, hard-capped at 3 retries.
+## This is the FIRST .ais-grammar-layer expression of the
+## reflector pattern from Week 17 Fri — runtime dispatch via
+## `loop`-block label is a follow-up (today Mon ships the
+## grammar + a runtime integration test exercising the parsed
+## loop AST through `patterns::reflector::run` with mocked
+## sub-agent dispatch + the `max_iter` hard-cap honoured).
+##
+## ## Cross-module composition
+##
+## Sibling modules under `../architect/`, `../coder/`,
+## `../code_reviewer/` are referenced via `use <module>.<label>`
+## (Decision 44.1).  Each sibling is a self-contained
+## `project { … }` block (the Week 19 single-file agents);
+## the multi-module resolver merges all four projects' resource
+## namespaces at validate time + this module's pipelines refer
+## to the merged labels with the `use` prefix.
+
+project "orchestrator-module" {
+  budget {
+    hard_cap_per_day = $2
+    hard_cap_per_run = $0.30
+  }
+
+  ## Sequential chain — feature-spec → design → patch → verdict.
+  ## Each step's output is the next step's input (Decision 44.5
+  ## string-only handoff in v0.3; structured envelopes v0.5+).
+  pipeline "full_design" {
+    steps  = [use architect.architect, use coder.coder, use code_reviewer.code_reviewer]
+    input  = "natural-language feature spec for a new resource block"
+    output = "Coder's Patch + Test coverage + Reviewer's verdict (ACCEPT or feedback)"
+  }
+
+  ## Inner pipeline for the reflector loop wrap below — just the
+  ## Coder ↔ Reviewer two-step that the loop's condition checks
+  ## on each iteration.
+  pipeline "coder_review_cycle" {
+    steps  = [use coder.coder, use code_reviewer.code_reviewer]
+    input  = "Architect's 5-section design markdown"
+    output = "Reviewer's verdict (ACCEPT or revision feedback)"
+  }
+
+  ## Grammar-layer reflector loop.  Condition uses MiniJinja's
+  ## startswith filter (Decision 44.3) against the running output;
+  ## re-runs until ACCEPT or max_iter hit.  Runtime dispatch via
+  ## a `loop`-label CLI handler is a follow-up — today this block
+  ## VALIDATES, PARSES, + flows through the resolver's lockfile
+  ## emit, and a runtime integration test exercises the parsed
+  ## Loop AST node through `patterns::reflector::run` with
+  ## mocked sub-agent dispatch.
+  loop "review_cycle" {
+    body      = pipeline.coder_review_cycle
+    condition = "{{ output | startswith('ACCEPT') | not }}"
+    max_iter  = 3
+  }
+}

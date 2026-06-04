@@ -2488,20 +2488,21 @@ fn run_cost(file: PathBuf) -> Result<()> {
 //   2  docker unavailable when a stack check was attempted
 
 fn run_status(file: PathBuf, spend: bool, model_spend: Option<String>, main_spend: bool) -> Result<ExitCode> {
-    // Validate so the user sees the same diagnostics as `aislang validate`
-    // when the source is broken. Status is rare; the parse cost is
-    // immaterial.
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-    let (project, _warnings) = match aislang_core::validate(&source) {
-        Ok(v) => v,
-        Err(err) => {
-            render_validate_error(&source, &err);
-            return Err(anyhow::anyhow!("(see error above)"));
-        }
-    };
+    // v0.3 Week 20 Mon follow-up: dir-vs-file dispatch via
+    // load_project_input.  Single-file input → source_dir = file
+    // parent; multi-module dir input → source_dir = the dir itself.
+    // Status got left out of the Week 17 Tue dir-input wave because
+    // it was rarely exercised; the W20 multi-module orchestrator
+    // surfaced the gap when `aislang status <project-dir>/` failed
+    // with `Is a directory (os error 21)`.
+    let loaded = load_project_input(&file)?;
+    let project = &loaded.resolved.project;
 
-    let source_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let source_dir = if file.is_dir() {
+        file.as_path()
+    } else {
+        file.parent().unwrap_or_else(|| Path::new("."))
+    };
     // canonicalize() fails on a missing dir; degrade to the raw path
     // so the diagnostic still mentions a useful location.
     let output_dir = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.to_path_buf());
@@ -3173,12 +3174,15 @@ fn run_rag_query(
 
     // Look up the embedding-block referenced by the vector_store
     // so we can stand up a LiteLlmEmbedder with matching dims.
+    // Multi-module discipline: `vs.embedding` is a parser-produced
+    // ref (cross-module or same-module-bare); resolve to the merged-
+    // project lookup key via Ref::qualified_in against vs.label.
+    let emb_key = vs.embedding.qualified_in(&vs.label);
     let emb_block = proj.embeddings.iter()
-        .find(|e| e.label == vs.embedding.label)
+        .find(|e| e.label == emb_key)
         .ok_or_else(|| anyhow::anyhow!(
-            "vector_store `{vs_label}` references embedding `{}` \
-             which doesn't exist in the project",
-             vs.embedding.label))?;
+            "vector_store `{vs_label}` references embedding `{emb_key}` \
+             which doesn't exist in the project"))?;
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
     let catalog_entry = catalog
@@ -3271,12 +3275,12 @@ fn build_rag_index_for(
         }
     };
 
+    let emb_key = vs.embedding.qualified_in(&vs.label);
     let emb_block = proj.embeddings.iter()
-        .find(|e| e.label == vs.embedding.label)
+        .find(|e| e.label == emb_key)
         .ok_or_else(|| anyhow::anyhow!(
-            "vector_store `{vs_label}` references embedding `{}` \
-             which doesn't exist in the project",
-            vs.embedding.label))?;
+            "vector_store `{vs_label}` references embedding `{emb_key}` \
+             which doesn't exist in the project"))?;
     let catalog = aislang_catalog::bundled()
         .map_err(|e| anyhow::anyhow!("load catalog: {e}"))?;
     let catalog_entry = catalog
@@ -3479,8 +3483,43 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         model_label = "(router)".to_string();   // banner-only
         orchestrator_steps = None;
     } else {
-        // No agent + no pipeline + no branch matched — surface a
-        // combined hint.
+        // No exact match + no unique suffix match in any of agent /
+        // pipeline / branch.  v0.3 Week 20 Mon follow-up: distinguish
+        // the AMBIGUOUS case (multiple modules declare the same bare
+        // label) from the truly UNKNOWN case (no module has it) — the
+        // user-reported full_design collision (architect.full_design
+        // vs orchestrator.full_design under multi-module) surfaced
+        // here as a confusing "no agent named" message when the real
+        // issue was ambiguity, not absence.
+        let suffix = format!(".{agent_label}");
+        let mut ambiguous: Vec<String> = Vec::new();
+        for a in &project.agents {
+            if a.label.ends_with(&suffix) {
+                ambiguous.push(a.label.clone());
+            }
+        }
+        for p in &project.pipelines {
+            if p.label.ends_with(&suffix) {
+                ambiguous.push(format!("{} (pipeline)", p.label));
+            }
+        }
+        for b in &project.branches {
+            if b.label.ends_with(&suffix) {
+                ambiguous.push(format!("{} (branch)", b.label));
+            }
+        }
+        if ambiguous.len() >= 2 {
+            ambiguous.sort();
+            return Err(anyhow::anyhow!(
+                "`{agent_label}` is ambiguous in {} — multiple modules declare it.\n  \
+                 candidates: {}\n  \
+                 disambiguate by typing the qualified `<module>.{agent_label}` form.",
+                file.display(),
+                ambiguous.join(", ")));
+        }
+        // Genuinely unknown — fall through to the v0.2 "no match"
+        // diagnostic with the full available list + nearest-neighbour
+        // suggestion.
         let mut available: Vec<String> = project.agents.iter()
             .map(|a| a.label.clone()).collect();
         available.extend(project.pipelines.iter()
@@ -3656,6 +3695,8 @@ async fn chat_via_mcp_serve(
     }
     eprintln!("connected to LiteLLM via mcp-serve's Session pool.");
     eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
+    eprintln!("for multi-line input (paste a markdown design etc.), open with `/paste`");
+    eprintln!("then end with `/end` on its own line.");
     eprintln!();
 
     let stdin = tokio::io::stdin();
@@ -3673,7 +3714,7 @@ async fn chat_via_mcp_serve(
         use std::io::Write;
         let _ = std::io::stderr().flush();
 
-        let line = match reader.next_line().await {
+        let first_line = match reader.next_line().await {
             Ok(Some(l)) => l,
             Ok(None)    => break "(end of input)",
             Err(e)      => {
@@ -3681,9 +3722,49 @@ async fn chat_via_mcp_serve(
                 return Err(anyhow::anyhow!("stdin read error: {e}"));
             }
         };
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "/exit" { break "(/exit — session ended)"; }
+        let first_trimmed = first_line.trim();
+        if first_trimmed.is_empty() { continue; }
+        if first_trimmed == "/exit" { break "(/exit — session ended)"; }
+
+        // v0.3 Week 20 Mon follow-up #2: multi-line paste mode.
+        // Pasting a multi-line markdown (e.g. the Architect's
+        // 5-section design into the Coder) under line-buffered
+        // stdin sends each line as a separate turn — the receiving
+        // agent sees a stream of one-line fragments and keeps
+        // asking for "the full input".  `/paste` opens an
+        // accumulating buffer + `/end` on its own line sends the
+        // joined content as ONE user message.  `/exit` inside the
+        // buffer aborts the session (same precedence as outside).
+        let line: String = if first_trimmed == "/paste" {
+            let mut buf = String::new();
+            loop {
+                let next = match reader.next_line().await {
+                    Ok(Some(l)) => l,
+                    Ok(None)    => break,            // EOF closes the buffer
+                    Err(e) => {
+                        client.cancel().await.ok();
+                        return Err(anyhow::anyhow!("stdin read error in /paste: {e}"));
+                    }
+                };
+                if next.trim() == "/end"  { break; }
+                if next.trim() == "/exit" {
+                    // Empty out the buffer + propagate the exit at
+                    // the outer loop's next iteration.  Simpler than
+                    // smuggling a flag out of the inner block.
+                    buf.clear();
+                    buf.push_str("/exit");
+                    break;
+                }
+                if !buf.is_empty() { buf.push('\n'); }
+                buf.push_str(&next);
+            }
+            if buf == "/exit" { break "(/exit — session ended)"; }
+            if buf.is_empty() { continue; }
+            buf
+        } else {
+            first_trimmed.to_string()
+        };
+        let line = line.as_str();
 
         // ── Dispatch one turn via the MCP tool.  Same Session
         // pool the Claude Desktop / Cursor chat uses (planning-doc

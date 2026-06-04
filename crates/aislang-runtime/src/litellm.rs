@@ -341,33 +341,53 @@ impl LiteLlmClient {
     /// to the first-resolved address. Pinning v4 sidesteps it.
     pub const DEFAULT_URL: &'static str = "http://127.0.0.1:4000";
 
-    /// 180 seconds (3 minutes). Sized for CPU-bound local inference
+    /// 300 seconds (5 minutes). Sized for CPU-bound local inference
     /// (Ollama on a developer laptop generating a 4k-token response
-    /// can comfortably take 60-120s; eval datasets exercise the
+    /// can comfortably take 60-180s; eval datasets exercise the
     /// long tail of those generations).
     ///
-    /// History: shipped at 30s originally. User report from week 8
-    /// e2e eval testing surfaced 30s firing on cases that asked for
-    /// long-form answers against Llama 3.1 8B on CPU. 3 minutes is
-    /// generous for local models AND still bounds a wedged proxy
-    /// from blocking the chat loop indefinitely. Fast cloud models
-    /// (Haiku, gpt-4o-mini, Sonnet) complete well under 30s, so
-    /// the longer ceiling doesn't hurt their UX.
+    /// History: 30s (v0.1) → 180s (v0.1 week 8, long-form answers
+    /// against Llama 3.1 8B on CPU) → 300s (v0.3 week 20 Mon, user
+    /// report against qwen3:8b on CPU which can comfortably exceed
+    /// 3 min for the Architect's reasoning-heavy 5-section markdown
+    /// designs).  5 min is generous for local models AND still
+    /// bounds a wedged proxy from blocking the chat loop
+    /// indefinitely.  Fast cloud models (Haiku, gpt-4o-mini, Sonnet)
+    /// complete well under 30s, so the longer ceiling doesn't hurt
+    /// their UX.
     ///
-    /// v0.2: make this configurable per-eval / per-session via the
+    /// Override at runtime via the `AISLANG_LITELLM_TIMEOUT_SECS`
+    /// env var (clamped to 1..=3600 to bound the worst case).
+    /// `Self::new` reads the env var on each construction.
+    ///
+    /// v0.5+: make this configurable per-eval / per-session via the
     /// `.ais` source's `model.latency_p95` field (currently used
     /// only as a resolver constraint), with a fallback to this
-    /// constant. Catalog entry's `latency_p95 * 4` is a reasonable
-    /// per-call timeout derivation.
-    pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
+    /// constant.  Catalog entry's `latency_p95 * 4` is a reasonable
+    /// per-call timeout derivation but underestimates for CPU-bound
+    /// hardware where the catalog's GPU-tuned latency_p95 values are
+    /// off by an order of magnitude.
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+    /// Env var read by `Self::new` to override
+    /// [`DEFAULT_TIMEOUT_SECS`](Self::DEFAULT_TIMEOUT_SECS) at
+    /// runtime.  Value parses as `u64` seconds, clamped to
+    /// `1..=3600` to keep both extremes bounded.  Missing /
+    /// malformed values fall through to the default.
+    pub const TIMEOUT_ENV_VAR: &'static str = "AISLANG_LITELLM_TIMEOUT_SECS";
 
     /// Build a client pointing at the given LiteLLM base URL.
     /// `base_url` must NOT include the `/v1/...` path — that's
     /// appended per-call.
+    ///
+    /// Per-call timeout: `DEFAULT_TIMEOUT_SECS` unless the
+    /// `AISLANG_LITELLM_TIMEOUT_SECS` env var supplies a parseable
+    /// override (clamped to 1..=3600).
     pub fn new(base_url: impl Into<String>) -> Result<Self, LiteLlmError> {
         let base_url = base_url.into();
+        let timeout_secs = resolve_timeout_secs();
         let http = Client::builder()
-            .timeout(Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| LiteLlmError::Transport {
                 url:   base_url.clone(),
@@ -509,6 +529,69 @@ impl LiteLlmClient {
         }
         span.end();
         Ok(parsed)
+    }
+}
+
+// ============================================================================
+// Helper: resolve the per-call timeout — env-var override + clamp.
+// ============================================================================
+
+/// Read `AISLANG_LITELLM_TIMEOUT_SECS` and clamp into `1..=3600`,
+/// falling through to [`LiteLlmClient::DEFAULT_TIMEOUT_SECS`] on
+/// missing / unparseable values.  Used by `LiteLlmClient::new` on
+/// every construction so override-then-rebuild works without a
+/// process restart.
+fn resolve_timeout_secs() -> u64 {
+    const MIN: u64 = 1;
+    const MAX: u64 = 3600;
+    match std::env::var(LiteLlmClient::TIMEOUT_ENV_VAR) {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(v) => v.clamp(MIN, MAX),
+            Err(_) => LiteLlmClient::DEFAULT_TIMEOUT_SECS,
+        },
+        Err(_) => LiteLlmClient::DEFAULT_TIMEOUT_SECS,
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    // The env var is process-global so each case sets+clears to
+    // keep the next case's setup deterministic.  Using a single
+    // test fn with serial calls (NOT separate #[test] fns) so
+    // cargo's parallel test runner can't interleave them.
+    #[test]
+    fn resolve_timeout_secs_env_var_round_trip_and_clamp() {
+        let v = LiteLlmClient::TIMEOUT_ENV_VAR;
+
+        // ── unset → default ─────────────────────────────────
+        // SAFETY: setting/removing env vars in tests is unsafe
+        // in edition 2024+ because another thread could be
+        // reading the env concurrently.  These tests are
+        // single-threaded by design (#[test] alone, no async
+        // dispatch), so the only reader is this test itself.
+        unsafe { std::env::remove_var(v); }
+        assert_eq!(resolve_timeout_secs(), LiteLlmClient::DEFAULT_TIMEOUT_SECS);
+
+        // ── valid value passes through ──────────────────────
+        unsafe { std::env::set_var(v, "600"); }
+        assert_eq!(resolve_timeout_secs(), 600);
+
+        // ── below MIN clamps up to 1 ────────────────────────
+        unsafe { std::env::set_var(v, "0"); }
+        assert_eq!(resolve_timeout_secs(), 1);
+
+        // ── above MAX clamps down to 3600 ───────────────────
+        unsafe { std::env::set_var(v, "99999"); }
+        assert_eq!(resolve_timeout_secs(), 3600);
+
+        // ── unparseable falls back to default ───────────────
+        unsafe { std::env::set_var(v, "five-hundred"); }
+        assert_eq!(resolve_timeout_secs(), LiteLlmClient::DEFAULT_TIMEOUT_SECS);
+
+        // Clean up.
+        unsafe { std::env::remove_var(v); }
     }
 }
 

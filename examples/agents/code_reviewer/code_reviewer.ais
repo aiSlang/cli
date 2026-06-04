@@ -43,14 +43,16 @@ project "code-reviewer-agent" {
     hard_cap_per_run = $0.10
   }
 
-  ## Reasoning-tier model for review work (mirrors Architect's
-  ## choice from Thu).  Qwen2.5-Coder is for code emission,
-  ## not code review.
+  ## Cloud-tier reasoning model for review work (mirrors
+  ## Architect's choice).  Haiku is the primary because CPU-
+  ## bound qwen3:8b inference exceeds the 5-minute LiteLLM
+  ## ceiling on commodity hardware; Ollama qwen3:8b stays as a
+  ## local fallback for the GPU case (Week 20 Mon follow-up).
   model "reviewer_brain" {
     requires    = [chat, reasoning]
     context_min = 32k
-    prefer      = [ollama.qwen3_8b]
-    fallback    = [anthropic.claude_haiku_4_5]
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
   }
 
   embedding "local_bge" {

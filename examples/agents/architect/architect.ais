@@ -51,14 +51,19 @@ project "architect-agent" {
     hard_cap_per_run = $0.10
   }
 
-  ## Reasoning-tier local LLM for design work.  bge-m3 ships
-  ## reasoning capability per the catalog; haiku fallback for
-  ## CI / cloud runs without Ollama.
+  ## Cloud-tier reasoning model for design work.  Haiku is the
+  ## primary because CPU-bound qwen3:8b inference comfortably
+  ## exceeds the LiteLLM client's 5-minute ceiling on commodity
+  ## hardware; Ollama qwen3:8b stays declared as a local fallback
+  ## for the GPU case (when AISLANG_LITELLM_TIMEOUT_SECS isn't
+  ## needed) — the same reasoning-tier model, just slower without
+  ## hardware acceleration.  Original "qwen3 primary" pre-dated
+  ## the user's CPU-inference reality check (Week 20 Mon follow-up).
   model "architect_brain" {
     requires    = [chat]
     context_min = 32k
-    prefer      = [ollama.qwen3_8b]
-    fallback    = [anthropic.claude_haiku_4_5]
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
   }
 
   embedding "local_bge" {
@@ -75,7 +80,7 @@ project "architect-agent" {
 
   prompt "architect_sys" {
     file    = "./prompts/architect.md"
-    version = "1.0.0"
+    version = "1.0.1"
   }
 
   agent "architect" {
@@ -85,16 +90,15 @@ project "architect-agent" {
     knowledge     = [vector_store.architect_kb]
   }
 
-  ## Placeholder pipeline — Thu ships Architect alone; Fri's
-  ## Coder + Reviewer agents extend `steps = [agent.architect,
-  ## agent.coder, agent.reviewer]`.  Keeping the pipeline label
-  ## stable across the Thu→Fri commits means users' command
-  ## history (`aislang chat full_design ...`) doesn't break.
-  pipeline "full_design" {
-    steps  = [agent.architect]
-    input  = "natural-language feature spec for a new resource block"
-    output = "5-section markdown design (Block name / Purpose / Fields / Grammar example / LANGUAGE-SPEC snippet / Decision implications)"
-  }
+  ## Single-step pipeline removed in W20 Mon follow-up: the real
+  ## 3-agent chain lives in `examples/agents/orchestrator/` (use
+  ## `aislang chat full_design examples/agents/orchestrator/`).
+  ## Keeping a same-named placeholder here caused an ambiguous
+  ## suffix-match with the orchestrator's real pipeline when the
+  ## user typed unqualified `full_design` against the orchestrator
+  ## dir.  For the standalone "iterate on a design" workflow,
+  ## chat against `agent.architect` directly — no pipeline
+  ## wrapper needed.
 
   ## Heuristic eval — 3 synthetic specs check that the Architect
   ## emits the 5-section structure + a fenced grammar block.
