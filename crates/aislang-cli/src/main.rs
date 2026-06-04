@@ -1593,12 +1593,25 @@ fn run_apply(file: PathBuf) -> Result<()> {
         eprintln!("  docker compose -f {} up -d", stack_path.display());
         return Ok(());
     }
+    // W20 Wed follow-up: walk up from the project dir looking for
+    // a `.env` so users can keep a single workspace-root `.env`
+    // for many sub-projects.  Docker Compose only auto-loads `.env`
+    // next to the compose file; when we find one further up we
+    // pass it explicitly via `--env-file`.  No-op if a `.env`
+    // already sits next to stack.yml (Compose handles that natively).
+    let discovered_env = find_dotenv_walking_up(&prep.output_dir);
+    if let Some(p) = discovered_env.as_ref() {
+        eprintln!("  env file:         {} (picked up from a parent dir)",
+            p.display());
+    }
     eprintln!("bringing stack up: docker compose -f {} up -d", stack_path.display());
-    let status = std::process::Command::new("docker")
-        .args(["compose", "-f"])
-        .arg(&stack_path)
-        .args(["up", "-d"])
-        .status()
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args(["compose", "-f"]).arg(&stack_path);
+    if let Some(p) = discovered_env.as_ref() {
+        cmd.args(["--env-file"]).arg(p);
+    }
+    cmd.args(["up", "-d"]);
+    let status = cmd.status()
         .map_err(|e| anyhow::anyhow!("invoke docker compose: {e}"))?;
     if !status.success() {
         return Err(anyhow::anyhow!(
@@ -1668,6 +1681,97 @@ fn run_apply(file: PathBuf) -> Result<()> {
     }
     eprintln!("  teardown:  aislang destroy {}", file.display());
     Ok(())
+}
+
+/// Walk up from `start` looking for a `.env` file.  Returns
+/// `Some(<absolute path>)` for the first match, or `None` if the
+/// search walks all the way to the filesystem root without
+/// finding one.  Skips `.env.example` (template, not the user's
+/// secrets file).
+///
+/// v0.3 Week 20 Wed.  Users keep a single workspace-root `.env`
+/// for many sub-projects (the repo pattern: one `.env` next to
+/// `Cargo.toml`, many `examples/agents/*/` sub-projects).  Docker
+/// Compose only auto-loads `.env` next to the compose file —
+/// pass it explicitly via `--env-file` when we find it further up.
+fn find_dotenv_walking_up(start: &Path) -> Option<PathBuf> {
+    let mut cur: PathBuf = start.to_path_buf();
+    // Skip the start dir itself — Docker Compose handles that
+    // case natively, no `--env-file` flag needed.
+    while let Some(parent) = cur.parent() {
+        let candidate = parent.join(".env");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        cur = parent.to_path_buf();
+    }
+    None
+}
+
+#[cfg(test)]
+mod dotenv_walk_tests {
+    use super::*;
+
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "aislang-cli-dotenv-walk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(
+                std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn find_dotenv_walking_up_returns_parent_match() {
+        // `.env` at `<root>/.env`; start = `<root>/sub/project/`;
+        // expect to find the root `.env` two levels up.
+        let root = tempdir();
+        std::fs::write(root.join(".env"), b"OLLAMA_API_BASE=...").unwrap();
+        let nested = root.join("sub").join("project");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = find_dotenv_walking_up(&nested)
+            .expect("should walk up to root and find .env");
+        assert_eq!(found, root.join(".env"));
+    }
+
+    #[test]
+    fn find_dotenv_walking_up_skips_start_dir() {
+        // Docker Compose already handles `.env` next to the stack
+        // — `find_dotenv_walking_up` is for the PARENT-dir case
+        // ONLY.  A `.env` IN `start` returns `None` so the caller
+        // doesn't pass redundant `--env-file`.
+        let root = tempdir();
+        std::fs::write(root.join(".env"), b"X=1").unwrap();
+        assert_eq!(find_dotenv_walking_up(&root), None,
+            "start dir match must not be returned — that's Compose's default behaviour");
+    }
+
+    #[test]
+    fn find_dotenv_walking_up_returns_none_when_no_env_in_ancestry() {
+        let root = tempdir();
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        // No `.env` anywhere — must walk to fs root + return None
+        // without panicking.
+        assert_eq!(find_dotenv_walking_up(&nested), None);
+    }
+
+    #[test]
+    fn find_dotenv_walking_up_picks_closest_match() {
+        // Closer .env wins over farther one (mirrors expected
+        // human intuition + matches how Compose ascent-search
+        // behaves elsewhere).
+        let root = tempdir();
+        std::fs::write(root.join(".env"), b"FAR=1").unwrap();
+        let mid  = root.join("workspace");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::write(mid.join(".env"), b"CLOSE=1").unwrap();
+        let nested = mid.join("project");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = find_dotenv_walking_up(&nested).expect("walk");
+        assert_eq!(found, mid.join(".env"));
+    }
 }
 
 /// `aislang destroy <file> [--force]` — locate the stack.yml emitted
@@ -2411,18 +2515,13 @@ fn first_agent_label_in_file(file: &Path) -> Option<String> {
 // `--json` for CI pipelines.
 
 fn run_cost(file: PathBuf) -> Result<()> {
-    // Validate so the user sees the same diagnostics they'd see on
-    // `aislang validate` if the source is broken. Cheap; the cost
-    // command is rare so we don't optimize away the parse.
-    let source = std::fs::read_to_string(&file)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?;
-    let (project, _warnings) = match aislang_core::validate(&source) {
-        Ok(v) => v,
-        Err(err) => {
-            render_validate_error(&source, &err);
-            return Err(anyhow::anyhow!("(see error above)"));
-        }
-    };
+    // v0.3 Week 20 Wed follow-up: dir-vs-file dispatch via
+    // load_project_input (same pattern as the W20 Mon `aislang
+    // status` dir-input fix).  `aislang cost <multi-module-dir>/`
+    // was failing with `Is a directory (os error 21)` because
+    // this fn still used the v0.2 direct `read_to_string` path.
+    let loaded = load_project_input(&file)?;
+    let project = &loaded.resolved.project;
 
     // Open the tracker read-only — `open_default` reads
     // ~/.aislang/spend.json if present, else seeds an empty one in

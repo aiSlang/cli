@@ -1936,8 +1936,15 @@ async fn build_session_for_agent_multi_module(
                     "catalog entry `{}.{}` not found",
                     model_id.provider, model_id.name))?;
             Some(BudgetConfig {
-                per_run_cap:        b.hard_cap_per_day,  // matches single-file
-                per_day_cap:        b.hard_cap_per_run,
+                // W20 Wed follow-up: multi-module path had the
+                // per_run_cap / per_day_cap fields SWAPPED — caused
+                // the user-reported "daily budget exceeded: $0.10 of
+                // $0.1 per-day cap" message when the actual exceed
+                // was against the per-RUN cap.  The single-file
+                // build_session_for_agent path + the eval path both
+                // map them correctly; this was a stale copy-paste.
+                per_run_cap:        b.hard_cap_per_run,
+                per_day_cap:        b.hard_cap_per_day,
                 cost_input_per_1k:  entry.cost_input,
                 cost_output_per_1k: entry.cost_output,
                 model_id_str:       format!("{}.{}", model_id.provider, model_id.name),

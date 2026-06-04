@@ -40,7 +40,7 @@
 project "code-reviewer-agent" {
   budget {
     hard_cap_per_day = $1
-    hard_cap_per_run = $0.10
+    hard_cap_per_run = $0.50
   }
 
   ## Cloud-tier reasoning model for review work (mirrors
