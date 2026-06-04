@@ -1,6 +1,6 @@
-# aiSlang Language Specification — v0 (v0.1 baseline + v0.2 additions)
+# aiSlang Language Specification — v0 (v0.1 baseline + v0.2 + v0.3 additions)
 
-Status: **Authoritative for v0.2.0-rc2** (Phase 2 Week 14 close — Track B foundation).  The v0.1 baseline is frozen; Phase 1 (Week 12-13) additions are forward-compatible at the AST level; Phase 2 Week 14 (Track B) additions are likewise purely-additive (any valid v0.1 file produces an AST that v0.2-rc2 deserialises identically — see §7).  One controlled grammar break in v0.2 Tue: see §4.9.
+Status: **Authoritative for v0.3.0-rc1** (Week 20 Fri close — dogfooded agent inventory + RAG + multi-module orchestrator + Qwen-on-Ollama integration).  The v0.1 + v0.2 baselines are frozen; v0.3 additions across Phase 1 (composition primitives `pipeline` / `loop` / `branch` + `skill` block + MiniJinja templates) and Phase 2 (`vector_store` + `embedding` blocks + `agent.knowledge` field + multi-module orchestrator dispatch) are purely-additive at the AST level — any valid v0.2-rc2 file produces an AST that v0.3.0-rc1 deserialises identically (see §7).  No controlled grammar breaks in v0.3.  Public-launch DoD remains v0.4 (first public release once Track C scaffolds land).
 
 This spec defines exactly enough of the language to make `examples/support-agent.ais` (in [PLAN-90-days-v0_1.md](PLAN-90-days-v0_1.md)) compile, type-check, plan, deploy, and run, **plus** the v0.2 grammar additions that landed in Phase 1 + Phase 2 Week 14:
 
