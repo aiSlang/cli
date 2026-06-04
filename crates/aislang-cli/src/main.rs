@@ -3483,8 +3483,43 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         model_label = "(router)".to_string();   // banner-only
         orchestrator_steps = None;
     } else {
-        // No agent + no pipeline + no branch matched — surface a
-        // combined hint.
+        // No exact match + no unique suffix match in any of agent /
+        // pipeline / branch.  v0.3 Week 20 Mon follow-up: distinguish
+        // the AMBIGUOUS case (multiple modules declare the same bare
+        // label) from the truly UNKNOWN case (no module has it) — the
+        // user-reported full_design collision (architect.full_design
+        // vs orchestrator.full_design under multi-module) surfaced
+        // here as a confusing "no agent named" message when the real
+        // issue was ambiguity, not absence.
+        let suffix = format!(".{agent_label}");
+        let mut ambiguous: Vec<String> = Vec::new();
+        for a in &project.agents {
+            if a.label.ends_with(&suffix) {
+                ambiguous.push(a.label.clone());
+            }
+        }
+        for p in &project.pipelines {
+            if p.label.ends_with(&suffix) {
+                ambiguous.push(format!("{} (pipeline)", p.label));
+            }
+        }
+        for b in &project.branches {
+            if b.label.ends_with(&suffix) {
+                ambiguous.push(format!("{} (branch)", b.label));
+            }
+        }
+        if ambiguous.len() >= 2 {
+            ambiguous.sort();
+            return Err(anyhow::anyhow!(
+                "`{agent_label}` is ambiguous in {} — multiple modules declare it.\n  \
+                 candidates: {}\n  \
+                 disambiguate by typing the qualified `<module>.{agent_label}` form.",
+                file.display(),
+                ambiguous.join(", ")));
+        }
+        // Genuinely unknown — fall through to the v0.2 "no match"
+        // diagnostic with the full available list + nearest-neighbour
+        // suggestion.
         let mut available: Vec<String> = project.agents.iter()
             .map(|a| a.label.clone()).collect();
         available.extend(project.pipelines.iter()

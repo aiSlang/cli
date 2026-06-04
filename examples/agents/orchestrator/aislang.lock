@@ -23,7 +23,7 @@
   },
   "oci_digests": {},
   "modules": {
-    "architect": "acbd7949f4609ce2503386fad3f647158c5cb9b723bc9ea1fdfe91c381217bbd",
+    "architect": "5ea0e6bf58e3cd70994b65284b661b3960ee61fbee4166634a1e6adb69fd5c42",
     "code_reviewer": "198ae25ab9f0143ff51d782ec6c8e7829cb4edf0d48df76122ab53481d3be339",
     "coder": "2df4ac1abad90b36e35af34c4f3685d8084577a8e48c10f8d82a2455ca272afb",
     "orchestrator": "22054763f8be4ee33e77cd177d17c32ecca2eb33d498e0aa9277623e16fbb377"

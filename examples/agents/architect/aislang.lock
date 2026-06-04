@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "acbd7949f4609ce2503386fad3f647158c5cb9b723bc9ea1fdfe91c381217bbd",
+  "source_hash": "5ea0e6bf58e3cd70994b65284b661b3960ee61fbee4166634a1e6adb69fd5c42",
   "model_bindings": {
     "architect_brain": {
       "provider": "anthropic",

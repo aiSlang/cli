@@ -90,16 +90,15 @@ project "architect-agent" {
     knowledge     = [vector_store.architect_kb]
   }
 
-  ## Placeholder pipeline — Thu ships Architect alone; Fri's
-  ## Coder + Reviewer agents extend `steps = [agent.architect,
-  ## agent.coder, agent.reviewer]`.  Keeping the pipeline label
-  ## stable across the Thu→Fri commits means users' command
-  ## history (`aislang chat full_design ...`) doesn't break.
-  pipeline "full_design" {
-    steps  = [agent.architect]
-    input  = "natural-language feature spec for a new resource block"
-    output = "5-section markdown design (Block name / Purpose / Fields / Grammar example / LANGUAGE-SPEC snippet / Decision implications)"
-  }
+  ## Single-step pipeline removed in W20 Mon follow-up: the real
+  ## 3-agent chain lives in `examples/agents/orchestrator/` (use
+  ## `aislang chat full_design examples/agents/orchestrator/`).
+  ## Keeping a same-named placeholder here caused an ambiguous
+  ## suffix-match with the orchestrator's real pipeline when the
+  ## user typed unqualified `full_design` against the orchestrator
+  ## dir.  For the standalone "iterate on a design" workflow,
+  ## chat against `agent.architect` directly — no pipeline
+  ## wrapper needed.
 
   ## Heuristic eval — 3 synthetic specs check that the Architect
   ## emits the 5-section structure + a fenced grammar block.
