@@ -3341,6 +3341,24 @@ fn build_rag_index_for(
             "no vector_store named `{vs_label}` in {}", project.display()))?;
     let project_root = std::fs::canonicalize(&loaded.project_root)
         .map_err(|e| anyhow::anyhow!("project root not readable: {e}"))?;
+    // v0.3 Week 20 Thu (dogfood finding): multi-module projects
+    // resolve a vector_store's relative `source` path against the
+    // CONTAINING MODULE's dir, NOT the project root.  The W19 Wed
+    // wiring used `project_root.join(path)` which works for
+    // single-file projects (where module_dir == project_root) but
+    // silently produced empty indexes for multi-module orchestrator
+    // sub-modules — discovered when the dogfood Coder hallucinated
+    // `hcl::Block` against an EMPTY (50-byte / 0-chunk) corpus
+    // index instead of the W20 Wed rewritten 217-KB chunked corpus.
+    // `vs_label` is module-qualified (e.g. `coder.coder_kb`); split
+    // on the first `.` to recover the module name + look up its
+    // canonical dir via `LoadedProject.module_dirs`.
+    let resolve_root: PathBuf = match vs_label.split_once('.') {
+        Some((module, _)) => loaded.module_dirs.get(module)
+            .cloned()
+            .unwrap_or_else(|| project_root.clone()),
+        None => project_root.clone(),
+    };
 
     // v0.3: only the Path source variant is wired in the CLI build.
     // Url / Crawl variants would need an HTTP fetcher (+ for crawl
@@ -3348,7 +3366,7 @@ fn build_rag_index_for(
     let source_text = match &vs.source {
         SourceUri::Path { path } => {
             let abs = if path.is_absolute() { path.clone() }
-                      else { project_root.join(path) };
+                      else { resolve_root.join(path) };
             // Single file → read directly; directory → concatenate
             // every readable file under it (lexicographic order)
             // with a separator marker so chunks don't span file
