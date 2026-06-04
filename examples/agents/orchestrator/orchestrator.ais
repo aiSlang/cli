@@ -52,9 +52,14 @@ project "orchestrator-module" {
   ## Each step's output is the next step's input (Decision 44.5
   ## string-only handoff in v0.3; structured envelopes v0.5+).
   pipeline "full_design" {
-    steps  = [use architect.architect, use coder.coder, use code_reviewer.code_reviewer]
+    ## v0.3 Week 20 Tue: extended from 3 steps to 4 with the
+    ## Tester leg appended.  Tester reads the Reviewer's
+    ## ACCEPT-or-feedback verdict + the Coder's most-recent
+    ## patch (threaded via the cumulative-input handoff) and
+    ## emits a Test plan + canonical `cargo test` invocation.
+    steps  = [use architect.architect, use coder.coder, use code_reviewer.code_reviewer, use tester.tester]
     input  = "natural-language feature spec for a new resource block"
-    output = "Coder's Patch + Test coverage + Reviewer's verdict (ACCEPT or feedback)"
+    output = "Tester's Test plan + cargo test invocation + ACCEPT-or-FAIL verdict"
   }
 
   ## Inner pipeline for the reflector loop wrap below — just the

@@ -188,6 +188,18 @@ enum Command {
         /// Path to the .ais project file. v0.2 may infer this from
         /// `aislang.lock` in the current directory.
         file:  PathBuf,
+        /// v0.3 Week 20 Tue: pause between pipeline steps so the
+        /// user can hand-edit the previous step's persisted output
+        /// before the next step picks it up.  Every step's reply
+        /// is ALWAYS persisted under `<project_root>/.aislang/
+        /// pipeline/<pipeline_label>/step_<N>_<agent>.md`
+        /// regardless of this flag — the flag controls whether the
+        /// CLI pauses + re-reads the file as the next step's
+        /// input.  Without `--interactive`, the orchestrator
+        /// runs unchanged from the Mon/W17-Thu pipe-forward
+        /// behaviour.  No-op for single-agent + router branches.
+        #[arg(long, default_value_t = false)]
+        interactive: bool,
     },
     /// Run the aiSlang MCP server (v0.2 Track A — week 12 Mon scaffold)
     ///
@@ -360,7 +372,8 @@ fn run() -> Result<ExitCode> {
         Command::Cost { file }       => run_cost(file).map(|_| ExitCode::SUCCESS)?,
         Command::Status { file, spend, model_spend, main_spend } =>
             run_status(file, spend, model_spend, main_spend)?,
-        Command::Chat { agent, file } => run_chat(agent, file).map(|_| ExitCode::SUCCESS)?,
+        Command::Chat { agent, file, interactive } =>
+            run_chat(agent, file, interactive).map(|_| ExitCode::SUCCESS)?,
         Command::McpServe { stdio, http } =>
             run_mcp_serve(stdio, http).map(|_| ExitCode::SUCCESS)?,
         Command::Skill { action } => match action {
@@ -3421,7 +3434,7 @@ fn run_skill(
     Ok(())
 }
 
-fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
+fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()> {
     // ── 1. read + validate source (single-file OR multi-module dir) ──
     // v0.3 Week 17 Tue: dir-vs-file dispatch via load_project_input.
     // The loader handles both shapes; we drive the same downstream
@@ -3569,9 +3582,112 @@ fn run_chat(agent_label: String, file: PathBuf) -> Result<()> {
         source_path, source_dir,
         qualified_agent_label, model_label,
         orchestrator_steps, router_dispatch,
+        interactive,
     ));
     drop(rt);
     result
+}
+
+/// Persist a single pipeline step's reply under `<root>/turn_<T>_
+/// step_<N>_<agent>.md` and return the absolute path.  Best-effort:
+/// IO errors print a warning + return the would-be path so the
+/// caller can still surface "step happened" to the user.
+///
+/// v0.3 Week 20 Tue.  Hoisted to a top-level fn so unit tests can
+/// pin the filename shape + the parent-dir creation + the
+/// roundtrip-after-edit contract that `--interactive` relies on
+/// without driving the full chat loop.
+fn persist_step_reply(
+    root:       &Path,
+    turn:       u64,
+    step:       usize,
+    step_label: &str,
+    reply:      &str,
+) -> PathBuf {
+    let fname = format!(
+        "turn_{turn:03}_step_{step:02}_{step_label}.md");
+    let path = root.join(fname);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, reply) {
+        eprintln!("\x1b[2;3m  · warn: failed to persist step output to {}: {e}\x1b[0m",
+            path.display());
+    }
+    path
+}
+
+#[cfg(test)]
+mod chat_persistence_tests {
+    use super::*;
+
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "aislang-cli-chat-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(
+                std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn persist_step_reply_writes_with_zero_padded_turn_and_step() {
+        // Pins the filename shape that `--interactive` relies on
+        // (the user's hand-edit roundtrips through the SAME path).
+        let root = tempdir();
+        let p = persist_step_reply(&root, 1, 2, "coder.coder",
+            "## Patch\nfoo\n");
+        assert_eq!(p.file_name().unwrap(),
+            "turn_001_step_02_coder.coder.md");
+        let read = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(read, "## Patch\nfoo\n");
+    }
+
+    #[test]
+    fn persist_step_reply_creates_missing_parent_dirs() {
+        // `<source_dir>/.aislang/pipeline/<pipeline_label>/`
+        // doesn't exist on a fresh project.  The helper MUST
+        // create it (recursively) or the first orchestrator
+        // run loses its trace.
+        let root = tempdir().join("nested").join("doesnt").join("exist");
+        assert!(!root.exists());
+        let p = persist_step_reply(&root, 1, 1, "architect.architect",
+            "design body");
+        assert!(p.exists());
+        assert!(root.exists());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "design body");
+    }
+
+    #[test]
+    fn persist_step_reply_overwrites_same_step_across_calls() {
+        // Reflector / loop dispatch re-runs the same (pipeline,
+        // step, agent) within a single turn → must overwrite,
+        // not collide.  The turn counter increments per
+        // top-level orchestrator run so cross-turn writes get
+        // distinct files automatically.
+        let root = tempdir();
+        let p1 = persist_step_reply(&root, 5, 3, "coder.coder",
+            "v1 patch");
+        let p2 = persist_step_reply(&root, 5, 3, "coder.coder",
+            "v2 patch");
+        assert_eq!(p1, p2);
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "v2 patch");
+    }
+
+    #[test]
+    fn persist_step_reply_round_trip_supports_hand_edit() {
+        // The `--interactive` UX is: persist → user edits the
+        // file → CLI re-reads.  Test the file-IO contract — a
+        // post-write modification round-trips on re-read.
+        let root = tempdir();
+        let p = persist_step_reply(&root, 1, 1, "architect.architect",
+            "first draft");
+        std::fs::write(&p, "user-edited body").unwrap();
+        let read = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(read, "user-edited body",
+            "user hand-edit must round-trip through the same path");
+    }
 }
 
 /// Drive an interactive chat session by spawning `aislang mcp-serve
@@ -3635,6 +3751,7 @@ async fn chat_via_mcp_serve(
     model_label: String,
     orchestrator_steps: Option<Vec<String>>,
     router_dispatch:    Option<RouterDispatch>,
+    interactive:        bool,
 ) -> Result<()> {
     use rmcp::{ServiceExt,
         model::{CallToolRequestParams, NumberOrString, ProgressToken, RawContent,
@@ -3853,6 +3970,21 @@ async fn chat_via_mcp_serve(
         let mut current_input = line.to_string();
         let mut last_reply: Option<String> = None;
         let mut dispatch_failed = false;
+        // v0.3 Week 20 Tue: persist each step's reply under
+        // `<source_dir>/.aislang/pipeline/<pipeline_label>/turn_<T>_
+        // step_<N>_<agent>.md` so the user can compare / diff
+        // between runs.  `<pipeline_label>` is `agent_label` when
+        // orchestrator-dispatched (the run_chat resolution path
+        // populated it with the qualified pipeline label).  Single-
+        // agent + router paths skip persistence (no step-by-step
+        // surface to inspect).  `--interactive` ALSO causes the
+        // CLI to pause between steps + re-read the persisted file
+        // as the next step's input — so a user edit propagates.
+        let persist_root = if steps.len() > 1 {
+            Some(source_dir.join(".aislang").join("pipeline").join(&agent_label))
+        } else {
+            None
+        };
         for (step_idx, step_label) in steps.iter().enumerate() {
             if steps.len() > 1 {
                 eprintln!("\x1b[2;3m  · orchestrator step {}/{} → agent `{step_label}`\x1b[0m",
@@ -3874,6 +4006,15 @@ async fn chat_via_mcp_serve(
                             _ => None,
                         })
                         .unwrap_or_else(|| "(empty response)".to_string());
+                    // Persist this step's reply for compare / diff /
+                    // hand-edit.  Best-effort — IO errors print a
+                    // warning but don't abort the chat.
+                    let persisted_path: Option<PathBuf> = persist_root.as_ref()
+                        .map(|root| {
+                            persist_step_reply(
+                                root, turn_counter,
+                                step_idx + 1, step_label, &reply)
+                        });
                     // v0.3 Week 17 Thu follow-up: surface the INTERMEDIATE
                     // step replies on stderr (dim/italic) so the user can
                     // SEE the chain progress instead of staring at a
@@ -3891,7 +4032,39 @@ async fn chat_via_mcp_serve(
                             .collect::<Vec<_>>().join("\n");
                         eprintln!("{indented}");
                     }
-                    current_input = reply.clone();
+                    // v0.3 Week 20 Tue: `--interactive` pause before
+                    // the NEXT step.  Skip after the last step (no
+                    // next step to feed).  After the pause, re-read
+                    // the persisted file so a user hand-edit gets
+                    // picked up as the next step's input.  Without
+                    // `--interactive`, current_input flows from the
+                    // in-memory reply (W17 Thu's behaviour).
+                    if interactive
+                        && steps.len() > 1
+                        && step_idx + 1 < steps.len()
+                        && persisted_path.is_some()
+                    {
+                        let p = persisted_path.as_ref().unwrap();
+                        eprintln!("\x1b[2;3m  · --interactive: edit {} if you want; press Enter to continue\x1b[0m",
+                            p.display());
+                        let _ = reader.next_line().await;
+                        match std::fs::read_to_string(p) {
+                            Ok(edited) => {
+                                if edited != reply {
+                                    eprintln!("\x1b[2;3m  · picked up hand-edit ({} -> {} bytes)\x1b[0m",
+                                        reply.len(), edited.len());
+                                }
+                                current_input = edited;
+                            }
+                            Err(e) => {
+                                eprintln!("\x1b[2;3m  · warn: re-read of {} failed: {e}; falling back to in-memory reply\x1b[0m",
+                                    p.display());
+                                current_input = reply.clone();
+                            }
+                        }
+                    } else {
+                        current_input = reply.clone();
+                    }
                     last_reply = Some(reply);
                 }
                 Err(e) => {

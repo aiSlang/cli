@@ -1,0 +1,123 @@
+## v0.3 Week 20 Tue — Tester agent.
+##
+## Reads Coder's Patch + Test coverage section + (optionally)
+## the Reviewer's verdict, then emits a structured Test plan
+## describing which `cargo test` invocations cover the new
+## block + the expected outcome.  Pairs with the reflector
+## runtime pattern from W17 Fri at the runtime layer: when
+## `cargo test` returns failures, the Tester's verdict feeds
+## back into the Coder for revision-with-feedback.
+##
+## ## Direct chat (one-shot test-plan emission)
+##
+## ```
+## aislang chat tester examples/agents/tester/tester.ais
+## > <paste the Coder's Patch + Test coverage from the Reviewer-
+##   ACCEPTed cycle>
+## ```
+##
+## ## Paired with Coder via the reflector pattern
+##
+## Tue ships the Tester agent + a runtime integration test that
+## drives `patterns::reflector::run(coder, tester, …)` where the
+## Tester returns either ACCEPT (test plan looks complete) or
+## "FAIL: <feedback>" pointing the Coder at the specific
+## coverage gap.  Same `is_accept_verdict` runtime contract as
+## the Coder ↔ Reviewer reflector test from W19 Fri.
+##
+## ## Skill block declared but not auto-invoked
+##
+## The `skill "run_tests"` block below declares the canonical
+## `cargo test --workspace --no-fail-fast` invocation that the
+## agent's Test plan SHOULD recommend.  Today the skill is
+## INVOKED MANUALLY via `aislang skill run run_tests
+## examples/agents/tester/tester.ais` (the W18 Wed-Thu pattern);
+## auto-invocation from inside the chat loop is deferred to v0.5+
+## (Decisions 46.x — see Out-of-scope in PLAN-v0_3.md).
+##
+## ## RAG context
+##
+## `knowledge = [vector_store.tester_kb]` — in-repo `cargo test`
+## convention summary + reflector-pattern feedback shape +
+## exit-status interpretation rules.
+##
+## ## Model choice
+##
+## Cloud-tier reasoning (Haiku) primary, matching Architect +
+## Reviewer.  Test planning is judgement work (which test names
+## cover which fields, did the Coder skip a range check the
+## Architect called out?), not code emission — qwen3:8b is the
+## local fallback for the GPU case.
+
+project "tester-agent" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.30
+  }
+
+  ## Reasoning-tier model.  See W20 Mon for the haiku-primary
+  ## rationale.
+  model "tester_brain" {
+    requires    = [chat, reasoning]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
+  }
+
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "tester_kb" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 768
+    chunk_overlap = 96
+  }
+
+  prompt "tester_sys" {
+    file    = "./prompts/tester.md"
+    version = "1.0.0"
+  }
+
+  ## Canonical `cargo test` invocation the agent's Test plan
+  ## recommends.  `--no-fail-fast` keeps the failure surface
+  ## complete on first run; `--workspace` covers every crate in
+  ## the merged Cargo.lock so a Coder patch in `aislang-core`
+  ## that breaks `aislang-runtime` is caught here.
+  skill "run_tests" {
+    exec        = "cargo test --workspace --no-fail-fast"
+    output_type = string
+  }
+
+  agent "tester" {
+    model         = model.tester_brain
+    system_prompt = prompt.tester_sys
+    tools         = []
+    knowledge     = [vector_store.tester_kb]
+  }
+
+  ## Single-step pipeline for standalone use; the orchestrator
+  ## project extends `full_design` from 3 steps to 4 with the
+  ## Tester leg appended (Tue follow-up to W20 Mon).
+  pipeline "test_once" {
+    steps  = [agent.tester]
+    input  = "Coder's Patch + Test coverage + Reviewer's verdict"
+    output = "Test plan + per-skill recommended invocations"
+  }
+
+  ## Heuristic eval — 3 synthetic Coder outputs check that the
+  ## Tester emits a Test plan section + names the canonical
+  ## `cargo test` invocation.
+  eval "test_plan_shape" {
+    dataset   = "./evals/tester_inputs.jsonl"
+    metric    = f1
+    threshold = 80%
+    agent     = agent.tester
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
