@@ -36,20 +36,21 @@ fn orchestrator_dir() -> PathBuf {
 }
 
 #[tokio::test]
-async fn orchestrator_multi_module_loads_with_4_modules_and_qualified_labels() {
-    // Load the on-disk fixture + assert the 4-module shape.  The
+async fn orchestrator_multi_module_loads_with_5_modules_and_qualified_labels() {
+    // Load the on-disk fixture + assert the 5-module shape.  The
     // multi-module loader merges architect / coder / code_reviewer
-    // / orchestrator namespaces; cross-module refs in
+    // / tester / orchestrator namespaces; cross-module refs in
     // `orchestrator.full_design.steps` MUST resolve through the
-    // merged symbol table or the load fails.
+    // merged symbol table or the load fails.  W20 Tue extends the
+    // W20 Mon 4-module shape with the Tester module.
     let dir = orchestrator_dir();
     let loaded = load_project_input(&dir)
         .expect("multi-module orchestrator project must load");
     let proj = &loaded.resolved.project;
 
-    // 4 agents: architect, coder, code_reviewer.  (Orchestrator
-    // module itself declares no `agent` block — it's pure
-    // composition surface.)
+    // 4 agents: architect, coder, code_reviewer, tester.
+    // (Orchestrator module itself declares no `agent` block — it's
+    // pure composition surface.)
     let agent_labels: Vec<&str> = proj.agents.iter()
         .map(|a| a.label.as_str()).collect();
     assert!(agent_labels.iter().any(|l| *l == "architect.architect"),
@@ -58,6 +59,8 @@ async fn orchestrator_multi_module_loads_with_4_modules_and_qualified_labels() {
         "coder.coder missing from merged labels: {agent_labels:?}");
     assert!(agent_labels.iter().any(|l| *l == "code_reviewer.code_reviewer"),
         "code_reviewer.code_reviewer missing: {agent_labels:?}");
+    assert!(agent_labels.iter().any(|l| *l == "tester.tester"),
+        "tester.tester missing from merged labels: {agent_labels:?}");
 
     // 2 pipelines on the orchestrator module: full_design (3-step)
     // + coder_review_cycle (2-step) — plus the placeholder
@@ -89,12 +92,13 @@ async fn orchestrator_multi_module_loads_with_4_modules_and_qualified_labels() {
 }
 
 #[tokio::test]
-async fn full_design_pipeline_dispatches_3_steps_in_order() {
-    // PLAN DoD: "pipeline.full_design dispatches the 3 sub-agents
-    // end-to-end via runtime patterns::orchestrator::run (mocked
-    // dispatch unit test)".  Loads the on-disk fixture + drives
-    // the pipeline through `orchestrator::run` with synthetic
-    // sub-agent replies that thread the cumulative input forward.
+async fn full_design_pipeline_dispatches_4_steps_in_order() {
+    // PLAN DoD (W20 Tue, extending Mon's 3-step version):
+    // "orchestrator pipeline extended from 3-step to 4-step with
+    // the Tester leg dispatching end-to-end".  Loads the on-disk
+    // fixture + drives the pipeline through `orchestrator::run`
+    // with synthetic sub-agent replies that thread the cumulative
+    // input forward.
     let dir = orchestrator_dir();
     let loaded = load_project_input(&dir).expect("load");
     let proj = &loaded.resolved.project;
@@ -110,7 +114,8 @@ async fn full_design_pipeline_dispatches_3_steps_in_order() {
             observed.lock().unwrap().push((agent.clone(), input.clone()));
             // Synthetic per-step reply that mimics the contract:
             // Architect → 5-section design; Coder → 3-section
-            // patch; Reviewer → ACCEPT.
+            // patch; Reviewer → ACCEPT verdict; Tester → ACCEPT +
+            // test plan summary.
             let reply = match agent.as_str() {
                 "architect.architect" =>
                     "## Block name\n`dataset`\n## Fields\n- path: Path\n".to_string(),
@@ -118,6 +123,9 @@ async fn full_design_pipeline_dispatches_3_steps_in_order() {
                     "## Patch\n```rust\nstruct Dataset {}\n```\n## Test coverage\n- foo\n".to_string(),
                 "code_reviewer.code_reviewer" =>
                     "ACCEPT\nbyte-stable.".to_string(),
+                "tester.tester" =>
+                    "ACCEPT\n## Test plan\n- parser_accepts_dataset_block\n\
+                     ## Skill invocation\n`cargo test --workspace --no-fail-fast`".to_string(),
                 other => panic!("unexpected dispatch target {other}"),
             };
             Ok(reply)
@@ -131,14 +139,17 @@ async fn full_design_pipeline_dispatches_3_steps_in_order() {
     ).await.expect("run");
 
     assert!(final_reply.starts_with("ACCEPT"),
-        "final reply is the reviewer's verdict; got:\n{final_reply}");
+        "final reply is the tester's verdict; got:\n{final_reply}");
+    assert!(final_reply.contains("cargo test"),
+        "tester's verdict must name the canonical cargo test invocation; got:\n{final_reply}");
 
     let steps = observed_steps.lock().unwrap();
-    assert_eq!(steps.len(), 3,
-        "exactly 3 dispatches (architect → coder → reviewer)");
+    assert_eq!(steps.len(), 4,
+        "exactly 4 dispatches (architect → coder → reviewer → tester)");
     assert_eq!(steps[0].0, "architect.architect");
     assert_eq!(steps[1].0, "coder.coder");
     assert_eq!(steps[2].0, "code_reviewer.code_reviewer");
+    assert_eq!(steps[3].0, "tester.tester");
 
     // Pin the cumulative-input-feeds-forward contract: each step
     // sees the PRIOR step's reply verbatim as its user input.
@@ -148,6 +159,8 @@ async fn full_design_pipeline_dispatches_3_steps_in_order() {
         "step 1 (coder) sees architect's design verbatim; got:\n{}", steps[1].1);
     assert!(steps[2].1.contains("## Patch"),
         "step 2 (reviewer) sees coder's patch verbatim; got:\n{}", steps[2].1);
+    assert!(steps[3].1.starts_with("ACCEPT"),
+        "step 3 (tester) sees reviewer's verdict verbatim; got:\n{}", steps[3].1);
 }
 
 #[tokio::test]

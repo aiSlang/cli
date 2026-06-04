@@ -102,9 +102,10 @@ project "architect-agent" {
 
   ## Heuristic eval — 3 synthetic specs check that the Architect
   ## emits the 5-section structure + a fenced grammar block.
-  ## Real quality-of-implementation eval (SonarQube-driven, per
-  ## Thu planning review Q7) lands Fri+ once Coder produces real
-  ## code worth scanning.
+  ## SonarQube-driven quality-of-implementation eval deferred to
+  ## v0.5+ — see PLAN-v0_3.md "Out of scope" §
+  ## ("External quality-gate tools consulted by Reviewer / Tester
+  ## via MCP") for the full deferral rationale.
   eval "structured_output" {
     dataset   = "./evals/architect_specs.jsonl"
     metric    = f1

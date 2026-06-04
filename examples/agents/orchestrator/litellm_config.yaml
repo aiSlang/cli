@@ -23,6 +23,14 @@ model_list:
   litellm_params:
     model: ollama/qwen2.5-coder:7b
     api_base: os.environ/OLLAMA_API_BASE
+- model_name: tester.tester_brain
+  litellm_params:
+    model: anthropic/claude-haiku-4-5
+    api_key: os.environ/ANTHROPIC_API_KEY
+- model_name: tester.tester_brain-fb-ollama-qwen3-8b
+  litellm_params:
+    model: ollama/qwen3:8b
+    api_base: os.environ/OLLAMA_API_BASE
 - model_name: architect.local_bge
   litellm_params:
     model: ollama/bge-m3:latest
@@ -35,6 +43,10 @@ model_list:
   litellm_params:
     model: ollama/bge-m3:latest
     api_base: os.environ/OLLAMA_API_BASE
+- model_name: tester.local_bge
+  litellm_params:
+    model: ollama/bge-m3:latest
+    api_base: os.environ/OLLAMA_API_BASE
 router_settings:
   fallbacks:
   - architect.architect_brain:
@@ -43,6 +55,8 @@ router_settings:
     - code_reviewer.reviewer_brain-fb-ollama-qwen3-8b
   - coder.coder_brain:
     - coder.coder_brain-fb-ollama-qwen2-5-coder-7b
+  - tester.tester_brain:
+    - tester.tester_brain-fb-ollama-qwen3-8b
 litellm_settings:
   callbacks:
   - otel

@@ -1505,6 +1505,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflector_coder_tester_shape_retries_on_missing_rejection_test() {
+        // v0.3 Week 20 Tue — pins the reflector contract for the
+        // Coder + Tester pairing.  Mirrors Mon's coder ↔ reviewer
+        // test (W19 Fri's contract) but with the Tester as critic:
+        // Coder v1 emits a patch + test coverage that SKIPS a
+        // rejection test the Architect's design called for;
+        // Tester returns `FAIL: <gap>` pointing at the specific
+        // missing test name; Coder v2 adds the rejection test;
+        // Tester ACCEPTs.
+        let coder_inputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let coder_inputs_clone = coder_inputs.clone();
+        let coder_call = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let coder_call_clone = coder_call.clone();
+        let tester_call = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let tester_call_clone = tester_call.clone();
+        let dispatch = move |agent: String, input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "coder" => {
+                    coder_inputs_clone.lock().unwrap().push(input);
+                    let mut c = coder_call_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        if n == 1 {
+                            // v1: happy-path test only; rejection test
+                            // missing for the closed-enum `format` field.
+                            Ok("## Patch\n```rust\npub datasets: Vec<Dataset>,\n```\n\
+                                ## Test coverage\n- parser_accepts_dataset_block\n\
+                                ## Notes\n".into())
+                        } else {
+                            // v2: rejection test added per Tester
+                            // feedback.
+                            Ok("## Patch\n```rust\npub datasets: Vec<Dataset>,\n```\n\
+                                ## Test coverage\n- parser_accepts_dataset_block\n\
+                                - parser_rejects_dataset_block_with_unknown_format\n\
+                                ## Notes\n".into())
+                        }
+                    })
+                }
+                "tester" => {
+                    let mut c = tester_call_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        if n == 1 {
+                            Ok("FAIL: rejection test missing for `format` enum.\n\
+                                \nGaps:\n\
+                                - `parser_rejects_dataset_block_with_unknown_format` \
+                                — assert on `matches!(err, ParseError::InvalidEnum \
+                                { .. })`.".into())
+                        } else {
+                            Ok("ACCEPT\ncoverage hits every Architect-declared \
+                                check.".into())
+                        }
+                    })
+                }
+                _ => unreachable!(),
+            }
+        };
+        let architect_design = "## Block name\n`dataset`\n\n## Fields\n- format: DatasetFormat (closed enum)\n";
+        let out = reflector::run("coder".into(), "tester".into(),
+            architect_design, /* max_retries = */ 3, dispatch).await.expect("run");
+        match out {
+            ReflectorOutcome::Accepted { draft, retry_count } => {
+                assert_eq!(retry_count, 1,
+                    "exactly one revision before tester accepts");
+                assert!(draft.contains("parser_rejects_dataset_block_with_unknown_format"),
+                    "accepted draft must be the revised one with the rejection test");
+            }
+            ReflectorOutcome::MaxRetries { .. } => panic!("expected Accepted"),
+        }
+        // Pin that the tester's feedback flowed back to the Coder's
+        // second invocation verbatim — same revision-prompt builder
+        // as the coder ↔ reviewer test (W19 Fri).
+        let inputs = coder_inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2,
+            "coder invoked twice: initial + one revision");
+        assert!(inputs[1].contains("parser_rejects_dataset_block_with_unknown_format"),
+            "second coder input must thread the tester's feedback verbatim; got:\n{}",
+            inputs[1]);
+    }
+
+    #[tokio::test]
     async fn reflector_bubbles_critic_session_error_with_context() {
         let dispatch = |agent: String, _input: String| -> DispatchFuture {
             match agent.as_str() {

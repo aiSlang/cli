@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-05-25",
+  "source_hash": "0daf5ea2b44c74bc982ea0af30890efe509d839061c85f1d33c22f9b6fe60e2c",
+  "model_bindings": {
+    "tester_brain": {
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
+    }
+  },
+  "prompt_hashes": {
+    "tester_sys": "eda1d32970a9dbb3f08759d83c7b3176308c12868559721112bcedfedad9ac78"
+  },
+  "oci_digests": {}
+}

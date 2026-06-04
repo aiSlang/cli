@@ -100,7 +100,10 @@ project "coder-agent" {
   ## Heuristic eval — 3 synthetic designs check that the Coder
   ## emits a fenced rust block + a "Test coverage" section.
   ## Real correctness eval (`cargo test` against the patched tree
-  ## via SonarQube-MCP) lands v0.5+.
+  ## via SonarQube-MCP / quality-gate MCP tools) deferred to
+  ## v0.5+ — see PLAN-v0_3.md "Out of scope" §
+  ## ("External quality-gate tools consulted by Reviewer / Tester
+  ## via MCP").
   eval "rust_patch_format" {
     dataset   = "./evals/coder_designs.jsonl"
     metric    = f1
