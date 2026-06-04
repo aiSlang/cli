@@ -1,0 +1,3 @@
+{"id": "minimal_goal", "input": "Outline a SQLite migration for the aislang store.", "expected_substring": "round-trip"}
+{"id": "explicit_audit", "input": "Frame the v0.3 store.db migration brief.  Cover the three plain-file sources + the audit-trail fields + reversibility.", "expected_substring": "reversibility"}
+{"id": "incremental_scope", "input": "We want to migrate JUST the spend tracking to SQLite first, leaving state + lockfile on plain files for now.  Write the feature spec.", "expected_substring": "spend"}

@@ -1,0 +1,123 @@
+## v0.3 Week 20 Wed — DB agent.
+##
+## Frames the v0.3 dogfood target — SQLite-based unification of
+## the v0.2 plain-files store (`~/.aislang/spend.json` +
+## `<source_dir>/.aislang/state.json` + per-project
+## `aislang.lock` mirrors) into a single `~/.aislang/store.db`.
+## Originally tracked as v0.2 DoD #7 (Centralized
+## `~/.aislang/store.json`) + scope-revised at v0.2 close to
+## land via the DB-agent dogfood here.  See PLAN-v0_3.md
+## Week 20 Wed row + PLAN-90-days-v0_2.md DoD #7 note.
+##
+## ## Direct chat (refine the migration brief)
+##
+## ```
+## aislang chat db examples/agents/db/db.ais
+## > Outline the v0.3 SQLite store migration.  Cover the three
+##   current plain-file sources + the reversibility contract.
+## ```
+##
+## The DB agent emits a **Feature spec** in the same shape the
+## Architect expects as input — the standalone chat is for
+## iterating on the migration brief before handing it to the
+## orchestrator.
+##
+## ## Hand off to the orchestrator (Thu dogfood)
+##
+## Once the Feature spec is shaped to your liking:
+##
+## ```
+## aislang chat full_design examples/agents/orchestrator/
+## > /paste
+## <paste the DB-agent's Feature spec output>
+## /end
+## ```
+##
+## …and the orchestrator chain runs Architect → Coder →
+## Code-reviewer → Tester end-to-end against the migration
+## spec.  Wed ships the DB agent + the migration brief
+## corpus; Thu's dogfood-validation row exercises the full
+## chain (see PLAN-v0_3.md Week 20 Thu).
+##
+## ## RAG context
+##
+## `knowledge = [vector_store.db_kb]` — current spend.json /
+## state.json / aislang.lock schemas + the proposed SQLite
+## tables + the Decision-44.4 byte-stability + reversibility
+## contracts.  Grounds the agent so it doesn't invent a
+## schema that loses today's audit-trail fields.
+##
+## ## Model choice
+##
+## Cloud-tier reasoning model (Haiku) primary, matching the
+## Architect / Reviewer / Tester choice from Mon-Tue.  Brief-
+## writing is judgement work (which fields are load-bearing
+## for v0.2 round-trip?  which v0.5+ extensions should we
+## leave hooks for?), not code emission.  qwen3:8b stays as
+## the local fallback for the GPU case.
+
+project "db-agent" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.30
+  }
+
+  ## Reasoning-tier model.  See W20 Mon for the haiku-primary
+  ## rationale.
+  model "db_brain" {
+    requires    = [chat, reasoning]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
+  }
+
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "db_kb" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 768
+    chunk_overlap = 96
+  }
+
+  prompt "db_sys" {
+    file    = "./prompts/db.md"
+    version = "1.0.0"
+  }
+
+  agent "db" {
+    model         = model.db_brain
+    system_prompt = prompt.db_sys
+    tools         = []
+    knowledge     = [vector_store.db_kb]
+  }
+
+  ## Single-step pipeline for standalone use.  The "DB drives
+  ## the orchestrator" workflow doesn't extend the orchestrator
+  ## project's pipeline — the user copy-pastes the DB agent's
+  ## output into the orchestrator's chat input.  v0.5+ may add
+  ## a "spec-handoff" composition primitive (Decisions 46.x —
+  ## see PLAN "Out of scope" §).
+  pipeline "brief_once" {
+    steps  = [agent.db]
+    input  = "high-level migration goal (string)"
+    output = "Feature spec (5-section markdown matching Architect's input shape)"
+  }
+
+  ## Heuristic eval — 3 synthetic high-level goals check that
+  ## the DB agent emits a Feature spec section + names the
+  ## three source plain-files + the reversibility contract.
+  eval "feature_spec_shape" {
+    dataset   = "./evals/db_briefs.jsonl"
+    metric    = f1
+    threshold = 80%
+    agent     = agent.db
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
