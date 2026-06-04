@@ -45,7 +45,7 @@
 project "orchestrator-module" {
   budget {
     hard_cap_per_day = $2
-    hard_cap_per_run = $0.30
+    hard_cap_per_run = $0.50
   }
 
   ## Sequential chain — feature-spec → design → patch → verdict.

@@ -59,7 +59,7 @@
 project "db-agent" {
   budget {
     hard_cap_per_day = $1
-    hard_cap_per_run = $0.30
+    hard_cap_per_run = $0.50
   }
 
   ## Reasoning-tier model.  See W20 Mon for the haiku-primary

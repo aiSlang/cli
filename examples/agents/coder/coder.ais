@@ -47,7 +47,7 @@
 project "coder-agent" {
   budget {
     hard_cap_per_day = $1
-    hard_cap_per_run = $0.10
+    hard_cap_per_run = $0.50
   }
 
   ## Cloud-tier code model.  Haiku is the primary because the
@@ -78,7 +78,7 @@ project "coder-agent" {
 
   prompt "coder_sys" {
     file    = "./prompts/coder.md"
-    version = "1.0.0"
+    version = "1.0.1"
   }
 
   agent "coder" {

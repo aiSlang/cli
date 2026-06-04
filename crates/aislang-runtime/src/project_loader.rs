@@ -424,10 +424,18 @@ fn load_multi_module_project(dir: &Path) -> Result<LoadedProject, ProjectLoadErr
         .map_err(|e| ProjectLoadError::Semantic {
             message: format!("bundled catalog load: {e}"),
         })?;
-    let resolved = aislang_resolver::resolve_multi(&module_inputs, &catalog)
+    let mut resolved = aislang_resolver::resolve_multi(&module_inputs, &catalog)
         .map_err(|e| ProjectLoadError::Semantic {
             message: format!("resolve error: {e}"),
         })?;
+    // W20 Wed follow-up: thread the manifest's `[project] name`
+    // into the merged project so `aislang status / cost / chat`
+    // surface the human-friendly name instead of the
+    // `<multi-module>` placeholder that resolve_multi seeds.
+    // resolve_multi keeps its placeholder for the standalone
+    // resolver-test path (where there's no manifest); the loader
+    // is the natural place to overlay the real name.
+    resolved.project.name = manifest.project.name.clone();
 
     Ok(LoadedProject {
         resolved,
