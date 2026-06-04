@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "2c60b3ed1e2e4b7edaa86389a045c5adfc77a3e2d5d72603ea75231f110d4c22",
+  "source_hash": "4eefe8063aa05470dd01b590bfd1ea38b4de6c044bec7dde58ca25165ab74a36",
   "model_bindings": {
     "architect_brain": {
       "provider": "ollama",
@@ -9,7 +9,7 @@
     }
   },
   "prompt_hashes": {
-    "architect_sys": "a47d003b195377f8e2a83c377372ffbad9f974673bebd4ffcb488788e3fe7fe2"
+    "architect_sys": "04566cc9297a7ee124c96813c0edd6ea93b9dc7a25629a1716fdf0cda7a19cda"
   },
   "oci_digests": {}
 }
