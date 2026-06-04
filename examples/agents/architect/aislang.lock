@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "4eefe8063aa05470dd01b590bfd1ea38b4de6c044bec7dde58ca25165ab74a36",
+  "source_hash": "acbd7949f4609ce2503386fad3f647158c5cb9b723bc9ea1fdfe91c381217bbd",
   "model_bindings": {
     "architect_brain": {
-      "provider": "ollama",
-      "name": "qwen3_8b"
+      "provider": "anthropic",
+      "name": "claude_haiku_4_5"
     }
   },
   "prompt_hashes": {

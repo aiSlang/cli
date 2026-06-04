@@ -3660,6 +3660,8 @@ async fn chat_via_mcp_serve(
     }
     eprintln!("connected to LiteLLM via mcp-serve's Session pool.");
     eprintln!("type your message and press Enter; `/exit` or Ctrl-D ends the session.");
+    eprintln!("for multi-line input (paste a markdown design etc.), open with `/paste`");
+    eprintln!("then end with `/end` on its own line.");
     eprintln!();
 
     let stdin = tokio::io::stdin();
@@ -3677,7 +3679,7 @@ async fn chat_via_mcp_serve(
         use std::io::Write;
         let _ = std::io::stderr().flush();
 
-        let line = match reader.next_line().await {
+        let first_line = match reader.next_line().await {
             Ok(Some(l)) => l,
             Ok(None)    => break "(end of input)",
             Err(e)      => {
@@ -3685,9 +3687,49 @@ async fn chat_via_mcp_serve(
                 return Err(anyhow::anyhow!("stdin read error: {e}"));
             }
         };
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "/exit" { break "(/exit — session ended)"; }
+        let first_trimmed = first_line.trim();
+        if first_trimmed.is_empty() { continue; }
+        if first_trimmed == "/exit" { break "(/exit — session ended)"; }
+
+        // v0.3 Week 20 Mon follow-up #2: multi-line paste mode.
+        // Pasting a multi-line markdown (e.g. the Architect's
+        // 5-section design into the Coder) under line-buffered
+        // stdin sends each line as a separate turn — the receiving
+        // agent sees a stream of one-line fragments and keeps
+        // asking for "the full input".  `/paste` opens an
+        // accumulating buffer + `/end` on its own line sends the
+        // joined content as ONE user message.  `/exit` inside the
+        // buffer aborts the session (same precedence as outside).
+        let line: String = if first_trimmed == "/paste" {
+            let mut buf = String::new();
+            loop {
+                let next = match reader.next_line().await {
+                    Ok(Some(l)) => l,
+                    Ok(None)    => break,            // EOF closes the buffer
+                    Err(e) => {
+                        client.cancel().await.ok();
+                        return Err(anyhow::anyhow!("stdin read error in /paste: {e}"));
+                    }
+                };
+                if next.trim() == "/end"  { break; }
+                if next.trim() == "/exit" {
+                    // Empty out the buffer + propagate the exit at
+                    // the outer loop's next iteration.  Simpler than
+                    // smuggling a flag out of the inner block.
+                    buf.clear();
+                    buf.push_str("/exit");
+                    break;
+                }
+                if !buf.is_empty() { buf.push('\n'); }
+                buf.push_str(&next);
+            }
+            if buf == "/exit" { break "(/exit — session ended)"; }
+            if buf.is_empty() { continue; }
+            buf
+        } else {
+            first_trimmed.to_string()
+        };
+        let line = line.as_str();
 
         // ── Dispatch one turn via the MCP tool.  Same Session
         // pool the Claude Desktop / Cursor chat uses (planning-doc

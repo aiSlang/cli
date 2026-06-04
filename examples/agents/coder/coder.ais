@@ -50,14 +50,18 @@ project "coder-agent" {
     hard_cap_per_run = $0.10
   }
 
-  ## Code-tier local LLM for Rust emission.  Qwen2.5-Coder 7B
-  ## is the Decision-44.8 "saved for Coder" model; haiku fallback
-  ## for CI / cloud runs without Ollama.
+  ## Cloud-tier code model.  Haiku is the primary because the
+  ## CPU-inference reality (qwen2.5-coder 7B comfortably exceeds
+  ## the 5-minute LiteLLM ceiling on commodity hardware) trumps
+  ## Decision 44.8's preferred-Qwen-for-Coder mapping.  Qwen2.5-
+  ## Coder stays declared as the local fallback so the wiring
+  ## works the moment GPU acceleration is available, without an
+  ## .ais edit (Week 20 Mon follow-up).
   model "coder_brain" {
     requires    = [chat]
     context_min = 32k
-    prefer      = [ollama.qwen2_5_coder_7b]
-    fallback    = [anthropic.claude_haiku_4_5]
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen2_5_coder_7b]
   }
 
   embedding "local_bge" {

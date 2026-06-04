@@ -51,14 +51,19 @@ project "architect-agent" {
     hard_cap_per_run = $0.10
   }
 
-  ## Reasoning-tier local LLM for design work.  bge-m3 ships
-  ## reasoning capability per the catalog; haiku fallback for
-  ## CI / cloud runs without Ollama.
+  ## Cloud-tier reasoning model for design work.  Haiku is the
+  ## primary because CPU-bound qwen3:8b inference comfortably
+  ## exceeds the LiteLLM client's 5-minute ceiling on commodity
+  ## hardware; Ollama qwen3:8b stays declared as a local fallback
+  ## for the GPU case (when AISLANG_LITELLM_TIMEOUT_SECS isn't
+  ## needed) — the same reasoning-tier model, just slower without
+  ## hardware acceleration.  Original "qwen3 primary" pre-dated
+  ## the user's CPU-inference reality check (Week 20 Mon follow-up).
   model "architect_brain" {
     requires    = [chat]
     context_min = 32k
-    prefer      = [ollama.qwen3_8b]
-    fallback    = [anthropic.claude_haiku_4_5]
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
   }
 
   embedding "local_bge" {
