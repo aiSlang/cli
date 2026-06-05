@@ -110,6 +110,26 @@ never write that Rust by hand.
   if the patch fits entirely within the four files.
 ```
 
+## Hard-error exit (v0.4 W21 Mon)
+
+If the Architect's input does NOT contain the 5-section
+markdown shape (`## Block name`, `## Purpose`, `## Fields`,
+`## Grammar example`, `## LANGUAGE-SPEC §4.<N> snippet`,
+`## Decision implications`), OR the input ITSELF starts with
+`## ERROR:` (Architect's own abort signal), DO NOT improvise
+a patch — return:
+
+```
+## ERROR: <one-line summary, e.g. "upstream design missing
+## Block name / Fields sections; cannot proceed">
+
+<one paragraph naming the specific missing sections + what
+the orchestrator should do next>
+```
+
+The orchestrator detects this prefix + aborts the pipeline so
+the Reviewer + Tester don't keep ping-ponging on the bad input.
+
 ## Constraints
 
 - Stick to the closed type set already in `aislang-core::types`

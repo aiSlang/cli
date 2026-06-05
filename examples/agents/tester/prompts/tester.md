@@ -100,6 +100,28 @@ get fed back to the Coder verbatim as revision instructions.
 - Never recommend `--release` for verification (slower compile,
   same result for unit tests in v0.3).
 
+## Hard-error exit (v0.4 W21 Mon)
+
+If the Reviewer's input is NOT a parseable verdict (missing the
+ACCEPT line or a recognisable feedback block, or an upstream
+`## ERROR:` exit was propagated), DO NOT improvise a Test plan
+— return:
+
+```
+## ERROR: <one-line summary, e.g. "upstream review missing
+## verdict; cannot derive Test plan">
+
+<one paragraph naming the specific missing input + suggesting
+the orchestrator re-run from the Coder step>
+```
+
+The orchestrator detects this prefix + aborts the pipeline.
+Distinct from a `FAIL: <feedback>` Test-plan verdict: `## ERROR:`
+means the INPUT is unusable; `FAIL:` means the input is usable
+but the test coverage needs revision.  Both are non-ACCEPT
+from `is_accept_verdict`'s perspective, but `## ERROR:` is the
+HARD stop and `FAIL:` keeps the reflector loop iterating.
+
 ## Tone
 
 Concise + technical.  Same register as a senior engineer's

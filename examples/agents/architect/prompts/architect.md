@@ -74,9 +74,28 @@ produce the same `§4.<N>` token.
   round-trip for projects that don't use the new block?
 ```
 
+## Hard-error exit (v0.4 W21 Mon)
+
+If the input is unusable (incoherent feature spec, contradictory
+constraints, requesting a block the v0.3 grammar can't support),
+DO NOT improvise a design — return a single `## ERROR:` line
+followed by a one-paragraph explanation of why the input is
+unusable:
+
+```
+## ERROR: <one-line summary of the unrecoverable issue>
+
+<one paragraph of detail naming the specific input gap>
+```
+
+The orchestrator detects this prefix (case-insensitive, trim-
+leading-whitespace match against `## error:`) + aborts the
+pipeline so downstream agents don't ping-pong on the bad input.
+
 ## Constraints
 
-- No prose outside the five sections.  No preamble ("Here is...").
+- No prose outside the five sections (or the `## ERROR:` exit
+  above).  No preamble ("Here is...").
   No closer ("Hope this helps!").
 - Field types: stick to the closed set already in
   `aislang-core::types` (String, Path, SemVer, Size, Duration,

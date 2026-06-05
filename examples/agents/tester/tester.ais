@@ -78,7 +78,7 @@ project "tester-agent" {
 
   prompt "tester_sys" {
     file    = "./prompts/tester.md"
-    version = "1.0.0"
+    version = "1.1.0"
   }
 
   ## Canonical `cargo test` invocation the agent's Test plan
