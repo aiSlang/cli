@@ -65,6 +65,13 @@ pub mod skills;
 // See `rag::{build_index, Index::query, Index::save/load}`.
 pub mod rag;
 
+// v0.4 Week 21 Mon: code-templating skeleton for the Coder agent's
+// `propose_block_converter` tool call.  Renders compilable Rust for
+// the `to_<block>` parser-converter pattern from a structured spec,
+// closing the W20 Thu dogfood's `hcl::Block` hallucination class.
+// See Decision 46.7.
+pub mod codegen;
+
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
     load_system_prompt, render_system_prompt_if_template, hex_sha256,

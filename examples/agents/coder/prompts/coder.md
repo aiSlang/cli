@@ -43,23 +43,51 @@ markdown.  Parse the sections by their `## ` headers:
 
 ## Output format (REQUIRED — Reviewer parses these sections)
 
-Reply with exactly these three sections, in order, as markdown:
+Reply with exactly these three sections, in order, as markdown.
+The `## Patch` section's PARSER-CONVERTER subsection is special:
+emit a TOOL CALL to `propose_block_converter` instead of free-text
+Rust (Decision 46.7 — W20 Thu dogfood found that free-text emission
+of the parser-converter section lets the model hallucinate
+`hcl::Block` / `hcl::Body` types that don't exist).  The runtime
+renders the converter from your tool-call args via the
+`aislang_runtime::codegen::render_block_converter` skeleton; you
+never write that Rust by hand.
 
 ```
 ## Patch
 
 ```rust
 // crates/aislang-core/src/ast.rs
-// ... struct + Project field + serde attrs ...
+// ... struct + Project field + serde attrs (FREE-TEXT — you write this) ...
+```
 
-// crates/aislang-core/src/parser.rs
-// ... parser converter fn + Project::from_hcl hook ...
+**TOOL CALL** (parser converter — NOT free-text Rust):
+```json
+{
+  "tool": "propose_block_converter",
+  "args": {
+    "block_name": "<keyword>",
+    "type_name":  "<RustCamelCaseName>",
+    "fields": [
+      {
+        "name": "<field_name>",
+        "ty":   "path | string | semver | bool | duration | money | size | int | enum | ref",
+        "required": true | false,
+        "range_min": "<lower bound for duration/int — e.g. \"1s\" or \"1\">",   // optional
+        "range_max": "<upper bound — e.g. \"24h\" or \"100\">",                  // optional
+        "enum_type": "<Rust enum type name — REQUIRED when ty=enum>"             // optional
+      }
+    ]
+  }
+}
+```
 
+```rust
 // crates/aislang-core/src/checker.rs
-// ... per-block validate fn + Project::validate hook ...
+// ... per-block validate fn + Project::validate hook (FREE-TEXT) ...
 
 // crates/aislang-core/tests/parser_fixtures.rs
-// ... or a new fixture file under tests/data/ ...
+// ... or a new fixture file under tests/data/ (FREE-TEXT) ...
 ```
 
 ## Test coverage
