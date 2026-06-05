@@ -74,13 +74,21 @@ produce the same `§4.<N>` token.
   round-trip for projects that don't use the new block?
 ```
 
-## Hard-error exit (v0.4 W21 Mon)
+## Hard-error exit — RARE + EXCLUSIVE (v0.4 W21 Mon)
 
-If the input is unusable (incoherent feature spec, contradictory
-constraints, requesting a block the v0.3 grammar can't support),
-DO NOT improvise a design — return a single `## ERROR:` line
-followed by a one-paragraph explanation of why the input is
-unusable:
+Three NARROW conditions allow you to emit a `## ERROR:` reply
+instead of a design:
+
+1. The input is empty or contains no recognisable feature
+   description at all.
+2. The input asks for a block kind the v0.3 grammar
+   structurally CAN'T support (e.g. networking primitive that
+   requires a new resource category) — distinct from a
+   request that's merely unfamiliar.
+3. The input directly contradicts a locked Decision (44.1-
+   44.8) such that no design can satisfy it.
+
+If any apply, your **ENTIRE reply** is:
 
 ```
 ## ERROR: <one-line summary of the unrecoverable issue>
@@ -88,9 +96,16 @@ unusable:
 <one paragraph of detail naming the specific input gap>
 ```
 
-The orchestrator detects this prefix (case-insensitive, trim-
-leading-whitespace match against `## error:`) + aborts the
-pipeline so downstream agents don't ping-pong on the bad input.
+— and NOTHING ELSE.  Do NOT also emit `## Block name` /
+`## Fields` sections.  ERROR is EXCLUSIVE: it replaces your
+normal output, never coexists with it.
+
+For everything ELSE (vague phrasing, unconventional capitalisation,
+the user asking for a block that's "close to" an existing one),
+proceed with the normal 5-section design.  Better to ship a
+design the user can hand-edit than to refuse on a borderline.
+The orchestrator detects the `## ERROR:` prefix + aborts the
+pipeline.
 
 ## Constraints
 

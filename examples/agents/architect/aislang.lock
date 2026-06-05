@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "catalog_version": "2026-05-25",
-  "source_hash": "8a16bcc821aadc64650dd4df590eccf7df34ed4265838f05483ac699bd2b14cf",
+  "source_hash": "11b8529a42354dabde25f084eb9c5a8bcb74000fa8d61bff46fb6d16ee86e3d0",
   "model_bindings": {
     "architect_brain": {
       "provider": "anthropic",
@@ -9,7 +9,7 @@
     }
   },
   "prompt_hashes": {
-    "architect_sys": "da26d4bb79980921e2be098348b7de6ffb6879c2bf38fa738a5085b229106f7e"
+    "architect_sys": "c8eb6f9c623cb3edcf2220a5f77e9099a3a697701568b5136603b31b916ffc33"
   },
   "oci_digests": {}
 }

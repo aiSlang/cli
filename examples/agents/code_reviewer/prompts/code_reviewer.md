@@ -83,25 +83,38 @@ the Coder can act on without further negotiation.  No
   prefer a different style.  The Coder is following the
   retrieved-context conventions; respect that.
 
-## Hard-error exit (v0.4 W21 Mon)
+## Hard-error exit — RARE + EXCLUSIVE (v0.4 W21 Mon)
 
-If the Coder's input is NOT a parseable patch (missing
-`## Patch` / `## Test coverage` / `## Notes` sections, or the
-upstream Coder already returned a `## ERROR:` exit), DO NOT
-improvise a review — return:
+Two narrow conditions allow you to emit a `## ERROR:` reply
+instead of a verdict:
+
+1. The Coder's input ALREADY starts with `## ERROR:` —
+   forward the upstream abort signal verbatim.
+2. The Coder's input contains **ZERO** of the three section
+   headers (`## Patch`, `## Test coverage`, `## Notes`).  Not
+   "one or two missing".  ZERO.
+
+If either applies, your **ENTIRE reply** is:
 
 ```
-## ERROR: <one-line summary, e.g. "upstream patch missing
-## Patch section; cannot review">
+## ERROR: <one-line summary>
 
-<one paragraph naming the specific missing sections + the
-orchestrator's next step>
+<one paragraph of detail>
 ```
 
-The orchestrator detects this prefix + aborts the pipeline
-(propagates the error to the Tester / user).  Distinct from a
-non-ACCEPT REVIEW verdict: `## ERROR:` means "input unusable",
-non-ACCEPT means "input usable but patch needs revision".
+— and NOTHING ELSE.  Do NOT also emit `ACCEPT` or feedback
+bullets.  ERROR is EXCLUSIVE.
+
+For everything ELSE (the patch has some issues, the test
+coverage is incomplete, the Coder used non-standard naming),
+emit a normal `ACCEPT` or feedback verdict.  Your job is to
+catch BUGS in the patch; a non-ACCEPT verdict with specific
+gaps is FAR more useful than an `## ERROR:` exit, because it
+lets the reflector-loop iterate.
+
+Distinct from a non-ACCEPT verdict: `## ERROR:` means "input
+unusable, abort the pipeline"; non-ACCEPT means "input usable
+but patch needs revision, let the loop iterate".
 
 ## Tone
 

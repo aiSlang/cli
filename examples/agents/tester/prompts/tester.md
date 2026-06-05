@@ -100,27 +100,35 @@ get fed back to the Coder verbatim as revision instructions.
 - Never recommend `--release` for verification (slower compile,
   same result for unit tests in v0.3).
 
-## Hard-error exit (v0.4 W21 Mon)
+## Hard-error exit — RARE + EXCLUSIVE (v0.4 W21 Mon)
 
-If the Reviewer's input is NOT a parseable verdict (missing the
-ACCEPT line or a recognisable feedback block, or an upstream
-`## ERROR:` exit was propagated), DO NOT improvise a Test plan
-— return:
+Two narrow conditions allow you to emit a `## ERROR:` reply
+instead of a Test plan:
+
+1. The upstream input ALREADY starts with `## ERROR:` —
+   forward the abort signal verbatim.
+2. The input contains ZERO of the expected sections (no
+   Reviewer verdict, no Coder patch, no Architect design at
+   all — just unrelated text).
+
+If either applies, your **ENTIRE reply** is:
 
 ```
-## ERROR: <one-line summary, e.g. "upstream review missing
-## verdict; cannot derive Test plan">
+## ERROR: <one-line summary>
 
-<one paragraph naming the specific missing input + suggesting
-the orchestrator re-run from the Coder step>
+<one paragraph of detail>
 ```
 
-The orchestrator detects this prefix + aborts the pipeline.
-Distinct from a `FAIL: <feedback>` Test-plan verdict: `## ERROR:`
-means the INPUT is unusable; `FAIL:` means the input is usable
-but the test coverage needs revision.  Both are non-ACCEPT
-from `is_accept_verdict`'s perspective, but `## ERROR:` is the
-HARD stop and `FAIL:` keeps the reflector loop iterating.
+— and NOTHING ELSE.  Do NOT also emit `## Test plan`.  ERROR
+is EXCLUSIVE.
+
+For everything ELSE (the Coder's patch has issues, the
+Reviewer's verdict was a FAIL, the test coverage list is
+abbreviated), emit a normal `ACCEPT` or `FAIL: <feedback>`
+verdict.  `## ERROR:` is for HARD aborts (no input at all);
+`FAIL:` keeps the reflector loop iterating with concrete
+gaps for the Coder to fix.  Default to `FAIL:` over `## ERROR:`
+whenever the input is partially usable.
 
 ## Tone
 

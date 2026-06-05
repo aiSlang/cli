@@ -3835,10 +3835,31 @@ fn persist_step_reply_iter(
 /// trim, case-insensitive) signals "the upstream input is
 /// unusable — stop the pipeline".  Single source of truth so
 /// the orchestrator + future tests agree on the wire shape.
+///
+/// v0.4 Week 21 Mon follow-up #2: extended to tolerate the
+/// common model-output shape variations that don't change
+/// the user-facing meaning — extra leading hashes, bold markdown
+/// `**ERROR:**`, the colon as part of a heading title, etc.  The
+/// `## ERROR:` form remains the documented canonical, but the
+/// detector is forgiving of header-level (`#` count) +
+/// emphasis-marker drift so a model that slips out of the strict
+/// `## ERROR:` shape doesn't escape the abort path.
 fn is_hard_error_signal(reply: &str) -> bool {
     let t = reply.trim_start();
-    t.to_lowercase().starts_with("## error:") ||
-        t.to_lowercase().starts_with("[pipeline_abort]")
+    // Strip leading markdown header / emphasis tokens so we
+    // recognise `## ERROR:`, `### ERROR:`, `**ERROR:**`,
+    // `ERROR:` bare, etc.  Anchored to the START of the reply
+    // + REQUIRE the colon (or bracket-wrapped abort marker) so
+    // a body sentence like "Error elsewhere in the patch" doesn't
+    // trip the detector.
+    let stripped = t
+        .trim_start_matches('#')
+        .trim_start_matches('*')
+        .trim_start();
+    let lc = stripped.to_lowercase();
+    lc.starts_with("error:") ||
+        lc.starts_with("[pipeline_abort]") ||
+        lc.starts_with("pipeline_abort:")
 }
 
 /// v0.4 Week 21 Mon follow-up — local ACCEPT-verdict detector
@@ -3973,14 +3994,32 @@ mod chat_persistence_tests {
 
     #[test]
     fn is_hard_error_signal_detects_md_header_prefix() {
+        // Canonical shape from the agent prompts: `## ERROR:`
         assert!(is_hard_error_signal("## ERROR: upstream produced garbage"));
         assert!(is_hard_error_signal("## error: lowercase still counts"));
         assert!(is_hard_error_signal("  ## ERROR: leading whitespace ok"));
+        // Different header levels — common model drift.
+        assert!(is_hard_error_signal("### ERROR: deeper heading"));
+        assert!(is_hard_error_signal("# ERROR: top-level heading"));
+        // Bold-emphasis shapes — model drift toward different markdown.
+        assert!(is_hard_error_signal("**ERROR:** bold emphasis form"));
+        assert!(is_hard_error_signal("**error:** lowercase bold"));
+        // Bare prefix without markdown markers.
+        assert!(is_hard_error_signal("ERROR: bare prefix"));
+        assert!(is_hard_error_signal("error: lowercase bare"));
+        // Alternative abort marker.
         assert!(is_hard_error_signal("[PIPELINE_ABORT] alternative marker"));
+        assert!(is_hard_error_signal("PIPELINE_ABORT: also accepted"));
+
         // Non-error replies don't trip it.
         assert!(!is_hard_error_signal("## Patch\n```rust\n..."));
         assert!(!is_hard_error_signal("ACCEPT\nlooks good"));
         assert!(!is_hard_error_signal("error elsewhere in the body"));
+        // CRITICAL anti-false-positive: prose body sentences that
+        // happen to start with the word "Error" must NOT trip
+        // (caught the v0.4 W21 Mon detector-strengthen pass).
+        assert!(!is_hard_error_signal("Error analyses found three issues"));
+        assert!(!is_hard_error_signal("Errors are expected — see Test coverage"));
         assert!(!is_hard_error_signal(""));
     }
 
@@ -4364,15 +4403,14 @@ async fn chat_via_mcp_serve(
             let mut error_signal    = false;
             for (step_idx, step_label) in steps.iter().enumerate() {
                 if steps.len() > 1 {
-                    if loop_max_iter.is_some() {
-                        eprintln!(
-                            "\x1b[2;3m  · loop iter {}/{} · step {}/{} → agent `{step_label}`\x1b[0m",
-                            iter + 1, max_iter + 1, step_idx + 1, steps.len());
-                    } else {
-                        eprintln!(
-                            "\x1b[2;3m  · orchestrator step {}/{} → agent `{step_label}`\x1b[0m",
-                            step_idx + 1, steps.len());
-                    }
+                    // v0.4 W21 Mon follow-up #2: UNIFIED iter counter
+                    // format across pipeline + loop dispatch (user-
+                    // reported issue 5).  Single-pass pipelines show
+                    // `iter 1/1` so the format is shape-stable across
+                    // the dispatch surfaces.
+                    eprintln!(
+                        "\x1b[2;3m  · iter {}/{} · step {}/{} → agent `{step_label}`\x1b[0m",
+                        iter + 1, max_iter + 1, step_idx + 1, steps.len());
                 }
                 let mut params = CallToolRequestParams::new("aislang_chat_turn")
                     .with_arguments(serde_json::json!({
@@ -4392,32 +4430,44 @@ async fn chat_via_mcp_serve(
                             .unwrap_or_else(|| "(empty response)".to_string());
                         // Persist with iter-aware filename so
                         // loop runs don't overwrite their own
-                        // history within the turn.
+                        // history within the turn.  Persist ALWAYS
+                        // — even on the error path, so the user
+                        // can inspect the erroring reply later.
                         let persisted_path: Option<PathBuf> = persist_root.as_ref()
                             .map(|root| {
                                 persist_step_reply_iter(
                                     root, turn_counter, iter + 1,
                                     step_idx + 1, step_label, &reply)
                             });
-                        if steps.len() > 1 && step_idx + 1 < steps.len() {
-                            let indented = reply.lines()
-                                .map(|l| format!("    \x1b[2;3m{l}\x1b[0m"))
-                                .collect::<Vec<_>>().join("\n");
-                            eprintln!("{indented}");
-                        }
-                        // v0.4 W21 Mon follow-up — ERROR-signal
-                        // propagation.  Any step whose reply
-                        // STARTS WITH `## ERROR:` (case-insensitive,
-                        // after trim) aborts the pipeline with that
-                        // step's reply as the final answer.  Closes
-                        // the user-reported bug 2 (Architect error
-                        // → Coder ping-pongs neural slop endlessly).
+                        // v0.4 W21 Mon follow-up #2: detect hard
+                        // error FIRST (user-reported issue 4 — the
+                        // erroring reply was being printed as
+                        // intermediate-step indented output AND as
+                        // the final stdout reply, total 4-5 mentions).
+                        // Single eprintln on the abort path; the
+                        // final `pipeline terminated on hard error`
+                        // line + stdout reply are still emitted in
+                        // the post-loop block.  This single-print
+                        // path also unifies pipeline + loop abort
+                        // behaviour (user-reported issue 1 — review_
+                        // cycle "appeared to continue" because the
+                        // same erroring reply was printed 5x).
                         if is_hard_error_signal(&reply) {
                             eprintln!(
                                 "\x1b[2;3m  · hard error signalled by `{step_label}`; aborting pipeline\x1b[0m");
                             last_reply = Some(reply);
                             error_signal = true;
                             break;
+                        }
+                        // No error → safe to print the intermediate
+                        // indented reply (skipped on the final step
+                        // since the post-loop block prints it to
+                        // stdout).
+                        if steps.len() > 1 && step_idx + 1 < steps.len() {
+                            let indented = reply.lines()
+                                .map(|l| format!("    \x1b[2;3m{l}\x1b[0m"))
+                                .collect::<Vec<_>>().join("\n");
+                            eprintln!("{indented}");
                         }
                         if interactive
                             && steps.len() > 1
@@ -4488,9 +4538,15 @@ async fn chat_via_mcp_serve(
         }
         if !outer_dispatch_failed {
             if let Some(reply) = final_reply {
-                if outer_error_signal {
-                    eprintln!("\x1b[2;3m  · pipeline terminated on hard error signal\x1b[0m");
-                }
+                // v0.4 W21 Mon follow-up #2: the per-step
+                // "hard error signalled by `X`; aborting pipeline"
+                // line already covers the abort summary — DON'T
+                // double-print a redundant "pipeline terminated"
+                // marker here.  Just emit the final reply (which
+                // IS the erroring `## ERROR:` text on stdout, so
+                // pipes / tee'd logs still see the actual error)
+                // and let the per-step abort line speak for itself.
+                let _ = outer_error_signal;
                 println!("{reply}");
             }
         }
