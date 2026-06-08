@@ -3998,6 +3998,16 @@ fn persist_step_reply_iter(
 /// emphasis-marker drift so a model that slips out of the strict
 /// `## ERROR:` shape doesn't escape the abort path.
 fn is_hard_error_signal(reply: &str) -> bool {
+    // v0.4 W21 Fri (Decision 46.6 finalize): bilingual error
+    // detector — markdown shape (v0.3 W21 Mon canonical
+    // `## ERROR:` + drift tolerances) OR JSON error envelope
+    // (W21 Thu `{"error": {"code":..., "message":...}}`).  The
+    // runtime trips on EITHER so mixed-mode chains (one agent
+    // emits JSON tool-call, another still emits markdown
+    // fallback) get a unified abort path.
+    if aislang_runtime::schemas::looks_like_error_envelope(reply) {
+        return true;
+    }
     let t = reply.trim_start();
     // Strip leading markdown header / emphasis tokens so we
     // recognise `## ERROR:`, `### ERROR:`, `**ERROR:**`,
@@ -4020,8 +4030,26 @@ fn is_hard_error_signal(reply: &str) -> bool {
 /// (trim + lowercase + starts-with `accept`).  Inlined here so
 /// the loop dispatch doesn't have to depend on the runtime
 /// patterns crate's private fn.
+///
+/// v0.4 W21 Fri (Decision 46.6 finalize): bilingual — also
+/// recognises the JSON tool-call shape `{"verdict": "ACCEPT"}`
+/// that Reviewer + Tester emit under the JSON contract.  Same
+/// detector for both wire formats so mixed-mode chains converge.
 fn is_accept_verdict_local(reply: &str) -> bool {
-    reply.trim().to_lowercase().starts_with("accept")
+    let trimmed = reply.trim();
+    // Fast path — v0.3 markdown shape.
+    if trimmed.to_lowercase().starts_with("accept") {
+        return true;
+    }
+    // v0.4 JSON shape — `{"verdict": "ACCEPT", ...}` (any field
+    // order, optional whitespace).  Parse the candidate as JSON
+    // + check the top-level `verdict` field.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(verdict) = v.get("verdict").and_then(|x| x.as_str()) {
+            return verdict.eq_ignore_ascii_case("accept");
+        }
+    }
+    false
 }
 
 /// v0.4 Week 21 Mon follow-up — pipeline-history cleanup at
@@ -4272,6 +4300,48 @@ mod chat_persistence_tests {
         assert!(!is_accept_verdict_local("FAIL: missing test"));
         assert!(!is_accept_verdict_local("rejects with concerns"));
         assert!(!is_accept_verdict_local(""));
+    }
+
+    #[test]
+    fn is_accept_verdict_local_recognises_json_verdict() {
+        // v0.4 W21 Fri (Decision 46.6): bilingual detector also
+        // matches `{"verdict": "ACCEPT"}` JSON shape that Reviewer
+        // + Tester emit under the JSON contract.
+        assert!(is_accept_verdict_local(r#"{"verdict": "ACCEPT"}"#));
+        assert!(is_accept_verdict_local(
+            r#"{"verdict": "ACCEPT", "rationale": "byte-stable"}"#));
+        assert!(is_accept_verdict_local(
+            r#"{"verdict": "accept", "rationale": "lowercase ok"}"#));
+        // FAIL verdict → false.
+        assert!(!is_accept_verdict_local(
+            r#"{"verdict": "FAIL", "rationale": "hcl::Block used"}"#));
+        // Error envelope → false (the abort signal goes through
+        // is_hard_error_signal, NOT through ACCEPT detection).
+        assert!(!is_accept_verdict_local(
+            r#"{"error": {"code": "input_malformed", "message": "..."}}"#));
+        // Bare empty object → false.
+        assert!(!is_accept_verdict_local(r#"{}"#));
+    }
+
+    #[test]
+    fn is_hard_error_signal_recognises_json_error_envelope() {
+        // v0.4 W21 Fri (Decision 46.6): bilingual error detector
+        // — markdown shape OR JSON envelope.  Closes the abort
+        // path under mixed-mode chains.
+        assert!(is_hard_error_signal(
+            r#"{"error": {"code": "input_malformed", "message": "Architect output missing block_name"}}"#));
+        assert!(is_hard_error_signal(
+            r#"{"error": {"code": "downstream_propagate", "message": "upstream forwarded"}}"#));
+        // Reviewer ACCEPT JSON → false (not an error envelope).
+        assert!(!is_hard_error_signal(
+            r#"{"verdict": "ACCEPT", "rationale": "good"}"#));
+        // Tester FAIL JSON → false (gaps[] is non-ACCEPT but not
+        // an abort — reflector loop iterates).
+        assert!(!is_hard_error_signal(
+            r#"{"verdict": "FAIL", "rationale": "...", "gaps": []}"#));
+        // Architect happy-path JSON → false.
+        assert!(!is_hard_error_signal(
+            r#"{"block_name": "dataset", "purpose": "...", "fields": [], "grammar_example": "", "language_spec_snippet": "", "decision_implications": {"new_refkind": null, "checker_invariants": [], "decision_conflicts": [], "byte_stable_v0_2_roundtrip": true}}"#));
     }
 
     #[test]

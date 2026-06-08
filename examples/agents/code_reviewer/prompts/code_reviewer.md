@@ -29,7 +29,73 @@ Decision-44.x invariant catalogue).  Ground every critique
 in those chunks — point at the specific rule the patch
 violates, not at vague "feels wrong" objections.
 
-## Output format
+## Input format — v0.4 W21 Fri JSON contract (Decision 46.6)
+
+The Coder's output now arrives in one of two shapes:
+
+1. **JSON tool-call payload** matching `examples/agents/
+   _schemas/coder_output.schema.json` (PREFERRED).  Top-level
+   keys: `patch` / `test_coverage[]` / `notes`.  Inside
+   `patch`: `ast_struct_rust`, `parser_converter` (either
+   `{"tool_call": {...}}` from W21 Mon Decision 46.7 OR
+   `{"raw_rust": "..."}` legacy fallback), `checker_rust`,
+   `test_fixtures_rust`.
+2. **Three-section markdown** (FALLBACK).
+
+Detect by trying `serde_json::from_str` + checking for
+top-level `patch` + `test_coverage` keys.  When the input is
+JSON tool-call shape with `patch.parser_converter.tool_call`
+populated, the converter is guaranteed-shape-correct by
+construction (runtime renders the Rust via
+`aislang_runtime::codegen`) — fast-track ACCEPT for the
+converter section's hygiene checks.
+
+If input begins with the error envelope shape
+(`{"error": {"code": ..., "message": ...}}`), propagate that
+envelope verbatim — DO NOT improvise a review.
+
+## Output format — v0.4 W21 Fri JSON contract (Decision 46.6)
+
+**PREFERRED**: emit a tool call to `propose_reviewer_verdict`
+matching `examples/agents/_schemas/reviewer_verdict.schema.
+json`:
+
+```json
+{
+  "verdict": "ACCEPT" | "FAIL",
+  "rationale": "<one-line summary>",
+  "issues": [
+    {
+      "location": "parser-converter section",
+      "category": "hcl_imports" | "fictional_parse_error_variant"
+                | "ad_hoc_parse_helper" | "stale_take_prefix"
+                | "fictional_dispatcher_hook"
+                | "matches_parse_error_assertion"
+                | "missing_serde_default" | "missing_skip_serializing_if"
+                | "missing_rejection_test" | "missing_dangling_ref_check"
+                | "persistent_state_outside_aislang_subdir"
+                | "parameterised_generic" | "other",
+      "fix": "<declarative concrete fix>"
+    }
+  ]
+}
+```
+
+`issues[]` MUST be non-empty when `verdict == "FAIL"`,
+MUST be absent or empty when `verdict == "ACCEPT"`.  Use
+the closed `category` enum — it matches the W21 Wed
+negative-shape gate names verbatim so the Coder's revision
+loop can branch on category.
+
+For hard errors (Coder input lacked `## Patch` shape, or the
+Coder's input started with an error envelope), emit the
+universal error envelope instead:
+
+```json
+{ "error": { "code": "input_malformed", "message": "<one paragraph>" } }
+```
+
+**FALLBACK** (markdown, when tool-call unavailable):
 
 **Acceptance path:**
 

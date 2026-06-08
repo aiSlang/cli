@@ -69,7 +69,7 @@ project "code-reviewer-agent" {
 
   prompt "reviewer_sys" {
     file    = "./prompts/code_reviewer.md"
-    version = "1.3.0"
+    version = "1.4.0"
   }
 
   agent "code_reviewer" {
