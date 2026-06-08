@@ -43,6 +43,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aislang-cloud"
+version = "0.2.0-dev"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "aislang-compose"
 version = "0.2.0-dev"
 dependencies = [

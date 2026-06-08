@@ -8,6 +8,7 @@ members = [
     "crates/aislang-compose",
     "crates/aislang-k8s",       # Phase 2 Week 14 Mon — K8s emitter
     "crates/aislang-runtime",
+    "crates/aislang-cloud",     # v0.4 Week 22 Mon — Track C control plane
 ]
 
 [workspace.package]
