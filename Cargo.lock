@@ -26,6 +26,7 @@ name = "aislang-cli"
 version = "0.2.0-dev"
 dependencies = [
  "aislang-catalog",
+ "aislang-cloud",
  "aislang-compose",
  "aislang-core",
  "aislang-k8s",
