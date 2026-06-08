@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aislang.dev/v0.4/schemas/reviewer_verdict.json",
+  "title": "Code-reviewer verdict",
+  "description": "Reviewer's structured ACCEPT / FAIL verdict on a Coder patch.  v0.4 replaces the v0.3 markdown `ACCEPT` line / `FAIL: ...` feedback with this JSON shape.  Runtime's `is_accept_verdict_local` reads `verdict == \"ACCEPT\"` directly (no string-prefix heuristic needed).",
+  "type": "object",
+  "required": ["verdict"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["ACCEPT", "FAIL"],
+      "description": "ACCEPT → reflector loop terminates with this patch as the final reply.  FAIL → runtime feeds `issues` + `rationale` back to the Coder as revision instructions."
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 500,
+      "description": "One-line summary.  For ACCEPT: what made the patch good (`byte-stable; canonical RawBlock shape`).  For FAIL: one-sentence summary of what's broken (`parser-converter uses hcl::* types that don't exist`)."
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["location", "category", "fix"],
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "Where in the patch the issue lives (`parser-converter section`, `tests/dataset_block_parses`, `ast.rs Project field`)."
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "hcl_imports",
+              "fictional_parse_error_variant",
+              "ad_hoc_parse_helper",
+              "stale_take_prefix",
+              "fictional_dispatcher_hook",
+              "matches_parse_error_assertion",
+              "missing_serde_default",
+              "missing_skip_serializing_if",
+              "missing_rejection_test",
+              "missing_dangling_ref_check",
+              "persistent_state_outside_aislang_subdir",
+              "parameterised_generic",
+              "other"
+            ],
+            "description": "Closed enum of REJECT categories from `code_reviewer/knowledge/01_review_checklist.md`."
+          },
+          "fix": {
+            "type": "string",
+            "description": "Concrete actionable fix the Coder can apply.  Declarative (`Use RawBlock`), not interrogative (`Did you consider RawBlock?`)."
+          }
+        }
+      },
+      "description": "Required + non-empty when verdict == FAIL.  MUST be absent or empty array when verdict == ACCEPT."
+    }
+  }
+}

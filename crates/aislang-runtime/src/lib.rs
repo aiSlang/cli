@@ -72,6 +72,13 @@ pub mod rag;
 // See Decision 46.7.
 pub mod codegen;
 
+// v0.4 Week 21 Thu: JSON inter-agent contract (Decision 46.6).
+// Pinned schemas under `examples/agents/_schemas/` + structural
+// validator for the wire format.  Replaces the v0.3 markdown-
+// section handoff between Architect / Coder / Reviewer / Tester
+// with schema-validated JSON via tool-call structured-output mode.
+pub mod schemas;
+
 pub use session::{
     Session, SessionError, ToolRegistry, BudgetConfig, MAX_TOOL_ITERS, TOOL_NAME_SEPARATOR,
     load_system_prompt, render_system_prompt_if_template, hex_sha256,

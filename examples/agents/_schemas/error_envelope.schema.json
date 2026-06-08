@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aislang.dev/v0.4/schemas/error_envelope.json",
+  "title": "Hard-error exit envelope",
+  "description": "Canonical wire shape any agent emits when its input is unusable and the pipeline must abort.  Equivalent to the v0.3 `## ERROR:` markdown prefix; runtime detects the top-level `error` key + aborts the pipeline.  EXCLUSIVE: when `error` is present, NO other top-level keys may carry agent output.",
+  "type": "object",
+  "required": ["error"],
+  "additionalProperties": false,
+  "properties": {
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "input_missing",
+            "input_malformed",
+            "input_contradicts_decisions",
+            "downstream_propagate",
+            "unknown"
+          ],
+          "description": "Closed enum so the runtime + future tools can branch on the error category."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 1000,
+          "description": "Human-readable one-paragraph explanation."
+        },
+        "from_step": {
+          "type": "string",
+          "description": "Qualified step label that originated the error (set by the runtime when forwarding a propagated error)."
+        }
+      }
+    }
+  }
+}
