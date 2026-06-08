@@ -1505,6 +1505,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflector_coder_reviewer_rejects_hcl_block_hallucination() {
+        // v0.4 Week 21 Wed — pins the Reviewer's NEGATIVE-shape
+        // gate from the corpus parity rewrite: a patch that uses
+        // `hcl::Block` / `hcl::Body` must be REJECTED on first
+        // pass (closes the W20 Thu dogfood-finding gap where the
+        // Reviewer ACCEPTed the hallucinated patch).  Coder v1
+        // emits the canonical hallucination shape; Reviewer
+        // rejects with feedback naming the `hcl::*` issue + the
+        // canonical to_<block> shape; Coder v2 emits a fix;
+        // Reviewer ACCEPTs.
+        let coder_inputs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let coder_inputs_clone = coder_inputs.clone();
+        let coder_call    = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let coder_call_clone = coder_call.clone();
+        let reviewer_call = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let reviewer_call_clone = reviewer_call.clone();
+        let dispatch = move |agent: String, input: String| -> DispatchFuture {
+            match agent.as_str() {
+                "coder" => {
+                    coder_inputs_clone.lock().unwrap().push(input);
+                    let mut c = coder_call_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        if n == 1 {
+                            // v1: the W20 Thu dogfood-finding shape
+                            // — `hcl::Block` parser-converter that
+                            // doesn't compile against the real codebase.
+                            Ok("## Patch\n```rust\nuse hcl::Block;\nfn parse_dataset_block(block: &hcl::Block) -> Result<Dataset, ParseError> {\n  // ...\n}\n```\n".into())
+                        } else {
+                            // v2: real shape — Chumsky RawBlock +
+                            // expect_* helpers per the W21 Wed
+                            // corpus rewrite.
+                            Ok("## Patch\n```rust\nfn to_dataset(raw: RawBlock) -> Result<Dataset, String> {\n    let label = require_single_label(\"dataset\", raw.labels)?;\n    // ...\n}\n```\n## Test coverage\n- parser_accepts_dataset_block\n## Notes\n".into())
+                        }
+                    })
+                }
+                "code_reviewer" => {
+                    let mut c = reviewer_call_clone.lock().unwrap();
+                    *c += 1;
+                    let n = *c;
+                    Box::pin(async move {
+                        if n == 1 {
+                            // The W21 Wed corpus's NEGATIVE-shape
+                            // gate verbatim: name the hcl::* + the
+                            // canonical replacement.
+                            Ok("FAIL: parser-converter uses `hcl::*` types that don't exist in aislang-core.\n\
+                                \nIssues:\n\
+                                - `use hcl::Block` — DELETE.  The hcl crate is not a dependency.\n\
+                                - `fn parse_dataset_block(block: &hcl::Block)` — REWRITE as \
+                                `fn to_dataset(raw: RawBlock) -> Result<Dataset, String>` + use \
+                                the canonical to_prompt shape from knowledge/04_real_parser_shape.md.".into())
+                        } else {
+                            Ok("ACCEPT\nparser-converter now follows the canonical RawBlock shape.".into())
+                        }
+                    })
+                }
+                _ => unreachable!(),
+            }
+        };
+        let architect_design = "## Block name\n`dataset`\n\n## Fields\n- path: Path\n";
+        let out = reflector::run("coder".into(), "code_reviewer".into(),
+            architect_design, /* max_retries = */ 3, dispatch).await.expect("run");
+        match out {
+            ReflectorOutcome::Accepted { draft, retry_count } => {
+                assert_eq!(retry_count, 1,
+                    "exactly one revision before reviewer accepts the hcl::* fix");
+                assert!(draft.contains("RawBlock"),
+                    "accepted draft must use the canonical RawBlock shape");
+                assert!(!draft.contains("hcl::"),
+                    "accepted draft must not contain the rejected `hcl::*` shape");
+            }
+            ReflectorOutcome::MaxRetries { .. } => panic!("expected Accepted"),
+        }
+        // Pin that the reviewer's hcl-specific feedback flowed back
+        // to the Coder's second invocation verbatim — the W21 Wed
+        // corpus rewrite hinges on this round-trip working.
+        let inputs = coder_inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 2,
+            "coder invoked twice: initial + one revision");
+        assert!(inputs[1].contains("hcl::") || inputs[1].contains("RawBlock"),
+            "second coder input must thread the hcl-specific feedback; got:\n{}",
+            inputs[1]);
+    }
+
+    #[tokio::test]
     async fn reflector_coder_tester_shape_retries_on_missing_rejection_test() {
         // v0.3 Week 20 Tue — pins the reflector contract for the
         // Coder + Tester pairing.  Mirrors Mon's coder ↔ reviewer

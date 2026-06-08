@@ -55,22 +55,56 @@ the Coder can act on without further negotiation.  No
 
 ## Reject if any of these are true
 
+The first six are **NEGATIVE-shape gates** — patterns that
+indicate the Coder authored against a fictional API.  See
+knowledge/01_review_checklist.md "NEGATIVE shape" + knowledge/
+04_real_parser_shape.md for the canonical shape to compare
+against.
+
+- Patch contains **`use hcl::*`** OR types like `hcl::Body`,
+  `hcl::Block`, `hcl::Attribute`.  The `hcl` crate is NOT a
+  dependency; cargo build fails.  The parser is Chumsky-based
+  + produces `RawBlock`.
+- Patch invents `ParseError::X` enum variants (e.g.
+  `ParseError::InvalidEnum`, `ParseError::MissingField`,
+  `ParseError::UnknownAttribute`).  `ParseError` is a STRUCT
+  with `message` + `span` fields, NOT an enum.
+- Patch defines ad-hoc `parse_*` helpers (e.g. `parse_bool`,
+  `parse_output_type`).  The real codebase uses `expect_*` —
+  see the closed set in knowledge/04.
+- Parser converter signature is anything other than
+  `fn to_<block>(raw: RawBlock) -> Result<<Type>, String>`.
+- Dispatcher hook is `Project::from_hcl` (fiction) or matches
+  on `block.identifier.as_str()` (HCL crate API).  The real
+  hook is `convert_to_project` + matches on `block.block_type.
+  as_str()`.
+- Rejection-test `matches!(err, ParseError::InvalidEnum { .. })`
+  or any other variant-pattern.  Real assertions match on
+  `ValidateError::Parse(errs)` + substring-check
+  `errs[0].message`.
+
+The next four are **POSITIVE-shape gates** — patterns that
+must be PRESENT for ACCEPT:
+
 - Any new optional field on `Project` (or a sub-struct) is
   missing `#[serde(default, skip_serializing_if = "...")]`.
   This breaks Decision 44.4 (byte-stable v0.2 round-trip).
-- Parser converter pokes at `hcl::Body` directly instead of
-  using `take_required_*` / `take_optional_*` helpers.
 - Range/enum check the DESIGN called out has no
   corresponding rejection test.
 - New `RefKind` variant added but no dangling-ref check in
   the checker (and the DESIGN said other blocks reference
   this one).
-- Test names don't follow the `<verb>_<subject>_<condition>`
-  convention.
 - Patch writes persistent state outside
   `<source_dir>/.aislang/<subtree>/` (Decision 44.4 contract).
 - Patch introduces a new generic type (`Map<K,V>`,
   `List<List<T>>`).  Decision 44.5 keeps types simple.
+
+If the Coder emitted a `propose_block_converter` tool call
+for the parser-converter section (W21 Mon Decision 46.7),
+the converter is guaranteed-shape-correct by construction —
+fast-track ACCEPT for the converter section's hygiene
+checks; still run the full negative-shape gate against the
+AST struct + checker + tests free-text sections.
 
 ## Don't reject for
 
