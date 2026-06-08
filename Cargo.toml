@@ -65,6 +65,13 @@ schemars    = "1.0"
 axum        = "0.7"
 tokio-util  = "0.7"
 tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "time", "sync", "signal", "net"] }
+# v0.4 W22 Thu — `aislang-cloud` SSE apply endpoint uses
+# `tempfile::TempDir` for the per-request ephemeral working dir.
+# Auto-cleanup on drop matches the contract that the apply pipeline
+# leaves zero filesystem residue after the stream closes
+# (Decision 46.2 + "tenant-scoped working dir auto-cleaned post-
+# apply" DoD).
+tempfile    = "3"
 # week-6 Wed: LiteLLM HTTP client + non-streaming chat loop
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # week-9 Mon: OTel-GenAI tracing — official Rust SDK + OTLP HTTP exporter
