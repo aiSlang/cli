@@ -344,6 +344,25 @@ enum RagCommand {
         #[arg(long, value_name = "URL", default_value = "http://localhost:4000")]
         litellm_url: String,
     },
+    /// v0.4 W21 Tue — scan every `vector_store` declared in a
+    /// project + report chunk counts per persisted index.  Exits
+    /// non-zero when any index is empty (0 chunks) or missing
+    /// from disk; exits 0 when every declared store has a healthy
+    /// index.  Closes the W20 Thu dogfood-finding gap (silent
+    /// empty-RAG indexes masked the Coder hallucination root
+    /// cause); pairs with the chat-time empty-RAG warning that
+    /// fires when a user starts a chat against an agent whose
+    /// `knowledge` refs a store with 0 chunks.
+    Verify {
+        /// Path to the .ais project file or project root dir.
+        project: PathBuf,
+        /// Treat a missing index file the same as a 0-chunk index
+        /// (both exit non-zero).  Default: missing = non-zero,
+        /// empty = non-zero — `--strict` is a no-op today but
+        /// reserved for future per-store severity levels.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -395,6 +414,8 @@ fn run() -> Result<ExitCode> {
             RagCommand::Query { label, project, query, top_k, litellm_url } =>
                 run_rag_query(label, project, query, top_k, litellm_url)
                     .map(|_| ExitCode::SUCCESS)?,
+            RagCommand::Verify { project, strict } =>
+                run_rag_verify(project, strict)?,
         },
     };
     Ok(code)
@@ -3252,6 +3273,124 @@ fn run_rag_build(
     Ok(())
 }
 
+/// v0.4 W21 Tue — `aislang rag verify <project>` scan-all-stores
+/// health check.
+///
+/// Walks every `vector_store` declared in the (merged, multi-
+/// module-aware) project + reports the on-disk chunk count for
+/// each.  Closes the W20 Thu dogfood-finding gap: the multi-
+/// module orchestrator silently built EMPTY (50-byte / 0-chunk)
+/// indexes for every sub-agent's corpus because the per-store
+/// `source` was resolving against the wrong dir.  The Coder
+/// hallucinated `hcl::Block` against an empty corpus index +
+/// nothing surfaced the empty state until manual JSON-inspection
+/// of the `.bin` files.
+///
+/// Exit semantics:
+/// - **Exit 0** — every declared store has a healthy index
+///   (>0 chunks).
+/// - **Exit non-zero** — at least one store either has 0 chunks
+///   OR its `.bin` file is missing from disk.  The
+///   `aislang::v0_4::RagVerifyFailed` `anyhow` error contains
+///   a per-store summary so the user sees which stores are
+///   broken.
+fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
+    let loaded = load_project_input(&project)?;
+    let proj = &loaded.resolved.project;
+    let project_root = std::fs::canonicalize(&loaded.project_root)
+        .map_err(|e| anyhow::anyhow!("project root not readable: {e}"))?;
+
+    if proj.vector_stores.is_empty() {
+        eprintln!("aislang rag verify: no vector_store blocks declared in {} \
+                   — nothing to verify",
+            project.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    eprintln!("aislang rag verify: scanning {} declared vector_store(s) in {}",
+        proj.vector_stores.len(), project.display());
+
+    let mut unhealthy = 0u32;
+    let mut healthy   = 0u32;
+    for vs in &proj.vector_stores {
+        let idx_path = project_root.join(".aislang").join("vector")
+            .join(format!("{}.bin", vs.label));
+        let report = inspect_rag_index(&idx_path);
+        match report {
+            RagIndexReport::Healthy { chunks, bytes } => {
+                eprintln!("  ✓ `{}`: {chunks} chunks ({bytes} bytes) — {}",
+                    vs.label, idx_path.display());
+                healthy += 1;
+            }
+            RagIndexReport::Empty { bytes } => {
+                eprintln!("  ✗ `{}`: EMPTY (0 chunks, {bytes} bytes) — {}",
+                    vs.label, idx_path.display());
+                eprintln!("    hint: run `aislang apply {}` to rebuild, or",
+                    project.display());
+                eprintln!("          `aislang rag build {} {}` to build just this store",
+                    vs.label, project.display());
+                unhealthy += 1;
+            }
+            RagIndexReport::Missing => {
+                eprintln!("  ✗ `{}`: MISSING — {}",
+                    vs.label, idx_path.display());
+                eprintln!("    hint: run `aislang apply {}` to build the indexes",
+                    project.display());
+                unhealthy += 1;
+            }
+            RagIndexReport::Corrupt { cause } => {
+                eprintln!("  ✗ `{}`: CORRUPT — {}: {cause}",
+                    vs.label, idx_path.display());
+                unhealthy += 1;
+            }
+        }
+    }
+
+    eprintln!();
+    if unhealthy == 0 {
+        eprintln!("aislang rag verify: OK — {healthy} healthy store(s)");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!("aislang rag verify: FAILED — {healthy} healthy, {unhealthy} unhealthy");
+        Ok(ExitCode::from(2))
+    }
+}
+
+/// Per-store health classification used by `aislang rag verify`
+/// + by the chat-time empty-RAG warning at `aislang chat`
+/// session start.  Single source of truth so both surfaces use
+/// the same definitions.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RagIndexReport {
+    Healthy { chunks: usize, bytes: u64 },
+    Empty   { bytes: u64 },
+    Missing,
+    Corrupt { cause: String },
+}
+
+/// Inspect a single on-disk RAG index file + classify it.  Pure
+/// function over the filesystem (no network, no embedder
+/// instantiation) so it's cheap enough to call at every
+/// `aislang chat` session start without delaying the chat loop.
+pub(crate) fn inspect_rag_index(idx_path: &Path) -> RagIndexReport {
+    if !idx_path.exists() {
+        return RagIndexReport::Missing;
+    }
+    let bytes = std::fs::metadata(idx_path)
+        .map(|m| m.len()).unwrap_or(0);
+    match aislang_runtime::rag::Index::load(idx_path) {
+        Ok(idx) => {
+            let n = idx.chunks.len();
+            if n == 0 {
+                RagIndexReport::Empty { bytes }
+            } else {
+                RagIndexReport::Healthy { chunks: n, bytes }
+            }
+        }
+        Err(e) => RagIndexReport::Corrupt { cause: format!("{e:?}") },
+    }
+}
+
 /// `aislang rag query <label> <project> "<text>" [--top-k N] [--litellm-url …]` —
 /// v0.3 Week 19 Wed follow-up.  Loads the cached index (building
 /// it on-demand if missing), embeds the query text via the same
@@ -3752,6 +3891,20 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool, keep_history:
         clean_pipeline_history(&source_dir, &qualified_agent_label);
     }
 
+    // v0.4 W21 Tue — empty-RAG warning at chat-session start.
+    // Scan every agent that's about to dispatch (the qualified
+    // step labels for orchestrator + loop, the single agent for
+    // direct chat) + warn on stderr if any of its `knowledge`
+    // refs points at an empty / missing / corrupt RAG index.
+    // Closes the W20 Thu dogfood-finding gap (empty indexes
+    // silently masked the Coder hallucination root cause).  Fail-
+    // soft: warning only, never aborts the chat.
+    warn_on_empty_rag_indexes(
+        &loaded, &source_dir,
+        &qualified_agent_label, orchestrator_steps.as_deref(),
+        router_dispatch.as_ref(),
+    );
+
     // ── 3. spin tokio runtime + drive the MCP-proxied chat loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3884,6 +4037,91 @@ fn clean_pipeline_history(source_dir: &Path, pipeline_label: &str) {
         if let Err(e) = std::fs::remove_dir_all(&p) {
             eprintln!("\x1b[2;3m  · warn: failed to clean {}: {e}\x1b[0m",
                 p.display());
+        }
+    }
+}
+
+/// v0.4 W21 Tue — chat-time empty-RAG warning.  Scans every
+/// agent that's about to dispatch + warns on stderr if any of
+/// its `knowledge` refs points at an empty / missing / corrupt
+/// RAG index.  Fail-soft — only emits warnings, never aborts
+/// the chat session.
+///
+/// Resolution rules:
+/// - **Direct agent chat** (`orchestrator_steps == None &&
+///   router_dispatch == None`) — scan the single `agent_label`'s
+///   knowledge.
+/// - **Orchestrator / loop** (`orchestrator_steps == Some(_)`) —
+///   scan every qualified step label.
+/// - **Router branch** — scan every unique agent across all
+///   case-pipelines + the default-pipeline.
+fn warn_on_empty_rag_indexes(
+    loaded:             &LoadedProject,
+    source_dir:         &Path,
+    agent_label:        &str,
+    orchestrator_steps: Option<&[String]>,
+    router_dispatch:    Option<&RouterDispatch>,
+) {
+    let project = &loaded.resolved.project;
+    // Build the set of qualified agent labels to scan.
+    let mut to_scan: Vec<String> = Vec::new();
+    if let Some(steps) = orchestrator_steps {
+        to_scan.extend(steps.iter().cloned());
+    } else if let Some(r) = router_dispatch {
+        to_scan.push(r.classifier_agent_label.clone());
+        for (_, steps) in &r.case_keys_and_steps {
+            to_scan.extend(steps.iter().cloned());
+        }
+        to_scan.extend(r.default_steps.iter().cloned());
+    } else {
+        to_scan.push(agent_label.to_string());
+    }
+    // De-dup while preserving order — `agent_label` may repeat
+    // across cases.
+    to_scan.sort();
+    to_scan.dedup();
+
+    // For each agent, look up its `knowledge` refs + check each
+    // store's on-disk index.
+    let project_root = std::fs::canonicalize(source_dir)
+        .unwrap_or_else(|_| source_dir.to_path_buf());
+    for agent_lbl in &to_scan {
+        let agent = match project.agents.iter().find(|a| a.label == *agent_lbl) {
+            Some(a) => a,
+            None    => continue,    // already warned at resolution time
+        };
+        let knowledge = match &agent.knowledge {
+            Some(k) if !k.is_empty() => k,
+            _ => continue,
+        };
+        for vs_ref in knowledge {
+            let vs_key = vs_ref.qualified_in(&agent.label);
+            let vs = match project.vector_stores.iter()
+                .find(|v| v.label == vs_key)
+            {
+                Some(v) => v,
+                None    => continue,    // checker should have caught this
+            };
+            let idx_path = project_root.join(".aislang").join("vector")
+                .join(format!("{}.bin", vs.label));
+            match inspect_rag_index(&idx_path) {
+                RagIndexReport::Healthy { .. } => { /* quiet on healthy */ }
+                RagIndexReport::Empty { .. } => {
+                    eprintln!(
+                        "\x1b[2;3m  · warn: agent `{}`'s knowledge store `{}` has 0 chunks — agent will run UNGROUNDED.  Run `aislang rag build {} <project>` to fix.\x1b[0m",
+                        agent_lbl, vs.label, vs.label);
+                }
+                RagIndexReport::Missing => {
+                    eprintln!(
+                        "\x1b[2;3m  · warn: agent `{}`'s knowledge store `{}` index file is MISSING — agent will run UNGROUNDED.  Run `aislang apply <project>` to build the indexes.\x1b[0m",
+                        agent_lbl, vs.label);
+                }
+                RagIndexReport::Corrupt { cause } => {
+                    eprintln!(
+                        "\x1b[2;3m  · warn: agent `{}`'s knowledge store `{}` index file is CORRUPT ({cause}) — agent will run UNGROUNDED.\x1b[0m",
+                        agent_lbl, vs.label);
+                }
+            }
         }
     }
 }
@@ -4074,6 +4312,86 @@ mod chat_persistence_tests {
         assert_eq!(std::fs::read_to_string(
             kept_subdir.join("turn_001_step_01_x.md")).unwrap(),
             "kept\n");
+    }
+
+    // ── v0.4 Week 21 Tue: rag verify / chat-time warning ──
+
+    /// Synthesize a minimal Index .bin file on disk with the
+    /// given chunk count.  The runtime's `Index::save` is the
+    /// "right" way but adds bge-m3 dim noise; for the verifier's
+    /// pure classification tests, this hand-rolled JSON shape
+    /// matches `Index`'s serde wire format (label/dims/chunks).
+    fn write_index_bin(path: &std::path::Path, chunks: usize) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let chunks_json: Vec<String> = (0..chunks)
+            .map(|i| format!(
+                "{{\"text\":\"chunk {i}\",\"vector\":[0.0]}}"))
+            .collect();
+        let body = format!(
+            "{{\"label\":\"test_kb\",\"dims\":1,\"chunks\":[{}]}}",
+            chunks_json.join(","));
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn inspect_rag_index_classifies_healthy_when_chunks_present() {
+        let dir = tempdir();
+        let p = dir.join("healthy.bin");
+        write_index_bin(&p, 5);
+        match inspect_rag_index(&p) {
+            RagIndexReport::Healthy { chunks, bytes } => {
+                assert_eq!(chunks, 5);
+                assert!(bytes > 0);
+            }
+            other => panic!("expected Healthy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_rag_index_classifies_empty_when_zero_chunks() {
+        // The W20 Thu dogfood-finding shape: 50-byte file with
+        // an empty chunks array.  The verifier MUST flag this
+        // as Empty (not Healthy) so the user sees the gap before
+        // the agent runs ungrounded.
+        let dir = tempdir();
+        let p = dir.join("empty.bin");
+        write_index_bin(&p, 0);
+        match inspect_rag_index(&p) {
+            RagIndexReport::Empty { bytes } => {
+                assert!(bytes > 0,
+                    "Empty != Missing — file exists but has 0 chunks");
+            }
+            other => panic!("expected Empty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_rag_index_classifies_missing_when_file_absent() {
+        let dir = tempdir();
+        let p = dir.join("nonexistent.bin");
+        assert!(!p.exists());
+        match inspect_rag_index(&p) {
+            RagIndexReport::Missing => { /* expected */ }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_rag_index_classifies_corrupt_when_json_invalid() {
+        // Malformed payload — neither a valid Index nor an empty
+        // file.  Verifier must report Corrupt with the cause,
+        // not silently treat as missing.
+        let dir = tempdir();
+        let p = dir.join("corrupt.bin");
+        std::fs::write(&p, b"this is not JSON at all").unwrap();
+        match inspect_rag_index(&p) {
+            RagIndexReport::Corrupt { cause } => {
+                assert!(!cause.is_empty());
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 }
 
