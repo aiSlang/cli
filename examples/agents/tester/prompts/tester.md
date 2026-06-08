@@ -25,7 +25,63 @@ reflector-feedback shape).  Ground every recommendation in
 those chunks — point at the in-repo convention not a generic
 one.
 
-## Output format (REQUIRED — Coder revisions parse these)
+## Input format — v0.4 W21 Fri JSON contract (Decision 46.6)
+
+You receive the Reviewer's verdict JSON (matching
+`examples/agents/_schemas/reviewer_verdict.schema.json`) AND
+the Coder's patch JSON (matching `coder_output.schema.json`)
+threaded through the orchestrator's cumulative-input handoff.
+
+Detect the JSON shape by trying `serde_json::from_str` + check
+for top-level `verdict` (Reviewer) or `patch` + `test_coverage`
+(Coder).  If input begins with the error envelope shape
+(`{"error": {...}}`), propagate it verbatim — DO NOT improvise
+a test plan.
+
+If the input is markdown (fallback), parse via the v0.3 header
+convention.
+
+## Output format — v0.4 W21 Fri JSON contract (Decision 46.6)
+
+**PREFERRED**: emit a tool call to `propose_tester_output`
+matching `examples/agents/_schemas/tester_output.schema.json`:
+
+```json
+{
+  "test_plan": [
+    {
+      "test_name": "<verb>_<subject>_<condition>",
+      "covers_field": "<field>" | "(all)",
+      "kind": "happy_path" | "rejection" | "round_trip" | "dangling_ref"
+    }
+  ],
+  "skill_invocation": "cargo test --workspace --no-fail-fast[ -- <name1>[ <name2>...]]",
+  "verdict": "ACCEPT" | "FAIL",
+  "rationale": "<one-line summary>",
+  "gaps": [
+    {
+      "missing_test": "<verb>_<subject>_<condition>",
+      "should_assert": "<declarative description>"
+    }
+  ]
+}
+```
+
+`gaps[]` MUST be non-empty when `verdict == "FAIL"`, MUST be
+absent or empty when `verdict == "ACCEPT"`.  The
+`skill_invocation` regex requires the canonical `cargo test
+--workspace --no-fail-fast` form (+ optional `-- <names>`
+filter); use the filter only when ≤4 specific test names need
+running.
+
+For hard errors (input lacked recognisable sections), emit
+the universal error envelope:
+
+```json
+{ "error": { "code": "input_malformed", "message": "<one paragraph>" } }
+```
+
+**FALLBACK** (markdown, when tool-call unavailable):
 
 Reply with exactly these three sections, in order, as markdown:
 

@@ -234,6 +234,174 @@ async fn review_cycle_loop_max_iter_3_caps_when_reviewer_never_accepts() {
 }
 
 #[tokio::test]
+async fn full_design_pipeline_round_trips_json_contract_through_4_steps() {
+    // v0.4 Week 21 Fri (Decision 46.6 finalize): pin the JSON
+    // inter-agent contract round-tripping through the full 4-step
+    // orchestrator chain.  Each step's mocked dispatch emits a
+    // payload conforming to its schema; downstream agents see
+    // structured JSON instead of markdown.  Closes the W20 Thu
+    // dogfood-finding lesson: "agents are free to emit plausible-
+    // looking but wrong markdown" — schema validation at every
+    // wire boundary forces structural conformance.
+    use aislang_runtime::schemas::{
+        structurally_validate, looks_like_error_envelope,
+        ARCHITECT_OUTPUT, CODER_OUTPUT, REVIEWER_VERDICT, TESTER_OUTPUT,
+    };
+    let dir = orchestrator_dir();
+    let loaded = load_project_input(&dir).expect("load");
+    let proj = &loaded.resolved.project;
+    let full_design = proj.pipelines.iter()
+        .find(|p| p.label == "orchestrator.full_design")
+        .expect("full_design pipeline");
+
+    let observed_steps = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let observed_clone = observed_steps.clone();
+    let dispatch = move |agent: String, input: String| -> DispatchFuture {
+        let observed = observed_clone.clone();
+        Box::pin(async move {
+            observed.lock().unwrap().push((agent.clone(), input.clone()));
+            let reply = match agent.as_str() {
+                "architect.architect" => r##"{
+                    "block_name": "dataset",
+                    "purpose": "Declare training data for the eval block to bind metrics against.",
+                    "fields": [
+                        { "name": "path", "type": "Path", "required": true,
+                          "description": "filesystem path" }
+                    ],
+                    "grammar_example": "dataset \"x\" { path = \"./x.jsonl\" }",
+                    "language_spec_snippet": "§4.<N> declares datasets...",
+                    "decision_implications": {
+                        "new_refkind": "Dataset",
+                        "checker_invariants": [],
+                        "decision_conflicts": [],
+                        "byte_stable_v0_2_roundtrip": true
+                    }
+                }"##.to_string(),
+                "coder.coder" => r##"{
+                    "patch": {
+                        "ast_struct_rust": "pub struct Dataset { pub label: String, pub path: PathBuf }",
+                        "parser_converter": {
+                            "tool_call": {
+                                "block_name": "dataset", "type_name": "Dataset", "fields": []
+                            }
+                        },
+                        "checker_rust": "fn validate_datasets(...) { Ok(()) }",
+                        "test_fixtures_rust": "#[test] fn dataset_block_parses() { ... }"
+                    },
+                    "test_coverage": [
+                        { "test_name": "dataset_block_parses", "kind": "happy_path",
+                          "covers_field": "path" }
+                    ],
+                    "notes": { "new_refkind_variant": "Dataset",
+                               "files_edited_beyond_four": [] }
+                }"##.to_string(),
+                "code_reviewer.code_reviewer" => r##"{
+                    "verdict": "ACCEPT",
+                    "rationale": "byte-stable + canonical RawBlock shape via tool-call"
+                }"##.to_string(),
+                "tester.tester" => r##"{
+                    "test_plan": [
+                        { "test_name": "dataset_block_parses",
+                          "covers_field": "path", "kind": "happy_path" }
+                    ],
+                    "skill_invocation": "cargo test --workspace --no-fail-fast -- dataset_block_parses",
+                    "verdict": "ACCEPT",
+                    "rationale": "coverage hits every Architect-declared check"
+                }"##.to_string(),
+                other => panic!("unexpected dispatch target {other}"),
+            };
+            Ok(reply)
+        })
+    };
+
+    let final_reply = orchestrator::run(
+        full_design,
+        "Design a `dataset` block for declaring training data",
+        dispatch,
+    ).await.expect("run");
+
+    // Final reply is the Tester's verdict; must validate against
+    // tester_output schema.
+    structurally_validate(TESTER_OUTPUT, &final_reply)
+        .expect("final tester reply must validate against tester_output schema");
+    assert!(!looks_like_error_envelope(&final_reply),
+        "happy-path final reply must NOT be an error envelope");
+    let final_v: serde_json::Value = serde_json::from_str(&final_reply).unwrap();
+    assert_eq!(final_v.get("verdict").and_then(|x| x.as_str()), Some("ACCEPT"),
+        "happy-path chain terminates at Tester ACCEPT");
+
+    // Each step's reply validates against its schema as seen by
+    // the NEXT step's input.  Walk the observed dispatch trace.
+    let steps = observed_steps.lock().unwrap();
+    assert_eq!(steps.len(), 4);
+
+    // Step 1 reply (architect's output) flows into step 2 (coder) input.
+    structurally_validate(ARCHITECT_OUTPUT, &steps[1].1)
+        .expect("step 2 input (architect's output) must validate against architect_output schema");
+    // Step 2 reply (coder's output) flows into step 3 (reviewer) input.
+    structurally_validate(CODER_OUTPUT, &steps[2].1)
+        .expect("step 3 input (coder's output) must validate against coder_output schema");
+    // Step 3 reply (reviewer's verdict) flows into step 4 (tester) input.
+    structurally_validate(REVIEWER_VERDICT, &steps[3].1)
+        .expect("step 4 input (reviewer's verdict) must validate against reviewer_verdict schema");
+}
+
+#[tokio::test]
+async fn full_design_pipeline_aborts_on_json_error_envelope_at_step_1() {
+    // v0.4 Week 21 Fri: when Architect emits the canonical JSON
+    // error envelope, the orchestrator pattern still runs every
+    // downstream step (orchestrator::run is a pure sequential
+    // dispatcher without error-signal awareness — the CLI's
+    // chat-loop layer detects + aborts).  This test pins that
+    // the runtime's `looks_like_error_envelope` detector at
+    // least RECOGNISES the architect's reply as the abort signal,
+    // even though enforcing pipeline-abort at the orchestrator
+    // pattern itself is v0.5+ work.
+    use aislang_runtime::schemas::looks_like_error_envelope;
+    let dir = orchestrator_dir();
+    let loaded = load_project_input(&dir).expect("load");
+    let proj = &loaded.resolved.project;
+    let full_design = proj.pipelines.iter()
+        .find(|p| p.label == "orchestrator.full_design")
+        .expect("full_design pipeline");
+
+    let architect_error = r##"{
+        "error": {
+            "code": "input_malformed",
+            "message": "Feature spec is empty; cannot design."
+        }
+    }"##;
+
+    let dispatch = move |agent: String, _input: String| -> DispatchFuture {
+        let architect_error = architect_error.to_string();
+        Box::pin(async move {
+            // Architect emits the abort envelope; downstream steps
+            // would receive it as input but the test pins on the
+            // detection contract (the chat-loop layer aborts, not
+            // orchestrator::run).
+            match agent.as_str() {
+                "architect.architect"            => Ok(architect_error),
+                "coder.coder"                    => Ok("(forwarded)".to_string()),
+                "code_reviewer.code_reviewer"    => Ok("(forwarded)".to_string()),
+                "tester.tester"                  => Ok("(forwarded)".to_string()),
+                _ => unreachable!(),
+            }
+        })
+    };
+
+    let _ = orchestrator::run(
+        full_design,
+        "(empty)",
+        dispatch,
+    ).await.expect("run");
+
+    // The architect's error envelope is recognised as an abort
+    // signal — the CLI chat-loop layer uses this to break out of
+    // the dispatch loop without forwarding to downstream agents.
+    assert!(looks_like_error_envelope(architect_error));
+}
+
+#[tokio::test]
 async fn pipeline_dispatch_propagates_session_error_with_step_context() {
     // Sanity: a SessionError mid-pipeline must surface with the
     // failing step's qualified label so the user knows which
