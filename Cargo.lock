@@ -26,6 +26,7 @@ name = "aislang-cli"
 version = "0.2.0-dev"
 dependencies = [
  "aislang-catalog",
+ "aislang-cloud",
  "aislang-compose",
  "aislang-core",
  "aislang-k8s",
@@ -40,6 +41,18 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "aislang-cloud"
+version = "0.2.0-dev"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

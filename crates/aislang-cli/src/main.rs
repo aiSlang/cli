@@ -286,6 +286,16 @@ enum Command {
         #[command(subcommand)]
         action: RagCommand,
     },
+    /// v0.4 Track C — `aislang-cloud` managed control plane
+    /// (Decision 46.1).  Today's `serve` subcommand boots the REST
+    /// endpoint surface against the in-memory project store; Tue's
+    /// Postgres schema-per-tenant swap stays inside the cloud
+    /// crate so this CLI surface is byte-stable across the
+    /// W22 Phase 1 days.
+    Cloud {
+        #[command(subcommand)]
+        action: CloudCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -365,6 +375,37 @@ enum RagCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum CloudCommand {
+    /// Boot the REST endpoint surface — `axum::serve` against the
+    /// configured port.  Reads the bearer token from
+    /// `AISLANG_CLOUD_TOKEN` and refuses to start with an empty
+    /// token (server would otherwise accept unauthenticated
+    /// requests).
+    ///
+    /// Quick smoke test:
+    ///
+    /// ```sh
+    /// AISLANG_CLOUD_TOKEN=hunter2 aislang cloud serve &
+    /// curl -H 'Authorization: Bearer hunter2' \
+    ///      -H 'X-Aislang-Tenant: alpha' \
+    ///      http://127.0.0.1:4001/v1/projects
+    /// # → {"projects":[]}
+    /// ```
+    Serve {
+        /// Bind host (default 127.0.0.1 — does NOT bind 0.0.0.0
+        /// by default to avoid accidentally exposing an
+        /// unhardened control plane to the network).
+        #[arg(long, value_name = "HOST", default_value = "127.0.0.1")]
+        host: String,
+        /// Bind port (default 4001 from
+        /// `aislang_cloud::DEFAULT_PORT`).
+        #[arg(long, value_name = "PORT",
+              default_value_t = aislang_cloud::DEFAULT_PORT)]
+        port: u16,
+    },
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -416,6 +457,10 @@ fn run() -> Result<ExitCode> {
                     .map(|_| ExitCode::SUCCESS)?,
             RagCommand::Verify { project, strict } =>
                 run_rag_verify(project, strict)?,
+        },
+        Command::Cloud { action } => match action {
+            CloudCommand::Serve { host, port } =>
+                run_cloud_serve(host, port).map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3354,6 +3399,44 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
         eprintln!("aislang rag verify: FAILED — {healthy} healthy, {unhealthy} unhealthy");
         Ok(ExitCode::from(2))
     }
+}
+
+/// v0.4 W22 Mon follow-up — `aislang cloud serve` thin wrapper
+/// around `aislang_cloud::serve`.  Reads the bearer token from
+/// `AISLANG_CLOUD_TOKEN`, binds a TcpListener on
+/// `<host>:<port>`, calls `aislang_cloud::serve`.  Refuses to
+/// start without a token (would otherwise accept every
+/// unauthenticated request + leak the store).
+fn run_cloud_serve(host: String, port: u16) -> Result<()> {
+    let config = aislang_cloud::ServerConfig::from_env().ok_or_else(|| {
+        anyhow::anyhow!(
+            "AISLANG_CLOUD_TOKEN is unset or empty — refusing to start the \
+             control plane without a bearer token (Decision 46.1).  Set it \
+             before launching:\n  \
+             AISLANG_CLOUD_TOKEN=<token> aislang cloud serve")
+    })?;
+    let state = aislang_cloud::AppState::new(
+        config, aislang_cloud::ProjectStore::new());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        let addr = format!("{host}:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr).await
+            .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+        eprintln!("aislang cloud: listening on http://{addr}");
+        eprintln!("aislang cloud: bearer auth enabled (AISLANG_CLOUD_TOKEN)");
+        eprintln!("aislang cloud: smoke test:");
+        eprintln!("  curl -H 'Authorization: Bearer <token>' \\");
+        eprintln!("       -H 'X-Aislang-Tenant: alpha' \\");
+        eprintln!("       http://{addr}/v1/projects");
+        aislang_cloud::serve(listener, state).await
+            .map_err(|e| anyhow::anyhow!("axum serve: {e}"))
+    })?;
+    Ok(())
 }
 
 /// Per-store health classification used by `aislang rag verify`
