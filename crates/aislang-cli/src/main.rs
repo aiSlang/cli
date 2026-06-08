@@ -3415,8 +3415,14 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
              before launching:\n  \
              AISLANG_CLOUD_TOKEN=<token> aislang cloud serve")
     })?;
-    let state = aislang_cloud::AppState::new(
-        config, aislang_cloud::ProjectStore::new());
+    // v0.4 W22 Tue: AppState now carries `Arc<dyn Store>`; the
+    // in-memory ProjectStore is the W22-Mon scaffold default.
+    // PgStore swap lives behind `AISLANG_CLOUD_DB_URL` — when set,
+    // the CLI binds the Postgres pool; absent → fall back to the
+    // in-memory store so `aislang cloud serve` still works for
+    // local-dev smoke tests without a Postgres.
+    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
+        .filter(|s| !s.is_empty());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3424,6 +3430,18 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
 
     rt.block_on(async move {
+        let state = if let Some(url) = db_url {
+            eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
+            let pg = aislang_cloud::db::PgStore::connect(&url).await
+                .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
+            aislang_cloud::AppState::new(config, std::sync::Arc::new(pg))
+        } else {
+            eprintln!("aislang cloud: AISLANG_CLOUD_DB_URL unset \
+                       — using in-memory store (local dev only; \
+                       no data persists across restarts)");
+            aislang_cloud::AppState::with_in_memory_store(config)
+        };
+
         let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await
             .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
