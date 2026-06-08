@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aislang.dev/v0.4/schemas/coder_output.json",
+  "title": "Coder agent output",
+  "description": "Structured Rust patch emitted by the Coder agent given an Architect's architect_output.json input.  v0.4 replaces the v0.3 3-section markdown (## Patch / ## Test coverage / ## Notes) with this JSON shape.  The parser-converter subsection optionally uses the W21 Mon `propose_block_converter` tool call (Decision 46.7) for guaranteed-shape-correct rendering.",
+  "type": "object",
+  "required": ["patch", "test_coverage", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "patch": {
+      "type": "object",
+      "required": ["ast_struct_rust", "checker_rust", "test_fixtures_rust"],
+      "additionalProperties": false,
+      "properties": {
+        "ast_struct_rust": {
+          "type": "string",
+          "minLength": 50,
+          "description": "Free-text Rust for the AST struct + Project field + serde attributes.  See knowledge/01_ast_struct_conventions.md for the canonical shape."
+        },
+        "parser_converter": {
+          "$ref": "#/$defs/parser_converter",
+          "description": "Either a tool-call spec (W21 Mon Decision 46.7 — preferred, runtime renders the Rust) OR free-text Rust (legacy / fallback).  Exactly one of the two variants must be populated."
+        },
+        "checker_rust": {
+          "type": "string",
+          "minLength": 30,
+          "description": "Free-text Rust for the `validate_<block>s` fn + `Project::validate` dispatch hook.  See knowledge/03_checker_invariants.md."
+        },
+        "test_fixtures_rust": {
+          "type": "string",
+          "minLength": 50,
+          "description": "Free-text Rust for the parser_fixtures.rs tests + any new `tests/data/<block>_block.{ais,json}` fixture pair content.  Each rejection test asserts on `ValidateError::Parse(errs)` substring (NOT a fictional `ParseError::X` variant)."
+        }
+      }
+    },
+    "test_coverage": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["test_name", "kind", "covers_field"],
+        "properties": {
+          "test_name": {
+            "type": "string",
+            "pattern": "^[a-z_][a-z0-9_]*$",
+            "description": "<verb>_<subject>_<condition> convention from `crates/aislang-core/tests/`."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "happy_path",
+              "range_rejection",
+              "enum_rejection",
+              "duplicate_label",
+              "byte_stable_roundtrip",
+              "dangling_ref"
+            ]
+          },
+          "covers_field": {
+            "type": "string",
+            "description": "Field name from the Architect's `fields[]` array that this test exercises; or `(all)` for whole-block tests like duplicate-label / byte-stable round-trip."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "object",
+      "required": ["new_refkind_variant", "files_edited_beyond_four"],
+      "properties": {
+        "new_refkind_variant": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[A-Z][A-Za-z0-9]*$" }
+          ],
+          "description": "The new `RefKind::X` variant if added; null otherwise.  Mirrors Architect's `decision_implications.new_refkind`."
+        },
+        "files_edited_beyond_four": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Any file path edited outside the canonical four (ast.rs / parser.rs / checker.rs / parser_fixtures.rs).  Empty array when the patch fits within the four."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "parser_converter": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["tool_call"],
+          "additionalProperties": false,
+          "properties": {
+            "tool_call": {
+              "type": "object",
+              "required": ["block_name", "type_name", "fields"],
+              "description": "Args for `aislang_runtime::codegen::render_block_converter`.  Schema mirrors `BlockConverterSpec` verbatim.  See knowledge/05_propose_block_converter_tool.md."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["raw_rust"],
+          "additionalProperties": false,
+          "properties": {
+            "raw_rust": {
+              "type": "string",
+              "minLength": 80,
+              "description": "Free-text Rust for the `to_<block>` converter fn.  Must NOT use `hcl::*` types or invent `ParseError::X` variants.  Reviewer's negative-shape gate enforces this — see code_reviewer/knowledge/01_review_checklist.md."
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -20,7 +20,57 @@ patterns the codebase doesn't already use.  If the retrieved
 context contradicts what you're about to propose, surface the
 conflict explicitly in "Decision implications".
 
-## Output format (REQUIRED — Coder parses these sections)
+## Output format — v0.4 W21 Thu JSON contract (Decision 46.6)
+
+**PREFERRED**: emit a tool call to `propose_architect_design`
+with structured args matching `examples/agents/_schemas/
+architect_output.schema.json`.  Schema-validated at the
+LiteLLM wire boundary — no markdown-section drift.  See the
+section "Tool-call argument shape" below.
+
+**FALLBACK** (when tool-call mode is unavailable in your
+context — e.g. standalone testing): emit the equivalent
+five-section markdown documented below.  Coder accepts both;
+the runtime auto-detects which shape the reply uses.
+
+### Tool-call argument shape
+
+```json
+{
+  "block_name": "<keyword>",
+  "purpose": "<1-3 sentence problem statement + when an .ais author reaches for it>",
+  "fields": [
+    {
+      "name": "<snake_case>",
+      "type": "Path | String | SemVer | Bool | Duration | Money | Size | Int | Capability | Url | Ref | Enum | List<Path> | List<String> | List<Ref>",
+      "required": true | false,
+      "description": "<what it does, default, range check>",
+      "range_min": "<for Duration/Int — e.g. \"1s\" or \"256\">" | null,
+      "range_max": "<for Duration/Int — e.g. \"24h\" or \"8192\">" | null,
+      "enum_type": "<Rust enum type name — REQUIRED when type=Enum>" | null,
+      "enum_variants": ["<variant1>", "<variant2>"] | null
+    }
+  ],
+  "grammar_example": "<sample .ais source showing the block in use; HCL-style, no fences>",
+  "language_spec_snippet": "<paragraph + Type? field table; use literal §4.<N> placeholder>",
+  "decision_implications": {
+    "new_refkind": "<Rust enum variant name>" | null,
+    "checker_invariants": ["<one bullet per check beyond duplicate-label>"],
+    "decision_conflicts": [
+      { "decision": "44.x", "stance": "conflicts | defers_to_v0_5", "note": "<reason>" }
+    ],
+    "byte_stable_v0_2_roundtrip": true | false
+  }
+}
+```
+
+`type` MUST be from the closed enum above (matches the closed
+set in `aislang-core::types`).  `decision_conflicts` is an
+empty array when the design satisfies every locked Decision
+44.x.  Use the literal token `§4.<N>` in `language_spec_
+snippet` — see "Section number discipline" below.
+
+### Fallback: five-section markdown (when tool-call unavailable)
 
 Reply with exactly these five sections, in order, as markdown:
 

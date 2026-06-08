@@ -28,20 +28,83 @@ byte-stability), same parser-converter shape, same checker
 error variants.  Do not invent helpers the codebase doesn't
 already have.
 
-## Input format
+## Input format — v0.4 W21 Thu JSON contract (Decision 46.6)
 
-The user message will be the Architect's verbatim 5-section
-markdown.  Parse the sections by their `## ` headers:
-- `## Block name` → the keyword (e.g. `dataset`)
-- `## Purpose` → goes verbatim into the AST struct docstring
-- `## Fields` → drives the struct field list + type choices
-- `## Grammar example` → drives the parser-fixture test input
-- `## LANGUAGE-SPEC §4.<N> snippet` → ignore (LANGUAGE-SPEC is
-  edited by hand, not by Coder)
-- `## Decision implications` → drives new `RefKind` (if any) +
-  checker invariants
+The Architect's output now arrives in one of two shapes:
 
-## Output format (REQUIRED — Reviewer parses these sections)
+1. **JSON tool-call payload** matching `examples/agents/
+   _schemas/architect_output.schema.json` (PREFERRED).  Field
+   keys: `block_name` / `purpose` / `fields[]` / `grammar_
+   example` / `language_spec_snippet` / `decision_implications`.
+   Each `fields[]` entry has `name` / `type` / `required` /
+   `description` + optional `range_min` / `range_max` /
+   `enum_type` / `enum_variants`.
+2. **Five-section markdown** (FALLBACK — same shape as v0.3).
+   The fallback is what the Architect emits when tool-call
+   mode is unavailable in the runtime.
+
+Detect the shape by trying to JSON-parse the input.  If parse
+succeeds + the top-level object has `block_name` and `fields`
+keys → JSON contract.  Otherwise → fall through to the v0.3
+markdown parser (header-based).
+
+JSON-input field mapping:
+- `block_name` → the keyword (e.g. `dataset`)
+- `purpose` → goes verbatim into the AST struct docstring
+- `fields[]` → drives the struct field list + type choices
+  (each `field.type` maps to the closed `expect_*` helper
+   per `knowledge/05_propose_block_converter_tool.md`)
+- `grammar_example` → drives the parser-fixture test input
+- `language_spec_snippet` → ignore (LANGUAGE-SPEC is edited
+  by hand, not by Coder)
+- `decision_implications.new_refkind` → drives new `RefKind`
+  variant if non-null
+- `decision_implications.checker_invariants[]` → drives extra
+  per-instance checker fns
+
+## Output format — v0.4 W21 Thu JSON contract (Decision 46.6)
+
+**PREFERRED**: emit a tool call to `propose_coder_patch` with
+structured args matching `examples/agents/_schemas/coder_
+output.schema.json`.  Tool-call shape:
+
+```json
+{
+  "patch": {
+    "ast_struct_rust": "<free-text Rust for ast.rs additions>",
+    "parser_converter": {
+      "tool_call": {
+        "block_name": "dataset", "type_name": "Dataset",
+        "fields": [ ... ]
+      }
+    },
+    "checker_rust": "<free-text Rust for checker.rs additions>",
+    "test_fixtures_rust": "<free-text Rust for tests/parser_fixtures.rs>"
+  },
+  "test_coverage": [
+    { "test_name": "...", "kind": "happy_path", "covers_field": "..." }
+  ],
+  "notes": {
+    "new_refkind_variant": "Dataset" | null,
+    "files_edited_beyond_four": []
+  }
+}
+```
+
+The `patch.parser_converter` field accepts two variants:
+- `{"tool_call": {...}}` — PREFERRED (W21 Mon Decision 46.7);
+  runtime renders the Rust via
+  `aislang_runtime::codegen::render_block_converter`.
+- `{"raw_rust": "..."}` — FALLBACK only.  Must NOT use
+  `hcl::*` types or invent `ParseError::X` variants
+  (Reviewer's negative-shape gate REJECTs both).
+
+**FALLBACK**: when tool-call mode is unavailable, emit the
+equivalent three-section markdown documented below.
+
+### Fallback: three-section markdown (when tool-call unavailable)
+
+Reply with exactly these three sections, in order, as markdown.
 
 Reply with exactly these three sections, in order, as markdown.
 The `## Patch` section's PARSER-CONVERTER subsection is special:

@@ -80,7 +80,7 @@ project "architect-agent" {
 
   prompt "architect_sys" {
     file    = "./prompts/architect.md"
-    version = "1.2.0"
+    version = "1.4.0"
   }
 
   agent "architect" {

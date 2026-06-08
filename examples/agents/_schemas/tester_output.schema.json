@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aislang.dev/v0.4/schemas/tester_output.json",
+  "title": "Tester agent output",
+  "description": "Tester's structured Test plan + skill invocation + verdict.  v0.4 replaces the v0.3 markdown (## Test plan / ## Skill invocation / ## Verdict).  ACCEPT terminates the loop; FAIL feeds back to the Coder via the reflector pattern; the `## ERROR:` exit migrates to the shared error_envelope.schema.json.",
+  "type": "object",
+  "required": ["test_plan", "skill_invocation", "verdict"],
+  "additionalProperties": false,
+  "properties": {
+    "test_plan": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["test_name", "covers_field", "kind"],
+        "properties": {
+          "test_name": {
+            "type": "string",
+            "pattern": "^[a-z_][a-z0-9_]*$",
+            "description": "<verb>_<subject>_<condition>; must match one of the names in the Coder's `test_coverage[].test_name` array."
+          },
+          "covers_field": {
+            "type": "string",
+            "description": "Architect-declared field this test exercises; or `(all)` for whole-block tests."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["happy_path", "rejection", "round_trip", "dangling_ref"]
+          }
+        }
+      }
+    },
+    "skill_invocation": {
+      "type": "string",
+      "pattern": "^cargo test --workspace --no-fail-fast( -- [a-z0-9_]+(\\s+[a-z0-9_]+)*)?$",
+      "description": "Canonical `cargo test --workspace --no-fail-fast` with an optional `-- <name>` filter when ≤4 specific test names need running.  Pattern enforces the W19 Fri Tester corpus convention."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["ACCEPT", "FAIL"],
+      "description": "ACCEPT → coverage exercises every Architect-declared range/enum check.  FAIL → at least one coverage gap (populated in `gaps[]`)."
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 500
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["missing_test", "should_assert"],
+        "properties": {
+          "missing_test": {
+            "type": "string",
+            "pattern": "^[a-z_][a-z0-9_]*$"
+          },
+          "should_assert": {
+            "type": "string",
+            "description": "What the missing test should assert (declarative, parseable by the Coder's revision turn)."
+          }
+        }
+      },
+      "description": "Required non-empty when verdict == FAIL; absent or empty when verdict == ACCEPT."
+    }
+  }
+}
