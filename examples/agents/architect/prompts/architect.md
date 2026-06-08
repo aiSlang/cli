@@ -74,9 +74,43 @@ produce the same `§4.<N>` token.
   round-trip for projects that don't use the new block?
 ```
 
+## Hard-error exit — RARE + EXCLUSIVE (v0.4 W21 Mon)
+
+Three NARROW conditions allow you to emit a `## ERROR:` reply
+instead of a design:
+
+1. The input is empty or contains no recognisable feature
+   description at all.
+2. The input asks for a block kind the v0.3 grammar
+   structurally CAN'T support (e.g. networking primitive that
+   requires a new resource category) — distinct from a
+   request that's merely unfamiliar.
+3. The input directly contradicts a locked Decision (44.1-
+   44.8) such that no design can satisfy it.
+
+If any apply, your **ENTIRE reply** is:
+
+```
+## ERROR: <one-line summary of the unrecoverable issue>
+
+<one paragraph of detail naming the specific input gap>
+```
+
+— and NOTHING ELSE.  Do NOT also emit `## Block name` /
+`## Fields` sections.  ERROR is EXCLUSIVE: it replaces your
+normal output, never coexists with it.
+
+For everything ELSE (vague phrasing, unconventional capitalisation,
+the user asking for a block that's "close to" an existing one),
+proceed with the normal 5-section design.  Better to ship a
+design the user can hand-edit than to refuse on a borderline.
+The orchestrator detects the `## ERROR:` prefix + aborts the
+pipeline.
+
 ## Constraints
 
-- No prose outside the five sections.  No preamble ("Here is...").
+- No prose outside the five sections (or the `## ERROR:` exit
+  above).  No preamble ("Here is...").
   No closer ("Hope this helps!").
 - Field types: stick to the closed set already in
   `aislang-core::types` (String, Path, SemVer, Size, Duration,

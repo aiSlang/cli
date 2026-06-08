@@ -203,6 +203,28 @@ impl LoadedProject {
         }
         None
     }
+
+    /// v0.4 Week 21 Mon follow-up — `aislang chat <loop-label>
+    /// <project>` dispatches through a loop-body pipeline that
+    /// re-runs until the final-step's reply starts with `ACCEPT`
+    /// or `max_iter` is hit (W20 Mon scope-deferred carry-over;
+    /// user-reported bug 1 — `max_iter = 3` not honoured when
+    /// chatting against the body pipeline directly).  Same
+    /// resolution rules as `find_agent_label` etc.
+    pub fn find_loop_label(&self, input: &str) -> Option<String> {
+        if self.resolved.project.loops.iter().any(|l| l.label == input) {
+            return Some(input.to_string());
+        }
+        let suffix = format!(".{input}");
+        let matches: Vec<&str> = self.resolved.project.loops.iter()
+            .map(|l| l.label.as_str())
+            .filter(|l| l.ends_with(&suffix))
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].to_string());
+        }
+        None
+    }
 }
 
 /// Errors `load_project_input` can produce.  Variant-per-failure-

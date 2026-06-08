@@ -200,6 +200,15 @@ enum Command {
         /// behaviour.  No-op for single-agent + router branches.
         #[arg(long, default_value_t = false)]
         interactive: bool,
+        /// v0.4 Week 21 Mon: keep `<project>/.aislang/pipeline/
+        /// <pipeline_label>/` from the previous chat session.
+        /// Default behaviour wipes that dir at session start so
+        /// each chat session leaves a clean trace (user-reported
+        /// bug 4 — old + new chat artifacts mixed in the dir).
+        /// `--keep-history` opts out.  No-op for single-agent +
+        /// router paths (no persistence dir).
+        #[arg(long, default_value_t = false)]
+        keep_history: bool,
     },
     /// Run the aiSlang MCP server (v0.2 Track A — week 12 Mon scaffold)
     ///
@@ -372,8 +381,8 @@ fn run() -> Result<ExitCode> {
         Command::Cost { file }       => run_cost(file).map(|_| ExitCode::SUCCESS)?,
         Command::Status { file, spend, model_spend, main_spend } =>
             run_status(file, spend, model_spend, main_spend)?,
-        Command::Chat { agent, file, interactive } =>
-            run_chat(agent, file, interactive).map(|_| ExitCode::SUCCESS)?,
+        Command::Chat { agent, file, interactive, keep_history } =>
+            run_chat(agent, file, interactive, keep_history).map(|_| ExitCode::SUCCESS)?,
         Command::McpServe { stdio, http } =>
             run_mcp_serve(stdio, http).map(|_| ExitCode::SUCCESS)?,
         Command::Skill { action } => match action {
@@ -3551,7 +3560,7 @@ fn run_skill(
     Ok(())
 }
 
-fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()> {
+fn run_chat(agent_label: String, file: PathBuf, interactive: bool, keep_history: bool) -> Result<()> {
     // ── 1. read + validate source (single-file OR multi-module dir) ──
     // v0.3 Week 17 Tue: dir-vs-file dispatch via load_project_input.
     // The loader handles both shapes; we drive the same downstream
@@ -3567,6 +3576,11 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
     let model_label:           String;
     let orchestrator_steps: Option<Vec<String>>;
     let router_dispatch:    Option<RouterDispatch>;
+    // v0.4 Week 21 Mon follow-up — loop-label dispatch.  When
+    // Some(N), the chat loop re-runs `orchestrator_steps` until
+    // the final reply starts with `ACCEPT` or N attempts elapse.
+    // None = single pipeline pass (the v0.3 behaviour).
+    let loop_max_iter: Option<u32>;
 
     if let Some(resolved) = loaded.find_agent_label(&agent_label) {
         let agent = project.agents.iter()
@@ -3581,6 +3595,36 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
         };
         orchestrator_steps = None;
         router_dispatch    = None;
+        loop_max_iter      = None;
+    } else if let Some(resolved) = loaded.find_loop_label(&agent_label) {
+        // v0.4 Week 21 Mon follow-up: loop-label dispatch
+        // (W20 Mon scope-deferred carry-over; user-reported
+        // bug 1).  The loop's body MUST resolve to a pipeline;
+        // we drive that pipeline's steps through orchestrator
+        // dispatch + re-run until ACCEPT or max_iter cap.
+        let loop_block = project.loops.iter()
+            .find(|l| l.label == resolved)
+            .expect("find_loop_label returned a label that doesn't exist");
+        let body_module = resolved.split_once('.').map(|(m, _)| m);
+        let body_label = match (&loop_block.body.module, body_module) {
+            (Some(m), _)    => format!("{m}.{}", loop_block.body.label),
+            (None, Some(c)) => format!("{c}.{}", loop_block.body.label),
+            (None, None)    => loop_block.body.label.clone(),
+        };
+        let body_pipeline = project.pipelines.iter()
+            .find(|p| p.label == body_label)
+            .ok_or_else(|| anyhow::anyhow!(
+                "loop `{resolved}` body references pipeline `{body_label}` \
+                 which does not exist"))?;
+        if body_pipeline.steps.is_empty() {
+            return Err(anyhow::anyhow!(
+                "loop `{resolved}` body pipeline `{body_label}` has no steps"));
+        }
+        orchestrator_steps = Some(qualify_pipeline_steps(body_pipeline));
+        qualified_agent_label = loop_block.label.clone();
+        model_label = format!("(loop, max_iter={})", loop_block.max_iter);
+        router_dispatch = None;
+        loop_max_iter = Some(loop_block.max_iter);
     } else if let Some(resolved) = loaded.find_pipeline_label(&agent_label) {
         // v0.3 Week 17 Thu: pipeline-label dispatch → orchestrator
         // pattern.  Each user message triggers a full pipeline run;
@@ -3597,6 +3641,7 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
         qualified_agent_label = pipeline.label.clone();
         model_label = "(orchestrator)".to_string();   // banner-only
         router_dispatch = None;
+        loop_max_iter = None;
     } else if let Some(resolved) = loaded.find_branch_label(&agent_label) {
         // v0.3 Week 17 Fri: branch-label dispatch → router pattern.
         // Per turn: classifier picks a case key from user input →
@@ -3612,6 +3657,7 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
         qualified_agent_label = branch.label.clone();
         model_label = "(router)".to_string();   // banner-only
         orchestrator_steps = None;
+        loop_max_iter = None;
     } else {
         // No exact match + no unique suffix match in any of agent /
         // pipeline / branch.  v0.3 Week 20 Mon follow-up: distinguish
@@ -3638,6 +3684,11 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
                 ambiguous.push(format!("{} (branch)", b.label));
             }
         }
+        for l in &project.loops {
+            if l.label.ends_with(&suffix) {
+                ambiguous.push(format!("{} (loop)", l.label));
+            }
+        }
         if ambiguous.len() >= 2 {
             ambiguous.sort();
             return Err(anyhow::anyhow!(
@@ -3656,6 +3707,8 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
             .map(|p| format!("{} (pipeline)", p.label)));
         available.extend(project.branches.iter()
             .map(|b| format!("{} (branch)", b.label)));
+        available.extend(project.loops.iter()
+            .map(|l| format!("{} (loop)", l.label)));
         available.sort();
         let agent_labels: Vec<&str> = project.agents.iter()
             .map(|a| a.label.as_str()).collect();
@@ -3690,6 +3743,15 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
         .map_err(|e| anyhow::anyhow!(
             "source file `{}` not readable: {e}", file.display()))?;
 
+    // v0.4 W21 Mon follow-up — clean pipeline history at session
+    // start unless `--keep-history`.  Only meaningful for multi-
+    // step dispatches (orchestrator / loop) where the persistence
+    // dir actually gets written; single-agent + router paths
+    // never created it.
+    if !keep_history && orchestrator_steps.is_some() {
+        clean_pipeline_history(&source_dir, &qualified_agent_label);
+    }
+
     // ── 3. spin tokio runtime + drive the MCP-proxied chat loop ──
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3699,7 +3761,7 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
         source_path, source_dir,
         qualified_agent_label, model_label,
         orchestrator_steps, router_dispatch,
-        interactive,
+        interactive, loop_max_iter,
     ));
     drop(rt);
     result
@@ -3714,6 +3776,13 @@ fn run_chat(agent_label: String, file: PathBuf, interactive: bool) -> Result<()>
 /// pin the filename shape + the parent-dir creation + the
 /// roundtrip-after-edit contract that `--interactive` relies on
 /// without driving the full chat loop.
+// v0.3 W20 Tue: single-iteration persistence helper.  Superseded by
+// `persist_step_reply_iter` at v0.4 W21 Mon (the live caller uses
+// the iter-aware variant); kept for the existing
+// `chat_persistence_tests` filename-shape contract + as a thin
+// fallback for any future single-pass dispatch that doesn't want
+// the `iter_<I>` segment.
+#[allow(dead_code)]
 fn persist_step_reply(
     root:       &Path,
     turn:       u64,
@@ -3732,6 +3801,91 @@ fn persist_step_reply(
             path.display());
     }
     path
+}
+
+/// v0.4 Week 21 Mon follow-up — iter-aware variant for loop
+/// dispatch.  Filename: `turn_<T>_iter_<I>_step_<N>_<agent>.md`
+/// so multi-iteration runs don't overwrite their own history
+/// (user-reported bug 3 — pipeline iteration # visible in
+/// artifacts as well as progress output).
+fn persist_step_reply_iter(
+    root:       &Path,
+    turn:       u64,
+    iter:       u32,
+    step:       usize,
+    step_label: &str,
+    reply:      &str,
+) -> PathBuf {
+    let fname = format!(
+        "turn_{turn:03}_iter_{iter:02}_step_{step:02}_{step_label}.md");
+    let path = root.join(fname);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, reply) {
+        eprintln!("\x1b[2;3m  · warn: failed to persist step output to {}: {e}\x1b[0m",
+            path.display());
+    }
+    path
+}
+
+/// v0.4 Week 21 Mon follow-up — hard-error-signal detector for
+/// the orchestrator's per-step abort path (user-reported bug 2).
+/// Any agent that prefixes its reply with `## ERROR:` (after
+/// trim, case-insensitive) signals "the upstream input is
+/// unusable — stop the pipeline".  Single source of truth so
+/// the orchestrator + future tests agree on the wire shape.
+///
+/// v0.4 Week 21 Mon follow-up #2: extended to tolerate the
+/// common model-output shape variations that don't change
+/// the user-facing meaning — extra leading hashes, bold markdown
+/// `**ERROR:**`, the colon as part of a heading title, etc.  The
+/// `## ERROR:` form remains the documented canonical, but the
+/// detector is forgiving of header-level (`#` count) +
+/// emphasis-marker drift so a model that slips out of the strict
+/// `## ERROR:` shape doesn't escape the abort path.
+fn is_hard_error_signal(reply: &str) -> bool {
+    let t = reply.trim_start();
+    // Strip leading markdown header / emphasis tokens so we
+    // recognise `## ERROR:`, `### ERROR:`, `**ERROR:**`,
+    // `ERROR:` bare, etc.  Anchored to the START of the reply
+    // + REQUIRE the colon (or bracket-wrapped abort marker) so
+    // a body sentence like "Error elsewhere in the patch" doesn't
+    // trip the detector.
+    let stripped = t
+        .trim_start_matches('#')
+        .trim_start_matches('*')
+        .trim_start();
+    let lc = stripped.to_lowercase();
+    lc.starts_with("error:") ||
+        lc.starts_with("[pipeline_abort]") ||
+        lc.starts_with("pipeline_abort:")
+}
+
+/// v0.4 Week 21 Mon follow-up — local ACCEPT-verdict detector
+/// matching `patterns::reflector::is_accept_verdict` semantics
+/// (trim + lowercase + starts-with `accept`).  Inlined here so
+/// the loop dispatch doesn't have to depend on the runtime
+/// patterns crate's private fn.
+fn is_accept_verdict_local(reply: &str) -> bool {
+    reply.trim().to_lowercase().starts_with("accept")
+}
+
+/// v0.4 Week 21 Mon follow-up — pipeline-history cleanup at
+/// chat-session start (user-reported bug 4 — old + new chat
+/// artifacts mixing in `.aislang/pipeline/<label>/`).  Wipes
+/// the per-pipeline subdir before the first turn so each chat
+/// session starts with a clean trace.  Best-effort: errors
+/// print a warning + continue.  `--keep-history` (lifted to
+/// the CLI) skips this.
+fn clean_pipeline_history(source_dir: &Path, pipeline_label: &str) {
+    let p = source_dir.join(".aislang").join("pipeline").join(pipeline_label);
+    if p.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&p) {
+            eprintln!("\x1b[2;3m  · warn: failed to clean {}: {e}\x1b[0m",
+                p.display());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3805,6 +3959,122 @@ mod chat_persistence_tests {
         assert_eq!(read, "user-edited body",
             "user hand-edit must round-trip through the same path");
     }
+
+    // ── v0.4 Week 21 Mon follow-up tests ──────────────────────
+
+    #[test]
+    fn persist_step_reply_iter_filename_has_iter_segment() {
+        // Loop-dispatch filename shape must include iter_<I>
+        // so multi-iteration runs don't overwrite each other
+        // (user-reported bug 3).
+        let root = tempdir();
+        let p = persist_step_reply_iter(&root, 1, 2, 3, "coder.coder",
+            "## Patch v2\n");
+        assert_eq!(p.file_name().unwrap(),
+            "turn_001_iter_02_step_03_coder.coder.md");
+        let read = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(read, "## Patch v2\n");
+    }
+
+    #[test]
+    fn persist_step_reply_iter_does_not_overwrite_other_iters() {
+        // Same (turn, step, agent) at different iter values must
+        // land at DISTINCT paths.  Pin the loop-dispatch
+        // non-overwrite invariant.
+        let root = tempdir();
+        let p1 = persist_step_reply_iter(&root, 1, 1, 2, "coder.coder", "v1");
+        let p2 = persist_step_reply_iter(&root, 1, 2, 2, "coder.coder", "v2");
+        let p3 = persist_step_reply_iter(&root, 1, 3, 2, "coder.coder", "v3");
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert_eq!(std::fs::read_to_string(&p1).unwrap(), "v1");
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "v2");
+        assert_eq!(std::fs::read_to_string(&p3).unwrap(), "v3");
+    }
+
+    #[test]
+    fn is_hard_error_signal_detects_md_header_prefix() {
+        // Canonical shape from the agent prompts: `## ERROR:`
+        assert!(is_hard_error_signal("## ERROR: upstream produced garbage"));
+        assert!(is_hard_error_signal("## error: lowercase still counts"));
+        assert!(is_hard_error_signal("  ## ERROR: leading whitespace ok"));
+        // Different header levels — common model drift.
+        assert!(is_hard_error_signal("### ERROR: deeper heading"));
+        assert!(is_hard_error_signal("# ERROR: top-level heading"));
+        // Bold-emphasis shapes — model drift toward different markdown.
+        assert!(is_hard_error_signal("**ERROR:** bold emphasis form"));
+        assert!(is_hard_error_signal("**error:** lowercase bold"));
+        // Bare prefix without markdown markers.
+        assert!(is_hard_error_signal("ERROR: bare prefix"));
+        assert!(is_hard_error_signal("error: lowercase bare"));
+        // Alternative abort marker.
+        assert!(is_hard_error_signal("[PIPELINE_ABORT] alternative marker"));
+        assert!(is_hard_error_signal("PIPELINE_ABORT: also accepted"));
+
+        // Non-error replies don't trip it.
+        assert!(!is_hard_error_signal("## Patch\n```rust\n..."));
+        assert!(!is_hard_error_signal("ACCEPT\nlooks good"));
+        assert!(!is_hard_error_signal("error elsewhere in the body"));
+        // CRITICAL anti-false-positive: prose body sentences that
+        // happen to start with the word "Error" must NOT trip
+        // (caught the v0.4 W21 Mon detector-strengthen pass).
+        assert!(!is_hard_error_signal("Error analyses found three issues"));
+        assert!(!is_hard_error_signal("Errors are expected — see Test coverage"));
+        assert!(!is_hard_error_signal(""));
+    }
+
+    #[test]
+    fn is_accept_verdict_local_matches_runtime_semantics() {
+        // Mirror patterns::reflector::is_accept_verdict — trim +
+        // lowercase + starts-with `accept`.  The CLI loop dispatch
+        // uses this verdict to terminate the outer loop early.
+        assert!(is_accept_verdict_local("ACCEPT"));
+        assert!(is_accept_verdict_local("Accept\nwith rationale"));
+        assert!(is_accept_verdict_local("  accept  "));
+        assert!(!is_accept_verdict_local("FAIL: missing test"));
+        assert!(!is_accept_verdict_local("rejects with concerns"));
+        assert!(!is_accept_verdict_local(""));
+    }
+
+    #[test]
+    fn clean_pipeline_history_wipes_existing_subdir() {
+        // Pin the bug-4 cleanup contract: chat-session start
+        // wipes `.aislang/pipeline/<label>/`.  Best-effort —
+        // missing dir is a no-op.
+        let dir = tempdir();
+        let pipeline = "orchestrator.full_design";
+        let subdir = dir.join(".aislang").join("pipeline").join(pipeline);
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("turn_001_step_01_x.md"), "stale\n").unwrap();
+        assert!(subdir.exists());
+
+        clean_pipeline_history(&dir, pipeline);
+        assert!(!subdir.exists(),
+            "subdir must be removed after clean_pipeline_history");
+
+        // Re-cleaning a non-existent dir is a silent no-op.
+        clean_pipeline_history(&dir, pipeline);
+    }
+
+    #[test]
+    fn clean_pipeline_history_leaves_other_pipelines_untouched() {
+        // Per-pipeline scoping: cleaning `full_design` doesn't
+        // touch `review_cycle`.
+        let dir = tempdir();
+        let kept_subdir = dir.join(".aislang").join("pipeline")
+            .join("orchestrator.review_cycle");
+        std::fs::create_dir_all(&kept_subdir).unwrap();
+        std::fs::write(kept_subdir.join("turn_001_step_01_x.md"),
+            "kept\n").unwrap();
+
+        clean_pipeline_history(&dir, "orchestrator.full_design");
+
+        assert!(kept_subdir.exists(),
+            "sibling pipeline subdir must NOT be touched");
+        assert_eq!(std::fs::read_to_string(
+            kept_subdir.join("turn_001_step_01_x.md")).unwrap(),
+            "kept\n");
+    }
 }
 
 /// Drive an interactive chat session by spawning `aislang mcp-serve
@@ -3869,6 +4139,7 @@ async fn chat_via_mcp_serve(
     orchestrator_steps: Option<Vec<String>>,
     router_dispatch:    Option<RouterDispatch>,
     interactive:        bool,
+    loop_max_iter:      Option<u32>,
 ) -> Result<()> {
     use rmcp::{ServiceExt,
         model::{CallToolRequestParams, NumberOrString, ProgressToken, RawContent,
@@ -3909,8 +4180,14 @@ async fn chat_via_mcp_serve(
     // path keeps the v0.2 wording byte-stable for the existing
     // chat-banner tests.
     if let Some(steps) = orchestrator_steps.as_ref() {
-        eprintln!("aislang chat — pipeline `{agent_label}` (orchestrator pattern, \
-                   {} steps) via aislang mcp-serve --stdio", steps.len());
+        if let Some(mx) = loop_max_iter {
+            eprintln!("aislang chat — loop `{agent_label}` (orchestrator pattern, \
+                       {} step{}, max_iter={mx}) via aislang mcp-serve --stdio",
+                steps.len(), if steps.len() == 1 { "" } else { "s" });
+        } else {
+            eprintln!("aislang chat — pipeline `{agent_label}` (orchestrator pattern, \
+                       {} steps) via aislang mcp-serve --stdio", steps.len());
+        }
         eprintln!("steps: {}", steps.join(" → "));
     } else if let Some(r) = router_dispatch.as_ref() {
         let case_keys: Vec<&str> = r.case_keys_and_steps.iter()
@@ -4084,116 +4361,192 @@ async fn chat_via_mcp_serve(
                 None    => vec![agent_label.clone()],
             }
         };
-        let mut current_input = line.to_string();
-        let mut last_reply: Option<String> = None;
-        let mut dispatch_failed = false;
         // v0.3 Week 20 Tue: persist each step's reply under
         // `<source_dir>/.aislang/pipeline/<pipeline_label>/turn_<T>_
-        // step_<N>_<agent>.md` so the user can compare / diff
-        // between runs.  `<pipeline_label>` is `agent_label` when
-        // orchestrator-dispatched (the run_chat resolution path
-        // populated it with the qualified pipeline label).  Single-
-        // agent + router paths skip persistence (no step-by-step
-        // surface to inspect).  `--interactive` ALSO causes the
-        // CLI to pause between steps + re-read the persisted file
-        // as the next step's input — so a user edit propagates.
+        // iter_<I>_step_<N>_<agent>.md` so the user can compare /
+        // diff between runs.  v0.4 W21 Mon follow-up: filename gains
+        // an `iter_<I>` segment when running under a loop
+        // dispatch (user-reported bug 3 — pipeline iteration #
+        // visible in persisted artifacts + progress output).
+        // Single-agent + router paths skip persistence (no
+        // step-by-step surface to inspect).
         let persist_root = if steps.len() > 1 {
             Some(source_dir.join(".aislang").join("pipeline").join(&agent_label))
         } else {
             None
         };
-        for (step_idx, step_label) in steps.iter().enumerate() {
-            if steps.len() > 1 {
-                eprintln!("\x1b[2;3m  · orchestrator step {}/{} → agent `{step_label}`\x1b[0m",
-                    step_idx + 1, steps.len());
-            }
-            let mut params = CallToolRequestParams::new("aislang_chat_turn")
-                .with_arguments(serde_json::json!({
-                    "source_path": source_path.to_string_lossy(),
-                    "source_dir":  source_dir.to_string_lossy(),
-                    "agent_label": step_label,
-                    "user_input":  current_input,
-                }).as_object().unwrap().clone());
-            params.set_progress_token(progress_token.clone());
-            match client.peer().call_tool(params).await {
-                Ok(result) => {
-                    let reply = result.content.first()
-                        .and_then(|c| match &c.raw {
-                            RawContent::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "(empty response)".to_string());
-                    // Persist this step's reply for compare / diff /
-                    // hand-edit.  Best-effort — IO errors print a
-                    // warning but don't abort the chat.
-                    let persisted_path: Option<PathBuf> = persist_root.as_ref()
-                        .map(|root| {
-                            persist_step_reply(
-                                root, turn_counter,
-                                step_idx + 1, step_label, &reply)
-                        });
-                    // v0.3 Week 17 Thu follow-up: surface the INTERMEDIATE
-                    // step replies on stderr (dim/italic) so the user can
-                    // SEE the chain progress instead of staring at a
-                    // black-box "step N/M" line + only the final answer.
-                    // The final step's reply still lands on stdout via
-                    // the println! below (pipe-clean for `aislang chat
-                    // … | jq`).  Single-agent path (steps.len() == 1) is
-                    // unchanged.
-                    if steps.len() > 1 && step_idx + 1 < steps.len() {
-                        // Multi-line replies get an indent so the dim
-                        // block visually distinguishes from the step
-                        // header above.
-                        let indented = reply.lines()
-                            .map(|l| format!("    \x1b[2;3m{l}\x1b[0m"))
-                            .collect::<Vec<_>>().join("\n");
-                        eprintln!("{indented}");
-                    }
-                    // v0.3 Week 20 Tue: `--interactive` pause before
-                    // the NEXT step.  Skip after the last step (no
-                    // next step to feed).  After the pause, re-read
-                    // the persisted file so a user hand-edit gets
-                    // picked up as the next step's input.  Without
-                    // `--interactive`, current_input flows from the
-                    // in-memory reply (W17 Thu's behaviour).
-                    if interactive
-                        && steps.len() > 1
-                        && step_idx + 1 < steps.len()
-                        && persisted_path.is_some()
-                    {
-                        let p = persisted_path.as_ref().unwrap();
-                        eprintln!("\x1b[2;3m  · --interactive: edit {} if you want; press Enter to continue\x1b[0m",
-                            p.display());
-                        let _ = reader.next_line().await;
-                        match std::fs::read_to_string(p) {
-                            Ok(edited) => {
-                                if edited != reply {
-                                    eprintln!("\x1b[2;3m  · picked up hand-edit ({} -> {} bytes)\x1b[0m",
-                                        reply.len(), edited.len());
-                                }
-                                current_input = edited;
-                            }
-                            Err(e) => {
-                                eprintln!("\x1b[2;3m  · warn: re-read of {} failed: {e}; falling back to in-memory reply\x1b[0m",
-                                    p.display());
-                                current_input = reply.clone();
-                            }
-                        }
-                    } else {
-                        current_input = reply.clone();
-                    }
-                    last_reply = Some(reply);
+
+        // v0.4 W21 Mon follow-up — outer loop wrapping the
+        // orchestrator step dispatch.  When `loop_max_iter` is
+        // Some(N), re-run the inner step loop until the final
+        // step's reply starts with `ACCEPT` or N iterations
+        // elapse.  When None, run exactly once (the v0.3
+        // behaviour).  Matches `patterns::reflector::is_accept
+        // _verdict` semantics on the final-step reply.
+        let max_iter = loop_max_iter.unwrap_or(0);     // 0 = single pass
+        let mut final_reply: Option<String> = None;
+        let mut outer_dispatch_failed = false;
+        let mut outer_error_signal = false;
+        'outer: for iter in 0..=max_iter {
+            let mut current_input = if iter == 0 {
+                line.to_string()
+            } else {
+                // Subsequent iterations feed the PRIOR FULL-PIPELINE
+                // reply back as the first step's input.  This is
+                // the simplest loop semantics: pipeline body keeps
+                // chewing on the cumulative output until the
+                // critic-equivalent (final step) ACCEPTs.
+                final_reply.clone().unwrap_or_else(|| line.to_string())
+            };
+            let mut last_reply: Option<String> = None;
+            let mut dispatch_failed = false;
+            let mut error_signal    = false;
+            for (step_idx, step_label) in steps.iter().enumerate() {
+                if steps.len() > 1 {
+                    // v0.4 W21 Mon follow-up #2: UNIFIED iter counter
+                    // format across pipeline + loop dispatch (user-
+                    // reported issue 5).  Single-pass pipelines show
+                    // `iter 1/1` so the format is shape-stable across
+                    // the dispatch surfaces.
+                    eprintln!(
+                        "\x1b[2;3m  · iter {}/{} · step {}/{} → agent `{step_label}`\x1b[0m",
+                        iter + 1, max_iter + 1, step_idx + 1, steps.len());
                 }
-                Err(e) => {
-                    eprintln!("aislang chat: orchestrator step {}/{} (`{step_label}`) failed: {e}",
-                        step_idx + 1, steps.len());
-                    dispatch_failed = true;
-                    break;
+                let mut params = CallToolRequestParams::new("aislang_chat_turn")
+                    .with_arguments(serde_json::json!({
+                        "source_path": source_path.to_string_lossy(),
+                        "source_dir":  source_dir.to_string_lossy(),
+                        "agent_label": step_label,
+                        "user_input":  current_input,
+                    }).as_object().unwrap().clone());
+                params.set_progress_token(progress_token.clone());
+                match client.peer().call_tool(params).await {
+                    Ok(result) => {
+                        let reply = result.content.first()
+                            .and_then(|c| match &c.raw {
+                                RawContent::Text(t) => Some(t.text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "(empty response)".to_string());
+                        // Persist with iter-aware filename so
+                        // loop runs don't overwrite their own
+                        // history within the turn.  Persist ALWAYS
+                        // — even on the error path, so the user
+                        // can inspect the erroring reply later.
+                        let persisted_path: Option<PathBuf> = persist_root.as_ref()
+                            .map(|root| {
+                                persist_step_reply_iter(
+                                    root, turn_counter, iter + 1,
+                                    step_idx + 1, step_label, &reply)
+                            });
+                        // v0.4 W21 Mon follow-up #2: detect hard
+                        // error FIRST (user-reported issue 4 — the
+                        // erroring reply was being printed as
+                        // intermediate-step indented output AND as
+                        // the final stdout reply, total 4-5 mentions).
+                        // Single eprintln on the abort path; the
+                        // final `pipeline terminated on hard error`
+                        // line + stdout reply are still emitted in
+                        // the post-loop block.  This single-print
+                        // path also unifies pipeline + loop abort
+                        // behaviour (user-reported issue 1 — review_
+                        // cycle "appeared to continue" because the
+                        // same erroring reply was printed 5x).
+                        if is_hard_error_signal(&reply) {
+                            eprintln!(
+                                "\x1b[2;3m  · hard error signalled by `{step_label}`; aborting pipeline\x1b[0m");
+                            last_reply = Some(reply);
+                            error_signal = true;
+                            break;
+                        }
+                        // No error → safe to print the intermediate
+                        // indented reply (skipped on the final step
+                        // since the post-loop block prints it to
+                        // stdout).
+                        if steps.len() > 1 && step_idx + 1 < steps.len() {
+                            let indented = reply.lines()
+                                .map(|l| format!("    \x1b[2;3m{l}\x1b[0m"))
+                                .collect::<Vec<_>>().join("\n");
+                            eprintln!("{indented}");
+                        }
+                        if interactive
+                            && steps.len() > 1
+                            && step_idx + 1 < steps.len()
+                            && persisted_path.is_some()
+                        {
+                            let p = persisted_path.as_ref().unwrap();
+                            eprintln!("\x1b[2;3m  · --interactive: edit {} if you want; press Enter to continue\x1b[0m",
+                                p.display());
+                            let _ = reader.next_line().await;
+                            match std::fs::read_to_string(p) {
+                                Ok(edited) => {
+                                    if edited != reply {
+                                        eprintln!("\x1b[2;3m  · picked up hand-edit ({} -> {} bytes)\x1b[0m",
+                                            reply.len(), edited.len());
+                                    }
+                                    current_input = edited;
+                                }
+                                Err(e) => {
+                                    eprintln!("\x1b[2;3m  · warn: re-read of {} failed: {e}; falling back to in-memory reply\x1b[0m",
+                                        p.display());
+                                    current_input = reply.clone();
+                                }
+                            }
+                        } else {
+                            current_input = reply.clone();
+                        }
+                        last_reply = Some(reply);
+                    }
+                    Err(e) => {
+                        eprintln!("aislang chat: orchestrator step {}/{} (`{step_label}`) failed: {e}",
+                            step_idx + 1, steps.len());
+                        dispatch_failed = true;
+                        break;
+                    }
+                }
+            }
+            if dispatch_failed {
+                outer_dispatch_failed = true;
+                break 'outer;
+            }
+            if error_signal {
+                outer_error_signal = true;
+                final_reply = last_reply;
+                break 'outer;
+            }
+            final_reply = last_reply.clone();
+            // Loop termination: ACCEPT on final step's reply,
+            // OR max_iter hit.  When `loop_max_iter` is None
+            // (max_iter == 0), the for-loop range 0..=0 runs
+            // exactly once + drops out — v0.3 single-pass
+            // behaviour preserved.
+            if loop_max_iter.is_some() {
+                if let Some(r) = &last_reply {
+                    if is_accept_verdict_local(r) {
+                        eprintln!(
+                            "\x1b[2;3m  · loop terminated at iter {}/{} on ACCEPT\x1b[0m",
+                            iter + 1, max_iter + 1);
+                        break 'outer;
+                    }
+                }
+                if iter == max_iter {
+                    eprintln!(
+                        "\x1b[2;3m  · loop hit max_iter cap ({}); no ACCEPT — surfacing last reply\x1b[0m",
+                        max_iter);
                 }
             }
         }
-        if !dispatch_failed {
-            if let Some(reply) = last_reply {
+        if !outer_dispatch_failed {
+            if let Some(reply) = final_reply {
+                // v0.4 W21 Mon follow-up #2: the per-step
+                // "hard error signalled by `X`; aborting pipeline"
+                // line already covers the abort summary — DON'T
+                // double-print a redundant "pipeline terminated"
+                // marker here.  Just emit the final reply (which
+                // IS the erroring `## ERROR:` text on stdout, so
+                // pipes / tee'd logs still see the actual error)
+                // and let the per-step abort line speak for itself.
+                let _ = outer_error_signal;
                 println!("{reply}");
             }
         }

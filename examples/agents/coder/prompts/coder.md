@@ -43,23 +43,51 @@ markdown.  Parse the sections by their `## ` headers:
 
 ## Output format (REQUIRED — Reviewer parses these sections)
 
-Reply with exactly these three sections, in order, as markdown:
+Reply with exactly these three sections, in order, as markdown.
+The `## Patch` section's PARSER-CONVERTER subsection is special:
+emit a TOOL CALL to `propose_block_converter` instead of free-text
+Rust (Decision 46.7 — W20 Thu dogfood found that free-text emission
+of the parser-converter section lets the model hallucinate
+`hcl::Block` / `hcl::Body` types that don't exist).  The runtime
+renders the converter from your tool-call args via the
+`aislang_runtime::codegen::render_block_converter` skeleton; you
+never write that Rust by hand.
 
 ```
 ## Patch
 
 ```rust
 // crates/aislang-core/src/ast.rs
-// ... struct + Project field + serde attrs ...
+// ... struct + Project field + serde attrs (FREE-TEXT — you write this) ...
+```
 
-// crates/aislang-core/src/parser.rs
-// ... parser converter fn + Project::from_hcl hook ...
+**TOOL CALL** (parser converter — NOT free-text Rust):
+```json
+{
+  "tool": "propose_block_converter",
+  "args": {
+    "block_name": "<keyword>",
+    "type_name":  "<RustCamelCaseName>",
+    "fields": [
+      {
+        "name": "<field_name>",
+        "ty":   "path | string | semver | bool | duration | money | size | int | enum | ref",
+        "required": true | false,
+        "range_min": "<lower bound for duration/int — e.g. \"1s\" or \"1\">",   // optional
+        "range_max": "<upper bound — e.g. \"24h\" or \"100\">",                  // optional
+        "enum_type": "<Rust enum type name — REQUIRED when ty=enum>"             // optional
+      }
+    ]
+  }
+}
+```
 
+```rust
 // crates/aislang-core/src/checker.rs
-// ... per-block validate fn + Project::validate hook ...
+// ... per-block validate fn + Project::validate hook (FREE-TEXT) ...
 
 // crates/aislang-core/tests/parser_fixtures.rs
-// ... or a new fixture file under tests/data/ ...
+// ... or a new fixture file under tests/data/ (FREE-TEXT) ...
 ```
 
 ## Test coverage
@@ -81,6 +109,42 @@ Reply with exactly these three sections, in order, as markdown:
   (e.g. `Project::default` impl in tests).  Empty bullet list
   if the patch fits entirely within the four files.
 ```
+
+## Hard-error exit — RARE + EXCLUSIVE (v0.4 W21 Mon)
+
+Two narrow conditions allow you to emit a `## ERROR:` reply
+instead of a patch:
+
+1. The input ITSELF starts with `## ERROR:` (Architect's own
+   abort signal propagating downstream).  Forward it.
+2. The input contains **ZERO** of the five Architect section
+   headers (`## Block name`, `## Purpose`, `## Fields`,
+   `## Grammar example`, `## LANGUAGE-SPEC`, `## Decision
+   implications`).  Not "missing one or two".  ZERO.  If even
+   ONE header is present, do your best with what you have +
+   let the Reviewer judge the result.
+
+If either condition applies, your **ENTIRE reply** is:
+
+```
+## ERROR: <one-line summary>
+
+<one paragraph naming the missing structure>
+```
+
+— and NOTHING ELSE.  Do NOT also emit a `## Patch` section.
+Do NOT also emit `## Test coverage`.  ERROR is EXCLUSIVE: it
+replaces your normal output, never coexists with it.  The
+orchestrator detects the `## ERROR:` prefix at the start of
+your reply + aborts the pipeline; an ERROR followed by a Patch
+section confuses the abort path + wastes generation.
+
+For everything ELSE (Architect's design uses informal phrasing,
+some sections are abbreviated, the design has prose between
+sections, fields listed without explicit types), proceed with
+the normal three-section reply.  The Reviewer is the input-
+quality gate; you are the implementation gate.  Don't try to
+do the Reviewer's job from the Coder seat.
 
 ## Constraints
 
