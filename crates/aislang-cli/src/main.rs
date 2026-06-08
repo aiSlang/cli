@@ -404,6 +404,33 @@ enum CloudCommand {
               default_value_t = aislang_cloud::DEFAULT_PORT)]
         port: u16,
     },
+    /// v0.4 W22 Tue follow-up — provision a tenant's Postgres
+    /// schema + tenant-migrations.  Idempotent (re-running against
+    /// an already-provisioned tenant is a no-op).
+    ///
+    /// Without this step, `GET /v1/projects` against an
+    /// un-provisioned tenant returns 500 (`relation "projects"
+    /// does not exist`) because the per-tenant schema hasn't been
+    /// created yet.  Future Phase 2 Week 23 signup flow will call
+    /// this automatically on first signup; for now, operators run
+    /// it explicitly per tenant (mirrors the `aislang apply` posture
+    /// where operator action provisions infrastructure).
+    ///
+    /// Requires `AISLANG_CLOUD_DB_URL` (the in-memory store has no
+    /// schema to provision; running this against the fallback store
+    /// surfaces a clear error).
+    ///
+    /// ```sh
+    /// AISLANG_CLOUD_DB_URL=postgres://... \
+    ///   aislang cloud provision alpha
+    /// ```
+    Provision {
+        /// Tenant slug to provision.  Must match
+        /// `^[a-z0-9][a-z0-9-]{0,63}$` (validated against the same
+        /// regex `public.tenants.slug`'s CHECK constraint enforces
+        /// at the DB layer).
+        tenant: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -461,6 +488,8 @@ fn run() -> Result<ExitCode> {
         Command::Cloud { action } => match action {
             CloudCommand::Serve { host, port } =>
                 run_cloud_serve(host, port).map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::Provision { tenant } =>
+                run_cloud_provision(tenant).map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3453,6 +3482,64 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
         eprintln!("       http://{addr}/v1/projects");
         aislang_cloud::serve(listener, state).await
             .map_err(|e| anyhow::anyhow!("axum serve: {e}"))
+    })?;
+    Ok(())
+}
+
+/// v0.4 W22 Tue follow-up — `aislang cloud provision <tenant>`.
+///
+/// Closes the UX gap surfaced by the live-Postgres e2e smoke: hitting
+/// `GET /v1/projects` against an un-provisioned tenant returned 500
+/// (`relation "projects" does not exist`) because the per-tenant
+/// schema hadn't been created.  This subcommand calls
+/// `PgStore::ensure_tenant_schema` to create the schema + replay the
+/// per-tenant migrations, so the next API call against that tenant
+/// hits a populated schema.
+///
+/// Idempotent — running it twice against the same tenant is a
+/// no-op (Postgres `CREATE SCHEMA IF NOT EXISTS` + `INSERT ... ON
+/// CONFLICT DO NOTHING` on the tenants registry).
+///
+/// Requires `AISLANG_CLOUD_DB_URL`.  The in-memory fallback has no
+/// schema to provision; running against it would silently succeed
+/// without doing useful work, so we refuse explicitly instead.
+fn run_cloud_provision(tenant: String) -> Result<()> {
+    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
+             provision` only makes sense against Postgres.  Set it before \
+             running:\n  \
+             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud provision <tenant>"))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    // Validate the slug client-side BEFORE opening the Postgres
+    // connection so a clear "malformed slug" error doesn't get
+    // preceded by misleading "provisioning schema `t_BAD;DROP`"
+    // banner output.  Mirrors the `public.tenants.slug` CHECK
+    // constraint at the DB layer (belt-and-suspenders).
+    if !aislang_cloud::db::is_valid_slug(&tenant) {
+        anyhow::bail!(
+            "tenant slug `{tenant}` is malformed — must match \
+             `^[a-z0-9][a-z0-9-]{{0,63}}$` (lowercase alnum + hyphens, \
+             starts with alnum, ≤64 chars)");
+    }
+
+    rt.block_on(async move {
+        use aislang_cloud::Store;
+        eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
+        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
+            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
+        eprintln!("aislang cloud: provisioning tenant `{tenant}` \
+                   (schema `t_{tenant}` + per-tenant migrations)");
+        pg.ensure_tenant_schema(&tenant).await
+            .map_err(|e| anyhow::anyhow!("ensure_tenant_schema: {e}"))?;
+        eprintln!("aislang cloud: tenant `{tenant}` provisioned ✓");
+        Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
 }
