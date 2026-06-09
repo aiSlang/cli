@@ -44,6 +44,12 @@ thiserror   = "1"
 anyhow      = "1"
 semver      = { version = "1",   features = ["serde"] }
 sha2        = "0.10"
+# v0.4 W23 Thu — `aislang-cloud` signup flow.  `rand` (CSPRNG) for
+# unguessable email-verify tokens + signup ids; `hmac` (+ existing
+# sha2) for Stripe webhook signature verification
+# (`Stripe-Signature: t=<ts>,v1=<hmac>`).
+rand        = "0.8"
+hmac        = "0.12"
 # week-6 Tue: in-CLI agent runtime (client). week-12 Mon: server side
 # for `aislang mcp-serve` — needs the `server` feature for the
 # ServerHandler trait + `tool_router`/`tool` macros, and
