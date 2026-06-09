@@ -484,6 +484,37 @@ enum CloudCommand {
         #[arg(long, value_name = "ID")]
         identifier: Option<String>,
     },
+    /// v0.4 W23 Mon follow-up — write `.env.cloud.example` to cwd.
+    ///
+    /// The template lists every operator-facing env var the
+    /// `aislang-cloud` crate reads at startup (control-plane
+    /// bearer auth, Postgres, Stripe Billing).  Copy to
+    /// `.env.cloud`, fill in the values, and re-run any
+    /// `aislang cloud <subcommand>` — each subcommand auto-loads
+    /// the nearest `.env.cloud` from cwd / parent dirs BEFORE
+    /// reading env vars.
+    ///
+    /// This template is SEPARATE from the per-project
+    /// `.env.example` that `aislang plan` emits — those cover the
+    /// project's provider credentials (consumed by docker
+    /// compose); this one covers the cloud OPERATOR's
+    /// control-plane secrets (consumed by the aislang binary
+    /// directly).
+    ///
+    /// ```sh
+    /// aislang cloud init                  # writes .env.cloud.example to cwd
+    /// cp .env.cloud.example .env.cloud
+    /// # edit .env.cloud and fill in AISLANG_CLOUD_TOKEN etc.
+    /// echo .env.cloud >> .gitignore
+    /// aislang cloud serve                 # auto-loads .env.cloud
+    /// ```
+    Init {
+        /// Overwrite an existing `.env.cloud.example` if present.
+        /// Default: refuse + print a clear message so we don't
+        /// stomp operator edits.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -546,6 +577,8 @@ fn run() -> Result<ExitCode> {
             CloudCommand::MeterEvent { customer, kind, quantity, identifier } =>
                 run_cloud_meter_event(customer, kind, quantity, identifier)
                     .map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::Init { force } =>
+                run_cloud_init(force).map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3486,6 +3519,31 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
     }
 }
 
+/// v0.4 W23 Mon follow-up — auto-load `.env.cloud` from the
+/// nearest parent dir BEFORE any cloud subcommand reads env vars.
+/// Prints a one-line banner so the operator sees which file (if
+/// any) populated their env.  Process env vars set in the shell
+/// keep precedence over file values (standard dotenv semantics).
+fn load_cloud_dotenv_with_banner() {
+    use aislang_cloud::env_template::{load_cloud_dotenv, DotenvLoadResult};
+    match load_cloud_dotenv() {
+        DotenvLoadResult::Loaded(path) => {
+            eprintln!("aislang cloud: loaded env from {}",
+                path.display());
+        }
+        DotenvLoadResult::NoFile => {
+            // Quiet by default — operator may legitimately be
+            // running via shell-exported vars (CI, `cargo test`,
+            // production systemd unit).
+        }
+        DotenvLoadResult::LoadError(msg) => {
+            // Non-fatal — env vars may still be set via shell.
+            // Surface as a warning so operator can fix the file.
+            eprintln!("aislang cloud: warning: dotenv load failed: {msg}");
+        }
+    }
+}
+
 /// v0.4 W22 Mon follow-up — `aislang cloud serve` thin wrapper
 /// around `aislang_cloud::serve`.  Reads the bearer token from
 /// `AISLANG_CLOUD_TOKEN`, binds a TcpListener on
@@ -3493,6 +3551,7 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
 /// start without a token (would otherwise accept every
 /// unauthenticated request + leak the store).
 fn run_cloud_serve(host: String, port: u16) -> Result<()> {
+    load_cloud_dotenv_with_banner();
     let config = aislang_cloud::ServerConfig::from_env().ok_or_else(|| {
         anyhow::anyhow!(
             "AISLANG_CLOUD_TOKEN is unset or empty — refusing to start the \
@@ -3560,6 +3619,7 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
 /// schema to provision; running against it would silently succeed
 /// without doing useful work, so we refuse explicitly instead.
 fn run_cloud_provision(tenant: String) -> Result<()> {
+    load_cloud_dotenv_with_banner();
     let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
@@ -3618,6 +3678,7 @@ fn run_cloud_meter_event(
     quantity:   u64,
     identifier: Option<String>,
 ) -> Result<()> {
+    load_cloud_dotenv_with_banner();
     use aislang_cloud::billing::{
         MeterEvent, MeterEventKind, StripeClient, generate_smoke_identifier,
         PINNED_API_VERSION,
@@ -3656,6 +3717,38 @@ fn run_cloud_meter_event(
         }
         Ok::<(), anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+/// v0.4 W23 Mon follow-up — `aislang cloud init`.  Writes
+/// `.env.cloud.example` to cwd listing every operator env var the
+/// `aislang-cloud` crate reads (see
+/// `aislang_cloud::env_template::CLOUD_ENV_VARS` for the
+/// canonical registry).
+///
+/// Refuses to overwrite an existing file unless `--force` is
+/// passed, so we don't stomp operator edits when re-run during
+/// an upgrade.
+fn run_cloud_init(force: bool) -> Result<()> {
+    use aislang_cloud::env_template::{
+        generate_cloud_env_example, CLOUD_ENV_EXAMPLE_FILENAME,
+    };
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
+    let path = cwd.join(CLOUD_ENV_EXAMPLE_FILENAME);
+    if path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists — pass --force to overwrite",
+            path.display());
+    }
+    std::fs::write(&path, generate_cloud_env_example())
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+    eprintln!("aislang cloud: wrote {} ✓", path.display());
+    eprintln!("  next steps:");
+    eprintln!("    cp {} .env.cloud", path.display());
+    eprintln!("    # edit .env.cloud + fill in AISLANG_CLOUD_TOKEN etc.");
+    eprintln!("    echo .env.cloud >> .gitignore");
+    eprintln!("    aislang cloud serve   # auto-loads .env.cloud");
     Ok(())
 }
 
