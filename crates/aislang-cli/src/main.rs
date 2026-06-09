@@ -515,6 +515,32 @@ enum CloudCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// v0.4 W23 Tue — map a tenant slug to its Stripe customer
+    /// id (Decision 46.3 metering pipeline).
+    ///
+    /// Phase 2 Thu W23 signup flow will set this automatically
+    /// after a successful Stripe Checkout; today the operator
+    /// runs it explicitly per tenant (mirrors `aislang cloud
+    /// provision`'s explicit-action posture).
+    ///
+    /// Tenants without a Stripe customer mapping accumulate
+    /// meter events in the in-process queue but the flusher
+    /// drops them (with a logged warning) on each tick — no
+    /// silent revenue loss, but no Stripe-side accounting
+    /// either.  Re-running this subcommand after the fact does
+    /// NOT replay dropped events; v0.5+ may add explicit
+    /// backfill.
+    ///
+    /// Requires `AISLANG_CLOUD_DB_URL`.  Customer ids must
+    /// match `^cus_[A-Za-z0-9]{1,60}$` (matches Stripe's actual
+    /// shape + the DB-layer CHECK constraint at
+    /// `migrations/20260609000000_tenants_stripe_customer.sql`).
+    SetCustomer {
+        /// Tenant slug (must already be provisioned).
+        tenant: String,
+        /// Stripe customer id, e.g. `cus_OrK5jdN5VbcM9G`.
+        stripe_customer_id: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -579,6 +605,9 @@ fn run() -> Result<ExitCode> {
                     .map(|_| ExitCode::SUCCESS)?,
             CloudCommand::Init { force } =>
                 run_cloud_init(force).map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::SetCustomer { tenant, stripe_customer_id } =>
+                run_cloud_set_customer(tenant, stripe_customer_id)
+                    .map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3586,6 +3615,30 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
             aislang_cloud::AppState::with_in_memory_store(config)
         };
 
+        // v0.4 W23 Tue (Decision 46.3) — spawn the metering
+        // background flusher.  Only fires when STRIPE_SECRET_KEY
+        // is present; otherwise the queue still accepts events
+        // (so handlers don't need to branch) but they just sit
+        // there until the operator wires Stripe up + restarts.
+        match aislang_cloud::billing::StripeClient::from_env() {
+            Ok(stripe) => {
+                let interval = std::time::Duration::from_secs(
+                    aislang_cloud::billing::DEFAULT_FLUSH_INTERVAL_SECS);
+                state.meter.spawn_flusher(
+                    stripe, state.store.clone(), interval);
+                eprintln!("aislang cloud: metering pipeline enabled \
+                           (flush every {}s)",
+                    aislang_cloud::billing::DEFAULT_FLUSH_INTERVAL_SECS);
+            }
+            Err(_) => {
+                eprintln!("aislang cloud: STRIPE_SECRET_KEY unset — \
+                           metering pipeline DISABLED (events still \
+                           enqueued + buffered, but never flushed to \
+                           Stripe until you set STRIPE_SECRET_KEY + \
+                           restart)");
+            }
+        }
+
         let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await
             .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -3750,6 +3803,83 @@ fn run_cloud_init(force: bool) -> Result<()> {
     eprintln!("    echo .env.cloud >> .gitignore");
     eprintln!("    aislang cloud serve   # auto-loads .env.cloud");
     Ok(())
+}
+
+/// v0.4 W23 Tue — `aislang cloud set-customer <tenant>
+/// <stripe_customer_id>`.
+///
+/// Maps a provisioned tenant slug to its Stripe customer record
+/// so the metering pipeline (Decision 46.3) can submit meter
+/// events against the right billable account.  Requires
+/// `AISLANG_CLOUD_DB_URL` — the in-memory fallback store doesn't
+/// persist across restarts so a mapping set there would
+/// disappear when `aislang cloud serve` cycles.
+///
+/// Customer-id validation:
+/// - Client-side: `^cus_[A-Za-z0-9]{1,60}$` regex (matches
+///   Stripe's actual format + the DB CHECK constraint).
+/// - DB-side: same regex enforced at insert.
+/// - Failure mode: malformed input fails fast BEFORE opening
+///   the Postgres connection (clear error, no transient DB
+///   noise in logs).
+fn run_cloud_set_customer(
+    tenant:             String,
+    stripe_customer_id: String,
+) -> Result<()> {
+    load_cloud_dotenv_with_banner();
+    // Client-side slug + customer-id validation.  Slug
+    // validation is reused from db.rs; the customer-id regex
+    // is duplicated here so the error fires before we open a
+    // Postgres connection.
+    if !aislang_cloud::db::is_valid_slug(&tenant) {
+        anyhow::bail!("tenant slug `{tenant}` is malformed — must match \
+                       `^[a-z0-9][a-z0-9-]{{0,63}}$`");
+    }
+    if !is_valid_stripe_customer_id(&stripe_customer_id) {
+        anyhow::bail!("stripe customer id `{stripe_customer_id}` is malformed \
+                       — must match `^cus_[A-Za-z0-9]{{1,60}}$`");
+    }
+
+    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
+             set-customer` only makes sense against Postgres (the \
+             in-memory fallback doesn't persist).  Set it before \
+             running:\n  \
+             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud \
+             set-customer <tenant> <cus_id>"))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        use aislang_cloud::Store;
+        eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
+        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
+            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
+        eprintln!("aislang cloud: mapping tenant `{tenant}` → \
+                   stripe_customer_id `{stripe_customer_id}`");
+        pg.set_tenant_stripe_customer(&tenant, &stripe_customer_id).await
+            .map_err(|e| anyhow::anyhow!("set_tenant_stripe_customer: {e}"))?;
+        eprintln!("aislang cloud: customer mapping persisted ✓");
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// Client-side Stripe customer-id validator — mirrors the
+/// `tenants_stripe_customer_id_format` CHECK constraint defined
+/// in `migrations/20260609000000_tenants_stripe_customer.sql`.
+/// Belt-and-suspenders with the DB constraint so malformed ids
+/// fail fast with a clear error before any SQL fires.
+fn is_valid_stripe_customer_id(s: &str) -> bool {
+    if !s.starts_with("cus_") { return false; }
+    let rest = &s[4..];
+    if rest.is_empty() || rest.len() > 60 { return false; }
+    rest.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Per-store health classification used by `aislang rag verify`
