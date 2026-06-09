@@ -541,6 +541,24 @@ enum CloudCommand {
         /// Stripe customer id, e.g. `cus_OrK5jdN5VbcM9G`.
         stripe_customer_id: String,
     },
+    /// v0.4 W23 Wed — set a tenant's billing plan (Decision 46.3
+    /// free-tier rate-limiting).
+    ///
+    /// `free` (default for new tenants) rate-limits control-plane
+    /// SP-equivalent operations (`apply` etc.) at 50/day; `paid`
+    /// is unrate-limited.  Phase 2 Thu W23 signup flow flips a
+    /// tenant to `paid` automatically after payment requisites
+    /// are confirmed; today the operator runs it explicitly.
+    ///
+    /// Requires `AISLANG_CLOUD_DB_URL` (the plan must persist
+    /// across `aislang cloud serve` restarts).
+    SetPlan {
+        /// Tenant slug (must already be provisioned).
+        tenant: String,
+        /// Plan: `free` (rate-limited 50 SP-equivalents/day) or
+        /// `paid` (unlimited).
+        plan: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -608,6 +626,8 @@ fn run() -> Result<ExitCode> {
             CloudCommand::SetCustomer { tenant, stripe_customer_id } =>
                 run_cloud_set_customer(tenant, stripe_customer_id)
                     .map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::SetPlan { tenant, plan } =>
+                run_cloud_set_plan(tenant, plan).map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3880,6 +3900,56 @@ fn is_valid_stripe_customer_id(s: &str) -> bool {
     let rest = &s[4..];
     if rest.is_empty() || rest.len() > 60 { return false; }
     rest.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// v0.4 W23 Wed — `aislang cloud set-plan <tenant> <free|paid>`.
+///
+/// Sets a tenant's billing plan (Decision 46.3 free-tier rate-
+/// limiting).  `free` rate-limits SP-equivalent operations at
+/// 50/day; `paid` is unlimited.  Requires `AISLANG_CLOUD_DB_URL`
+/// — the plan must persist across `aislang cloud serve` restarts
+/// (the in-process rate-limit COUNTER resets on restart, but the
+/// PLAN config is durable).
+fn run_cloud_set_plan(tenant: String, plan: String) -> Result<()> {
+    load_cloud_dotenv_with_banner();
+    if !aislang_cloud::db::is_valid_slug(&tenant) {
+        anyhow::bail!("tenant slug `{tenant}` is malformed — must match \
+                       `^[a-z0-9][a-z0-9-]{{0,63}}$`");
+    }
+    let parsed_plan = aislang_cloud::rate_limit::TenantPlan::parse_cli_value(&plan)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
+             set-plan` only makes sense against Postgres (the in-memory \
+             fallback doesn't persist).  Set it before running:\n  \
+             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud set-plan \
+             <tenant> <free|paid>"))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        use aislang_cloud::Store;
+        eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
+        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
+            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
+        eprintln!("aislang cloud: setting tenant `{tenant}` plan → `{}`",
+            parsed_plan.as_str());
+        pg.set_tenant_plan(&tenant, parsed_plan).await
+            .map_err(|e| anyhow::anyhow!("set_tenant_plan: {e}"))?;
+        eprintln!("aislang cloud: plan persisted ✓");
+        if parsed_plan == aislang_cloud::rate_limit::TenantPlan::Free {
+            eprintln!("  note: free tier rate-limited at {} SP-equivalents/day",
+                aislang_cloud::rate_limit::FREE_TIER_DAILY_SP_CAP);
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 /// Per-store health classification used by `aislang rag verify`
