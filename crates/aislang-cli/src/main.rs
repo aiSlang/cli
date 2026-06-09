@@ -431,6 +431,59 @@ enum CloudCommand {
         /// at the DB layer).
         tenant: String,
     },
+    /// v0.4 W23 Mon — Stripe metering API spike (Decision 46.3,
+    /// risk-3 mitigation per §"Three v0.4 risks worth pre-
+    /// mitigating").  Submits a single meter event to the Stripe
+    /// Billing meter-events API + prints the server-echoed
+    /// response.
+    ///
+    /// Two meter kinds per Decision 46.3:
+    ///   - `tokens`  per-1k-tokens for inference (mirrors v0.1
+    ///               `spend.json` micro-units field shape)
+    ///   - `sp`      per-SP-equivalent for control-plane operations
+    ///               (`apply`/`destroy`/`plan` = 1 SP-equivalent
+    ///               for billing)
+    ///
+    /// Both meter names must be pre-created in your Stripe
+    /// dashboard before submitting events — see
+    /// `docs/stripe-integration-notes.md` § "Meter must exist
+    /// before events".
+    ///
+    /// Requires `STRIPE_SECRET_KEY` env var (use `sk_test_...` for
+    /// sandbox; `sk_live_...` for production).  Optional
+    /// `STRIPE_API_BASE` override for sandbox-mocks +
+    /// stripe-mock locally.
+    ///
+    /// ```sh
+    /// STRIPE_SECRET_KEY=sk_test_... \
+    ///   aislang cloud meter-event \
+    ///     --customer cus_xxx \
+    ///     --kind tokens \
+    ///     --quantity 1000
+    /// ```
+    MeterEvent {
+        /// Stripe customer id (`cus_...`) to charge for this event.
+        /// In production this comes from the per-tenant Stripe
+        /// customer record persisted at signup; the spike CLI
+        /// takes it as a flag.
+        #[arg(long, value_name = "CUSTOMER_ID")]
+        customer: String,
+        /// Meter kind: `tokens` (per-1k-tokens inference) OR `sp`
+        /// (per-SP-equivalent control-plane operation).  See
+        /// Decision 46.3.
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// Quantity to record.  Stripe accumulates these across
+        /// events for the billing period.
+        #[arg(long, value_name = "N")]
+        quantity: u64,
+        /// Override the Stripe `identifier` field for idempotency
+        /// testing.  Defaults to a server-generated unique value.
+        /// Re-submitting the same identifier + same payload is a
+        /// no-op on Stripe's side (idempotent retry).
+        #[arg(long, value_name = "ID")]
+        identifier: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -490,6 +543,9 @@ fn run() -> Result<ExitCode> {
                 run_cloud_serve(host, port).map(|_| ExitCode::SUCCESS)?,
             CloudCommand::Provision { tenant } =>
                 run_cloud_provision(tenant).map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::MeterEvent { customer, kind, quantity, identifier } =>
+                run_cloud_meter_event(customer, kind, quantity, identifier)
+                    .map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3539,6 +3595,65 @@ fn run_cloud_provision(tenant: String) -> Result<()> {
         pg.ensure_tenant_schema(&tenant).await
             .map_err(|e| anyhow::anyhow!("ensure_tenant_schema: {e}"))?;
         eprintln!("aislang cloud: tenant `{tenant}` provisioned ✓");
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// v0.4 W23 Mon — `aislang cloud meter-event` Stripe metering spike.
+///
+/// Submits one meter event to the Stripe Billing meter-events API
+/// + prints the server-echoed response.  Demonstrates the full
+/// wire path the Phase 2 Tue automated emission will use (token
+/// + SP-equivalent meter events fire on every chat-turn + every
+/// `apply`/`destroy`/`plan`).
+///
+/// Reads `STRIPE_SECRET_KEY` (required) + optionally
+/// `STRIPE_API_BASE` (defaults to `https://api.stripe.com`) from
+/// env.  Refuses to start without a secret key — mirrors the
+/// `AISLANG_CLOUD_TOKEN` empty-check posture from W22 Mon.
+fn run_cloud_meter_event(
+    customer:   String,
+    kind:       String,
+    quantity:   u64,
+    identifier: Option<String>,
+) -> Result<()> {
+    use aislang_cloud::billing::{
+        MeterEvent, MeterEventKind, StripeClient, generate_smoke_identifier,
+        PINNED_API_VERSION,
+    };
+
+    let kind = MeterEventKind::parse_cli_value(&kind)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let identifier = identifier.unwrap_or_else(generate_smoke_identifier);
+    let event = MeterEvent {
+        kind,
+        stripe_customer_id: customer.clone(),
+        quantity,
+        identifier: identifier.clone(),
+        timestamp_secs: None,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        eprintln!("aislang cloud: building Stripe client (API version: {PINNED_API_VERSION})");
+        let client = StripeClient::from_env()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!("aislang cloud: submitting meter event \
+                   customer={customer} kind={} quantity={quantity} identifier={identifier}",
+            kind.as_event_name());
+        let resp = client.submit_meter_event(&event).await
+            .map_err(|e| anyhow::anyhow!("submit_meter_event: {e}"))?;
+        eprintln!("aislang cloud: Stripe accepted the event ✓");
+        eprintln!("  event_name = {}", resp.event_name);
+        eprintln!("  identifier = {}", resp.identifier);
+        if let Some(ts) = resp.timestamp {
+            eprintln!("  timestamp  = {ts}");
+        }
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
