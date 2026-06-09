@@ -19,6 +19,13 @@ stack.yml
 # Secrets / env
 .env
 .env.*
+# …but DO commit the templates (safe, all values blank).  The
+# per-project `.env.example` is emitted by `aislang plan`; the
+# operator-facing `.env.cloud.example` is emitted by `aislang
+# cloud init` (v0.4 W23 Mon follow-up — see crates/aislang-cloud/
+# src/env_template.rs).
+!.env.example
+!.env.cloud.example
 .secrets/
 *.key
 *.pem
