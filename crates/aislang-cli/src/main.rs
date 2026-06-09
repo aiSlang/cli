@@ -431,6 +431,90 @@ enum CloudCommand {
         /// at the DB layer).
         tenant: String,
     },
+    /// v0.4 W23 Mon — Stripe metering API spike (Decision 46.3,
+    /// risk-3 mitigation per §"Three v0.4 risks worth pre-
+    /// mitigating").  Submits a single meter event to the Stripe
+    /// Billing meter-events API + prints the server-echoed
+    /// response.
+    ///
+    /// Two meter kinds per Decision 46.3:
+    ///   - `tokens`  per-1k-tokens for inference (mirrors v0.1
+    ///               `spend.json` micro-units field shape)
+    ///   - `sp`      per-SP-equivalent for control-plane operations
+    ///               (`apply`/`destroy`/`plan` = 1 SP-equivalent
+    ///               for billing)
+    ///
+    /// Both meter names must be pre-created in your Stripe
+    /// dashboard before submitting events — see
+    /// `docs/stripe-integration-notes.md` § "Meter must exist
+    /// before events".
+    ///
+    /// Requires `STRIPE_SECRET_KEY` env var (use `sk_test_...` for
+    /// sandbox; `sk_live_...` for production).  Optional
+    /// `STRIPE_API_BASE` override for sandbox-mocks +
+    /// stripe-mock locally.
+    ///
+    /// ```sh
+    /// STRIPE_SECRET_KEY=sk_test_... \
+    ///   aislang cloud meter-event \
+    ///     --customer cus_xxx \
+    ///     --kind tokens \
+    ///     --quantity 1000
+    /// ```
+    MeterEvent {
+        /// Stripe customer id (`cus_...`) to charge for this event.
+        /// In production this comes from the per-tenant Stripe
+        /// customer record persisted at signup; the spike CLI
+        /// takes it as a flag.
+        #[arg(long, value_name = "CUSTOMER_ID")]
+        customer: String,
+        /// Meter kind: `tokens` (per-1k-tokens inference) OR `sp`
+        /// (per-SP-equivalent control-plane operation).  See
+        /// Decision 46.3.
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// Quantity to record.  Stripe accumulates these across
+        /// events for the billing period.
+        #[arg(long, value_name = "N")]
+        quantity: u64,
+        /// Override the Stripe `identifier` field for idempotency
+        /// testing.  Defaults to a server-generated unique value.
+        /// Re-submitting the same identifier + same payload is a
+        /// no-op on Stripe's side (idempotent retry).
+        #[arg(long, value_name = "ID")]
+        identifier: Option<String>,
+    },
+    /// v0.4 W23 Mon follow-up — write `.env.cloud.example` to cwd.
+    ///
+    /// The template lists every operator-facing env var the
+    /// `aislang-cloud` crate reads at startup (control-plane
+    /// bearer auth, Postgres, Stripe Billing).  Copy to
+    /// `.env.cloud`, fill in the values, and re-run any
+    /// `aislang cloud <subcommand>` — each subcommand auto-loads
+    /// the nearest `.env.cloud` from cwd / parent dirs BEFORE
+    /// reading env vars.
+    ///
+    /// This template is SEPARATE from the per-project
+    /// `.env.example` that `aislang plan` emits — those cover the
+    /// project's provider credentials (consumed by docker
+    /// compose); this one covers the cloud OPERATOR's
+    /// control-plane secrets (consumed by the aislang binary
+    /// directly).
+    ///
+    /// ```sh
+    /// aislang cloud init                  # writes .env.cloud.example to cwd
+    /// cp .env.cloud.example .env.cloud
+    /// # edit .env.cloud and fill in AISLANG_CLOUD_TOKEN etc.
+    /// echo .env.cloud >> .gitignore
+    /// aislang cloud serve                 # auto-loads .env.cloud
+    /// ```
+    Init {
+        /// Overwrite an existing `.env.cloud.example` if present.
+        /// Default: refuse + print a clear message so we don't
+        /// stomp operator edits.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -490,6 +574,11 @@ fn run() -> Result<ExitCode> {
                 run_cloud_serve(host, port).map(|_| ExitCode::SUCCESS)?,
             CloudCommand::Provision { tenant } =>
                 run_cloud_provision(tenant).map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::MeterEvent { customer, kind, quantity, identifier } =>
+                run_cloud_meter_event(customer, kind, quantity, identifier)
+                    .map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::Init { force } =>
+                run_cloud_init(force).map(|_| ExitCode::SUCCESS)?,
         },
     };
     Ok(code)
@@ -3430,6 +3519,31 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
     }
 }
 
+/// v0.4 W23 Mon follow-up — auto-load `.env.cloud` from the
+/// nearest parent dir BEFORE any cloud subcommand reads env vars.
+/// Prints a one-line banner so the operator sees which file (if
+/// any) populated their env.  Process env vars set in the shell
+/// keep precedence over file values (standard dotenv semantics).
+fn load_cloud_dotenv_with_banner() {
+    use aislang_cloud::env_template::{load_cloud_dotenv, DotenvLoadResult};
+    match load_cloud_dotenv() {
+        DotenvLoadResult::Loaded(path) => {
+            eprintln!("aislang cloud: loaded env from {}",
+                path.display());
+        }
+        DotenvLoadResult::NoFile => {
+            // Quiet by default — operator may legitimately be
+            // running via shell-exported vars (CI, `cargo test`,
+            // production systemd unit).
+        }
+        DotenvLoadResult::LoadError(msg) => {
+            // Non-fatal — env vars may still be set via shell.
+            // Surface as a warning so operator can fix the file.
+            eprintln!("aislang cloud: warning: dotenv load failed: {msg}");
+        }
+    }
+}
+
 /// v0.4 W22 Mon follow-up — `aislang cloud serve` thin wrapper
 /// around `aislang_cloud::serve`.  Reads the bearer token from
 /// `AISLANG_CLOUD_TOKEN`, binds a TcpListener on
@@ -3437,6 +3551,7 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
 /// start without a token (would otherwise accept every
 /// unauthenticated request + leak the store).
 fn run_cloud_serve(host: String, port: u16) -> Result<()> {
+    load_cloud_dotenv_with_banner();
     let config = aislang_cloud::ServerConfig::from_env().ok_or_else(|| {
         anyhow::anyhow!(
             "AISLANG_CLOUD_TOKEN is unset or empty — refusing to start the \
@@ -3504,6 +3619,7 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
 /// schema to provision; running against it would silently succeed
 /// without doing useful work, so we refuse explicitly instead.
 fn run_cloud_provision(tenant: String) -> Result<()> {
+    load_cloud_dotenv_with_banner();
     let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!(
@@ -3541,6 +3657,98 @@ fn run_cloud_provision(tenant: String) -> Result<()> {
         eprintln!("aislang cloud: tenant `{tenant}` provisioned ✓");
         Ok::<(), anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+/// v0.4 W23 Mon — `aislang cloud meter-event` Stripe metering spike.
+///
+/// Submits one meter event to the Stripe Billing meter-events API
+/// + prints the server-echoed response.  Demonstrates the full
+/// wire path the Phase 2 Tue automated emission will use (token
+/// + SP-equivalent meter events fire on every chat-turn + every
+/// `apply`/`destroy`/`plan`).
+///
+/// Reads `STRIPE_SECRET_KEY` (required) + optionally
+/// `STRIPE_API_BASE` (defaults to `https://api.stripe.com`) from
+/// env.  Refuses to start without a secret key — mirrors the
+/// `AISLANG_CLOUD_TOKEN` empty-check posture from W22 Mon.
+fn run_cloud_meter_event(
+    customer:   String,
+    kind:       String,
+    quantity:   u64,
+    identifier: Option<String>,
+) -> Result<()> {
+    load_cloud_dotenv_with_banner();
+    use aislang_cloud::billing::{
+        MeterEvent, MeterEventKind, StripeClient, generate_smoke_identifier,
+        PINNED_API_VERSION,
+    };
+
+    let kind = MeterEventKind::parse_cli_value(&kind)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let identifier = identifier.unwrap_or_else(generate_smoke_identifier);
+    let event = MeterEvent {
+        kind,
+        stripe_customer_id: customer.clone(),
+        quantity,
+        identifier: identifier.clone(),
+        timestamp_secs: None,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        eprintln!("aislang cloud: building Stripe client (API version: {PINNED_API_VERSION})");
+        let client = StripeClient::from_env()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!("aislang cloud: submitting meter event \
+                   customer={customer} kind={} quantity={quantity} identifier={identifier}",
+            kind.as_event_name());
+        let resp = client.submit_meter_event(&event).await
+            .map_err(|e| anyhow::anyhow!("submit_meter_event: {e}"))?;
+        eprintln!("aislang cloud: Stripe accepted the event ✓");
+        eprintln!("  event_name = {}", resp.event_name);
+        eprintln!("  identifier = {}", resp.identifier);
+        if let Some(ts) = resp.timestamp {
+            eprintln!("  timestamp  = {ts}");
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// v0.4 W23 Mon follow-up — `aislang cloud init`.  Writes
+/// `.env.cloud.example` to cwd listing every operator env var the
+/// `aislang-cloud` crate reads (see
+/// `aislang_cloud::env_template::CLOUD_ENV_VARS` for the
+/// canonical registry).
+///
+/// Refuses to overwrite an existing file unless `--force` is
+/// passed, so we don't stomp operator edits when re-run during
+/// an upgrade.
+fn run_cloud_init(force: bool) -> Result<()> {
+    use aislang_cloud::env_template::{
+        generate_cloud_env_example, CLOUD_ENV_EXAMPLE_FILENAME,
+    };
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
+    let path = cwd.join(CLOUD_ENV_EXAMPLE_FILENAME);
+    if path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists — pass --force to overwrite",
+            path.display());
+    }
+    std::fs::write(&path, generate_cloud_env_example())
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+    eprintln!("aislang cloud: wrote {} ✓", path.display());
+    eprintln!("  next steps:");
+    eprintln!("    cp {} .env.cloud", path.display());
+    eprintln!("    # edit .env.cloud + fill in AISLANG_CLOUD_TOKEN etc.");
+    eprintln!("    echo .env.cloud >> .gitignore");
+    eprintln!("    aislang cloud serve   # auto-loads .env.cloud");
     Ok(())
 }
 

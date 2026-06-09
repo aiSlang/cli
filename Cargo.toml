@@ -72,6 +72,14 @@ tokio       = { version = "1",   features = ["macros", "rt-multi-thread", "proce
 # (Decision 46.2 + "tenant-scoped working dir auto-cleaned post-
 # apply" DoD).
 tempfile    = "3"
+# v0.4 W23 Mon follow-up — `aislang cloud {serve,provision,meter-
+# event,init}` subcommands load operator secrets from a `.env.cloud`
+# file (mirrors the per-project `.env` pattern from v0.1, but
+# scoped to control-plane / Stripe / Postgres creds the
+# `aislang-cloud` crate reads directly).  `dotenvy` is the
+# maintained replacement for the deprecated `dotenv` crate.
+# Existing process env vars take precedence over file values.
+dotenvy     = "0.15"
 # week-6 Wed: LiteLLM HTTP client + non-streaming chat loop
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # week-9 Mon: OTel-GenAI tracing — official Rust SDK + OTLP HTTP exporter
