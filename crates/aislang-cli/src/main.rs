@@ -3623,7 +3623,8 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
 
     rt.block_on(async move {
-        let state = if let Some(url) = db_url {
+        let public_base_url = config.public_base_url.clone();
+        let mut state = if let Some(url) = db_url {
             eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
             let pg = aislang_cloud::db::PgStore::connect(&url).await
                 .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
@@ -3656,6 +3657,29 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
                            enqueued + buffered, but never flushed to \
                            Stripe until you set STRIPE_SECRET_KEY + \
                            restart)");
+            }
+        }
+
+        // v0.4 W23 Thu follow-up — swap in the REAL Stripe Checkout
+        // Session creator when STRIPE_PRICE_ID is set; otherwise the
+        // signup flow uses MockCheckoutCreator (whose checkout_url
+        // is a non-payable mock that 404s on Stripe).
+        match aislang_cloud::signup::StripeCheckoutCreator::from_env(&public_base_url) {
+            Ok(Some(creator)) => {
+                state.checkout_creator = std::sync::Arc::new(creator);
+                eprintln!("aislang cloud: live Stripe Checkout enabled \
+                           (STRIPE_PRICE_ID set) — signup checkout_url is \
+                           a real payable session");
+            }
+            Ok(None) => {
+                eprintln!("aislang cloud: STRIPE_PRICE_ID unset — signup \
+                           uses MOCK checkout (checkout_url is NOT payable; \
+                           set STRIPE_PRICE_ID to a recurring price to \
+                           enable real Stripe Checkout)");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Stripe Checkout misconfigured: {e}"));
             }
         }
 
