@@ -3683,6 +3683,27 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
             }
         }
 
+        // v0.4 W24 Tue — swap in the REAL GitHub PR commenter when
+        // GITHUB_TOKEN is set; otherwise the GitOps flow logs the
+        // plan comment instead of posting it.
+        match aislang_cloud::gitops::GithubPrCommenter::from_env() {
+            Ok(Some(commenter)) => {
+                state.pr_commenter = std::sync::Arc::new(commenter);
+                eprintln!("aislang cloud: GitOps PR comments ENABLED \
+                           (GITHUB_TOKEN set) — plan results post to PRs");
+            }
+            Ok(None) => {
+                eprintln!("aislang cloud: GITHUB_TOKEN unset — GitOps plan \
+                           comments are LOGGED only (not posted to GitHub; \
+                           set GITHUB_TOKEN to a PAT/installation token to \
+                           enable PR comments)");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "GitHub PR commenter misconfigured: {e}"));
+            }
+        }
+
         let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await
             .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
