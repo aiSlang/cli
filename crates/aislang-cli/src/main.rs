@@ -296,6 +296,66 @@ enum Command {
         #[command(subcommand)]
         action: CloudCommand,
     },
+    /// v0.4 Week 25 Mon — delegate a CLI verb to a remote control
+    /// plane (Decision 46.9, mission deliverable #2).  The same
+    /// `aislang` binary self-hosted + cloud users already run; only
+    /// `--target` differs.  Verbs operate on a project by its
+    /// server-stamped id (create projects via the REST API or the
+    /// signup flow first).
+    ///
+    /// ```sh
+    /// export AISLANG_CLOUD_TOKEN=…           # or pass --token
+    /// aislang remote --target=https://api.aislang.cloud \
+    ///   --tenant=acme validate p-abc123
+    /// aislang remote --target=… --tenant=acme plan    p-abc123
+    /// aislang remote --target=… --tenant=acme apply   p-abc123
+    /// aislang remote --target=… --tenant=acme destroy p-abc123
+    /// aislang remote --target=… --tenant=acme status  p-abc123
+    /// ```
+    Remote {
+        /// Control-plane base URL, e.g. `https://api.aislang.cloud`
+        /// (trailing slash optional).
+        #[arg(long, value_name = "URL")]
+        target: String,
+        /// Tenant slug sent as `X-Aislang-Tenant` (Decision 46.5).
+        /// Defaults to the `AISLANG_TENANT` env var, else `default`
+        /// (the self-hosted single-tenant convention).
+        #[arg(long, value_name = "SLUG")]
+        tenant: Option<String>,
+        /// Bearer token.  Defaults to `AISLANG_CLOUD_TOKEN` (loaded
+        /// from the nearest `.env.cloud`, same as `aislang cloud
+        /// serve`).
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        #[command(subcommand)]
+        action: RemoteCommand,
+    },
+}
+
+/// v0.4 Week 25 Mon — `aislang remote` verbs.  Each delegates to the
+/// control plane over the Decision-46.1 REST surface; see the
+/// per-verb endpoint map in `aislang_cloud::remote`.
+#[derive(Subcommand, Debug)]
+enum RemoteCommand {
+    /// Parse + typecheck + resolve a project server-side.  FREE — not
+    /// metered, not rate-limited (Decision 46.10).  Exit 0 if valid,
+    /// 2 if the source fails to load.
+    Validate {
+        /// Server-stamped project id (e.g. `p-abc123`).
+        id: String,
+    },
+    /// Plan a project server-side + print the generated Compose YAML
+    /// to stdout.  Billed 1 SP-equivalent (Decision 46.3 / 46.10).
+    Plan { id: String },
+    /// Apply a project server-side — streams progress events.  Billed
+    /// 1 SP-equivalent.  Exit 0 on `done`, 1 on an `error` event.
+    Apply { id: String },
+    /// Tear down a project's applied stack — streams progress events.
+    /// Billed 1 SP-equivalent + trails a `project.destroy` audit row.
+    Destroy { id: String },
+    /// Print a project's stored record (id / name / version /
+    /// timestamps).
+    Status { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -629,6 +689,8 @@ fn run() -> Result<ExitCode> {
             CloudCommand::SetPlan { tenant, plan } =>
                 run_cloud_set_plan(tenant, plan).map(|_| ExitCode::SUCCESS)?,
         },
+        Command::Remote { target, tenant, token, action } =>
+            run_remote(target, tenant, token, action)?,
     };
     Ok(code)
 }
@@ -3995,6 +4057,131 @@ fn run_cloud_set_plan(tenant: String, plan: String) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+/// v0.4 W25 Mon — `aislang remote --target` (Decision 46.9, mission
+/// deliverable #2).  Resolve the bearer token + tenant, build a
+/// [`aislang_cloud::remote::RemoteClient`], and delegate the chosen
+/// verb to the control plane.  Returns the process exit code:
+///   - validate: 0 valid / 2 invalid source / (errors propagate)
+///   - plan / status: 0 on success
+///   - apply / destroy: 0 on a `done` event, 1 on an `error` event
+///     or an incomplete stream
+fn run_remote(
+    target: String,
+    tenant: Option<String>,
+    token:  Option<String>,
+    action: RemoteCommand,
+) -> Result<ExitCode> {
+    // Auto-load `.env.cloud` so `AISLANG_CLOUD_TOKEN` / `AISLANG_TENANT`
+    // resolve the same way the `aislang cloud serve` operator surface
+    // already does.
+    load_cloud_dotenv_with_banner();
+
+    let token = token
+        .or_else(|| std::env::var("AISLANG_CLOUD_TOKEN").ok())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no bearer token — pass --token or set AISLANG_CLOUD_TOKEN \
+             (e.g. in .env.cloud).  This is the same token the control \
+             plane was started with."))?;
+    let tenant = tenant
+        .or_else(|| std::env::var("AISLANG_TENANT").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        use aislang_cloud::remote::{RemoteClient, RemoteError, SseTerminal};
+        let client = RemoteClient::new(&target, &token, &tenant);
+        eprintln!("aislang remote: target={target} tenant={tenant}");
+
+        // Print one SSE event as a progress line on stderr (results
+        // and artifacts go to stdout; progress narration to stderr so
+        // pipelines can capture clean output).
+        let print_event = |name: &str, data: &serde_json::Value| {
+            match name {
+                "progress" => eprintln!("  · {}: {}",
+                    data["phase"].as_str().unwrap_or("?"),
+                    data["detail"].as_str().unwrap_or("")),
+                "done" => eprintln!("  ✓ done"),
+                "error" => eprintln!("  ✗ error in {}: {}",
+                    data["phase"].as_str().unwrap_or("?"),
+                    data["error"].as_str().unwrap_or("")),
+                _ => {}
+            }
+        };
+
+        // Map a streaming outcome → exit code + a billing summary line.
+        let summarise_stream = |verb: &str, outcome: aislang_cloud::remote::SseOutcome| {
+            match outcome.terminal {
+                SseTerminal::Done(d) => {
+                    if let Some(q) = d["billing"]["quantity"].as_u64() {
+                        eprintln!("aislang remote: {verb} ok — billed {q} \
+                                   SP-equivalent");
+                    }
+                    ExitCode::SUCCESS
+                }
+                SseTerminal::Error(_) => {
+                    eprintln!("aislang remote: {verb} failed (see error above)");
+                    ExitCode::from(1)
+                }
+                SseTerminal::Incomplete => {
+                    eprintln!("aislang remote: {verb} stream ended without a \
+                               terminal event — treating as failure");
+                    ExitCode::from(1)
+                }
+            }
+        };
+
+        match action {
+            RemoteCommand::Status { id } => {
+                let row = client.status(&id).await?;
+                println!("{}", serde_json::to_string_pretty(&row)?);
+                Ok(ExitCode::SUCCESS)
+            }
+            RemoteCommand::Validate { id } => {
+                match client.validate(&id).await {
+                    Ok(v) => {
+                        eprintln!("aislang remote: ✓ valid — project `{}`",
+                            v["project_name"].as_str().unwrap_or("?"));
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    // 422 = the source failed to load.  Surface it as a
+                    // clean non-zero exit (2, mirroring local validate)
+                    // rather than an anyhow error trace.
+                    Err(RemoteError::Status { status: 422, body }) => {
+                        eprintln!("aislang remote: ✗ invalid — {body}");
+                        Ok(ExitCode::from(2))
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            RemoteCommand::Plan { id } => {
+                let v = client.plan(&id).await?;
+                if let Some(compose) = v["artifacts"]["docker_compose"].as_str() {
+                    // Compose YAML → stdout (the actual plan output).
+                    println!("{compose}");
+                }
+                eprintln!("aislang remote: ✓ planned `{}` — billed 1 \
+                           SP-equivalent",
+                    v["project_name"].as_str().unwrap_or("?"));
+                Ok(ExitCode::SUCCESS)
+            }
+            RemoteCommand::Apply { id } => {
+                let outcome = client.apply(&id, print_event).await?;
+                Ok(summarise_stream("apply", outcome))
+            }
+            RemoteCommand::Destroy { id } => {
+                let outcome = client.destroy(&id, print_event).await?;
+                Ok(summarise_stream("destroy", outcome))
+            }
+        }
+    })
 }
 
 /// Per-store health classification used by `aislang rag verify`
