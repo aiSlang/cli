@@ -491,6 +491,25 @@ enum CloudCommand {
         /// at the DB layer).
         tenant: String,
     },
+    /// v0.4 W25 — fully tear down a tenant + ALL of its data: drop
+    /// the tenant schema (projects / applied_stacks / idempotency_keys
+    /// / audit_log) + delete its shared-schema rows (`public.tenants`
+    /// / `tenant_members` / `project_repos` / `signups`).
+    ///
+    /// The inverse of `provision`.  **Destructive + irreversible** —
+    /// use for offboarding a customer or cleaning up test tenants.
+    /// Idempotent: deprovisioning an unknown tenant is a no-op.
+    ///
+    /// Requires `AISLANG_CLOUD_DB_URL`.
+    ///
+    /// ```sh
+    /// AISLANG_CLOUD_DB_URL=postgres://... \
+    ///   aislang cloud deprovision acme
+    /// ```
+    Deprovision {
+        /// Tenant slug to tear down.
+        tenant: String,
+    },
     /// v0.4 W23 Mon — Stripe metering API spike (Decision 46.3,
     /// risk-3 mitigation per §"Three v0.4 risks worth pre-
     /// mitigating").  Submits a single meter event to the Stripe
@@ -678,6 +697,8 @@ fn run() -> Result<ExitCode> {
                 run_cloud_serve(host, port).map(|_| ExitCode::SUCCESS)?,
             CloudCommand::Provision { tenant } =>
                 run_cloud_provision(tenant).map(|_| ExitCode::SUCCESS)?,
+            CloudCommand::Deprovision { tenant } =>
+                run_cloud_deprovision(tenant).map(|_| ExitCode::SUCCESS)?,
             CloudCommand::MeterEvent { customer, kind, quantity, identifier } =>
                 run_cloud_meter_event(customer, kind, quantity, identifier)
                     .map(|_| ExitCode::SUCCESS)?,
@@ -3871,6 +3892,50 @@ fn run_cloud_provision(tenant: String) -> Result<()> {
         pg.ensure_tenant_schema(&tenant).await
             .map_err(|e| anyhow::anyhow!("ensure_tenant_schema: {e}"))?;
         eprintln!("aislang cloud: tenant `{tenant}` provisioned ✓");
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// v0.4 W25 — `aislang cloud deprovision <tenant>`.  The inverse of
+/// `provision`: drops the tenant schema + deletes all of its
+/// shared-schema rows.  Destructive + irreversible.  Idempotent — a
+/// no-op (with a clear message) when the tenant doesn't exist.
+fn run_cloud_deprovision(tenant: String) -> Result<()> {
+    load_cloud_dotenv_with_banner();
+    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
+             deprovision` only makes sense against Postgres.  Set it before \
+             running:\n  \
+             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud deprovision <tenant>"))?;
+
+    if !aislang_cloud::db::is_valid_slug(&tenant) {
+        anyhow::bail!(
+            "tenant slug `{tenant}` is malformed — must match \
+             `^[a-z0-9][a-z0-9-]{{0,63}}$`");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
+
+    rt.block_on(async move {
+        use aislang_cloud::Store;
+        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
+            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
+        eprintln!("aislang cloud: deprovisioning tenant `{tenant}` \
+                   (DROP SCHEMA t_{tenant} CASCADE + delete shared rows)");
+        let existed = pg.deprovision_tenant(&tenant).await
+            .map_err(|e| anyhow::anyhow!("deprovision_tenant: {e}"))?;
+        if existed {
+            eprintln!("aislang cloud: tenant `{tenant}` deprovisioned ✓");
+        } else {
+            eprintln!("aislang cloud: tenant `{tenant}` did not exist — nothing \
+                       to do");
+        }
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
