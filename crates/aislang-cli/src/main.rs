@@ -3690,6 +3690,19 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
             eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
             let pg = aislang_cloud::db::PgStore::connect(&url).await
                 .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
+            // v0.4 W25 — reconcile every existing tenant schema to the
+            // current per-tenant DDL on startup (idempotent ALTER ...
+            // ADD COLUMN IF NOT EXISTS / CREATE TABLE IF NOT EXISTS), so
+            // a schema change shipped in this build (e.g. the `repo`
+            // column / `audit_log` table) backfills onto pre-existing
+            // tenants WITHOUT a manual per-tenant re-provision.
+            match pg.reconcile_all_tenant_schemas().await {
+                Ok((ok, failed)) => eprintln!(
+                    "aislang cloud: reconciled {ok} tenant schema(s) to current \
+                     DDL ({failed} failed)"),
+                Err(e) => eprintln!(
+                    "aislang cloud: WARN tenant-schema reconcile skipped: {e}"),
+            }
             aislang_cloud::AppState::new(config, std::sync::Arc::new(pg))
         } else {
             eprintln!("aislang cloud: AISLANG_CLOUD_DB_URL unset \
