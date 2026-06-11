@@ -3766,6 +3766,29 @@ fn run_cloud_serve(host: String, port: u16) -> Result<()> {
             }
         }
 
+        // v0.4 W25 Tue follow-up — swap in the REAL AWS SES email
+        // sender when AISLANG_EMAIL_FROM is set; otherwise signup
+        // verify-emails are LOGGED only (LoggingEmailSender default).
+        match aislang_cloud::signup::SesEmailSender::from_env() {
+            Ok(Some(sender)) => {
+                state.email_sender = std::sync::Arc::new(sender);
+                eprintln!("aislang cloud: live email ENABLED via AWS SES \
+                           (AISLANG_EMAIL_FROM set) — signup verify links \
+                           are emailed to users");
+            }
+            Ok(None) => {
+                eprintln!("aislang cloud: AISLANG_EMAIL_FROM unset — signup \
+                           verify emails are LOGGED only (not sent; set \
+                           AISLANG_EMAIL_FROM + AISLANG_SES_REGION + \
+                           AISLANG_SES_SMTP_USER + AISLANG_SES_SMTP_PASSWORD \
+                           to enable AWS SES)");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "SES email sender misconfigured: {e}"));
+            }
+        }
+
         let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await
             .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
