@@ -1,0 +1,13 @@
+# Keep the Docker build context small + the build reproducible.
+# NB: .git is intentionally NOT ignored — build.rs stamps the version
+# string from the git hash.
+target/
+**/target/
+.env
+.env.cloud
+*.log
+lcov.info
+.scannerwork/
+deploy/
+docs/
+tests/stress/
