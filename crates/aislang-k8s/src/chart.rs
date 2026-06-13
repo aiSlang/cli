@@ -221,6 +221,17 @@ pub fn build_values_yaml(ingress_host: Option<&str>) -> String {
 /// pattern verbatim.
 pub fn helm_templatize(manifest_body: &str) -> String {
     manifest_body
+        // Escape any pre-existing Helm delimiters in the (possibly
+        // user-authored) manifest content FIRST — e.g. `{{ output }}` in
+        // an agent prompt baked into the `aislang-project` ConfigMap —
+        // so Helm renders them as LITERAL text instead of trying to
+        // evaluate `output` as a template function.  Helm only starts an
+        // action on `{{`, so escaping the opening delimiter is enough (a
+        // lone `}}` is literal).  `str::replace` doesn't re-scan its own
+        // output, so the inserted `{{ "{{" }}` is safe; the four REAL
+        // `{{ .Values… }}` substitutions below are inserted AFTER this,
+        // so they stay live template actions.
+        .replace("{{", r#"{{ "{{" }}"#)
         .replace(AGENT_RUNTIME_IMAGE,                    IMAGE_TEMPLATE_REPLACEMENT)
         .replace(&format!("storage: {OPENWEBUI_DEFAULT_PVC_SIZE}"),
                  &format!("storage: {PVC_SIZE_TEMPLATE_REPLACEMENT}"))
@@ -369,6 +380,23 @@ mod tests {
         let templated = helm_templatize(&body);
         assert!(templated.contains(PVC_SIZE_TEMPLATE_REPLACEMENT),
             "PVC size must be templated; got:\n{templated}");
+    }
+
+    #[test] fn helm_templatize_escapes_user_double_braces() {
+        // An agent prompt baked into the aislang-project ConfigMap may
+        // contain `{{ output }}` (output-piping syntax).  It must NOT
+        // reach Helm as a live action (which 500s with `function
+        // "output" not defined`) — it's escaped to render as literal.
+        let body = "data:\n  prompt: \"summarise {{ output }} now\"\n";
+        let t = helm_templatize(body);
+        assert!(!t.contains("{{ output }}"),
+            "raw `{{{{ output }}}}` must be escaped; got:\n{t}");
+        assert!(t.contains(r#"{{ "{{" }}"#),
+            "must use Helm's literal-`{{{{` escape; got:\n{t}");
+        // The four real substitutions still produce LIVE actions —
+        // escaping happens before they're inserted.
+        let img = helm_templatize(&format!("image: {AGENT_RUNTIME_IMAGE}\n"));
+        assert!(img.contains(IMAGE_TEMPLATE_REPLACEMENT));
     }
 
     #[test] fn helm_templatize_replaces_litellm_replicas_only() {
