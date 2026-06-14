@@ -23,7 +23,9 @@ project "e2e-stack" {
     cost_max    = $0.001 per 1k_tokens
     latency_p95 = 2s
     residency   = [eu, us]
-    prefer   = [anthropic.claude_haiku_4_5, openai.gpt_4o_mini]
+    // OpenAI first so the e2e chat exercise works with OPENAI_API_KEY
+    // (swap the order or set ANTHROPIC_API_KEY to route to Claude).
+    prefer   = [openai.gpt_4o_mini, anthropic.claude_haiku_4_5]
     fallback = [ollama.llama_3_1_8b]
   }
 
