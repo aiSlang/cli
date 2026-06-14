@@ -4174,6 +4174,21 @@ fn run_remote(
     token:  Option<String>,
     action: RemoteCommand,
 ) -> Result<ExitCode> {
+    // `--target` is the control-plane BASE URL (where `aislang cloud
+    // serve` is reachable) — e.g. `https://api.aislang.cloud` or a
+    // port-forward `http://127.0.0.1:4001`.  A common mix-up is passing
+    // the executor mode (`kubernetes`) here; catch that with a clear
+    // message rather than reqwest's cryptic "relative URL without a base".
+    if !target.starts_with("http://") && !target.starts_with("https://") {
+        anyhow::bail!(
+            "--target must be the control plane's URL (e.g. \
+             https://api.aislang.cloud, or a port-forward \
+             http://127.0.0.1:4001), not `{target}`.\n\
+             (The executor mode `kubernetes` is a SERVER-side setting — \
+             you set it on the control plane via the Helm chart's \
+             `executor` value, not on `aislang remote`.)");
+    }
+
     // Auto-load `.env.cloud` so `AISLANG_CLOUD_TOKEN` / `AISLANG_TENANT`
     // resolve the same way the `aislang cloud serve` operator surface
     // already does.
