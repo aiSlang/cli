@@ -39,3 +39,6 @@ stack.yml
 
 # Allow lockfile (this is a binary crate — Cargo.lock should be committed)
 !Cargo.lock
+
+# mdbook build output (docs.aislang.cloud)
+docs-site/book/
