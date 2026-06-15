@@ -1,0 +1,21 @@
+# cargo-audit configuration — v0.4 W26 Tue security review.
+#
+# Run:  cargo audit            (CI / dev — fetches the advisory DB)
+#       cargo audit -d <path> --no-fetch   (offline / NFS workaround)
+#
+# The DoD bar is ZERO high/critical advisories.  Documented exceptions
+# below (each MUST state why it isn't exploitable in THIS workspace).
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" RSA timing sidechannel in the
+    # `rsa` crate (severity 5.9 MEDIUM; no upstream fix available).
+    #
+    # NOT EXPLOITABLE HERE: `rsa` is pulled ONLY by `sqlx-mysql`, which is
+    # never compiled — `aislang-cloud` uses sqlx with `default-features =
+    # false` + the `postgres` feature only (no `mysql`).  `cargo tree -i
+    # rsa` prints nothing: the vulnerable code is a lock-file entry, not in
+    # the build graph.  Re-evaluate if a Postgres/MySQL switch or any new
+    # dependency actually pulls `rsa` into a compiled binary.
+    "RUSTSEC-2023-0071",
+]
