@@ -1183,7 +1183,11 @@ mod tests {
         // items[] maps:
         //   project.ais  → project.ais
         //   aislang.lock → aislang.lock
-        //   <prompt-label> → prompts/<prompt-label>
+        //   <prompt-label> → <the prompt's declared file path>, e.g.
+        //                    `system` (file = "./prompts/system.md")
+        //                    → prompts/system.md.  The path is the SOURCE's
+        //                    file path (NOT prompts/<label>) so the runtime's
+        //                    `file = ...` resolves to the mounted file.
         let items = vol["configMap"]["items"].as_sequence()
             .expect("items[] must be present (we set per-key paths)");
         let paths: Vec<(String, String)> = items.iter()
@@ -1196,8 +1200,9 @@ mod tests {
             "items[] must map project.ais → project.ais; got: {paths:?}");
         assert!(paths.iter().any(|(k, p)| k == "aislang.lock" && p == "aislang.lock"),
             "items[] must map aislang.lock → aislang.lock; got: {paths:?}");
-        assert!(paths.iter().any(|(k, p)| k == "system" && p == "prompts/system"),
-            "items[] must map system → prompts/system; got: {paths:?}");
+        assert!(paths.iter().any(|(k, p)| k == "system" && p == "prompts/system.md"),
+            "items[] must map system → its file path prompts/system.md \
+             (so the runtime's `file = ./prompts/system.md` resolves); got: {paths:?}");
     }
 
     #[test] fn agent_runtime_carries_aislang_labels_with_deploy_propagated() {
