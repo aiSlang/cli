@@ -1037,6 +1037,25 @@ mod tests {
             "agent-runtime must envFrom the providers Secret; got: {names:?}");
     }
 
+    #[test] fn agent_runtime_sets_in_cluster_litellm_url() {
+        // chat_turn dials LiteLLM at AISLANG_LITELLM_URL; in K8s LiteLLM is
+        // a sibling pod (`litellm:4000`), NOT localhost.  Without this env
+        // the runtime falls back to 127.0.0.1:4000 and every chat turn
+        // fails with "error sending request for url".
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent-runtime Deployment");
+        let env = dep.2["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_sequence().expect("env is list");
+        let litellm = env.iter()
+            .find(|e| e["name"].as_str() == Some("AISLANG_LITELLM_URL"))
+            .expect("agent-runtime must set AISLANG_LITELLM_URL");
+        assert_eq!(litellm["value"].as_str(), Some("http://litellm:4000"),
+            "AISLANG_LITELLM_URL must point at the in-cluster litellm service");
+    }
+
     #[test] fn aislang_project_configmap_contains_source_and_lockfile() {
         // Decision 43.4: the CM bakes the .ais source + lockfile body
         // so the pod has everything it needs to run `aislang mcp-serve`
@@ -1183,7 +1202,11 @@ mod tests {
         // items[] maps:
         //   project.ais  → project.ais
         //   aislang.lock → aislang.lock
-        //   <prompt-label> → prompts/<prompt-label>
+        //   <prompt-label> → <the prompt's declared file path>, e.g.
+        //                    `system` (file = "./prompts/system.md")
+        //                    → prompts/system.md.  The path is the SOURCE's
+        //                    file path (NOT prompts/<label>) so the runtime's
+        //                    `file = ...` resolves to the mounted file.
         let items = vol["configMap"]["items"].as_sequence()
             .expect("items[] must be present (we set per-key paths)");
         let paths: Vec<(String, String)> = items.iter()
@@ -1196,8 +1219,9 @@ mod tests {
             "items[] must map project.ais → project.ais; got: {paths:?}");
         assert!(paths.iter().any(|(k, p)| k == "aislang.lock" && p == "aislang.lock"),
             "items[] must map aislang.lock → aislang.lock; got: {paths:?}");
-        assert!(paths.iter().any(|(k, p)| k == "system" && p == "prompts/system"),
-            "items[] must map system → prompts/system; got: {paths:?}");
+        assert!(paths.iter().any(|(k, p)| k == "system" && p == "prompts/system.md"),
+            "items[] must map system → its file path prompts/system.md \
+             (so the runtime's `file = ./prompts/system.md` resolves); got: {paths:?}");
     }
 
     #[test] fn agent_runtime_carries_aislang_labels_with_deploy_propagated() {

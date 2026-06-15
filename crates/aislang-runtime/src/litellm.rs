@@ -341,6 +341,22 @@ impl LiteLlmClient {
     /// to the first-resolved address. Pinning v4 sidesteps it.
     pub const DEFAULT_URL: &'static str = "http://127.0.0.1:4000";
 
+    /// Env var overriding the LiteLLM base URL the agent dials.  Unset →
+    /// [`Self::DEFAULT_URL`] (localhost — the local CLI / compose case).
+    /// The K8s emitter sets this to the in-cluster service
+    /// `http://litellm:4000` on the agent-runtime pod, since there LiteLLM
+    /// is a sibling pod, NOT localhost.
+    pub const URL_ENV_VAR: &'static str = "AISLANG_LITELLM_URL";
+
+    /// The LiteLLM base URL from [`Self::URL_ENV_VAR`], if set + non-empty.
+    /// Callers pass the result as the `litellm_url` arg to `Session::open*`
+    /// (None → the session uses [`Self::DEFAULT_URL`]).
+    pub fn url_from_env() -> Option<String> {
+        std::env::var(Self::URL_ENV_VAR).ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     /// 300 seconds (5 minutes). Sized for CPU-bound local inference
     /// (Ollama on a developer laptop generating a 4k-token response
     /// can comfortably take 60-180s; eval datasets exercise the

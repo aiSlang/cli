@@ -653,6 +653,33 @@ fn build_aislang_project_configmap_inner(
     )
 }
 
+/// Normalize a prompt's declared `file` path (relative to the project
+/// source dir) into the path it must mount at inside the agent-runtime
+/// ConfigMap volume — i.e. relative to [`PROJECT_MOUNT_DIR`].  Strips a
+/// leading `./` (and any redundant path components) so the agent runtime's
+/// `file = "./prompts/system.md"` resolves to the mounted file.  Falls back
+/// to `prompts/<label>` if the path escapes the mount dir (absolute, or
+/// contains `..`) — which K8s would reject as an items[] path anyway.
+fn cm_prompt_mount_path(file: &std::path::Path, label: &str) -> String {
+    use std::path::Component;
+    let escapes = file.components().any(|c|
+        matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+    if escapes {
+        return format!("{PROJECT_PROMPTS_SUBDIR}/{label}");
+    }
+    let rel: Vec<String> = file.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None, // drop CurDir (`.`) etc.
+        })
+        .collect();
+    if rel.is_empty() {
+        format!("{PROJECT_PROMPTS_SUBDIR}/{label}")
+    } else {
+        rel.join("/")
+    }
+}
+
 /// Build the agent-runtime Deployment + Service.  The Deployment
 /// runs the published aiSlang binary as `aislang mcp-serve --http
 /// 0.0.0.0:<port> <PROJECT_MOUNT_DIR>/<PROJECT_CM_AIS_KEY>`; the
@@ -773,15 +800,27 @@ pub fn build_agent_runtime_with_sources(
             },
         ]
     };
+    // Map each prompt label to the ORIGINAL relative file path it was
+    // declared with in the .ais (e.g. `./prompts/system.md`), normalized to
+    // a CM-relative mount path (`prompts/system.md`).  The agent runtime
+    // resolves the source's `file = "./prompts/<x>"` against the mount dir,
+    // so the file MUST land at exactly that path — mounting it at
+    // `prompts/<label>` (the v0.2/v0.3 behaviour) left it unreadable
+    // whenever the label != filename or the file had an extension (e.g.
+    // label `system` + `system.md` → runtime opens `prompts/system.md`,
+    // file mounted at `prompts/system` → ENOENT).
+    let prompt_file_paths: BTreeMap<&str, String> = resolved.project.prompts
+        .iter()
+        .map(|p| (p.label.as_str(), cm_prompt_mount_path(&p.file, &p.label)))
+        .collect();
     // Sorted iteration over prompt labels for determinism.
     let mut prompt_labels: Vec<&String> =
         resolved.prompt_hashes.keys().collect();
     prompt_labels.sort();
     for label in prompt_labels {
-        cm_items.push(KeyToPath {
-            key:  label.clone(),
-            path: format!("{PROJECT_PROMPTS_SUBDIR}/{label}"),
-        });
+        let path = prompt_file_paths.get(label.as_str()).cloned()
+            .unwrap_or_else(|| format!("{PROJECT_PROMPTS_SUBDIR}/{label}"));
+        cm_items.push(KeyToPath { key: label.clone(), path });
     }
 
     // ── Container spec.
@@ -813,7 +852,20 @@ pub fn build_agent_runtime_with_sources(
         // pattern is `aislang.agent_runtime.<deploy-label>` —
         // distinguishes deploys when a single Jaeger sees traces
         // from multiple aislang stacks (multi-tenant clusters).
-        env: Some(otel_env_vars("agent_runtime", deploy_label)),
+        env: Some({
+            // OTLP span export + the in-cluster LiteLLM URL.  chat_turn's
+            // session dials LiteLLM at AISLANG_LITELLM_URL; in K8s LiteLLM
+            // is a SIBLING pod (`litellm:4000`), not localhost, so set it
+            // explicitly — otherwise the runtime falls back to
+            // 127.0.0.1:4000 and every chat turn fails with "error sending
+            // request for url".
+            let mut env = otel_env_vars("agent_runtime", deploy_label);
+            env.push(EnvVar {
+                name:  "AISLANG_LITELLM_URL".to_string(),
+                value: "http://litellm:4000".to_string(),
+            });
+            env
+        }),
         // Default image entrypoint is `aislang`; pass the mcp-serve
         // subcommand + transport flag as args.  `--http 0.0.0.0:<port>`
         // binds on every pod interface so the Service can reach it.
@@ -1153,4 +1205,34 @@ pub fn build_openwebui_ingress(deploy_label: &str, host: &str) -> Ingress {
             }],
         },
     )
+}
+
+#[cfg(test)]
+mod prompt_path_tests {
+    use super::cm_prompt_mount_path;
+    use std::path::Path;
+
+    #[test]
+    fn maps_declared_file_path_so_runtime_resolves_it() {
+        // `file = "./prompts/system.md"` must mount at prompts/system.md
+        // (the path the runtime opens), NOT prompts/<label>.
+        assert_eq!(cm_prompt_mount_path(Path::new("./prompts/system.md"), "system"),
+                   "prompts/system.md");
+        assert_eq!(cm_prompt_mount_path(Path::new("prompts/system.md"), "system"),
+                   "prompts/system.md");
+        // Bare filename (no subdir) → mounts at the root of the mount dir.
+        assert_eq!(cm_prompt_mount_path(Path::new("./system.md"), "system"),
+                   "system.md");
+    }
+
+    #[test]
+    fn falls_back_to_prompts_label_on_unsafe_paths() {
+        // Traversal / absolute can't mount inside the volume → safe fallback.
+        assert_eq!(cm_prompt_mount_path(Path::new("../escape.md"), "system"),
+                   "prompts/system");
+        assert_eq!(cm_prompt_mount_path(Path::new("/etc/passwd"), "system"),
+                   "prompts/system");
+        assert_eq!(cm_prompt_mount_path(Path::new("."), "system"),
+                   "prompts/system");
+    }
 }
