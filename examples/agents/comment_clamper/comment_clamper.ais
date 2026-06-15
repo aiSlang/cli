@@ -1,0 +1,68 @@
+## v0.4 Week 26 Mon — comment-clamper dogfood agent.
+##
+## Mission soft-pref "agents author v0.4 code": an aiSlang agent that
+## CLAMPS the codebase's verbose doc-comments (the long Decision-46.x
+## narrations + PLAN-style day-row notes that accreted across the build)
+## down to a budget, WITHOUT changing code or losing load-bearing
+## meaning (Decision refs, invariants, the "why" behind a non-obvious
+## choice).  Run over `crates/aislang-cloud/` as the W26 Mon refactor's
+## comment pass.
+##
+## ## Direct chat (one comment block at a time)
+##
+## ```
+## aislang chat comment_clamper \
+##   examples/agents/comment_clamper/comment_clamper.ais
+## > <paste a verbose /// doc-comment or //! module header>
+## ```
+##
+## The agent returns ONLY the clamped comment (same `///` / `//!` / `//`
+## prefix), ready to paste back over the original.  It never emits code,
+## never invents Decision numbers, and keeps every reference that was in
+## the input.
+##
+## ## Model choice
+##
+## anthropic.claude_haiku_4_5 primary — clamping is a bounded
+## summarization task (fast tier is plenty); ollama qwen3:8b fallback
+## for the offline/CI case.
+
+project "comment-clamper-agent" {
+  budget {
+    hard_cap_per_day = $1
+    hard_cap_per_run = $0.20
+    optimize_for     = cost
+  }
+
+  model "clamp_brain" {
+    requires    = [chat]
+    context_min = 32k
+    cost_max    = $0.005 per 1k_tokens
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
+  }
+
+  prompt "clamp_sys" {
+    file    = "./prompts/comment_clamper.md"
+    version = "1.0.0"
+  }
+
+  agent "comment_clamper" {
+    model         = model.clamp_brain
+    system_prompt = prompt.clamp_sys
+    tools         = []
+  }
+
+  ## Single-step pipeline — one clamp pass over one comment block.
+  ## Driving it over a whole crate is a shell loop around `aislang
+  ## chat` (the operator pass), one block in → clamped block out.
+  pipeline "clamp_once" {
+    steps  = [agent.comment_clamper]
+    input  = "one verbose Rust doc-comment / module header"
+    output = "the clamped comment, same prefix, code untouched"
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
