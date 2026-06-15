@@ -1866,8 +1866,11 @@ async fn build_session_for_agent(
     let tool_registry = ToolRegistry::from_servers(&server_tools);
 
     // ── 6. open Session with optional budget + tracker ──
+    // litellm_url from AISLANG_LITELLM_URL (the K8s emitter sets it to
+    // http://litellm:4000); None → localhost default for the local CLI.
+    let litellm_url = crate::litellm::LiteLlmClient::url_from_env();
     let s = Session::open_with_tools(
-        &model_label, system_prompt, None,
+        &model_label, system_prompt, litellm_url.as_deref(),
         mcp_clients, tool_registry,
     ).map_err(|e| format!("open session: {e}"))?;
     let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };
@@ -2035,8 +2038,9 @@ async fn build_session_for_agent_multi_module(
     //       FULL qualified key (`coder.fast` etc) — LiteLLM's
     //       router config from `aislang plan` uses the same key,
     //       so the dispatch stays consistent across plan + chat.
+    let litellm_url = crate::litellm::LiteLlmClient::url_from_env();
     let s = Session::open_with_tools(
-        &model_key, system_prompt, None,
+        &model_key, system_prompt, litellm_url.as_deref(),
         mcp_clients, tool_registry,
     ).map_err(|e| format!("open session: {e}"))?;
     let s = match budget_cfg { Some(b) => s.with_budget(b), None => s };

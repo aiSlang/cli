@@ -852,7 +852,20 @@ pub fn build_agent_runtime_with_sources(
         // pattern is `aislang.agent_runtime.<deploy-label>` —
         // distinguishes deploys when a single Jaeger sees traces
         // from multiple aislang stacks (multi-tenant clusters).
-        env: Some(otel_env_vars("agent_runtime", deploy_label)),
+        env: Some({
+            // OTLP span export + the in-cluster LiteLLM URL.  chat_turn's
+            // session dials LiteLLM at AISLANG_LITELLM_URL; in K8s LiteLLM
+            // is a SIBLING pod (`litellm:4000`), not localhost, so set it
+            // explicitly — otherwise the runtime falls back to
+            // 127.0.0.1:4000 and every chat turn fails with "error sending
+            // request for url".
+            let mut env = otel_env_vars("agent_runtime", deploy_label);
+            env.push(EnvVar {
+                name:  "AISLANG_LITELLM_URL".to_string(),
+                value: "http://litellm:4000".to_string(),
+            });
+            env
+        }),
         // Default image entrypoint is `aislang`; pass the mcp-serve
         // subcommand + transport flag as args.  `--http 0.0.0.0:<port>`
         // binds on every pod interface so the Service can reach it.
