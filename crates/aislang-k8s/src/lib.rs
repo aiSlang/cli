@@ -1624,7 +1624,7 @@ mod tests {
         ProjectSources {
             ais_source:    String::new(),
             modules,
-            manifest:      Some("[project]\nname = \"multi\"\nversion = \"0.1.0\"\n".to_string()),
+            manifest:      Some("[project]\nname = \"multi\"\nversion = \"0.1.0\"\n\n[modules]\nm1 = \"../m1/m1.ais\"\nm2 = \"../m2/m2.ais\"\n".to_string()),
             lockfile:      None,
             prompt_bodies: Btm::new(),
         }
@@ -1645,9 +1645,18 @@ mod tests {
             "CM data must carry `m1.ais` key for multi-module; got:\n{cm_yaml}");
         assert!(data["m2.ais"].as_str().is_some(),
             "CM data must carry `m2.ais` key for multi-module; got:\n{cm_yaml}");
-        // Manifest present under aislang.toml.
-        assert!(data["aislang.toml"].as_str().is_some(),
-            "CM data must carry `aislang.toml` key for multi-module; got:\n{cm_yaml}");
+        // Manifest present under aislang.toml — AND its [modules] paths
+        // rewritten to the flattened `<name>.ais` files the CM mounts at
+        // the root (not the repo's sibling-dir `../m1/m1.ais` paths, which
+        // would make the in-pod loader read `/etc/aislang/../m1/...`).
+        let manifest = data["aislang.toml"].as_str()
+            .expect("CM data must carry `aislang.toml` key for multi-module");
+        assert!(manifest.contains("m1 = \"m1.ais\"") && manifest.contains("m2 = \"m2.ais\""),
+            "manifest [modules] must be flattened to <name>.ais; got:\n{manifest}");
+        assert!(!manifest.contains("../"),
+            "manifest must not retain sibling-dir (`..`) module paths; got:\n{manifest}");
+        assert!(manifest.contains("name = \"multi\""),
+            "manifest [project] must be preserved verbatim; got:\n{manifest}");
         // Lockfile key present (empty string is fine — None lockfile).
         assert!(data["aislang.lock"].as_str().is_some(),
             "CM data must always carry `aislang.lock` key; got:\n{cm_yaml}");

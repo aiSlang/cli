@@ -607,6 +607,41 @@ pub fn build_aislang_project_configmap_multi(
     )
 }
 
+/// Rewrite a multi-module manifest's `[modules]` table so every entry
+/// points at the FLATTENED `<name>.ais` file the ConfigMap actually
+/// mounts at the project root, instead of the repo's original
+/// (possibly sibling-dir, `..`-escaping) path.  Everything outside
+/// `[modules]` — notably `[project]` + comments — is preserved
+/// verbatim; the `[modules]` table is regenerated from the known module
+/// names (which are exactly the CM's `<name>.ais` data keys).
+fn flatten_manifest_modules(
+    manifest:       &str,
+    module_sources: &BTreeMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    let mut in_modules = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            // A new table header ends any `[modules]` run; we re-emit
+            // `[modules]` ourselves at the end, so drop the old one.
+            in_modules = trimmed.starts_with("[modules]");
+            if in_modules { continue; }
+        }
+        if in_modules { continue; }   // skip the old per-module path lines
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !out.is_empty() && !out.ends_with('\n') { out.push('\n'); }
+    out.push_str("\n[modules]\n");
+    for name in module_sources.keys() {
+        // Module names are aiSlang identifiers (`a-z0-9_`), safe as bare
+        // TOML keys; the value is the flattened mount-root filename.
+        out.push_str(&format!("{name} = \"{name}.ais\"\n"));
+    }
+    out
+}
+
 /// Common backing implementation.  Single-file callers pass an
 /// `ais_source` + empty module map; multi-module callers pass an
 /// empty `ais_source` + populated module map.
@@ -631,12 +666,21 @@ fn build_aislang_project_configmap_inner(
         // Single-file (v0.2 baseline).
         data.insert(PROJECT_CM_AIS_KEY.to_string(), ais_source.to_string());
     } else {
-        // Multi-module (v0.3 Thu).
+        // Multi-module (v0.3 Thu).  Module sources are FLATTENED to
+        // `<name>.ais` at the mount root (the CM can't reproduce the
+        // repo's sibling-dir layout — `../architect/architect.ais`
+        // escapes the mount + K8s rejects `..` in items[] paths).  The
+        // manifest must therefore be REWRITTEN to match: its `[modules]`
+        // paths point at the original sibling dirs, so a verbatim copy
+        // makes the runtime loader read `/etc/aislang/../architect/...`
+        // → ENOENT.  flatten_manifest_modules() rebases each entry to
+        // `<name>.ais` so manifest + files agree inside the pod.
         for (name, source) in module_sources {
             data.insert(format!("{name}.ais"), source.clone());
         }
         if let Some(m) = manifest {
-            data.insert(PROJECT_CM_MANIFEST_KEY.to_string(), m.to_string());
+            data.insert(PROJECT_CM_MANIFEST_KEY.to_string(),
+                flatten_manifest_modules(m, module_sources));
         }
     }
     data.insert(PROJECT_CM_LOCKFILE_KEY.to_string(),
