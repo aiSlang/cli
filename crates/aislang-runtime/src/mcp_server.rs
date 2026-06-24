@@ -1224,6 +1224,190 @@ impl AislangServer {
         Ok(CallToolResult::success(vec![Content::text(reply)]))
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // W26 — server-side pattern dispatch.  `chat_turn` runs ONE agent;
+    // `run_pipeline` runs a multi-agent **pipeline** or **loop** in a
+    // single call (the orchestration the CLI's `aislang chat
+    // <pattern_label>` does client-side), so a remote MCP client (Claude
+    // Desktop) can invoke `coder_review_cycle` / `full_design` directly
+    // instead of hand-rolling the step-threading in a prompt.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Run a declared **pipeline** or **loop** end-to-end: dispatch each
+    /// step agent in order, threading every reply into the next step's
+    /// input; for a loop, re-run the body pipeline (feeding its reply
+    /// back) until an `ACCEPT…` verdict or `max_iter`.  Returns a
+    /// per-step transcript + the final reply.
+    #[tool(
+        name = "aislang_run_pipeline",
+        description = "Run a multi-agent PIPELINE or LOOP defined in the \
+            project (e.g. `coder_review_cycle`, `full_design`, \
+            `review_cycle`) end-to-end in ONE call — the same orchestration \
+            `aislang chat <label>` does locally.  Each step agent's reply is \
+            threaded into the next step; a loop re-runs its body pipeline \
+            (feeding the reply back) until the reply starts with `ACCEPT` or \
+            `max_iter` is hit.  Use this instead of manually chaining \
+            `aislang_chat_turn` calls.  Pass `source_path` (the project dir \
+            or .ais file) + `pattern_label` + `user_input`.  Branches \
+            (router) are not supported here yet — use the CLI for those.",
+        annotations(
+            title             = "Run pipeline / loop",
+            destructive_hint  = false,
+            read_only_hint    = false,
+            idempotent_hint   = false,
+            open_world_hint   = true,
+        )
+    )]
+    pub async fn run_pipeline(&self,
+        Parameters(p): Parameters<RunPipelineParameters>,
+    ) -> Result<CallToolResult, RmcpError> {
+        // ── resolve source_dir + source (dir-input dispatch, same as chat_turn).
+        let dir_input: Option<PathBuf> = p.source_path.as_deref()
+            .map(std::path::Path::new)
+            .filter(|pp| pp.is_dir())
+            .map(|pp| pp.to_path_buf());
+        let (source_dir, source) = if let Some(dir) = dir_input.as_ref() {
+            let canonical = std::fs::canonicalize(dir).map_err(|e|
+                RmcpError::invalid_params(
+                    format!("source_path dir `{}` not readable: {e}", dir.display()),
+                    None))?;
+            (canonical, String::new())
+        } else {
+            let sd = resolve_source_dir_or_infer_from_path(
+                p.source_dir.as_deref(), p.source_path.as_deref())?;
+            let s = resolve_source(p.source.clone(), p.source_path.clone(), &sd)?;
+            (sd, s)
+        };
+
+        // ── load the project to resolve the pattern label + its steps.
+        let loaded = crate::load_project_input(&source_dir)
+            .map_err(|e| RmcpError::invalid_params(
+                format!("load project: {e}"), None))?;
+        let project = &loaded.resolved.project;
+        let label   = &p.pattern_label;
+
+        // Resolve label → (qualified label, step agents, max_iter, is_loop).
+        // Mirrors the CLI's run_chat dispatch setup.
+        let (qualified, steps, max_iter, is_loop) =
+            if let Some(resolved) = loaded.find_loop_label(label) {
+                let lb = project.loops.iter().find(|l| l.label == resolved)
+                    .expect("find_loop_label returned a missing label");
+                let body_module = resolved.split_once('.').map(|(m, _)| m);
+                let body_label = match (&lb.body.module, body_module) {
+                    (Some(m), _)    => format!("{m}.{}", lb.body.label),
+                    (None, Some(c)) => format!("{c}.{}", lb.body.label),
+                    (None, None)    => lb.body.label.clone(),
+                };
+                let bp = project.pipelines.iter().find(|pp| pp.label == body_label)
+                    .ok_or_else(|| RmcpError::invalid_params(format!(
+                        "loop `{resolved}` body pipeline `{body_label}` does not exist"),
+                        None))?;
+                (resolved.clone(), qualify_pipeline_step_labels(bp), lb.max_iter, true)
+            } else if let Some(resolved) = loaded.find_pipeline_label(label) {
+                let pl = project.pipelines.iter().find(|pp| pp.label == resolved)
+                    .expect("find_pipeline_label returned a missing label");
+                (resolved.clone(), qualify_pipeline_step_labels(pl), 0u32, false)
+            } else if loaded.find_branch_label(label).is_some() {
+                return Err(RmcpError::invalid_params(format!(
+                    "`{label}` is a branch (router) — not supported via MCP yet; \
+                     run it from the CLI (`aislang chat {label} <dir>`)"), None));
+            } else {
+                let mut names: Vec<&str> = project.pipelines.iter()
+                    .map(|pp| pp.label.as_str())
+                    .chain(project.loops.iter().map(|l| l.label.as_str()))
+                    .collect();
+                names.sort();
+                return Err(RmcpError::invalid_params(format!(
+                    "no pipeline or loop named `{label}`; available: {}",
+                    if names.is_empty() { "(none declared)".to_string() }
+                    else { names.join(", ") }), None));
+            };
+        if steps.is_empty() {
+            return Err(RmcpError::invalid_params(
+                format!("`{qualified}` has no steps to run"), None));
+        }
+
+        // ── orchestrate.  Pipeline → one pass; loop → up to max_iter passes,
+        //    feeding each pass's final reply back, stopping on ACCEPT.
+        let passes = if is_loop { max_iter.max(1) } else { 1 };
+        let mut transcript   = String::new();
+        let mut current      = p.user_input.clone();
+        let mut final_reply  = String::new();
+        let mut accepted     = false;
+        let mut iters_run    = 0u32;
+        for iter in 1..=passes {
+            iters_run = iter;
+            if is_loop {
+                transcript.push_str(&format!("\n══ iteration {iter}/{passes} ══\n"));
+            }
+            for (i, step) in steps.iter().enumerate() {
+                let reply = self.run_one_agent_turn(&source, &source_dir, step, &current)
+                    .await
+                    .map_err(|e| RmcpError::internal_error(
+                        format!("step[{i}] `{step}`: {e}"), None))?;
+                transcript.push_str(&format!("\n▸ {step}\n{reply}\n"));
+                current     = reply.clone();
+                final_reply = reply;
+            }
+            if is_loop && is_accept_verdict(&final_reply) { accepted = true; break; }
+        }
+
+        let header = if is_loop {
+            format!("{qualified} (loop) — {} after {iters_run} iteration(s)\n",
+                if accepted { "ACCEPTED" } else { "stopped (max_iter reached)" })
+        } else {
+            format!("{qualified} (pipeline) — {} step(s)\n", steps.len())
+        };
+        Ok(CallToolResult::success(vec![Content::text(
+            format!("{header}{transcript}\n── final reply ──\n{final_reply}"))]))
+    }
+
+    /// Run ONE agent turn against the (source_dir, agent_label) session
+    /// (get-or-create from the shared pool), returning the reply.  The
+    /// reusable core `run_pipeline` calls per step; mirrors `chat_turn`'s
+    /// session + `spawn_blocking`-turn dance minus progress/RAG streaming.
+    async fn run_one_agent_turn(
+        &self,
+        source:      &str,
+        source_dir:  &Path,
+        agent_label: &str,
+        user_input:  &str,
+    ) -> Result<String, String> {
+        let key = SessionKey {
+            source_dir:  source_dir.to_path_buf(),
+            agent_label: agent_label.to_string(),
+        };
+        let session = {
+            let map = self.sessions.read().await;
+            if let Some(s) = map.get(&key) {
+                Arc::clone(s)
+            } else {
+                drop(map);
+                let mut map = self.sessions.write().await;
+                if let Some(s) = map.get(&key) {
+                    Arc::clone(s)
+                } else {
+                    let built = build_session_for_agent(source, source_dir, agent_label)
+                        .await
+                        .map_err(|e| format!("open session for `{agent_label}`: {e}"))?;
+                    let arc = Arc::new(built);
+                    map.insert(key.clone(), Arc::clone(&arc));
+                    arc
+                }
+            }
+        };
+        let input = user_input.to_string();
+        // Session::turn is !Send (holds an OTel guard across awaits); hand it
+        // to a blocking thread with its own current-thread runtime, same as
+        // chat_turn.  The JoinHandle is Send, so this stays #[tool]-compatible.
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build()
+                .map_err(|e| format!("build inner runtime: {e}"))?;
+            rt.block_on(session.turn(&input)).map_err(|e| format!("{e}"))
+        }).await.map_err(|e| format!("join turn task: {e}"))?
+    }
+
     /// Run a declared eval against the deployed stack.  Loads the
     /// dataset, opens a fresh Session, scores every case, aggregates,
     /// returns the EvalReport as pretty JSON.
@@ -1526,6 +1710,33 @@ pub struct ChatTurnParameters {
     pub user_input: String,
 }
 
+/// `run_pipeline` parameters — like `chat_turn` but targets a PIPELINE
+/// or LOOP label instead of a single agent.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct RunPipelineParameters {
+    /// **PREFERRED.**  Filesystem path to the project — a directory (a
+    /// multi-module project root holding `aislang.toml`) or a single
+    /// `.ais` file.  In a deployed agent this is the mount dir
+    /// (`/etc/aislang`).
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// **For in-memory callers only.**  The full `.ais` source body
+    /// (single-file projects).  `source_path` wins when both are given.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Directory that module/prompt paths resolve against.  Defaults to
+    /// cwd / inferred from `source_path`.
+    #[serde(default)]
+    pub source_dir: Option<String>,
+    /// The pipeline or loop label to run (e.g. `coder_review_cycle`,
+    /// `full_design`, `review_cycle`).  Accepts a bare label or a
+    /// module-qualified one; a unique suffix match also resolves.
+    pub pattern_label: String,
+    /// Initial input fed to the FIRST step (and, for a loop, the first
+    /// pass).  Each step's reply threads into the next step's input.
+    pub user_input: String,
+}
+
 /// `eval` parameters.  No agent_label — each `eval` block in the
 /// source declares its own agent (or defaults to the project's
 /// single agent).
@@ -1737,6 +1948,37 @@ fn build_rag_prefix_for_turn(
             i + 1, score, text));
     }
     Ok(out)
+}
+
+/// Fold a pipeline's `steps: Vec<Ref>` into qualified agent labels for
+/// the `(source_dir, agent_label)` session-key lookup.  Mirrors the CLI's
+/// `qualify_pipeline_steps` + `patterns::orchestrator::qualified_step_labels`:
+/// a cross-module ref → `m.<label>`; a same-module ref inherits the
+/// pipeline's own `<module>.` prefix; single-file → the bare label.
+fn qualify_pipeline_step_labels(pipeline: &aislang_core::ast::Pipeline) -> Vec<String> {
+    let containing = pipeline.label.split_once('.').map(|(m, _)| m);
+    pipeline.steps.iter().map(|r| match (&r.module, containing) {
+        (Some(m), _)    => format!("{m}.{}", r.label),
+        (None, Some(c)) => format!("{c}.{}", r.label),
+        (None, None)    => r.label.clone(),
+    }).collect()
+}
+
+/// Loop stop-condition (v0.3/W26 scope): the body pipeline's final reply
+/// is an ACCEPT verdict.  Matches the CLI's check — a leading `ACCEPT`
+/// (case-insensitive) on the trimmed reply, or a `{"verdict":"ACCEPT…"}`
+/// JSON shape.  (Template-driven `loop.condition` is a v0.5 item.)
+fn is_accept_verdict(reply: &str) -> bool {
+    let t = reply.trim();
+    if t.to_ascii_lowercase().starts_with("accept") {
+        return true;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        if let Some(s) = v.get("verdict").and_then(|x| x.as_str()) {
+            return s.trim().to_ascii_lowercase().starts_with("accept");
+        }
+    }
+    false
 }
 
 async fn build_session_for_agent(
@@ -3601,6 +3843,57 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c, "different source_dir → different key");
         assert_ne!(a, d, "different agent_label → different key");
+    }
+
+    // ── run_pipeline orchestration helpers ───────────────────────
+    // The tool's happy path needs a live LiteLLM (exercised via Claude
+    // Desktop like chat_turn); these cover the pure logic underneath.
+
+    #[test]
+    fn pipeline_step_labels_qualify_by_module_then_pipeline_prefix() {
+        use aislang_core::ast::{Pipeline, Ref, RefKind};
+        let mk = |module: Option<&str>, label: &str| Ref {
+            kind:   RefKind::Agent,
+            label:  label.to_string(),
+            module: module.map(str::to_string),
+        };
+        // Multi-module pipeline `coder.coder_review_cycle`: a cross-module
+        // step keeps its module; a same-module step inherits the pipeline's
+        // `coder.` prefix.
+        let p = Pipeline {
+            label:  "coder.coder_review_cycle".to_string(),
+            steps:  vec![mk(Some("coder"), "coder"),
+                         mk(Some("code_reviewer"), "code_reviewer"),
+                         mk(None, "tester")],
+            input:  None,
+            output: None,
+        };
+        assert_eq!(qualify_pipeline_step_labels(&p), vec![
+            "coder.coder".to_string(),
+            "code_reviewer.code_reviewer".to_string(),
+            "coder.tester".to_string(),
+        ]);
+        // Single-file pipeline (bare label) → bare step labels.
+        let s = Pipeline {
+            label:  "p".to_string(),
+            steps:  vec![mk(None, "a"), mk(None, "b")],
+            input:  None,
+            output: None,
+        };
+        assert_eq!(qualify_pipeline_step_labels(&s),
+            vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn accept_verdict_detection_matches_cli() {
+        assert!(is_accept_verdict("ACCEPT — looks good"));
+        assert!(is_accept_verdict("  accept\n"));
+        assert!(is_accept_verdict("ACCEPTED, ship it"));
+        assert!(is_accept_verdict(r#"{"verdict":"ACCEPT"}"#));
+        assert!(!is_accept_verdict("Needs revision: rename the field"));
+        assert!(!is_accept_verdict(r#"{"verdict":"reject"}"#));
+        assert!(!is_accept_verdict("the reviewer may ACCEPT next round"),
+            "a non-leading ACCEPT must NOT count as a verdict");
     }
 
     // ── chat_turn parameter-validation paths ─────────────────────
