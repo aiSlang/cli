@@ -1286,9 +1286,9 @@ impl AislangServer {
         let project = &loaded.resolved.project;
         let label   = &p.pattern_label;
 
-        // Resolve label → (qualified label, step agents, max_iter, is_loop).
+        // Resolve label → (qualified, step agents, max_iter, is_loop, condition).
         // Mirrors the CLI's run_chat dispatch setup.
-        let (qualified, steps, max_iter, is_loop) =
+        let (qualified, steps, max_iter, is_loop, loop_condition) =
             if let Some(resolved) = loaded.find_loop_label(label) {
                 let lb = project.loops.iter().find(|l| l.label == resolved)
                     .expect("find_loop_label returned a missing label");
@@ -1302,11 +1302,12 @@ impl AislangServer {
                     .ok_or_else(|| RmcpError::invalid_params(format!(
                         "loop `{resolved}` body pipeline `{body_label}` does not exist"),
                         None))?;
-                (resolved.clone(), qualify_pipeline_step_labels(bp), lb.max_iter, true)
+                (resolved.clone(), qualify_pipeline_step_labels(bp), lb.max_iter,
+                 true, Some(lb.condition.clone()))
             } else if let Some(resolved) = loaded.find_pipeline_label(label) {
                 let pl = project.pipelines.iter().find(|pp| pp.label == resolved)
                     .expect("find_pipeline_label returned a missing label");
-                (resolved.clone(), qualify_pipeline_step_labels(pl), 0u32, false)
+                (resolved.clone(), qualify_pipeline_step_labels(pl), 0u32, false, None)
             } else if loaded.find_branch_label(label).is_some() {
                 return Err(RmcpError::invalid_params(format!(
                     "`{label}` is a branch (router) — not supported via MCP yet; \
@@ -1327,14 +1328,30 @@ impl AislangServer {
                 format!("`{qualified}` has no steps to run"), None));
         }
 
+        // ── Fresh run: drop any cached sessions for these step agents so each
+        //    `run_pipeline` invocation starts with clean history (the CLI
+        //    clears pipeline history per run too).  History still accumulates
+        //    ACROSS iterations WITHIN this run (so a loop's worker sees the
+        //    critic's prior feedback) — we only reset once, here.
+        {
+            let mut map = self.sessions.write().await;
+            for step in &steps {
+                map.remove(&SessionKey {
+                    source_dir:  source_dir.clone(),
+                    agent_label: step.clone(),
+                });
+            }
+        }
+
         // ── orchestrate.  Pipeline → one pass; loop → up to max_iter passes,
-        //    feeding each pass's final reply back, stopping on ACCEPT.
+        //    feeding each pass's final reply back, stopping when the loop's
+        //    `.ais` condition says so (or, if it can't be evaluated, on ACCEPT).
         let passes = if is_loop { max_iter.max(1) } else { 1 };
-        let mut transcript   = String::new();
-        let mut current      = p.user_input.clone();
-        let mut final_reply  = String::new();
-        let mut accepted     = false;
-        let mut iters_run    = 0u32;
+        let mut transcript    = String::new();
+        let mut current       = p.user_input.clone();
+        let mut final_reply   = String::new();
+        let mut stopped_early = false;
+        let mut iters_run     = 0u32;
         for iter in 1..=passes {
             iters_run = iter;
             if is_loop {
@@ -1349,12 +1366,26 @@ impl AislangServer {
                 current     = reply.clone();
                 final_reply = reply;
             }
-            if is_loop && is_accept_verdict(&final_reply) { accepted = true; break; }
+            // Stop when the loop's declared `condition` is no longer true.
+            // The condition is a MiniJinja template over `output` (the body's
+            // final reply); e.g. `{{ output | startswith('ACCEPT') | not }}`
+            // means "keep looping while output does NOT start with ACCEPT".
+            // If it can't be evaluated, fall back to the ACCEPT heuristic.
+            if is_loop {
+                let keep_going = match loop_condition.as_deref() {
+                    Some(cond) if !cond.trim().is_empty() =>
+                        eval_loop_condition(cond, &final_reply)
+                            .unwrap_or_else(|_| !is_accept_verdict(&final_reply)),
+                    _ => !is_accept_verdict(&final_reply),
+                };
+                if !keep_going { stopped_early = true; break; }
+            }
         }
 
         let header = if is_loop {
             format!("{qualified} (loop) — {} after {iters_run} iteration(s)\n",
-                if accepted { "ACCEPTED" } else { "stopped (max_iter reached)" })
+                if stopped_early { "condition satisfied" }
+                else { "stopped (max_iter reached)" })
         } else {
             format!("{qualified} (pipeline) — {} step(s)\n", steps.len())
         };
@@ -1964,10 +1995,31 @@ fn qualify_pipeline_step_labels(pipeline: &aislang_core::ast::Pipeline) -> Vec<S
     }).collect()
 }
 
-/// Loop stop-condition (v0.3/W26 scope): the body pipeline's final reply
-/// is an ACCEPT verdict.  Matches the CLI's check — a leading `ACCEPT`
-/// (case-insensitive) on the trimmed reply, or a `{"verdict":"ACCEPT…"}`
-/// JSON shape.  (Template-driven `loop.condition` is a v0.5 item.)
+/// Evaluate a `loop.condition` MiniJinja template against the body's
+/// final reply (bound as `output`), returning whether the loop should
+/// CONTINUE (truthy = keep looping).  Registers the string filters the
+/// DSL's conditions use (`startswith` / `endswith` / `contains` / `not`)
+/// on top of MiniJinja's built-ins, e.g.
+/// `{{ output | startswith('ACCEPT') | not }}` → keep looping while the
+/// reply does NOT start with `ACCEPT`.  Errors (bad template / unknown
+/// filter) propagate so the caller can fall back to the ACCEPT heuristic.
+fn eval_loop_condition(condition: &str, output: &str) -> Result<bool, String> {
+    let mut env = minijinja::Environment::new();
+    env.add_filter("startswith", |s: String, p: String| s.starts_with(&p));
+    env.add_filter("endswith",   |s: String, p: String| s.ends_with(&p));
+    env.add_filter("contains",   |s: String, p: String| s.contains(&p));
+    env.add_filter("not",        |b: bool| !b);
+    let rendered = env.render_str(condition, minijinja::context! { output => output })
+        .map_err(|e| format!("evaluate loop condition `{condition}`: {e}"))?;
+    // The loop continues while the condition renders truthy.
+    let t = rendered.trim().to_ascii_lowercase();
+    Ok(t == "true" || t == "1" || t == "yes")
+}
+
+/// Fallback loop stop-condition when `loop.condition` can't be evaluated:
+/// the body pipeline's final reply is an ACCEPT verdict.  Matches the
+/// CLI's check — a leading `ACCEPT` (case-insensitive) on the trimmed
+/// reply, or a `{"verdict":"ACCEPT…"}` JSON shape.
 fn is_accept_verdict(reply: &str) -> bool {
     let t = reply.trim();
     if t.to_ascii_lowercase().starts_with("accept") {
@@ -3882,6 +3934,21 @@ mod tests {
         };
         assert_eq!(qualify_pipeline_step_labels(&s),
             vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn loop_condition_honours_the_ais_template() {
+        // The orchestrator.ais `review_cycle` condition: keep looping while
+        // the reply does NOT start with ACCEPT.
+        let cond = "{{ output | startswith('ACCEPT') | not }}";
+        // Reviewer NOT done → condition true → keep looping.
+        assert_eq!(eval_loop_condition(cond, "Needs revision: rename field").unwrap(), true);
+        // Reviewer accepted → condition false → stop.
+        assert_eq!(eval_loop_condition(cond, "ACCEPT — ship it").unwrap(), false);
+        // Other filters wire up too.
+        assert_eq!(eval_loop_condition("{{ output | contains('TODO') }}", "has TODO left").unwrap(), true);
+        // An unknown filter / bad template errors (caller falls back to ACCEPT).
+        assert!(eval_loop_condition("{{ output | no_such_filter }}", "x").is_err());
     }
 
     #[test]
