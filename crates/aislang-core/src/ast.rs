@@ -434,6 +434,12 @@ pub struct VectorStore {
 ///   - **Crawl** — `crawl:http://…` or `crawl:https://…`.  Indexer
 ///     recursively crawls from the seed URL within the same host;
 ///     depth + politeness limits are runtime concerns (Wed/v0.5).
+///   - **Git** — `git:<owner>/<repo>[#<subpath>]` (W26).  Indexer
+///     clones the GitHub repo (default branch, shallow) and reads the
+///     optional `#<subpath>` (a dir or file inside it; the repo root
+///     when omitted).  Lets a knowledge base track an EXTERNAL codebase
+///     (e.g. aiSlang's own source) instead of a local dir.  Private
+///     repos authenticate via `GITHUB_TOKEN`.
 ///
 /// Tagged enum so JSON round-trip is unambiguous; serde
 /// `#[serde(tag = "kind", rename_all = "snake_case")]` mirrors the
@@ -444,6 +450,13 @@ pub enum SourceUri {
     Path  { path: PathBuf },
     Url   { url:  String  },
     Crawl { url:  String  },
+    Git   {
+        /// `<owner>/<repo>` GitHub slug.
+        repo: String,
+        /// Optional dir/file within the repo (the `#…` fragment).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
 }
 
 /// v0.3 Week 19 Tue — first-class `embedding` block (Decision 44.6).
