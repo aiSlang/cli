@@ -377,6 +377,20 @@ impl Index {
     }
 }
 
+/// Directory the per-store index `.bin` files live in for a given project
+/// root.  Defaults to `<project_root>/.aislang/vector/` (the local-CLI
+/// layout).  When `AISLANG_VECTOR_DIR` is set (W26 — the managed cloud sets
+/// it to a writable volume because the project ConfigMap mount is read-only),
+/// indexes are read/written there instead.  Both the builder (`aislang rag
+/// build`) and the chat-time loader (`build_rag_prefix_for_turn`) call this so
+/// they always agree on the path.
+pub fn vector_index_dir(project_root: &Path) -> std::path::PathBuf {
+    match std::env::var("AISLANG_VECTOR_DIR") {
+        Ok(d) if !d.trim().is_empty() => std::path::PathBuf::from(d.trim()),
+        _ => project_root.join(".aislang").join("vector"),
+    }
+}
+
 // f32-as-Ord wrapper for the heap.  NaN sorts as -Infinity (i.e. last);
 // the embedder is contract-bound to never produce NaN, but we degrade
 // gracefully rather than panicking.

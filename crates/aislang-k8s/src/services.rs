@@ -269,6 +269,7 @@ pub fn build_litellm(
                     items: None,                       // Mount all keys as files
                 }),
                 persistent_volume_claim:    None,
+                empty_dir:                   None,
             }]),
             init_containers: None,
         },
@@ -501,6 +502,12 @@ pub const PROJECT_CM_MANIFEST_KEY: &str = "aislang.toml";
 /// the agent-runtime pod.  Pod command: `aislang mcp-serve --http
 /// 0.0.0.0:<port> /etc/aislang/project.ais` (Decision 43.3).
 pub const PROJECT_MOUNT_DIR: &str = "/etc/aislang";
+
+/// Writable dir (an emptyDir volume) where the agent-runtime builds + reads
+/// RAG index `.bin` files in-pod.  Separate from the read-only project CM
+/// mount; exported to the runtime via the `AISLANG_VECTOR_DIR` env var so
+/// `rag build-all` + `build_rag_prefix_for_turn` agree on the location (W26).
+pub const VECTOR_INDEX_DIR: &str = "/var/aislang/vector";
 
 /// Sub-directory inside [`PROJECT_MOUNT_DIR`] where per-prompt body
 /// files land.  One file per `prompt` block keyed by `prompt.label`
@@ -908,6 +915,13 @@ pub fn build_agent_runtime_with_sources(
                 name:  "AISLANG_LITELLM_URL".to_string(),
                 value: "http://litellm:4000".to_string(),
             });
+            // W26 — RAG indexes live in this WRITABLE emptyDir, not under the
+            // read-only project ConfigMap mount.  Both the in-pod builder
+            // (`rag build-all`) + the chat-time loader honour AISLANG_VECTOR_DIR.
+            env.push(EnvVar {
+                name:  "AISLANG_VECTOR_DIR".to_string(),
+                value: VECTOR_INDEX_DIR.to_string(),
+            });
             env
         }),
         // Default image entrypoint is `aislang`; pass the mcp-serve
@@ -927,21 +941,39 @@ pub fn build_agent_runtime_with_sources(
         // (`/etc/aislang/`); MCP clients send that path explicitly
         // in their chat_turn args.  See `aislang-runtime::mcp_server::
         // chat_turn` for the per-call source_path/dir contract.
-        command: None,
-        args: Some(vec![
-            "mcp-serve".to_string(),
-            "--http".to_string(),
-            format!("0.0.0.0:{port}"),
+        // W26 — wrap the entrypoint: wait for LiteLLM, build RAG indexes for
+        // any declared knowledge sources (e.g. `git:` corpora) into the
+        // writable vector volume, THEN serve.  `rag build-all` is tolerant
+        // (per-store failures don't block serving), so a project with no
+        // RAG (or an unreachable source) still comes up.  `exec` so mcp-serve
+        // is PID 1's child + receives signals.
+        command: Some(vec!["sh".to_string(), "-c".to_string()]),
+        args: Some(vec![format!(
+            "LURL=\"${{AISLANG_LITELLM_URL:-http://litellm:4000}}\"; \
+             i=0; until curl -s -o /dev/null \"$LURL/\" 2>/dev/null || \
+             [ \"$i\" -ge 30 ]; do i=$((i+1)); sleep 2; done; \
+             aislang rag build-all {mount} --litellm-url \"$LURL\" || true; \
+             exec aislang mcp-serve --http 0.0.0.0:{port}",
+            mount = PROJECT_MOUNT_DIR)],
+        ),
+        volume_mounts: Some(vec![
+            VolumeMount {
+                name:       "project".to_string(),
+                mount_path: PROJECT_MOUNT_DIR.to_string(),
+                read_only:  Some(true),
+                // No sub_path here — we want the WHOLE CM mounted as a
+                // directory at /etc/aislang/, with items[] selecting
+                // which keys appear and where.
+                sub_path:   None,
+            },
+            // Writable scratch for built RAG indexes (the CM mount is ro).
+            VolumeMount {
+                name:       "vector".to_string(),
+                mount_path: VECTOR_INDEX_DIR.to_string(),
+                read_only:  Some(false),
+                sub_path:   None,
+            },
         ]),
-        volume_mounts: Some(vec![VolumeMount {
-            name:       "project".to_string(),
-            mount_path: PROJECT_MOUNT_DIR.to_string(),
-            read_only:  Some(true),
-            // No sub_path here — we want the WHOLE CM mounted as a
-            // directory at /etc/aislang/, with items[] selecting
-            // which keys appear and where.
-            sub_path:   None,
-        }]),
     };
 
     let pod_template = PodTemplate {
@@ -953,14 +985,24 @@ pub fn build_agent_runtime_with_sources(
         },
         spec: PodSpec {
             containers: vec![container],
-            volumes:    Some(vec![Volume {
-                name:                    "project".to_string(),
-                config_map:              Some(ConfigMapVolumeSource {
-                    name:  "aislang-project".to_string(),
-                    items: Some(cm_items),
-                }),
-                persistent_volume_claim: None,
-            }]),
+            volumes:    Some(vec![
+                Volume {
+                    name:                    "project".to_string(),
+                    config_map:              Some(ConfigMapVolumeSource {
+                        name:  "aislang-project".to_string(),
+                        items: Some(cm_items),
+                    }),
+                    persistent_volume_claim: None,
+                    empty_dir:               None,
+                },
+                // W26 — ephemeral writable dir for built RAG indexes.
+                Volume {
+                    name:                    "vector".to_string(),
+                    config_map:              None,
+                    persistent_volume_claim: None,
+                    empty_dir:               Some(EmptyDirVolumeSource::default()),
+                },
+            ]),
             init_containers: None,
         },
     };
@@ -1178,6 +1220,7 @@ pub fn build_openwebui(deploy_label: &str, pvc_size: &str)
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
                     claim_name: OPENWEBUI_PVC_NAME.to_string(),
                 }),
+                empty_dir:               None,
             }]),
             init_containers: None,
         },

@@ -433,6 +433,18 @@ enum RagCommand {
         #[arg(long, default_value_t = false)]
         strict: bool,
     },
+    /// v0.4 W26 — build EVERY declared `vector_store`'s index in one go,
+    /// tolerating per-store failures (logs them, exits 0 so a stack still
+    /// comes up).  Indexes land in `AISLANG_VECTOR_DIR` if set, else
+    /// `<project>/.aislang/vector/`.  Used by the managed-cloud agent-runtime
+    /// entrypoint to build `git:` knowledge corpora in-pod before serving.
+    BuildAll {
+        /// Path to the .ais project file or project root dir.
+        project: PathBuf,
+        /// LiteLLM proxy base URL (default: localhost:4000).
+        #[arg(long, value_name = "URL", default_value = "http://localhost:4000")]
+        litellm_url: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -691,6 +703,8 @@ fn run() -> Result<ExitCode> {
                     .map(|_| ExitCode::SUCCESS)?,
             RagCommand::Verify { project, strict } =>
                 run_rag_verify(project, strict)?,
+            RagCommand::BuildAll { project, litellm_url } =>
+                run_rag_build_all(project, litellm_url).map(|_| ExitCode::SUCCESS)?,
         },
         Command::Cloud { action } => match action {
             CloudCommand::Serve { host, port } =>
@@ -3523,36 +3537,44 @@ fn qualify_pipeline_steps(
 /// abort apply (stack is up either way + user can rebuild via
 /// `aislang rag build <label> <project>` manually).
 fn auto_build_rag_indexes(project: &Path) {
-    let loaded = match load_project_input(project) {
+    // apply runs the local Compose stack → LiteLLM at localhost:4000.
+    let _ = run_rag_build_all(project.to_path_buf(), "http://localhost:4000".to_string());
+}
+
+/// `aislang rag build-all <project> [--litellm-url …]` (W26) — build EVERY
+/// declared vector_store's index, tolerating per-store failures (logged, not
+/// fatal, so a stack still comes up).  Shared by `apply`'s auto-build + the
+/// managed-cloud agent-runtime entrypoint (which builds `git:` knowledge
+/// corpora in-pod before serving).  Indexes land per `vector_index_dir`
+/// (honours `AISLANG_VECTOR_DIR`).
+fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
+    let loaded = match load_project_input(&project) {
         Ok(l) => l,
-        Err(_) => return,   // load already errored above — skip
+        Err(e) => {
+            eprintln!("aislang rag build-all: load failed (skipping): {e}");
+            return Ok(());
+        }
     };
     let proj = &loaded.resolved.project;
     if proj.vector_stores.is_empty() {
-        return;   // common single-agent v0.2 case: no RAG declared
+        eprintln!("aislang rag build-all: no vector_store blocks — nothing to build");
+        return Ok(());
     }
     eprintln!();
-    eprintln!("building RAG indexes for {} declared vector_store(s):",
+    eprintln!("building RAG indexes for {} declared vector_store(s) (litellm={litellm_url}):",
         proj.vector_stores.len());
-    // LiteLLM is up at localhost:4000 — wait_for_litellm_ready above
-    // already proved it.  Match the same convention `rag build`
-    // uses (the literal `http://localhost:4000`); v0.5+ may read
-    // this from a project knob.
-    let litellm_url = "http://localhost:4000".to_string();
     for vs in &proj.vector_stores {
         eprint!("  - `{}` … ", vs.label);
-        match build_rag_index_for(&vs.label, project, &litellm_url) {
-            Ok((built, idx_path)) => {
-                match built.save(&idx_path) {
-                    Ok(bytes) => eprintln!(
-                        "{} chunks ({} bytes) → {}",
-                        built.chunks.len(), bytes, idx_path.display()),
-                    Err(e) => eprintln!("FAILED at save: {e}"),
-                }
-            }
+        match build_rag_index_for(&vs.label, &project, &litellm_url) {
+            Ok((built, idx_path)) => match built.save(&idx_path) {
+                Ok(bytes) => eprintln!("{} chunks ({} bytes) → {}",
+                    built.chunks.len(), bytes, idx_path.display()),
+                Err(e) => eprintln!("FAILED at save: {e}"),
+            },
             Err(e) => eprintln!("FAILED at build: {e}"),
         }
     }
+    Ok(())
 }
 
 fn run_rag_build(
@@ -3608,7 +3630,7 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
     let mut unhealthy = 0u32;
     let mut healthy   = 0u32;
     for vs in &proj.vector_stores {
-        let idx_path = project_root.join(".aislang").join("vector")
+        let idx_path = aislang_runtime::rag::vector_index_dir(&project_root)
             .join(format!("{}.bin", vs.label));
         let report = inspect_rag_index(&idx_path);
         match report {
@@ -4358,7 +4380,7 @@ fn run_rag_query(
 
     let project_root = std::fs::canonicalize(&loaded.project_root)
         .map_err(|e| anyhow::anyhow!("project root not readable: {e}"))?;
-    let idx_path = project_root.join(".aislang").join("vector")
+    let idx_path = aislang_runtime::rag::vector_index_dir(&project_root)
         .join(format!("{vs_label}.bin"));
 
     // Build on first call if missing — same posture as
@@ -4550,7 +4572,7 @@ fn build_rag_index_for(
         &embedder,
     ).map_err(|e| anyhow::anyhow!("build index: {e}"))?;
 
-    let idx_path = project_root.join(".aislang").join("vector")
+    let idx_path = aislang_runtime::rag::vector_index_dir(&project_root)
         .join(format!("{vs_label}.bin"));
     Ok((index, idx_path))
 }
@@ -5185,7 +5207,7 @@ fn warn_on_empty_rag_indexes(
                 Some(v) => v,
                 None    => continue,    // checker should have caught this
             };
-            let idx_path = project_root.join(".aislang").join("vector")
+            let idx_path = aislang_runtime::rag::vector_index_dir(&project_root)
                 .join(format!("{}.bin", vs.label));
             match inspect_rag_index(&idx_path) {
                 RagIndexReport::Healthy { .. } => { /* quiet on healthy */ }

@@ -1951,7 +1951,7 @@ fn build_rag_prefix_for_turn(
                 std::io::ErrorKind::NotFound,
                 format!("embedding ({}, {}) not in catalog",
                     emb_block.provider, emb_block.model)))?;
-        let idx_path = project_root.join(".aislang").join("vector")
+        let idx_path = crate::rag::vector_index_dir(&project_root)
             .join(format!("{}.bin", vs.label));
         let index = Index::load(&idx_path)
             .map_err(|e| std::io::Error::new(

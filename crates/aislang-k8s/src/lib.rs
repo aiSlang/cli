@@ -986,21 +986,21 @@ mod tests {
         let cport = container["ports"][0]["containerPort"].as_i64()
             .expect("containerPort is int");
         assert_eq!(cport, 9000, "containerPort must match expose.port");
-        let args: Vec<&str> = container["args"].as_sequence().expect("args list")
+        // W26 — the entrypoint is now an `sh -c` wrapper that builds RAG
+        // indexes then `exec`s mcp-serve.  Assert on the script string.
+        let cmd: Vec<&str> = container["command"].as_sequence().expect("command list")
             .iter().filter_map(|v| v.as_str()).collect();
-        assert!(args.contains(&"0.0.0.0:9000"),
-            "args must include the --http bind `0.0.0.0:9000`; got: {args:?}");
-        assert!(args.contains(&"mcp-serve"),
-            "args must include the mcp-serve subcommand; got: {args:?}");
-        // **No trailing positional path arg.** The CLI's mcp-serve
-        // subcommand doesn't accept one; per-call source_path goes
-        // in each chat_turn MCP request.  Pinned negatively so a
-        // future regression that reintroduces the positional fails
-        // here AND in the k8s-smoke axis simultaneously.
-        assert!(!args.iter().any(|a| a.ends_with(".ais") || a.contains("/etc/aislang")),
-            "args must NOT include a .ais source path positional — \
-             it crashes the pod at startup with 'unexpected argument'; \
-             got: {args:?}");
+        assert_eq!(cmd, vec!["sh", "-c"], "entrypoint wraps via `sh -c`");
+        let script = container["args"][0].as_str()
+            .expect("args[0] is the entrypoint script");
+        assert!(script.contains("mcp-serve --http 0.0.0.0:9000"),
+            "entrypoint must serve mcp on 0.0.0.0:9000; got: {script}");
+        // **No trailing positional path arg to mcp-serve** — it crashes the
+        // pod with 'unexpected argument'.  mcp-serve is the final command, so
+        // the script must END with the bind (nothing after it).
+        assert!(script.trim_end().ends_with("mcp-serve --http 0.0.0.0:9000"),
+            "mcp-serve must be the final command with NO source-path positional; \
+             got: {script}");
     }
 
     #[test] fn agent_runtime_defaults_to_port_8080_when_expose_absent() {
@@ -1684,22 +1684,39 @@ mod tests {
 
         let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
             .expect("agent-runtime Deployment must be emitted");
-        // Args must contain mcp-serve + --http <bind>, NOTHING else
-        // positional.
-        assert!(dep_yaml.contains("- mcp-serve\n"),
-            "agent-runtime args must carry the mcp-serve subcommand; \
+        // W26 — the entrypoint is an `sh -c` wrapper (build RAG indexes, then
+        // exec mcp-serve).  The serve command must appear with NO positional
+        // source path after the bind (which crashes the pod).
+        assert!(dep_yaml.contains("mcp-serve --http 0.0.0.0:"),
+            "agent-runtime entrypoint must exec mcp-serve --http <bind>; \
              got:\n{dep_yaml}");
-        assert!(dep_yaml.contains("- --http\n"),
-            "agent-runtime args must carry the --http transport flag; \
-             got:\n{dep_yaml}");
-        // Neither the file-path nor the directory-path positional
-        // forms should appear — the CLI rejects both.
         assert!(!dep_yaml.contains("/etc/aislang/project.ais"),
-            "agent-runtime args must NOT carry a .ais file-path \
-             positional; got:\n{dep_yaml}");
-        assert!(!dep_yaml.contains("- /etc/aislang\n"),
-            "agent-runtime args must NOT carry an /etc/aislang \
-             directory positional; got:\n{dep_yaml}");
+            "agent-runtime must NOT pass a .ais file-path positional to \
+             mcp-serve; got:\n{dep_yaml}");
+        // The build-all step legitimately references /etc/aislang as its
+        // project dir, but mcp-serve itself must not be handed a positional —
+        // it's the final `exec`, so nothing follows the bind.
+        assert!(dep_yaml.contains("rag build-all /etc/aislang"),
+            "agent-runtime entrypoint must build RAG indexes before serving; \
+             got:\n{dep_yaml}");
+    }
+
+    #[test] fn agent_runtime_ships_writable_vector_volume_and_env() {
+        // W26 — RAG indexes are built into a writable emptyDir (the project CM
+        // mount is read-only) + located via AISLANG_VECTOR_DIR.
+        let resolved  = resolved_with_k8s_deploy("prod");
+        let sources   = multi_module_sources();
+        let catalog   = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
+        let dep_yaml  = artifacts.manifests.get("agent-runtime.yaml")
+            .expect("agent-runtime Deployment must be emitted");
+        assert!(dep_yaml.contains("emptyDir: {}"),
+            "must mount a writable emptyDir for RAG indexes; got:\n{dep_yaml}");
+        assert!(dep_yaml.contains("name: vector"),
+            "the `vector` volume + mount must be present; got:\n{dep_yaml}");
+        assert!(dep_yaml.contains("AISLANG_VECTOR_DIR")
+            && dep_yaml.contains("/var/aislang/vector"),
+            "must export AISLANG_VECTOR_DIR=/var/aislang/vector; got:\n{dep_yaml}");
     }
 
     #[test] fn multi_module_cm_volume_mount_items_remap_per_module() {
