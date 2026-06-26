@@ -1669,13 +1669,35 @@ fn expect_source_uri(field: &str, v: RawValue) -> Result<SourceUri, String> {
         // identifiers don't apply here, so we only accept String).
         other => return Err(format!(
             "`{field}` expects a string source URI \
-             (e.g. `\"./docs/\"`, `\"https://x.com\"`, or `\"crawl:https://x.com\"`); \
-             got {other:?}"
+             (e.g. `\"./docs/\"`, `\"https://x.com\"`, `\"crawl:https://x.com\"`, \
+             or `\"git:owner/repo#subpath\"`); got {other:?}"
         )),
     };
     if s.trim().is_empty() {
         return Err(format!(
             "`{field}` source URI must be non-empty"));
+    }
+    if let Some(rest) = s.strip_prefix("git:") {
+        // `git:<owner>/<repo>[#<subpath>]` — clone an external GitHub repo.
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err(format!(
+                "`{field}` `git:` prefix must be followed by `owner/repo[#subpath]`"));
+        }
+        let (repo, path) = match rest.split_once('#') {
+            Some((r, p)) => {
+                let p = p.trim();
+                (r.trim().to_string(),
+                 if p.is_empty() { None } else { Some(p.to_string()) })
+            }
+            None => (rest.to_string(), None),
+        };
+        let halves: Vec<&str> = repo.split('/').collect();
+        if halves.len() != 2 || halves[0].is_empty() || halves[1].is_empty() {
+            return Err(format!(
+                "`{field}` `git:` source must be `owner/repo[#subpath]`; got `git:{rest}`"));
+        }
+        return Ok(SourceUri::Git { repo, path });
     }
     if let Some(rest) = s.strip_prefix("crawl:") {
         if rest.trim().is_empty() {
@@ -4419,6 +4441,50 @@ mod project_tests {
         assert!(matches!(&vs.source,
             SourceUri::Crawl { url } if url == "https://example.com"),
             "got: {:?}", vs.source);
+    }
+
+    #[test] fn vector_store_block_parses_with_git_source() {
+        // W26 — `git:owner/repo#subpath` clones an external repo as the corpus.
+        let src = project_with_composition_body(r#"
+          vector_store "repo_kb" {
+            embedding  = embedding.openai_small
+            source     = "git:aislang/aislang#crates/aislang-core/src"
+            chunk_size = 2k
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        assert!(matches!(&p.vector_stores[0].source,
+            SourceUri::Git { repo, path }
+                if repo == "aislang/aislang"
+                && path.as_deref() == Some("crates/aislang-core/src")),
+            "got: {:?}", p.vector_stores[0].source);
+    }
+
+    #[test] fn vector_store_git_source_without_subpath() {
+        let src = project_with_composition_body(r#"
+          vector_store "whole_repo" {
+            embedding  = embedding.openai_small
+            source     = "git:acme/widgets"
+            chunk_size = 2k
+          }
+        "#);
+        let p = assert_parse_ok(&src);
+        assert!(matches!(&p.vector_stores[0].source,
+            SourceUri::Git { repo, path }
+                if repo == "acme/widgets" && path.is_none()),
+            "got: {:?}", p.vector_stores[0].source);
+    }
+
+    #[test] fn vector_store_git_source_rejects_malformed_slug() {
+        // Missing the `owner/` half → parse error.
+        let src = project_with_composition_body(r#"
+          vector_store "bad" {
+            embedding  = embedding.openai_small
+            source     = "git:justrepo"
+            chunk_size = 2k
+          }
+        "#);
+        assert_parse_err_contains(&src, "owner/repo");
     }
 
     #[test] fn vector_store_chunk_size_below_range_fails() {

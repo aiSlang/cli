@@ -278,7 +278,18 @@ pub struct Volume {
     /// this for `/app/backend/data` persistence.  None on Tue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistent_volume_claim: Option<PersistentVolumeClaimVolumeSource>,
+
+    /// emptyDir source — an ephemeral pod-lifetime scratch volume (W26:
+    /// the agent-runtime's writable RAG index dir, since the project
+    /// ConfigMap mount is read-only).  Serializes as `emptyDir: {}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub empty_dir: Option<EmptyDirVolumeSource>,
 }
+
+/// `emptyDir: {}` — default (node-disk) ephemeral volume.  No knobs wired
+/// (medium/sizeLimit) yet; the empty object is the common case.
+#[derive(Serialize, Default)]
+pub struct EmptyDirVolumeSource {}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

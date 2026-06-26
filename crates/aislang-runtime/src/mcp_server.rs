@@ -1396,7 +1396,7 @@ impl AislangServer {
     /// Run ONE agent turn against the (source_dir, agent_label) session
     /// (get-or-create from the shared pool), returning the reply.  The
     /// reusable core `run_pipeline` calls per step; mirrors `chat_turn`'s
-    /// session + `spawn_blocking`-turn dance minus progress/RAG streaming.
+    /// session + `spawn_blocking`-turn dance (incl. RAG prepend, W26).
     async fn run_one_agent_turn(
         &self,
         source:      &str,
@@ -1427,6 +1427,19 @@ impl AislangServer {
                 }
             }
         };
+        // RAG prepend (best-effort, same as chat_turn): retrieve top-K chunks
+        // from the agent's declared knowledge stores + prepend to the system
+        // prompt for THIS turn.  No-op (empty prefix) when no index is present,
+        // so pipeline steps stay functional even without RAG.  W26: this closes
+        // the gap where run_pipeline agents saw zero retrieved context.
+        let rag_prefix = {
+            let sd = source_dir.to_path_buf();
+            let al = agent_label.to_string();
+            let ui = user_input.to_string();
+            tokio::task::spawn_blocking(move || {
+                build_rag_prefix_for_turn(&sd, &sd, &al, &ui).unwrap_or_default()
+            }).await.unwrap_or_default()
+        };
         let input = user_input.to_string();
         // Session::turn is !Send (holds an OTel guard across awaits); hand it
         // to a blocking thread with its own current-thread runtime, same as
@@ -1435,7 +1448,8 @@ impl AislangServer {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all().build()
                 .map_err(|e| format!("build inner runtime: {e}"))?;
-            rt.block_on(session.turn(&input)).map_err(|e| format!("{e}"))
+            rt.block_on(session.turn_with_progress_and_extra_system_prefix(
+                &rag_prefix, &input, |_ev| {})).map_err(|e| format!("{e}"))
         }).await.map_err(|e| format!("join turn task: {e}"))?
     }
 
@@ -1937,7 +1951,7 @@ fn build_rag_prefix_for_turn(
                 std::io::ErrorKind::NotFound,
                 format!("embedding ({}, {}) not in catalog",
                     emb_block.provider, emb_block.model)))?;
-        let idx_path = project_root.join(".aislang").join("vector")
+        let idx_path = crate::rag::vector_index_dir(&project_root)
             .join(format!("{}.bin", vs.label));
         let index = Index::load(&idx_path)
             .map_err(|e| std::io::Error::new(

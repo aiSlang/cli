@@ -85,8 +85,9 @@ async fn handshake_succeeds_and_lists_all_phase_1_tools() {
         "aislang_apply",      // Wed
         "aislang_destroy",    // Wed
         "aislang_status",     // Wed
-        "aislang_chat_turn",  // Thu
-        "aislang_eval",       // Thu
+        "aislang_chat_turn",    // Thu
+        "aislang_eval",         // Thu
+        "aislang_run_pipeline", // W26 — pipeline/loop dispatch
     ];
     for tool in expected {
         assert!(names.contains(tool),
