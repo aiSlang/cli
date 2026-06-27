@@ -2089,8 +2089,21 @@ async fn build_session_for_agent(
     }
     use crate::{BudgetConfig, SpawnConfig, StdioChild, ToolRegistry};
 
+    // Single-file path.  Dir-input callers (chat_turn / run_pipeline with
+    // source_path = <dir>) pass an EMPTY `source`; read the lone `*.ais` in the
+    // dir (e.g. the agent-runtime's `/etc/aislang/project.ais` mount) so a
+    // single-file project can be addressed by its DIRECTORY, not just the file.
+    let source: String = if source.trim().is_empty() {
+        let f = crate::project_loader::lone_ais_in_dir(source_dir).ok_or_else(|| format!(
+            "no `aislang.toml` and no single `.ais` in `{}` — point at a .ais \
+             file or add a manifest", source_dir.display()))?;
+        std::fs::read_to_string(&f).map_err(|e| format!("read {}: {e}", f.display()))?
+    } else {
+        source.to_string()
+    };
+
     // ── 1. validate + find agent ──
-    let (project, _warnings) = aislang_core::validate(source)
+    let (project, _warnings) = aislang_core::validate(&source)
         .map_err(|e| format!("parse error: {e}"))?;
     let agent = project.agents.iter()
         .find(|a| a.label == agent_label)
