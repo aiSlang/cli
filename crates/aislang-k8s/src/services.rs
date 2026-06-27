@@ -302,6 +302,10 @@ pub fn build_litellm(
         DeploymentSpec {
             replicas: 1,
             selector: LabelSelector { match_labels: selector.clone() },
+            // Recreate (W26): a re-onboard rewrites model_list; tear the old
+            // pod down first so the gap reads as "starting" and no surge
+            // replica doubles the pod (cost) during overlap.
+            strategy: Some(DeploymentStrategy::recreate()),
             template: pod_template,
         },
     );
@@ -392,6 +396,7 @@ pub fn build_jaeger(deploy_label: &str) -> (Deployment, Service) {
         DeploymentSpec {
             replicas: 1,
             selector: LabelSelector { match_labels: selector.clone() },
+            strategy: None,                              // default RollingUpdate
             template: pod_template,
         },
     );
@@ -499,6 +504,7 @@ pub fn build_budget_counter(
         DeploymentSpec {
             replicas: 1,
             selector: LabelSelector { match_labels: selector },
+            strategy: None,                              // default RollingUpdate
             template: pod_template,
         },
     )
@@ -1064,6 +1070,14 @@ pub fn build_agent_runtime_with_sources(
         DeploymentSpec {
             replicas: 1,
             selector: LabelSelector { match_labels: selector.clone() },
+            // Recreate (W26): a re-onboard swaps the deployed PROJECT.  A
+            // RollingUpdate would keep the OLD pod serving the OLD project's
+            // ConfigMap until the NEW pod finishes its multi-minute RAG build
+            // — clients silently get stale agents (e.g. `architect` after
+            // re-onboarding `orchestrator`).  Tear the old pod down first so
+            // the gap is a clean "warming up" 503 (see gateway warmup probe),
+            // and skip the surge replica that would double the pod (+ node).
+            strategy: Some(DeploymentStrategy::recreate()),
             template: pod_template,
         },
     );
@@ -1302,6 +1316,10 @@ pub fn build_openwebui(deploy_label: &str, pvc_size: &str)
         DeploymentSpec {
             replicas: 1,
             selector: LabelSelector { match_labels: selector.clone() },
+            // Recreate: Open WebUI mounts a ReadWriteOnce PVC, and a
+            // RollingUpdate surge pod can't mount it while the old pod holds
+            // it → the rollout deadlocks.  Kill-then-create avoids that.
+            strategy: Some(DeploymentStrategy::recreate()),
             template: pod_template,
         },
     );

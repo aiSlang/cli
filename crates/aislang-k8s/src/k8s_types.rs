@@ -121,7 +121,37 @@ pub struct DeploymentSpec {
     /// (Decision 43.7).
     pub replicas: u32,
     pub selector: LabelSelector,
+
+    /// Rollout strategy.  Omitted → K8s default (RollingUpdate).  Set to
+    /// `Recreate` on the agent-runtime + LiteLLM (W26): a re-onboard swaps
+    /// the deployed PROJECT, and a RollingUpdate keeps the OLD pod serving
+    /// the OLD project's ConfigMap until the NEW pod finishes its (multi-
+    /// minute) RAG build — so clients silently get stale results instead
+    /// of the new project.  `Recreate` tears the old pod down FIRST, so the
+    /// gap is a clean "warming up" window (the gateway answers 503/starting)
+    /// rather than stale-serving — and it skips the surge replica, avoiding
+    /// a doubled pod (and the node it may scale up) during the overlap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<DeploymentStrategy>,
+
     pub template: PodTemplate,
+}
+
+/// A Deployment rollout strategy.  We only ever emit the bare `Recreate`
+/// form (no `rollingUpdate` knobs), so a single `type` field suffices.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentStrategy {
+    #[serde(rename = "type")]
+    pub type_: String,
+}
+
+impl DeploymentStrategy {
+    /// `strategy: { type: Recreate }` — kill the old pod before creating
+    /// the new one.
+    pub fn recreate() -> Self {
+        Self { type_: "Recreate".to_string() }
+    }
 }
 
 #[derive(Serialize)]
