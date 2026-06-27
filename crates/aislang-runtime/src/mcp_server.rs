@@ -1240,16 +1240,16 @@ impl AislangServer {
     /// per-step transcript + the final reply.
     #[tool(
         name = "aislang_run_pipeline",
-        description = "Run a multi-agent PIPELINE or LOOP defined in the \
-            project (e.g. `coder_review_cycle`, `full_design`, \
-            `review_cycle`) end-to-end in ONE call — the same orchestration \
-            `aislang chat <label>` does locally.  Each step agent's reply is \
-            threaded into the next step; a loop re-runs its body pipeline \
-            (feeding the reply back) until the reply starts with `ACCEPT` or \
-            `max_iter` is hit.  Use this instead of manually chaining \
-            `aislang_chat_turn` calls.  Pass `source_path` (the project dir \
-            or .ais file) + `pattern_label` + `user_input`.  Branches \
-            (router) are not supported here yet — use the CLI for those.",
+        description = "Run a PIPELINE, LOOP, or single AGENT defined in the \
+            project (e.g. `full_design`, `review_cycle`, or a bare agent like \
+            `architect`) end-to-end in ONE call — the same dispatch \
+            `aislang chat <label>` does locally.  A pipeline threads each step \
+            agent's reply into the next; a loop re-runs its body until the \
+            reply starts with `ACCEPT` (or its `.ais` condition) or `max_iter`; \
+            a bare agent label runs that one agent.  Use this instead of \
+            manually chaining `aislang_chat_turn` calls.  Pass `source_path` \
+            (the project dir or .ais file) + `pattern_label` + `user_input`.  \
+            Branches (router) are not supported here yet — use the CLI.",
         annotations(
             title             = "Run pipeline / loop",
             destructive_hint  = false,
@@ -1312,14 +1312,21 @@ impl AislangServer {
                 return Err(RmcpError::invalid_params(format!(
                     "`{label}` is a branch (router) — not supported via MCP yet; \
                      run it from the CLI (`aislang chat {label} <dir>`)"), None));
+            } else if let Some(resolved) = loaded.find_agent_label(label) {
+                // A bare AGENT label → run it as a single-step pipeline (one
+                // turn), so `run_pipeline` doubles as a single-agent dispatcher.
+                // Self-contained agents (e.g. `architect`) declare no
+                // pipeline/loop; `chat_turn` is the lower-level equivalent.
+                (resolved.clone(), vec![resolved.clone()], 0u32, false, None)
             } else {
-                let mut names: Vec<&str> = project.pipelines.iter()
-                    .map(|pp| pp.label.as_str())
+                let mut names: Vec<&str> = project.agents.iter()
+                    .map(|a| a.label.as_str())
+                    .chain(project.pipelines.iter().map(|pp| pp.label.as_str()))
                     .chain(project.loops.iter().map(|l| l.label.as_str()))
                     .collect();
                 names.sort();
                 return Err(RmcpError::invalid_params(format!(
-                    "no pipeline or loop named `{label}`; available: {}",
+                    "no agent, pipeline, or loop named `{label}`; available: {}",
                     if names.is_empty() { "(none declared)".to_string() }
                     else { names.join(", ") }), None));
             };
@@ -1792,9 +1799,10 @@ pub struct RunPipelineParameters {
     /// cwd / inferred from `source_path`.
     #[serde(default)]
     pub source_dir: Option<String>,
-    /// The pipeline or loop label to run (e.g. `coder_review_cycle`,
-    /// `full_design`, `review_cycle`).  Accepts a bare label or a
-    /// module-qualified one; a unique suffix match also resolves.
+    /// The pipeline, loop, or single-agent label to run (e.g.
+    /// `full_design`, `review_cycle`, or a bare agent like `architect`).
+    /// Accepts a bare label or a module-qualified one; a unique suffix
+    /// match also resolves.
     pub pattern_label: String,
     /// Initial input fed to the FIRST step (and, for a loop, the first
     /// pass).  Each step's reply threads into the next step's input.
