@@ -287,9 +287,39 @@ impl std::error::Error for ProjectLoadError {}
 /// dir vs file and dispatches to the matching pipeline.
 pub fn load_project_input(input: &Path) -> Result<LoadedProject, ProjectLoadError> {
     if input.is_dir() {
-        load_multi_module_project(input)
+        // Multi-module → an `aislang.toml` manifest in the dir.  Otherwise a
+        // dir holding a SINGLE `*.ais` is a single-file project addressed by
+        // its DIRECTORY (e.g. the agent-runtime's `/etc/aislang` mount, which
+        // holds just `project.ais`) — load that file.  No `.ais` (or several
+        // without a manifest) → let the multi-module loader raise its
+        // "needs aislang.toml" error.
+        if input.join(aislang_core::manifest::MANIFEST_FILE_NAME).exists() {
+            load_multi_module_project(input)
+        } else if let Some(file) = lone_ais_in_dir(input) {
+            load_single_file_project(&file)
+        } else {
+            load_multi_module_project(input)
+        }
     } else {
         load_single_file_project(input)
+    }
+}
+
+/// The single `*.ais` file directly in `dir`, or `None` when there are zero
+/// or more than one.  Lets a single-file project be addressed by its
+/// directory (the agent-runtime mounts it as `<dir>/project.ais`), not just
+/// the file path.  Shared by [`load_project_input`] +
+/// `mcp_server::build_session_for_agent`.
+pub fn lone_ais_in_dir(dir: &Path) -> Option<PathBuf> {
+    let mut ais: Vec<PathBuf> = std::fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file()
+            && p.extension().and_then(|x| x.to_str()) == Some("ais"))
+        .collect();
+    ais.sort();
+    match ais.len() {
+        1 => Some(ais.remove(0)),
+        _ => None,
     }
 }
 
@@ -498,6 +528,28 @@ mod tests {
         assert!(loaded.manifest.is_none());
         // The single-file path should expose at least the demo agent.
         assert!(loaded.resolved.project.agents.iter().any(|a| a.label == "support"));
+    }
+
+    #[test] fn lone_ais_in_dir_detects_single_file_project() {
+        // W26 — a dir holding exactly one `*.ais` (the agent-runtime mounts a
+        // single-file project as `<dir>/project.ais`) resolves to that file;
+        // non-.ais siblings are ignored; zero or 2+ `.ais` → None.
+        let dir = std::env::temp_dir()
+            .join(format!("aislang-loneais-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(lone_ais_in_dir(&dir).is_none(), "empty dir → None");
+        std::fs::write(dir.join("project.ais"), "project \"x\" {}").unwrap();
+        std::fs::create_dir(dir.join("prompts")).unwrap();
+        std::fs::write(dir.join("prompts").join("p.md"), "hi").unwrap();
+        assert_eq!(lone_ais_in_dir(&dir), Some(dir.join("project.ais")),
+            "lone .ais (non-.ais siblings ignored) resolves");
+        std::fs::write(dir.join("two.ais"), "project \"y\" {}").unwrap();
+        assert!(lone_ais_in_dir(&dir).is_none(),
+            "two .ais without a manifest → ambiguous None");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test] fn loads_multi_module_demo_fixture() {
