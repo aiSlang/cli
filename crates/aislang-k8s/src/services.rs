@@ -248,6 +248,7 @@ pub fn build_litellm(
             // EISDIR.  sub_path makes the mount file-shaped.
             sub_path:   Some("config.yaml".to_string()),
         }]),
+        readiness_probe: None,
     };
 
     let pod_template = PodTemplate {
@@ -348,6 +349,7 @@ pub fn build_jaeger(deploy_label: &str) -> (Deployment, Service) {
         command:       None,
         args:          None,
         volume_mounts: None,
+        readiness_probe: None,
     };
 
     let pod_template = PodTemplate {
@@ -454,6 +456,7 @@ pub fn build_budget_counter(
              them now.' && sleep infinity".to_string(),
         ]),
         volume_mounts: None,
+        readiness_probe: None,
     };
 
     let pod_template = PodTemplate {
@@ -974,6 +977,23 @@ pub fn build_agent_runtime_with_sources(
                 sub_path:   None,
             },
         ]),
+        // W26 — gate readiness on `mcp-serve` having BOUND the port.  The
+        // entrypoint above waits for LiteLLM then runs `rag build-all`
+        // (minutes, for a large corpus) BEFORE binding, so without this
+        // probe K8s marks the pod Ready immediately and a re-onboard's
+        // rolling update terminates the still-serving OLD pod before the
+        // NEW one can answer → the gateway 502s ("agent unreachable") for
+        // the whole build window.  A tcpSocket probe keeps the old pod in
+        // the Service's endpoints (and blocks rollout cutover) until the
+        // new pod actually listens.  failureThreshold × periodSeconds =
+        // 60 × 10s = 10 min of startup grace covers a slow RAG build.
+        readiness_probe: Some(Probe {
+            tcp_socket:            Some(TcpSocketAction { port }),
+            initial_delay_seconds: Some(5),
+            period_seconds:        Some(10),
+            timeout_seconds:       Some(3),
+            failure_threshold:     Some(60),
+        }),
     };
 
     let pod_template = PodTemplate {
@@ -1203,6 +1223,7 @@ pub fn build_openwebui(deploy_label: &str, pvc_size: &str)
             read_only:  None,         // = false (rw — SQLite needs write)
             sub_path:   None,
         }]),
+        readiness_probe: None,
     };
 
     let pod_template = PodTemplate {
