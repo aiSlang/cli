@@ -1049,6 +1049,24 @@ mod tests {
             "no expose → fallback to AGENT_RUNTIME_DEFAULT_PORT");
     }
 
+    #[test] fn agent_runtime_and_litellm_use_recreate_strategy() {
+        // W26: a re-onboard swaps the deployed project / model_list.  These
+        // two pods must Recreate (kill-then-create) so the OLD pod can't keep
+        // serving the OLD project during the NEW pod's RAG build, and so no
+        // surge replica doubles the pod (cost) during the overlap.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let res = all_resources(&artifacts);
+        for manifest in [AGENT_RUNTIME_MANIFEST_FILENAME, LITELLM_MANIFEST_FILENAME] {
+            let dep = res.iter()
+                .find(|(f, k, _)| f == manifest && k == "Deployment")
+                .unwrap_or_else(|| panic!("{manifest} Deployment present"));
+            let strat = dep.2["spec"]["strategy"]["type"].as_str();
+            assert_eq!(strat, Some("Recreate"),
+                "{manifest} must use the Recreate strategy; got: {strat:?}");
+        }
+    }
+
     #[test] fn agent_runtime_has_tcp_readiness_probe_on_serving_port() {
         // W26: the pod's entrypoint waits for LiteLLM then runs `rag
         // build-all` (can be minutes) BEFORE `mcp-serve` binds.  A
