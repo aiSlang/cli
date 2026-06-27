@@ -186,6 +186,50 @@ pub struct Container {
     /// agent-runtime pod's `/etc/aislang/` mount.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<VolumeMount>>,
+
+    /// Readiness gate.  Emitted on the agent-runtime container (W26) so
+    /// the Service withholds the pod from its endpoints — and a rolling
+    /// update withholds cutover from the OLD pod — until `aislang
+    /// mcp-serve` has actually bound its port, which only happens AFTER
+    /// the in-pod `rag build-all` completes.  Without it K8s marks the
+    /// container Ready the instant the process starts (pre-bind), so a
+    /// re-onboard's rollout drops the old pod into a multi-minute hole
+    /// where the gateway 502s with "agent unreachable".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<Probe>,
+}
+
+/// A container readiness/liveness Probe.  We only emit the `tcpSocket`
+/// form (can the pod accept TCP on its serving port yet?) — enough to
+/// gate on `mcp-serve` having bound, without an HTTP health route.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Probe {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_socket: Option<TcpSocketAction>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_delay_seconds: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_seconds: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+
+    /// How many consecutive failures before the pod is declared
+    /// un-Ready.  Set generously on the agent-runtime so a slow
+    /// `rag build-all` (large corpus) doesn't trip readiness before the
+    /// first successful bind — `failureThreshold × periodSeconds` is the
+    /// startup grace window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpSocketAction {
+    pub port: u16,
 }
 
 #[derive(Serialize)]

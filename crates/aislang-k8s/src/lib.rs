@@ -1018,6 +1018,33 @@ mod tests {
             "no expose → fallback to AGENT_RUNTIME_DEFAULT_PORT");
     }
 
+    #[test] fn agent_runtime_has_tcp_readiness_probe_on_serving_port() {
+        // W26: the pod's entrypoint waits for LiteLLM then runs `rag
+        // build-all` (can be minutes) BEFORE `mcp-serve` binds.  A
+        // tcpSocket readinessProbe on the serving port keeps the OLD pod
+        // in the Service's endpoints (and blocks a rolling-update cutover)
+        // until the NEW pod actually listens — otherwise a re-onboard's
+        // rollout 502s the gateway for the whole build window.  Pin the
+        // probe so the gate can't silently regress.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&artifacts).into_iter()
+            .find(|(f, k, _)| f == AGENT_RUNTIME_MANIFEST_FILENAME && k == "Deployment")
+            .expect("agent-runtime Deployment");
+        let container = &dep.2["spec"]["template"]["spec"]["containers"][0];
+        let probe = &container["readinessProbe"];
+        let probe_port = probe["tcpSocket"]["port"].as_i64()
+            .expect("readinessProbe.tcpSocket.port int");
+        let cport = container["ports"][0]["containerPort"].as_i64()
+            .expect("containerPort int");
+        assert_eq!(probe_port, cport,
+            "readiness probe must target the SAME port mcp-serve binds");
+        // Generous startup grace so a slow RAG build doesn't trip readiness
+        // before the first bind (failureThreshold × periodSeconds).
+        assert!(probe["failureThreshold"].as_i64().unwrap_or(0) >= 30,
+            "readiness probe needs a wide startup grace for RAG builds; got: {probe:?}");
+    }
+
     #[test] fn agent_runtime_envfroms_aislang_providers_secret() {
         // Decision 43.5: agent-runtime ALSO needs provider creds (it
         // dials LiteLLM AND, for some fallback configurations, hits
