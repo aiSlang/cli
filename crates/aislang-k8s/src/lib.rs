@@ -744,6 +744,37 @@ mod tests {
             "ConfigMap data[config.yaml] must contain the router YAML; got:\n{body}");
     }
 
+    #[test] fn litellm_pod_annotation_tracks_router_config_content() {
+        // W26: LiteLLM reads its `model_list` ONCE at startup.  A
+        // re-onboard rewrites the router config.yaml; if the pod template
+        // is byte-identical, `helm upgrade` won't roll the pod and it
+        // keeps serving the PREVIOUS project's models — rejecting the new
+        // project's models with `Invalid model name …`.  The pod template
+        // must carry a hash of the config so a config change rolls it.
+        // The hash must equal a SHA-256 of the exact CM `config.yaml`.
+        let catalog = aislang_catalog::bundled().expect("bundled");
+        let artifacts = emit(&empty_resolved(), &catalog, &empty_sources()).expect("emit");
+        let res = all_resources(&artifacts);
+        let dep = res.iter()
+            .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "Deployment")
+            .expect("litellm Deployment present");
+        let cm = res.iter()
+            .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "ConfigMap")
+            .expect("litellm-config CM present");
+        let config_yaml = cm.2["data"]["config.yaml"].as_str()
+            .expect("CM data[config.yaml] is a string");
+        let annotation = dep.2["spec"]["template"]["metadata"]["annotations"]
+            [services::LITELLM_CONFIG_HASH_ANNOTATION].as_str()
+            .expect("litellm pod template must carry the config-hash annotation");
+        // sha256 of the CM body, hex (mirror services::sha256_hex).
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(config_yaml.as_bytes());
+        let want: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(annotation, want,
+            "litellm pod config-hash annotation must equal SHA-256 of its config.yaml");
+    }
+
     #[test] fn budget_counter_carries_cap_envs_when_budget_set() {
         use aislang_core::ast::{Project, Budget};
         use aislang_core::types::{Money, Currency, OptimizeFor};

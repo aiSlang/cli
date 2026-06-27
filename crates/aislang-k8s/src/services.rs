@@ -196,6 +196,15 @@ pub fn build_litellm(
         cm_data,
     );
 
+    // Pod-template annotation tying the pod to the config CONTENT — so a
+    // re-onboard that rewrites `model_list` rolls the pod (LiteLLM only
+    // reads config.yaml at startup; see LITELLM_CONFIG_HASH_ANNOTATION).
+    let mut pod_annotations = BTreeMap::new();
+    pod_annotations.insert(
+        LITELLM_CONFIG_HASH_ANNOTATION.to_string(),
+        sha256_hex(router_yaml),
+    );
+
     // ── Container: LiteLLM serving on 4000, config mounted from CM.
     let container = Container {
         name:  "litellm".to_string(),
@@ -248,7 +257,19 @@ pub fn build_litellm(
             // EISDIR.  sub_path makes the mount file-shaped.
             sub_path:   Some("config.yaml".to_string()),
         }]),
-        readiness_probe: None,
+        // W26 — now that a config change ROLLS this pod (see
+        // LITELLM_CONFIG_HASH_ANNOTATION), gate readiness on the router
+        // port being bound so the rolling update keeps the OLD LiteLLM
+        // serving until the NEW one is up — otherwise the agent-runtime
+        // dials LiteLLM into a gap and chat turns fail with "error
+        // sending request for url".
+        readiness_probe: Some(Probe {
+            tcp_socket:            Some(TcpSocketAction { port: 4000 }),
+            initial_delay_seconds: Some(3),
+            period_seconds:        Some(5),
+            timeout_seconds:       Some(3),
+            failure_threshold:     Some(12),
+        }),
     };
 
     let pod_template = PodTemplate {
@@ -259,7 +280,7 @@ pub fn build_litellm(
             name:        String::new(),
             namespace:   None,
             labels:      labels.clone(),
-            annotations: BTreeMap::new(),
+            annotations: pod_annotations,
         },
         spec: PodSpec {
             containers:      vec![container],
@@ -542,6 +563,17 @@ pub const PROMPT_HASH_ANNOTATION_PREFIX: &str = "aislang.prompt-hash/";
 /// pods.  One annotation key, deterministic SHA-256 of the
 /// concatenated `(.ais source || lockfile)` body.
 pub const PROJECT_HASH_ANNOTATION: &str = "aislang.project-hash";
+
+/// Annotation on the LiteLLM pod template carrying a SHA-256 of the
+/// generated router `config.yaml`.  LiteLLM reads its `model_list`
+/// ONCE at startup, so a re-onboard that swaps the project (and thus
+/// the `model_list`) is invisible to a running pod unless the pod
+/// rolls — leaving it serving the previous project's models and
+/// rejecting the new ones with `Invalid model name …`.  Stamping the
+/// config hash here makes `helm upgrade` roll the Deployment whenever
+/// the config changes (same trigger pattern as the agent-runtime's
+/// prompt/project hashes).
+pub const LITELLM_CONFIG_HASH_ANNOTATION: &str = "aislang.litellm-config-hash";
 
 /// Resolve the agent-runtime listening port from the deploy block.
 /// Returns the user-declared `expose.port` when present, else the
@@ -1092,6 +1124,24 @@ fn sha256_hex_of_multi_module(sources: &crate::ProjectSources) -> String {
     let bytes = h.finalize();
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes { out.push_str(&format!("{b:02x}")); }
+    out
+}
+
+/// Hex SHA-256 of a single string.  Drives the LiteLLM pod's
+/// `aislang.litellm-config-hash` annotation — any change to the
+/// generated router config.yaml shifts this → the pod template
+/// changes → `helm upgrade` rolls the LiteLLM Deployment so it
+/// re-reads `/app/config.yaml` (LiteLLM loads its `model_list` once at
+/// startup; a ConfigMap edit alone is invisible to the running pod).
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let bytes = h.finalize();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
     out
 }
 
