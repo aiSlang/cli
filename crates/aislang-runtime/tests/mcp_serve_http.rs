@@ -86,7 +86,7 @@ async fn http_handshake_succeeds_and_lists_all_phase_1_tools() {
     let tools = client.peer().list_tools(Default::default()).await
         .expect("list_tools failed over HTTP");
 
-    // Pin the same 11-tool surface the stdio test pins.  Sharing
+    // Pin the same 12-tool surface the stdio test pins.  Sharing
     // the same expected-set across both transports is the
     // architectural assertion: stdio vs. HTTP is a wire choice;
     // the tool router is one piece of code.
@@ -104,6 +104,7 @@ async fn http_handshake_succeeds_and_lists_all_phase_1_tools() {
         "aislang_status",
         "aislang_chat_turn",
         "aislang_eval",
+        "aislang_run_pipeline",
     ];
     assert_eq!(tools.tools.len(), expected.len(),
         "HTTP tool count should match stdio's; got: {names:?}");
@@ -196,10 +197,10 @@ async fn http_two_clients_can_connect_concurrently() {
     let (tools_a, ping_a) = a.expect("client A task");
     let (tools_b, ping_b) = b.expect("client B task");
 
-    // Both clients should see the full 11-tool surface and a
+    // Both clients should see the full 12-tool surface and a
     // non-empty ping reply.
-    assert_eq!(tools_a, 11, "client A tool count");
-    assert_eq!(tools_b, 11, "client B tool count");
+    assert_eq!(tools_a, 12, "client A tool count");
+    assert_eq!(tools_b, 12, "client B tool count");
     assert!(ping_a >= 1, "client A ping reply content");
     assert!(ping_b >= 1, "client B ping reply content");
 

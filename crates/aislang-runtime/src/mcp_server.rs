@@ -1260,6 +1260,16 @@ impl AislangServer {
     )]
     pub async fn run_pipeline(&self,
         Parameters(p): Parameters<RunPipelineParameters>,
+        // W26: progress streaming.  A pipeline (or even a single slow
+        // architect turn) can run for minutes; the LiteLLM client is
+        // non-streaming, so without periodic progress the MCP client's
+        // request timeout fires (`-32001 Request timed out`) with no
+        // indication of what's happening.  We emit a step-boundary message
+        // per step PLUS a periodic heartbeat while a step is in flight —
+        // both reset the client's timeout and tell the user "step 2/3:
+        // coder running…".  Same extractors `chat_turn` uses.
+        meta:   Meta,
+        client: Peer<RoleServer>,
     ) -> Result<CallToolResult, RmcpError> {
         // ── resolve source_dir + source (dir-input dispatch, same as chat_turn).
         let dir_input: Option<PathBuf> = p.source_path.as_deref()
@@ -1350,6 +1360,70 @@ impl AislangServer {
             }
         }
 
+        // ── Progress streaming (W26).  When the client supplied a
+        //    `progressToken`, stream human-readable progress so (a) the
+        //    client's request timeout keeps resetting across a multi-minute
+        //    run and (b) the user sees which step is running.  Two sources
+        //    feed one monotonic-counter forwarder:
+        //      • step-boundary messages (sent from the loop), and
+        //      • a HEARTBEAT every `PROGRESS_HEARTBEAT_SECS` while a step is
+        //        in flight — the non-streaming LiteLLM call emits nothing on
+        //        its own, so the heartbeat is what actually holds the
+        //        connection open during a long single turn.
+        //    No token → `progress_tx` is None and every send is a cheap no-op.
+        const PROGRESS_HEARTBEAT_SECS: u64 = 10;
+        let progress_token = meta.get_progress_token();
+        let status = std::sync::Arc::new(std::sync::Mutex::new(
+            format!("starting `{qualified}`…")));
+        let (progress_tx, forwarder, heartbeat) = if let Some(token) = progress_token {
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<String>();
+            // Forwarder: owns the monotonic `progress` counter so every
+            // notification strictly increases (clients require that).
+            let client_fwd = client.clone();
+            let fwd = tokio::spawn(async move {
+                let mut n = 0f64;
+                while let Some(msg) = rx.recv().await {
+                    n += 1.0;
+                    let _ = client_fwd.notify_progress(ProgressNotificationParam {
+                        progress_token: token.clone(),
+                        progress:       n,
+                        total:          None,
+                        message:        Some(msg),
+                    }).await;
+                }
+            });
+            // Heartbeat: re-announce the current status on a timer so a long
+            // single turn (non-streaming LiteLLM) still resets the client
+            // timeout.  Stops when the channel closes (run finished).
+            let hb_tx     = tx.clone();
+            let hb_status = status.clone();
+            let hb = tokio::spawn(async move {
+                let mut elapsed = 0u64;
+                loop {
+                    tokio::time::sleep(
+                        std::time::Duration::from_secs(PROGRESS_HEARTBEAT_SECS)).await;
+                    elapsed += PROGRESS_HEARTBEAT_SECS;
+                    let s = hb_status.lock()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    if hb_tx.send(format!("⏳ {s} ({elapsed}s elapsed)")).is_err() {
+                        break; // channel closed → run done
+                    }
+                }
+            });
+            (Some(tx), Some(fwd), Some(hb))
+        } else {
+            (None, None, None)
+        };
+        // Update `status` + push an immediate progress message (no-op when
+        // the caller didn't request progress).
+        let announce = |progress_tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+                        status: &std::sync::Arc<std::sync::Mutex<String>>,
+                        msg: String| {
+            if let Ok(mut g) = status.lock() { *g = msg.clone(); }
+            if let Some(tx) = progress_tx { let _ = tx.send(msg); }
+        };
+
         // ── orchestrate.  Pipeline → one pass; loop → up to max_iter passes,
         //    feeding each pass's final reply back, stopping when the loop's
         //    `.ais` condition says so (or, if it can't be evaluated, on ACCEPT).
@@ -1362,12 +1436,22 @@ impl AislangServer {
         // The very first dispatch gets the user's input verbatim; every later
         // step gets it FRAMED as the previous agent's output (see below).
         let mut prev_step: Option<String> = None;
-        for iter in 1..=passes {
+        // Capture a step failure instead of `?`-returning straight out, so the
+        // progress tasks below are always cleaned up before we propagate it.
+        let mut run_error: Option<String> = None;
+        'outer: for iter in 1..=passes {
             iters_run = iter;
             if is_loop {
                 transcript.push_str(&format!("\n══ iteration {iter}/{passes} ══\n"));
             }
             for (i, step) in steps.iter().enumerate() {
+                // Announce the step (immediate message + sets the heartbeat's
+                // current status) so a long turn streams "step 2/3: coder …".
+                announce(&progress_tx, &status, format!(
+                    "{}step {}/{}: `{step}` running…",
+                    if is_loop { format!("iteration {iter}/{passes} — ") }
+                    else { String::new() },
+                    i + 1, steps.len()));
                 // Handoff framing: passing one agent's reply RAW as the next
                 // agent's user_input causes identity bleed — the LLM reads the
                 // prior agent's first-person prose ("I am the Architect…") and
@@ -1383,10 +1467,15 @@ impl AislangServer {
                          ----- begin output from `{prev}` -----\n{current}\n\
                          ----- end output from `{prev}` -----"),
                 };
-                let reply = self.run_one_agent_turn(&source, &source_dir, step, &input)
-                    .await
-                    .map_err(|e| RmcpError::internal_error(
-                        format!("step[{i}] `{step}`: {e}"), None))?;
+                let reply = match self.run_one_agent_turn(
+                    &source, &source_dir, step, &input).await
+                {
+                    Ok(r)  => r,
+                    Err(e) => {
+                        run_error = Some(format!("step[{i}] `{step}`: {e}"));
+                        break 'outer;
+                    }
+                };
                 transcript.push_str(&format!("\n▸ {step}\n{reply}\n"));
                 current     = reply.clone();
                 final_reply = reply;
@@ -1406,6 +1495,23 @@ impl AislangServer {
                 };
                 if !keep_going { stopped_early = true; break; }
             }
+        }
+
+        // ── Tear down progress streaming: stop the heartbeat, close the
+        //    channel, and drain the forwarder so any queued messages flush
+        //    before we return (bounded by a short timeout so a wedged
+        //    transport can't hang the response).
+        if let Some(hb) = heartbeat { hb.abort(); }
+        drop(progress_tx);
+        if let Some(fwd) = forwarder {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5), fwd).await;
+        }
+
+        // A step failure is propagated here — AFTER the cleanup above — so the
+        // progress tasks never outlive the call.
+        if let Some(e) = run_error {
+            return Err(RmcpError::internal_error(e, None));
         }
 
         let header = if is_loop {
