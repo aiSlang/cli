@@ -1345,6 +1345,25 @@ impl AislangServer {
                 format!("`{qualified}` has no steps to run"), None));
         }
 
+        // ── RAG health (#2): warn — in the transcript the user actually sees
+        //    — when a step agent declares `knowledge` but its index is
+        //    missing/empty (retrieval silently off).  Cheap: reuses the
+        //    already-loaded project + per-store file reads, deduped per agent.
+        let rag_warnings: Vec<String> = {
+            let project_root = source_dir.canonicalize()
+                .unwrap_or_else(|_| source_dir.clone());
+            let mut seen = std::collections::HashSet::new();
+            let mut ws = Vec::new();
+            for step in &steps {
+                if seen.insert(step.clone()) {
+                    if let Some(w) = rag_health_warning(project, &project_root, step) {
+                        ws.push(w);
+                    }
+                }
+            }
+            ws
+        };
+
         // ── Fresh run: drop any cached sessions for these step agents so each
         //    `run_pipeline` invocation starts with clean history (the CLI
         //    clears pipeline history per run too).  History still accumulates
@@ -1521,8 +1540,11 @@ impl AislangServer {
         } else {
             format!("{qualified} (pipeline) — {} step(s)\n", steps.len())
         };
+        // Prepend any RAG warnings so they're the first thing the user reads.
+        let warn_block = if rag_warnings.is_empty() { String::new() }
+            else { format!("{}\n\n", rag_warnings.join("\n")) };
         Ok(CallToolResult::success(vec![Content::text(
-            format!("{header}{transcript}\n── final reply ──\n{final_reply}"))]))
+            format!("{warn_block}{header}{transcript}\n── final reply ──\n{final_reply}"))]))
     }
 
     /// Run ONE agent turn against the (source_dir, agent_label) session
@@ -1990,6 +2012,48 @@ fn resolve_mcp_secrets_for_agent(
 ///
 /// Used by both `chat_turn` (cached via the SessionKey-keyed map)
 /// and `eval` (fresh per eval run, never cached).
+/// W26 (#2) — cheap RAG health probe for the USER-FACING warning, no
+/// embedding call.  For an agent that DECLARES `knowledge`, check each
+/// referenced `vector_store` has a non-empty on-disk index.  Returns a
+/// one-line warning naming the unhealthy stores, or `None` when the agent
+/// declares no knowledge or every declared index is present + non-empty.
+/// `run_pipeline` prepends this to the chat transcript so "RAG is broken /
+/// off" is visible to the user, not just buried in pod logs (the
+/// `rag build-all … || true` entrypoint otherwise hides a failed corpus
+/// build).  `project`/`project_root` come from the already-loaded project so
+/// this adds only per-store file reads.
+fn rag_health_warning(
+    project:      &aislang_core::ast::Project,
+    project_root: &std::path::Path,
+    agent_label:  &str,
+) -> Option<String> {
+    let agent = project.agents.iter().find(|a| a.label == agent_label)?;
+    let knowledge = agent.knowledge.as_ref().filter(|k| !k.is_empty())?;
+    let dir = crate::rag::vector_index_dir(project_root);
+    let mut unhealthy: Vec<String> = Vec::new();
+    for vs_ref in knowledge {
+        let vs_key = vs_ref.qualified_in(&agent.label);
+        // Resolve to the store's own (possibly cross-module) label.
+        let label = project.vector_stores.iter()
+            .find(|v| v.label == vs_key)
+            .map(|v| v.label.clone())
+            .unwrap_or(vs_key);
+        let path = dir.join(format!("{label}.bin"));
+        let healthy = crate::rag::Index::load(&path)
+            .map(|i| !i.chunks.is_empty())
+            .unwrap_or(false);
+        if !healthy { unhealthy.push(label); }
+    }
+    if unhealthy.is_empty() { return None; }
+    Some(format!(
+        "⚠ RAG unavailable for `{agent_label}`: no usable index for [{}] — this \
+         agent is running WITHOUT retrieval (grounding off, answers may be \
+         ungrounded). Most likely a missing OPENAI_API_KEY / GITHUB_TOKEN or an \
+         unbuilt corpus; check `aislang rag verify /etc/aislang` and the \
+         agent-runtime logs.",
+        unhealthy.join(", ")))
+}
+
 /// v0.3 Week 19 Thu — RAG prepend for chat_turn.
 ///
 /// Given the agent + user_input, retrieve the top-K most-relevant
