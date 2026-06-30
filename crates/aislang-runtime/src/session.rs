@@ -169,6 +169,13 @@ pub enum SessionProgress {
         bytes:     usize,
         is_error:  bool,
     },
+    /// Liveness signal while a LiteLLM completion streams in (W26).
+    /// Emitted (THROTTLED — see the turn loop) as SSE content deltas
+    /// arrive, so a long non-tool generation keeps the MCP client's
+    /// request timeout from firing (a single completion can run minutes
+    /// with no other progress event in between).  PII-safe: carries the
+    /// cumulative character count only, never the streamed text.
+    Streaming { step: u64, iteration: u32, chars: usize },
     /// LiteLLM returned a `tool_calls`-free response — the turn's
     /// final answer.  Caller can use this as the "drain" / "done"
     /// marker before the function result arrives over the wire.
@@ -194,6 +201,7 @@ impl SessionProgress {
             Self::ToolDispatchStart { step, .. } => *step,
             Self::ToolCall          { step, .. } => *step,
             Self::ToolResult        { step, .. } => *step,
+            Self::Streaming         { step, .. } => *step,
             Self::FinalAnswer       { step, .. } => *step,
             Self::TraceUrl          { step, .. } => *step,
         }
@@ -218,6 +226,8 @@ impl SessionProgress {
                     if *fragments == 1 { "" } else { "s" },
                     if *is_error { ", is_error=true" } else { "" },
                 ),
+            Self::Streaming { chars, .. } =>
+                format!("streaming response… ({chars} chars)"),
             Self::FinalAnswer { bytes, .. } =>
                 format!("final answer ready ({bytes}B)"),
             Self::TraceUrl { url, .. } =>
@@ -639,8 +649,15 @@ impl Session {
         // Monotonic step counter for SessionProgress events — passed
         // verbatim to rmcp `ProgressNotificationParam.progress` (rmcp
         // requires monotonicity).
-        let mut step: u64 = 0;
-        let mut bump = || { let s = step; step += 1; s };
+        // Monotonic progress counter.  Atomic + shared (not a capturing
+        // FnMut) so the streaming token callback below can bump it too while
+        // the loop also uses it — keeps every `progress` value strictly
+        // increasing across both sources (W26).
+        let step = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bump = {
+            let step = std::sync::Arc::clone(&step);
+            move || step.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
 
         // ── OTel: open the turn-level span (week 9 Wed) ──
         // Parent = `Context::current()` (per-command root attached
@@ -744,7 +761,38 @@ impl Session {
                 timeout:    None,
                 max_tokens: None,
             };
-            let response = self.litellm.send_chat_full(&req).await?;
+            // Stream by default (W26): forward each content fragment as a
+            // `Token` progress event so a long completion keeps the host's
+            // request timeout alive + renders live.  `tool_calls` are
+            // reassembled inside the client, so the loop below sees the same
+            // shape either way.  `AISLANG_LITELLM_STREAM=0` falls back to the
+            // single-shot call (kill-switch for any streaming regression).
+            let response = if crate::litellm::LiteLlmClient::streaming_enabled() {
+                let step_tok = std::sync::Arc::clone(&step);
+                let iter_u   = _iter as u32;
+                // Throttle liveness events to ~1/750ms: enough to keep the
+                // client's request timeout reset, without one notification
+                // per token flooding the progress channel.  `chars` is the
+                // running total streamed so far (PII-safe — no text).
+                let mut chars: usize = 0;
+                let mut last = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                self.litellm.send_chat_full_streaming(&req, |text: &str| {
+                    chars += text.chars().count();
+                    if last.elapsed() >= std::time::Duration::from_millis(750) {
+                        last = std::time::Instant::now();
+                        on_progress(SessionProgress::Streaming {
+                            step: step_tok.fetch_add(
+                                1, std::sync::atomic::Ordering::Relaxed),
+                            iteration: iter_u,
+                            chars,
+                        });
+                    }
+                }).await?
+            } else {
+                self.litellm.send_chat_full(&req).await?
+            };
 
             // Capture usage BEFORE consuming the response into the
             // assistant message. LiteLLM emits per-completion token
@@ -1423,12 +1471,13 @@ mod tests {
         // Final reply unchanged from the bare `turn()` path.
         assert_eq!(out, "ack: hi");
 
-        // v0.3 Week 18 Mon follow-up: turn now emits TraceUrl FIRST
-        // (before any LLM call) so the chat stdout carries a clickable
-        // Jaeger link.  Sequence is now: TraceUrl → IterationStart →
-        // FinalAnswer.
+        // v0.3 Week 18 Mon follow-up: turn emits TraceUrl FIRST (before any
+        // LLM call) so the chat stdout carries a clickable Jaeger link.
+        // W26: streaming-by-default adds a `Streaming` liveness event from the
+        // LLM call (here the non-SSE mock falls back to one content callback).
+        // Sequence: TraceUrl → IterationStart → Streaming → FinalAnswer.
         let evs = events.lock().unwrap();
-        assert_eq!(evs.len(), 3, "expected 3 events; got: {evs:?}");
+        assert_eq!(evs.len(), 4, "expected 4 events; got: {evs:?}");
         match &evs[0] {
             SessionProgress::TraceUrl { step: 0, url } => {
                 assert!(url.contains("/trace/"),
@@ -1443,15 +1492,23 @@ mod tests {
             other => panic!("expected IterationStart{{step:1, iter:0}}; got {other:?}"),
         }
         match &evs[2] {
-            SessionProgress::FinalAnswer { step: 2, iteration: 0, bytes } => {
+            SessionProgress::Streaming { step: 2, iteration: 0, chars } => {
+                assert_eq!(*chars, "ack: hi".chars().count(),
+                    "Streaming carries the cumulative char count");
+            }
+            other => panic!("expected Streaming{{step:2, iter:0}}; got {other:?}"),
+        }
+        match &evs[3] {
+            SessionProgress::FinalAnswer { step: 3, iteration: 0, bytes } => {
                 assert_eq!(*bytes, "ack: hi".len());
             }
-            other => panic!("expected FinalAnswer{{step:2, iter:0}}; got {other:?}"),
+            other => panic!("expected FinalAnswer{{step:3, iter:0}}; got {other:?}"),
         }
         // step() values are monotonically increasing (rmcp's
         // notify_progress requires this).
         assert!(evs[0].step() < evs[1].step());
         assert!(evs[1].step() < evs[2].step());
+        assert!(evs[2].step() < evs[3].step());
     }
 
     #[tokio::test]

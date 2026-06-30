@@ -23,6 +23,9 @@ serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 # week-6 Wed
 reqwest      = { workspace = true }
+# W26: StreamExt for consuming reqwest's `bytes_stream()` in the streaming
+# LiteLLM client (SSE chat completions).
+futures-util = "0.3"
 sha2         = { workspace = true }
 # week-7 Tue: cost arithmetic needs Money + Currency from core's types.
 # Decision 6: budget enforcement lives in this crate, not LiteLLM config.
