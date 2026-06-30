@@ -3560,9 +3560,15 @@ fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
         eprintln!("aislang rag build-all: no vector_store blocks — nothing to build");
         return Ok(());
     }
+    let total = proj.vector_stores.len();
     eprintln!();
-    eprintln!("building RAG indexes for {} declared vector_store(s) (litellm={litellm_url}):",
-        proj.vector_stores.len());
+    eprintln!("building RAG indexes for {total} declared vector_store(s) (litellm={litellm_url}):");
+    // #2: track outcomes so we can print one unmissable SUMMARY line — the
+    // entrypoint runs this with `|| true`, so a per-store failure is otherwise
+    // invisible without grepping.  `failed` names go in the summary verbatim.
+    let mut built = 0usize;
+    let mut skipped = 0usize;
+    let mut failed: Vec<String> = Vec::new();
     for vs in &proj.vector_stores {
         eprint!("  - `{}` … ", vs.label);
         // Resolve the corpus + paths first (cheap relative to embedding) so we
@@ -3572,7 +3578,11 @@ fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
         // pod restart, so an identical corpus skips the multi-minute embed.
         let prep = match prepare_rag_build(&vs.label, &project, &litellm_url) {
             Ok(p)  => p,
-            Err(e) => { eprintln!("FAILED at prepare: {e}"); continue; }
+            Err(e) => {
+                eprintln!("FAILED at prepare: {e}");
+                failed.push(format!("{} (prepare: {e})", vs.label));
+                continue;
+            }
         };
         let hash   = corpus_hash_hex(&prep.source_text);
         let marker = corpus_marker_path(&prep.idx_path);
@@ -3582,6 +3592,7 @@ fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
                 .unwrap_or(false);
         if fresh {
             eprintln!("up to date (corpus hash match) — skipping rebuild");
+            skipped += 1;
             continue;
         }
         let index = match aislang_runtime::rag::build_index(
@@ -3589,10 +3600,15 @@ fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
             prep.chunk_size, prep.chunk_overlap, &prep.embedder)
         {
             Ok(i)  => i,
-            Err(e) => { eprintln!("FAILED at build: {e}"); continue; }
+            Err(e) => {
+                eprintln!("FAILED at build: {e}");
+                failed.push(format!("{} (build: {e})", vs.label));
+                continue;
+            }
         };
         match index.save(&prep.idx_path) {
             Ok(bytes) => {
+                built += 1;
                 // Record the corpus hash only AFTER a successful save, so a
                 // failed/partial build never marks itself "fresh".
                 if let Err(e) = std::fs::write(&marker, &hash) {
@@ -3604,8 +3620,25 @@ fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
                         index.chunks.len(), bytes, prep.idx_path.display());
                 }
             }
-            Err(e) => eprintln!("FAILED at save: {e}"),
+            Err(e) => {
+                eprintln!("FAILED at save: {e}");
+                failed.push(format!("{} (save: {e})", vs.label));
+            }
         }
+    }
+    // ── Unmissable summary (#2).  A non-empty `failed` list is the signal the
+    //    user needs: those agents will run WITHOUT retrieval.
+    let healthy = built + skipped;
+    eprintln!();
+    if failed.is_empty() {
+        eprintln!("RAG build summary: OK — {healthy}/{total} store(s) ready \
+            ({built} built, {skipped} cached).");
+    } else {
+        eprintln!("RAG build summary: DEGRADED — {healthy}/{total} ready, \
+            {} FAILED → those agents run WITHOUT retrieval:", failed.len());
+        for f in &failed { eprintln!("    ✗ {f}"); }
+        eprintln!("  fix: ensure OPENAI_API_KEY (embeddings) + GITHUB_TOKEN (git: \
+            corpora) are set via `PUT /v1/providers`, then restart the pod.");
     }
     Ok(())
 }
