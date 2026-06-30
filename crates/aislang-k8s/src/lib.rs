@@ -314,11 +314,15 @@ pub fn emit(
         &deploy_label,
         sources,
     );
+    // W26 — PVC backing the RAG index dir so built indexes survive pod
+    // restarts (an unchanged corpus is then NOT re-embedded on re-onboard).
+    let vector_pvc = services::build_vector_pvc(&deploy_label);
     manifests.insert(
         AGENT_RUNTIME_MANIFEST_FILENAME.to_string(),
         join_manifests(&[
-            ("Deployment", serde_yaml::to_string(&agent_dep)?),
-            ("Service",    serde_yaml::to_string(&agent_svc)?),
+            ("PersistentVolumeClaim", serde_yaml::to_string(&vector_pvc)?),
+            ("Deployment",            serde_yaml::to_string(&agent_dep)?),
+            ("Service",               serde_yaml::to_string(&agent_svc)?),
         ]),
     );
 
@@ -985,10 +989,11 @@ mod tests {
             .collect();
         assert_eq!(kinds,
             std::collections::BTreeSet::from([
+                "PersistentVolumeClaim".to_string(),  // W26 — RAG index cache
                 "Deployment".to_string(),
                 "Service".to_string(),
             ]),
-            "agent-runtime.yaml must contain Deployment + Service");
+            "agent-runtime.yaml must contain PVC + Deployment + Service");
     }
 
     #[test] fn agent_runtime_pod_uses_expose_port() {
@@ -1778,18 +1783,23 @@ mod tests {
     }
 
     #[test] fn agent_runtime_ships_writable_vector_volume_and_env() {
-        // W26 — RAG indexes are built into a writable emptyDir (the project CM
-        // mount is read-only) + located via AISLANG_VECTOR_DIR.
+        // W26 — RAG indexes are built into a writable, PERSISTENT volume (the
+        // project CM mount is read-only) + located via AISLANG_VECTOR_DIR.  The
+        // volume is a PVC (not emptyDir) so indexes survive pod restarts and an
+        // unchanged corpus isn't re-embedded on re-onboard.
         let resolved  = resolved_with_k8s_deploy("prod");
         let sources   = multi_module_sources();
         let catalog   = aislang_catalog::bundled().expect("bundled");
         let artifacts = emit(&resolved, &catalog, &sources).expect("emit");
         let dep_yaml  = artifacts.manifests.get("agent-runtime.yaml")
             .expect("agent-runtime Deployment must be emitted");
-        assert!(dep_yaml.contains("emptyDir: {}"),
-            "must mount a writable emptyDir for RAG indexes; got:\n{dep_yaml}");
         assert!(dep_yaml.contains("name: vector"),
             "the `vector` volume + mount must be present; got:\n{dep_yaml}");
+        assert!(dep_yaml.contains(&format!("claimName: {}", services::VECTOR_PVC_NAME)),
+            "the vector volume must be backed by the RAG-index PVC; got:\n{dep_yaml}");
+        assert!(dep_yaml.contains("kind: PersistentVolumeClaim")
+            && dep_yaml.contains(services::VECTOR_PVC_NAME),
+            "the agent-runtime manifest must emit the vector PVC; got:\n{dep_yaml}");
         assert!(dep_yaml.contains("AISLANG_VECTOR_DIR")
             && dep_yaml.contains("/var/aislang/vector"),
             "must export AISLANG_VECTOR_DIR=/var/aislang/vector; got:\n{dep_yaml}");

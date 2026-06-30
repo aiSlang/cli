@@ -3565,13 +3565,46 @@ fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
         proj.vector_stores.len());
     for vs in &proj.vector_stores {
         eprint!("  - `{}` … ", vs.label);
-        match build_rag_index_for(&vs.label, &project, &litellm_url) {
-            Ok((built, idx_path)) => match built.save(&idx_path) {
-                Ok(bytes) => eprintln!("{} chunks ({} bytes) → {}",
-                    built.chunks.len(), bytes, idx_path.display()),
-                Err(e) => eprintln!("FAILED at save: {e}"),
-            },
-            Err(e) => eprintln!("FAILED at build: {e}"),
+        // Resolve the corpus + paths first (cheap relative to embedding) so we
+        // can short-circuit when the corpus is unchanged AND a built index is
+        // already present.  W26: this is what makes a re-onboard fast — on a
+        // PVC-backed vector dir the prior `.bin` + `.corpus-hash` survive the
+        // pod restart, so an identical corpus skips the multi-minute embed.
+        let prep = match prepare_rag_build(&vs.label, &project, &litellm_url) {
+            Ok(p)  => p,
+            Err(e) => { eprintln!("FAILED at prepare: {e}"); continue; }
+        };
+        let hash   = corpus_hash_hex(&prep.source_text);
+        let marker = corpus_marker_path(&prep.idx_path);
+        let fresh  = prep.idx_path.exists()
+            && std::fs::read_to_string(&marker)
+                .map(|s| s.trim() == hash)
+                .unwrap_or(false);
+        if fresh {
+            eprintln!("up to date (corpus hash match) — skipping rebuild");
+            continue;
+        }
+        let index = match aislang_runtime::rag::build_index(
+            vs.label.clone(), &prep.source_text,
+            prep.chunk_size, prep.chunk_overlap, &prep.embedder)
+        {
+            Ok(i)  => i,
+            Err(e) => { eprintln!("FAILED at build: {e}"); continue; }
+        };
+        match index.save(&prep.idx_path) {
+            Ok(bytes) => {
+                // Record the corpus hash only AFTER a successful save, so a
+                // failed/partial build never marks itself "fresh".
+                if let Err(e) = std::fs::write(&marker, &hash) {
+                    eprintln!("{} chunks ({} bytes) → {} (warning: marker write \
+                        failed, will rebuild next time: {e})",
+                        index.chunks.len(), bytes, prep.idx_path.display());
+                } else {
+                    eprintln!("{} chunks ({} bytes) → {}",
+                        index.chunks.len(), bytes, prep.idx_path.display());
+                }
+            }
+            Err(e) => eprintln!("FAILED at save: {e}"),
         }
     }
     Ok(())
@@ -4439,13 +4472,57 @@ fn run_rag_query(
 /// read+chunk source → embed via LiteLLM → return the built
 /// `Index` + its on-disk path.  Used by both `rag build` (which
 /// just saves) and `rag query`'s on-first-call build path.
+/// Everything needed to build ONE vector_store's index EXCEPT the (expensive)
+/// embedding pass: the resolved corpus text, where the `.bin` lands, and the
+/// chunking + embedder config.  Split out of [`build_rag_index_for`] so
+/// callers can hash `source_text` and decide whether to skip the rebuild
+/// before paying for embeddings (W26 RAG cache).
+struct PreparedRagBuild {
+    source_text:   String,
+    idx_path:      PathBuf,
+    chunk_size:    usize,
+    chunk_overlap: usize,
+    embedder:      aislang_runtime::rag::LiteLlmEmbedder,
+}
+
+/// SHA-256 (hex) of a corpus body — the cache key written next to the index
+/// as `<label>.corpus-hash`.  An unchanged corpus → same hash → skip rebuild.
+fn corpus_hash_hex(source_text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(source_text.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Path of the corpus-hash marker companion file for an index `.bin`.
+fn corpus_marker_path(idx_path: &Path) -> PathBuf {
+    idx_path.with_extension("corpus-hash")
+}
+
 fn build_rag_index_for(
     vs_label:    &str,
     project:     &Path,
     litellm_url: &str,
 ) -> Result<(aislang_runtime::rag::Index, PathBuf)> {
+    use aislang_runtime::rag::build_index;
+    let prep = prepare_rag_build(vs_label, project, litellm_url)?;
+    let index = build_index(
+        vs_label.to_string(),
+        &prep.source_text,
+        prep.chunk_size,
+        prep.chunk_overlap,
+        &prep.embedder,
+    ).map_err(|e| anyhow::anyhow!("build index: {e}"))?;
+    Ok((index, prep.idx_path))
+}
+
+fn prepare_rag_build(
+    vs_label:    &str,
+    project:     &Path,
+    litellm_url: &str,
+) -> Result<PreparedRagBuild> {
     use aislang_core::ast::SourceUri;
-    use aislang_runtime::rag::{build_index, LiteLlmEmbedder};
+    use aislang_runtime::rag::LiteLlmEmbedder;
 
     let loaded = load_project_input(project)?;
     let proj = &loaded.resolved.project;
@@ -4559,22 +4636,20 @@ fn build_rag_index_for(
         litellm_url, &emb_block.label,
         catalog_entry.dimensions as usize);
 
-    eprintln!("aislang rag: building `{vs_label}` index ({} chars source, \
+    eprintln!("aislang rag: prepared `{vs_label}` corpus ({} chars source, \
                chunk_size={} chunk_overlap={}, embedder=`{}` dims={})",
         source_text.len(), vs.chunk_size.units, vs.chunk_overlap.units,
         emb_block.label, catalog_entry.dimensions);
 
-    let index = build_index(
-        vs_label.to_string(),
-        &source_text,
-        vs.chunk_size.units    as usize,
-        vs.chunk_overlap.units as usize,
-        &embedder,
-    ).map_err(|e| anyhow::anyhow!("build index: {e}"))?;
-
     let idx_path = aislang_runtime::rag::vector_index_dir(&project_root)
         .join(format!("{vs_label}.bin"));
-    Ok((index, idx_path))
+    Ok(PreparedRagBuild {
+        source_text,
+        idx_path,
+        chunk_size:    vs.chunk_size.units    as usize,
+        chunk_overlap: vs.chunk_overlap.units as usize,
+        embedder,
+    })
 }
 
 // ── W26: `git:` vector_store source helpers ──────────────────────────────
@@ -6596,6 +6671,23 @@ async fn run_eval_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- RAG corpus-hash cache (W26) ----
+
+    #[test] fn corpus_hash_is_stable_and_content_sensitive() {
+        let a = corpus_hash_hex("hello world");
+        assert_eq!(a, corpus_hash_hex("hello world"), "same corpus → same hash");
+        assert_ne!(a, corpus_hash_hex("hello world!"), "changed corpus → new hash");
+        assert_eq!(a.len(), 64, "SHA-256 hex is 64 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test] fn corpus_marker_sits_next_to_the_index_bin() {
+        // `<dir>/coder.coder_kb.bin` → `<dir>/coder.coder_kb.corpus-hash`.
+        let idx = std::path::Path::new("/var/aislang/vector/coder.coder_kb.bin");
+        assert_eq!(corpus_marker_path(idx),
+            std::path::Path::new("/var/aislang/vector/coder.coder_kb.corpus-hash"));
+    }
 
     // ---- levenshtein ----
 

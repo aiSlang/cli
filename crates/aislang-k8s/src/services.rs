@@ -533,11 +533,40 @@ pub const PROJECT_CM_MANIFEST_KEY: &str = "aislang.toml";
 /// 0.0.0.0:<port> /etc/aislang/project.ais` (Decision 43.3).
 pub const PROJECT_MOUNT_DIR: &str = "/etc/aislang";
 
-/// Writable dir (an emptyDir volume) where the agent-runtime builds + reads
-/// RAG index `.bin` files in-pod.  Separate from the read-only project CM
-/// mount; exported to the runtime via the `AISLANG_VECTOR_DIR` env var so
-/// `rag build-all` + `build_rag_prefix_for_turn` agree on the location (W26).
+/// Writable dir where the agent-runtime builds + reads RAG index `.bin`
+/// files in-pod.  Separate from the read-only project CM mount; exported to
+/// the runtime via the `AISLANG_VECTOR_DIR` env var so `rag build-all` +
+/// `build_rag_prefix_for_turn` agree on the location (W26).  Backed by a PVC
+/// ([`VECTOR_PVC_NAME`]) so indexes survive pod restarts.
 pub const VECTOR_INDEX_DIR: &str = "/var/aislang/vector";
+
+/// PVC name backing [`VECTOR_INDEX_DIR`] — persists built RAG indexes (and
+/// their `.corpus-hash` markers) across pod restarts so an unchanged corpus
+/// is NOT re-embedded on every apply/re-onboard.
+pub const VECTOR_PVC_NAME: &str = "aislang-vector";
+
+/// Default size for the vector-index PVC.  Indexes are small (a few MB per
+/// store — chunk text + float vectors), 1Gi is generous headroom.
+pub const VECTOR_PVC_SIZE: &str = "1Gi";
+
+/// Build the PVC that backs the agent-runtime's RAG index dir.  Emitted
+/// alongside the agent-runtime Deployment/Service (see lib.rs `emit`).
+/// ReadWriteOnce + the Recreate rollout strategy keep a single writer; the
+/// cluster's default StorageClass provisions it (EBS on EKS, same as the
+/// Open WebUI PVC).
+pub fn build_vector_pvc(deploy_label: &str) -> PersistentVolumeClaim {
+    let labels = aislang_labels("agent_runtime", deploy_label);
+    let mut requests = BTreeMap::new();
+    requests.insert("storage".to_string(), VECTOR_PVC_SIZE.to_string());
+    PersistentVolumeClaim::new(
+        ObjectMeta::new(VECTOR_PVC_NAME, labels),
+        PersistentVolumeClaimSpec {
+            access_modes:       vec!["ReadWriteOnce".to_string()],
+            resources:          PersistentVolumeClaimResources { requests },
+            storage_class_name: None,  // = cluster default
+        },
+    )
+}
 
 /// Sub-directory inside [`PROJECT_MOUNT_DIR`] where per-prompt body
 /// files land.  One file per `prompt` block keyed by `prompt.label`
@@ -1053,12 +1082,23 @@ pub fn build_agent_runtime_with_sources(
                     persistent_volume_claim: None,
                     empty_dir:               None,
                 },
-                // W26 — ephemeral writable dir for built RAG indexes.
+                // W26 — PERSISTENT writable dir for built RAG indexes.  Was
+                // an emptyDir, which is wiped on every pod restart → the
+                // in-pod `rag build-all` re-embedded the whole corpus (minutes)
+                // on each apply/re-onboard, blocking `mcp-serve` from binding
+                // and stranding the gateway in its "warming up" window.  Backing
+                // it with a PVC (see `build_vector_pvc`) lets the index survive
+                // restarts, so a re-onboard whose corpus is unchanged skips the
+                // rebuild (the CLI's `rag build-all` corpus-hash short-circuit)
+                // and the pod is serving in seconds.  RWO + the Recreate
+                // strategy keeps a single writer.
                 Volume {
                     name:                    "vector".to_string(),
                     config_map:              None,
-                    persistent_volume_claim: None,
-                    empty_dir:               Some(EmptyDirVolumeSource::default()),
+                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                        claim_name: VECTOR_PVC_NAME.to_string(),
+                    }),
+                    empty_dir:               None,
                 },
             ]),
             init_containers: None,

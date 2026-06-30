@@ -27,6 +27,7 @@ clap             = { workspace = true }
 anyhow           = { workspace = true }
 serde            = { workspace = true }   # week 10 Thu: derive for docker compose ps json
 serde_json       = { workspace = true }   # for -vvv JSON-IR rendering
+sha2             = { workspace = true }   # W26: RAG corpus-hash cache marker
 tokio            = { workspace = true }   # runtime for the chat subcommand (week 6 Wed)
 # week-9 Thu: per-case `aislang.case` span opened in the eval loop so
 # each CaseResult can carry a Jaeger deep-link URL. Direct dep instead
