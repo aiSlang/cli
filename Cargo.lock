@@ -142,6 +142,7 @@ dependencies = [
  "aislang-resolver",
  "axum",
  "futures-executor",
+ "futures-util",
  "minijinja",
  "opentelemetry",
  "opentelemetry-otlp",

@@ -546,6 +546,260 @@ impl LiteLlmClient {
         span.end();
         Ok(parsed)
     }
+
+    /// Env toggle for streaming (W26).  `AISLANG_LITELLM_STREAM` ∈
+    /// {`0`,`false`,`off`,`no`} disables the streaming path → callers fall
+    /// back to [`send_chat_full`].  Default = streaming ON.  A kill-switch so
+    /// a streaming/tool-call accumulation bug can be worked around in prod
+    /// without a redeploy.
+    pub const STREAM_ENV_VAR: &'static str = "AISLANG_LITELLM_STREAM";
+
+    /// Whether streaming is enabled (see [`STREAM_ENV_VAR`]).
+    pub fn streaming_enabled() -> bool {
+        match std::env::var(Self::STREAM_ENV_VAR) {
+            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"),
+            Err(_) => true,
+        }
+    }
+
+    /// Streaming counterpart to [`send_chat_full`].  Sends the request with
+    /// `stream: true`, parses the Server-Sent-Events delta stream, fires
+    /// `on_token(&str)` for each content fragment as it arrives, and returns
+    /// the SAME assembled [`ChatResponse`] the non-streaming path would —
+    /// content concatenated, `tool_calls` reconstructed from their streamed
+    /// fragments, `finish_reason` + `usage` (when the proxy emits it) carried
+    /// through.  The per-token callback is what keeps a long generation's
+    /// downstream MCP progress flowing (so the client's request timeout never
+    /// fires on a silent multi-minute completion).
+    ///
+    /// Tool calls stream as index-keyed fragments: the first fragment for an
+    /// index carries `id` + `function.name`, later fragments append
+    /// `function.arguments` chunks — we accumulate per index and assemble
+    /// whole [`ToolCall`]s at the end, so the tool-use loop sees the identical
+    /// shape it gets from a non-streaming response.
+    pub async fn send_chat_full_streaming<F>(
+        &self,
+        req:          &ChatRequest,
+        mut on_token: F,
+    ) -> Result<ChatResponse, LiteLlmError>
+    where
+        F: FnMut(&str),
+    {
+        use futures_util::StreamExt;
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        // Span mirrors send_chat_full (same gen_ai attrs + request body stamp).
+        let tracer = global::tracer("aislang");
+        let mut span = tracer.span_builder(gen_ai_span_name(&req.model))
+            .with_kind(SpanKind::Client)
+            .with_attributes(gen_ai_request_attrs(req))
+            .start(&tracer);
+        if let Ok(req_json) = serde_json::to_string(req) {
+            span.set_attribute(KeyValue::new("aislang.chat.request_json",
+                crate::session::truncate_for_span_attr(&req_json, 8192)));
+            span.set_attribute(KeyValue::new("aislang.chat.request_bytes_total",
+                req_json.len() as i64));
+        }
+
+        // Inject W3C trace context (same as the non-streaming path).
+        let mut carrier = HashMap::<String, String>::new();
+        let propagation_ctx = Context::current().with_remote_span_context(
+            span.span_context().clone());
+        global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&propagation_ctx,
+                &mut HeaderInjector(&mut carrier));
+        });
+
+        // Build the request with stream:true (clone so the caller's req — which
+        // the tool-use loop reuses across iterations — stays stream:false).
+        let stream_req = ChatRequest { stream: true, ..req.clone() };
+        let mut request = self.http.post(&url).json(&stream_req);
+        for (k, v) in &carrier { request = request.header(k, v); }
+
+        let response = request.send().await.map_err(|e| {
+            let _ = &span;
+            LiteLlmError::Transport { url: url.clone(), cause: e.to_string() }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LiteLlmError::BadStatus { url, status: status.as_u16(), body });
+        }
+
+        // ── Consume the byte stream, line-buffering across chunks. ──
+        let mut acc      = StreamAccumulator::default();
+        let mut line_buf = String::new();
+        let mut raw      = String::new();   // full body, for the non-SSE fallback
+        let mut body     = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk.map_err(|e| LiteLlmError::Transport {
+                url: url.clone(), cause: e.to_string() })?;
+            let s = String::from_utf8_lossy(&bytes);
+            raw.push_str(&s);
+            line_buf.push_str(&s);
+            // Process every COMPLETE line; keep the trailing partial buffered.
+            while let Some(nl) = line_buf.find('\n') {
+                let line = line_buf[..nl].trim_end_matches('\r').to_string();
+                line_buf.drain(..=nl);
+                acc.ingest_line(&line, &mut on_token);
+            }
+        }
+        // Flush any final bufferless line (stream ended without trailing \n).
+        if !line_buf.trim().is_empty() {
+            acc.ingest_line(line_buf.trim(), &mut on_token);
+        }
+
+        // If the body carried no SSE `data:` frames, the proxy answered with a
+        // plain (non-streaming) JSON ChatResponse — e.g. it ignored
+        // `stream:true`, or a test mock returned a single object.  Parse it
+        // directly and surface its content through the callback once so
+        // callers still get one liveness event.
+        let parsed = if acc.saw_data {
+            acc.into_response()
+        } else {
+            let resp: ChatResponse = serde_json::from_str(raw.trim())
+                .map_err(|e| LiteLlmError::BadResponse {
+                    url: url.clone(), cause: e.to_string(), body: raw.clone() })?;
+            if let Some(c) = resp.choices.first()
+                .and_then(|c| c.message.content.as_deref())
+            {
+                if !c.is_empty() { on_token(c); }
+            }
+            resp
+        };
+        for kv in gen_ai_response_attrs(&parsed) { span.set_attribute(kv); }
+        if let Ok(resp_json) = serde_json::to_string(&parsed) {
+            span.set_attribute(KeyValue::new("aislang.chat.response_json",
+                crate::session::truncate_for_span_attr(&resp_json, 8192)));
+            span.set_attribute(KeyValue::new("aislang.chat.response_bytes_total",
+                resp_json.len() as i64));
+        }
+        span.end();
+        Ok(parsed)
+    }
+}
+
+// ============================================================================
+// Streaming (SSE) accumulation — reassembles delta chunks into a ChatResponse
+// ============================================================================
+
+/// Per-index accumulator for a streamed `tool_calls` fragment.
+#[derive(Default)]
+struct ToolCallAccum { id: String, name: String, arguments: String }
+
+/// Accumulates an OpenAI-style streamed chat completion into the same
+/// [`ChatResponse`] the non-streaming endpoint returns.
+#[derive(Default)]
+struct StreamAccumulator {
+    content:       String,
+    tool_calls:    Vec<ToolCallAccum>,
+    finish_reason: Option<String>,
+    usage:         Option<UsageStats>,
+    done:          bool,
+    /// Whether ANY `data:` SSE frame was seen — drives the non-SSE
+    /// fallback in the caller (a body with no frames is a plain JSON
+    /// ChatResponse, not a stream).
+    saw_data:      bool,
+}
+
+impl StreamAccumulator {
+    /// Ingest one SSE line.  Returns `Some(true)` when the terminal
+    /// `data: [DONE]` sentinel was seen.  Non-`data:` lines (comments, blank
+    /// separators, the `event:` field) are ignored.
+    fn ingest_line<F: FnMut(&str)>(&mut self, line: &str, on_token: &mut F)
+        -> Option<bool>
+    {
+        let payload = line.strip_prefix("data:")?.trim();
+        self.saw_data = true;
+        if payload == "[DONE]" { self.done = true; return Some(true); }
+        // A malformed/partial JSON chunk is skipped rather than aborting the
+        // whole turn — the next chunk usually completes cleanly.
+        let chunk: StreamChunk = match serde_json::from_str(payload) {
+            Ok(c) => c, Err(_) => return Some(false),
+        };
+        if let Some(u) = chunk.usage { self.usage = Some(u); }
+        for choice in chunk.choices {
+            if let Some(fr) = choice.finish_reason { self.finish_reason = Some(fr); }
+            if let Some(c) = choice.delta.content {
+                if !c.is_empty() { on_token(&c); self.content.push_str(&c); }
+            }
+            for tc in choice.delta.tool_calls.unwrap_or_default() {
+                while self.tool_calls.len() <= tc.index {
+                    self.tool_calls.push(ToolCallAccum::default());
+                }
+                let slot = &mut self.tool_calls[tc.index];
+                if let Some(id) = tc.id { if !id.is_empty() { slot.id = id; } }
+                if let Some(f) = tc.function {
+                    if let Some(n) = f.name { if !n.is_empty() { slot.name = n; } }
+                    if let Some(a) = f.arguments { slot.arguments.push_str(&a); }
+                }
+            }
+        }
+        Some(false)
+    }
+
+    /// Assemble the final [`ChatResponse`] (one choice).
+    fn into_response(self) -> ChatResponse {
+        let tool_calls: Option<Vec<ToolCall>> = if self.tool_calls.is_empty() {
+            None
+        } else {
+            Some(self.tool_calls.into_iter().map(|t| ToolCall {
+                id:       t.id,
+                kind:     "function".to_string(),
+                function: FunctionCall { name: t.name, arguments: t.arguments },
+            }).collect())
+        };
+        // An assistant message invoking tools carries no textual content;
+        // otherwise carry the concatenated content (possibly empty).
+        let content = if self.content.is_empty() && tool_calls.is_some() {
+            None
+        } else {
+            Some(self.content)
+        };
+        ChatResponse {
+            id:    None,
+            model: None,
+            choices: vec![ChatChoice {
+                index:         0,
+                message:       ChatMessage {
+                    role: Role::Assistant, content, tool_calls,
+                    tool_call_id: None,
+                },
+                finish_reason: self.finish_reason,
+            }],
+            usage: self.usage,
+        }
+    }
+}
+
+// SSE delta wire types — only the fields we accumulate.
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)] choices: Vec<StreamChoice>,
+    #[serde(default)] usage:   Option<UsageStats>,
+}
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)] delta:         StreamDelta,
+    #[serde(default)] finish_reason: Option<String>,
+}
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)] content:    Option<String>,
+    #[serde(default)] tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+#[derive(Deserialize)]
+struct StreamToolCallDelta {
+    #[serde(default)] index:    usize,
+    #[serde(default)] id:       Option<String>,
+    #[serde(default)] function: Option<StreamFnDelta>,
+}
+#[derive(Deserialize, Default)]
+struct StreamFnDelta {
+    #[serde(default)] name:      Option<String>,
+    #[serde(default)] arguments: Option<String>,
 }
 
 // ============================================================================
@@ -1144,5 +1398,108 @@ mod tests {
         let msg    = &resp.choices[0].message;
         let calls  = msg.tool_calls.as_ref().expect("tool_calls present");
         assert_eq!(calls[0].function.name, "docs__list_dir");
+    }
+
+    // ----------------------------------------------------------------
+    // W26: streaming (SSE) send_chat_full_streaming
+    // ----------------------------------------------------------------
+
+    #[test] fn streaming_enabled_honours_env_toggle() {
+        let v = LiteLlmClient::STREAM_ENV_VAR;
+        // SAFETY: single-threaded test; no other test reads this var.
+        unsafe { std::env::remove_var(v); }
+        assert!(LiteLlmClient::streaming_enabled(), "default = streaming on");
+        for off in ["0", "false", "off", "no", "OFF", "False"] {
+            unsafe { std::env::set_var(v, off); }
+            assert!(!LiteLlmClient::streaming_enabled(), "`{off}` disables streaming");
+        }
+        for on in ["1", "true", "yes", "anything-else"] {
+            unsafe { std::env::set_var(v, on); }
+            assert!(LiteLlmClient::streaming_enabled(), "`{on}` keeps streaming on");
+        }
+        unsafe { std::env::remove_var(v); }
+    }
+
+    #[tokio::test]
+    async fn streaming_accumulates_content_and_fires_on_token() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        let server = MockServer::start().await;
+        // Three content deltas + finish + DONE.  Note the chunks arrive as one
+        // body; our line-buffer must split them on `\n`.
+        let sse = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse))
+            .mount(&server).await;
+
+        let client = LiteLlmClient::new(server.uri()).unwrap();
+        let req    = one_turn_request("fast", "sys", "hi");
+        let mut tokens: Vec<String> = Vec::new();
+        let resp = client.send_chat_full_streaming(&req, |t| tokens.push(t.to_string()))
+            .await.expect("streaming ok");
+        assert_eq!(tokens, vec!["Hel", "lo", " world"],
+            "on_token fires once per content delta");
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello world"),
+            "content concatenated in order");
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(resp.choices[0].message.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_reassembles_tool_calls_from_fragments() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        let server = MockServer::start().await;
+        // OpenAI streams tool_calls index-keyed: first fragment has id+name +
+        // a partial arguments string; later fragments append more arguments.
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"/data\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse))
+            .mount(&server).await;
+
+        let client = LiteLlmClient::new(server.uri()).unwrap();
+        let req    = one_turn_request("fast", "sys", "use a tool");
+        let resp = client.send_chat_full_streaming(&req, |_| {})
+            .await.expect("streaming ok");
+        let msg   = &resp.choices[0].message;
+        let calls = msg.tool_calls.as_ref().expect("tool_calls reassembled");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "list_dir");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"/data\"}",
+            "arguments concatenated across fragments into valid JSON");
+        assert!(msg.content.is_none(),
+            "a tool-calling assistant message carries no textual content");
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn streaming_surfaces_non_2xx_as_bad_status() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::method;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad model"))
+            .mount(&server).await;
+        let client = LiteLlmClient::new(server.uri()).unwrap();
+        let req    = one_turn_request("fast", "sys", "user");
+        let err    = client.send_chat_full_streaming(&req, |_| {}).await
+            .err().expect("must error");
+        match err {
+            LiteLlmError::BadStatus { status, body, .. } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("bad model"));
+            }
+            other => panic!("expected BadStatus, got {other:?}"),
+        }
     }
 }
