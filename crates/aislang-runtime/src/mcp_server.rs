@@ -1594,6 +1594,13 @@ impl AislangServer {
                 build_rag_prefix_for_turn(&sd, &sd, &al, &ui).unwrap_or_default()
             }).await.unwrap_or_default()
         };
+        // Log retrieval like chat_turn does — run_pipeline went through this
+        // path silently, so "is RAG actually firing?" wasn't visible in the
+        // pod logs (only chat_turn emitted a "RAG prepend" line).
+        if !rag_prefix.is_empty() {
+            eprintln!("  run_pipeline[{agent_label}]: RAG prepend \
+                ({}B retrieved context)", rag_prefix.len());
+        }
         let input = user_input.to_string();
         // Session::turn is !Send (holds an OTel guard across awaits); hand it
         // to a blocking thread with its own current-thread runtime, same as
