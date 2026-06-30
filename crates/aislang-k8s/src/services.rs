@@ -985,6 +985,15 @@ pub fn build_agent_runtime_with_sources(
                 name:  "AISLANG_LITELLM_URL".to_string(),
                 value: "http://litellm:4000".to_string(),
             });
+            // W26 — ride out the brief window where the sibling LiteLLM pod is
+            // ROLLING (Recreate on re-onboard, to pick up a new model_list):
+            // the agent-runtime can be Ready + serving a turn before LiteLLM is
+            // back, so a chat call would otherwise fail instantly with "error
+            // sending request for url".  Retry transient connects for ~30s.
+            env.push(EnvVar {
+                name:  "AISLANG_LITELLM_CONNECT_RETRY_SECS".to_string(),
+                value: "30".to_string(),
+            });
             // W26 — RAG indexes live in this WRITABLE emptyDir, not under the
             // read-only project ConfigMap mount.  Both the in-pod builder
             // (`rag build-all`) + the chat-time loader honour AISLANG_VECTOR_DIR.

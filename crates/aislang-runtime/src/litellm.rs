@@ -417,6 +417,61 @@ impl LiteLlmClient {
         Self::new(Self::DEFAULT_URL)
     }
 
+    /// Env var (seconds) bounding how long a chat call retries a CONNECT
+    /// failure before giving up (W26).  Default `0` = no retry (the local
+    /// CLI / test posture, so a genuinely-down proxy errors immediately).
+    /// The managed-cloud agent-runtime sets this to ~30 so a chat turn rides
+    /// out the brief window where the in-cluster LiteLLM pod is rolling
+    /// (Recreate on re-onboard) and not yet accepting connections — otherwise
+    /// the turn fails with "error sending request for url" the instant it
+    /// races ahead of LiteLLM's restart.  Clamped to `0..=300`.
+    pub const CONNECT_RETRY_ENV_VAR: &'static str = "AISLANG_LITELLM_CONNECT_RETRY_SECS";
+
+    /// The connect-retry budget from [`CONNECT_RETRY_ENV_VAR`] (default 0,
+    /// clamped `0..=300`).
+    fn connect_retry_budget() -> std::time::Duration {
+        let secs = std::env::var(Self::CONNECT_RETRY_ENV_VAR).ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(300);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Send `request`, retrying ONLY on transport CONNECT/timeout failures
+    /// (never on an HTTP status — a 4xx/5xx is a real response) for up to
+    /// [`connect_retry_budget`].  Backoff doubles from 500ms, capped at 4s.
+    /// A non-cloneable body (shouldn't happen for our JSON requests) is sent
+    /// once.  This is the resilience layer for the LiteLLM-pod-rolling window.
+    async fn send_with_retry(&self, request: reqwest::RequestBuilder, url: &str)
+        -> Result<reqwest::Response, LiteLlmError>
+    {
+        let deadline = std::time::Instant::now() + Self::connect_retry_budget();
+        let mut backoff = std::time::Duration::from_millis(500);
+        loop {
+            let attempt = match request.try_clone() {
+                Some(rb) => rb,
+                // Non-cloneable body → can't retry; single shot.
+                None => return request.send().await.map_err(|e|
+                    LiteLlmError::Transport { url: url.to_string(), cause: e.to_string() }),
+            };
+            match attempt.send().await {
+                Ok(r) => return Ok(r),
+                // Retry transient connection failures while inside the budget.
+                Err(e) if (e.is_connect() || e.is_timeout())
+                    && std::time::Instant::now() < deadline =>
+                {
+                    eprintln!("litellm: connect failed, retrying in {backoff:?} \
+                        (budget until {:?} from now): {e}",
+                        deadline.saturating_duration_since(std::time::Instant::now()));
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(4));
+                }
+                Err(e) => return Err(LiteLlmError::Transport {
+                    url: url.to_string(), cause: e.to_string() }),
+            }
+        }
+    }
+
     /// POST a non-streaming chat completion. Returns the first
     /// choice's assistant message content as a plain `String`.
     ///
@@ -494,20 +549,10 @@ impl LiteLlmClient {
         for (k, v) in &carrier {
             request = request.header(k, v);
         }
-        let response = request.send().await
-            .map_err(|e| {
-                // Span ends on Drop with whatever attrs are set;
-                // status defaults to "Unset" — that's fine for v0.1.
-                // Tue/Wed don't need `span.set_status(Error)` yet;
-                // Thu can add error semantics if useful for the
-                // demo. (Decision 21: telemetry is observational —
-                // never adds caller-visible behaviour.)
-                let _ = &span; // explicit no-op to silence "moved" lints
-                LiteLlmError::Transport {
-                    url:   url.clone(),
-                    cause: e.to_string(),
-                }
-            })?;
+        // Retry transient CONNECT failures (LiteLLM pod rolling) up to the
+        // configured budget; span ends on Drop with whatever attrs are set.
+        let response = self.send_with_retry(request, &url).await
+            .inspect_err(|_| { let _ = &span; })?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -618,10 +663,9 @@ impl LiteLlmClient {
         let mut request = self.http.post(&url).json(&stream_req);
         for (k, v) in &carrier { request = request.header(k, v); }
 
-        let response = request.send().await.map_err(|e| {
-            let _ = &span;
-            LiteLlmError::Transport { url: url.clone(), cause: e.to_string() }
-        })?;
+        // Retry transient CONNECT failures (LiteLLM rolling) up to the budget.
+        let response = self.send_with_retry(request, &url).await
+            .inspect_err(|_| { let _ = &span; })?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1403,6 +1447,38 @@ mod tests {
     // ----------------------------------------------------------------
     // W26: streaming (SSE) send_chat_full_streaming
     // ----------------------------------------------------------------
+
+    #[test] fn connect_retry_budget_parses_and_clamps_env() {
+        let v = LiteLlmClient::CONNECT_RETRY_ENV_VAR;
+        use std::time::Duration;
+        // SAFETY: single-threaded test; no concurrent reader of this var.
+        unsafe { std::env::remove_var(v); }
+        assert_eq!(LiteLlmClient::connect_retry_budget(), Duration::ZERO,
+            "default = no retry (immediate error on a down proxy)");
+        unsafe { std::env::set_var(v, "30"); }
+        assert_eq!(LiteLlmClient::connect_retry_budget(), Duration::from_secs(30));
+        unsafe { std::env::set_var(v, "99999"); }
+        assert_eq!(LiteLlmClient::connect_retry_budget(), Duration::from_secs(300),
+            "clamped to 300s");
+        unsafe { std::env::set_var(v, "not-a-number"); }
+        assert_eq!(LiteLlmClient::connect_retry_budget(), Duration::ZERO,
+            "unparseable → no retry");
+        unsafe { std::env::remove_var(v); }
+    }
+
+    #[tokio::test]
+    async fn unreachable_with_zero_budget_errors_immediately() {
+        // With the default (0) budget a down proxy must error fast, NOT hang.
+        // SAFETY: single-threaded async test owning the env var.
+        unsafe { std::env::remove_var(LiteLlmClient::CONNECT_RETRY_ENV_VAR); }
+        let client = LiteLlmClient::new("http://127.0.0.1:1").unwrap();
+        let req    = one_turn_request("fast", "sys", "user");
+        let start  = std::time::Instant::now();
+        let err    = client.send_chat(&req).await.err().expect("must error");
+        assert!(matches!(err, LiteLlmError::Transport { .. }));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5),
+            "zero budget must not retry-loop; errored in {:?}", start.elapsed());
+    }
 
     #[test] fn streaming_enabled_honours_env_toggle() {
         let v = LiteLlmClient::STREAM_ENV_VAR;
