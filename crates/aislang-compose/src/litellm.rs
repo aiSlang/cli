@@ -258,10 +258,10 @@ pub fn build_config(resolved: &ResolvedProject, catalog: &Catalog)
             })?;
         // Embedding entries reuse the same provider_creds table as
         // chat models — `OPENAI_API_KEY` / `COHERE_API_KEY` /
-        // `OLLAMA_API_BASE` get forwarded into the container env
-        // via the existing `referenced_env_vars` walk (which
-        // already iterates `model_list` regardless of whether the
-        // entry is chat or embedding).
+        // `OLLAMA_API_BASE`.  These get forwarded into the container env
+        // by `referenced_env_vars`' embedding walk (section 4) — WITHOUT
+        // it the compose target never handed OPENAI_API_KEY to LiteLLM and
+        // RAG embedding failed with an AuthenticationError.
         let creds = provider_creds(&emb.provider);
         model_list.push(ModelEntry {
             model_name: emb.label.clone(),
@@ -444,6 +444,25 @@ pub fn referenced_env_vars(resolved: &ResolvedProject) -> BTreeSet<String> {
             vars.insert(var.to_string());
         }
     }
+
+    // (4) Embedding providers.  `build_config` emits a `model_list` entry
+    //     per `embedding` block whose `litellm_params.api_key` is
+    //     `os.environ/<CRED>` (e.g. OpenAI text-embedding-3-small →
+    //     OPENAI_API_KEY).  The container must be handed that var or every
+    //     RAG index build fails at LiteLLM's `/v1/embeddings` with an
+    //     AuthenticationError — even when the CHAT models resolve fine.
+    //     This walk was MISSING: `referenced_env_vars` only iterated chat
+    //     model_bindings + prefer/fallback, so an OpenAI-embedded, non-
+    //     OpenAI-chat project (e.g. Anthropic/Ollama chat + OpenAI
+    //     embeddings) never forwarded OPENAI_API_KEY.  (K8s masks this by
+    //     `envFrom`-ing the whole providers Secret; compose forwards only
+    //     this explicit list, so the gap surfaces on the compose target.)
+    for emb in &resolved.project.embeddings {
+        let creds = provider_creds(&emb.provider);
+        if let Some(v) = creds.api_key  { vars.insert(v.to_string()); }
+        if let Some(v) = creds.api_base { vars.insert(v.to_string()); }
+    }
+
     vars
 }
 
@@ -1366,6 +1385,38 @@ mod tests {
             "ollama embeddings must NOT carry an API key");
         assert_eq!(bge_entry.litellm_params.api_base.as_deref(),
             Some("os.environ/OLLAMA_API_BASE"));
+    }
+
+    #[test] fn referenced_env_vars_includes_embedding_provider_creds() {
+        // Regression: a project whose CHAT models are Anthropic/Ollama but
+        // whose embedding is OpenAI must still forward OPENAI_API_KEY — the
+        // RAG index build embeds via LiteLLM's /v1/embeddings, which needs
+        // the OpenAI key.  Before this fix the embedding walk was missing,
+        // so the compose litellm container never got OPENAI_API_KEY and RAG
+        // failed with an AuthenticationError.
+        use aislang_core::ast::{Embedding, ModelId, Project};
+        let mut resolved = aislang_resolver::ResolvedProject {
+            project:         Project { name: "x".into(), ..Project::default() },
+            catalog_version: "test".into(),
+            model_bindings:  BTreeMap::new(),
+            prompt_hashes:   BTreeMap::new(),
+            ..Default::default()
+        };
+        // Chat model bound to Anthropic (NO OpenAI chat anywhere).
+        resolved.model_bindings.insert("brain".into(),
+            ModelId { provider: "anthropic".into(), name: "claude_haiku_4_5".into() });
+        // …but embeddings are OpenAI.
+        resolved.project.embeddings.push(Embedding {
+            label:    "openai_embed".into(),
+            provider: "openai".into(),
+            model:    "text-embedding-3-small".into(),
+        });
+
+        let vars = referenced_env_vars(&resolved);
+        assert!(vars.contains("ANTHROPIC_API_KEY"),
+            "chat provider key still present; got: {vars:?}");
+        assert!(vars.contains("OPENAI_API_KEY"),
+            "embedding provider key MUST be forwarded; got: {vars:?}");
     }
 
     #[test] fn embedding_block_with_unknown_pair_fails() {
