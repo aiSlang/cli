@@ -253,6 +253,24 @@ enum Command {
         /// `http://<host>:<port>/mcp`.
         #[arg(long, value_name = "ADDR", conflicts_with = "stdio")]
         http: Option<SocketAddr>,
+        /// W26: build the project's RAG indexes BEFORE serving (the
+        /// in-cluster agent-runtime startup step).  Given the project dir
+        /// (e.g. `/etc/aislang`), runs the same logic as `aislang rag
+        /// build-all` — tolerant of per-store failures — then serves.  This
+        /// replaces the old `sh -c "… rag build-all … exec mcp-serve"`
+        /// entrypoint, which required a shell the distroless image lacks
+        /// (`exec: "sh": not found` → CrashLoopBackOff).
+        #[arg(long, value_name = "DIR")]
+        rag_build_dir: Option<PathBuf>,
+        /// LiteLLM base URL the pre-serve RAG build embeds against
+        /// (defaults to the runtime's own `AISLANG_LITELLM_URL` / localhost).
+        #[arg(long, value_name = "URL")]
+        litellm_url: Option<String>,
+        /// Seconds to wait for LiteLLM to accept connections before the
+        /// pre-serve RAG build (0 = don't wait).  Only used with
+        /// `--rag-build-dir` when the project actually declares vector_stores.
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait_litellm_secs: u64,
     },
     /// Run a declared `skill { … }` block against the runtime.
     /// v0.3 Week 18 Thu follow-up — gives `.ais` authors a CLI
@@ -689,8 +707,9 @@ fn run() -> Result<ExitCode> {
             run_status(file, spend, model_spend, main_spend)?,
         Command::Chat { agent, file, interactive, keep_history } =>
             run_chat(agent, file, interactive, keep_history).map(|_| ExitCode::SUCCESS)?,
-        Command::McpServe { stdio, http } =>
-            run_mcp_serve(stdio, http).map(|_| ExitCode::SUCCESS)?,
+        Command::McpServe { stdio, http, rag_build_dir, litellm_url, wait_litellm_secs } =>
+            run_mcp_serve(stdio, http, rag_build_dir, litellm_url, wait_litellm_secs)
+                .map(|_| ExitCode::SUCCESS)?,
         Command::Skill { action } => match action {
             SkillCommand::Run { label, project, args } =>
                 run_skill(label, project, args).map(|_| ExitCode::SUCCESS)?,
@@ -757,7 +776,25 @@ fn run() -> Result<ExitCode> {
 ///     `multi_thread` so axum's connection accept loop, per-session
 ///     workers, and the !Send `Session::turn` `spawn_blocking`
 ///     workers can all overlap.
-fn run_mcp_serve(stdio: bool, http: Option<SocketAddr>) -> Result<()> {
+fn run_mcp_serve(
+    stdio:             bool,
+    http:              Option<SocketAddr>,
+    rag_build_dir:     Option<PathBuf>,
+    litellm_url:       Option<String>,
+    wait_litellm_secs: u64,
+) -> Result<()> {
+    // W26: optional pre-serve RAG build (the in-cluster agent-runtime step).
+    // Done in-process — NO shell — so it works on the distroless image where
+    // the old `sh -c "… rag build-all … exec mcp-serve"` entrypoint crashed
+    // with `exec: "sh": not found`.  Tolerant: a build failure NEVER blocks
+    // serving (matches the old `|| true`).
+    if let Some(dir) = rag_build_dir {
+        let url = litellm_url.clone().unwrap_or_else(||
+            aislang_runtime::litellm::LiteLlmClient::url_from_env()
+                .unwrap_or_else(|| aislang_runtime::litellm::LiteLlmClient::DEFAULT_URL.to_string()));
+        prestart_rag_build(&dir, &url, wait_litellm_secs);
+    }
+
     if let Some(addr) = http {
         return run_mcp_serve_http(addr);
     }
@@ -3547,6 +3584,54 @@ fn auto_build_rag_indexes(project: &Path) {
 /// managed-cloud agent-runtime entrypoint (which builds `git:` knowledge
 /// corpora in-pod before serving).  Indexes land per `vector_index_dir`
 /// (honours `AISLANG_VECTOR_DIR`).
+/// Pre-serve RAG build for the in-cluster agent-runtime (W26).  Runs in the
+/// SAME process as `mcp-serve` — no shell — so it works on the distroless
+/// image.  Skips entirely when the project declares no vector_stores (e.g.
+/// a RAG-less agent serves immediately); otherwise optionally waits for
+/// LiteLLM, then runs the tolerant `rag build-all` (a build failure never
+/// blocks serving).
+fn prestart_rag_build(dir: &Path, litellm_url: &str, wait_secs: u64) {
+    // Peek: any vector_stores to build?  If not, don't wait — serve at once.
+    let has_stores = load_project_input(dir).ok()
+        .map(|l| !l.resolved.project.vector_stores.is_empty())
+        .unwrap_or(false);
+    if !has_stores {
+        return;
+    }
+    if wait_secs > 0 {
+        wait_for_litellm(litellm_url, wait_secs);
+    }
+    if let Err(e) = run_rag_build_all(dir.to_path_buf(), litellm_url.to_string()) {
+        eprintln!("aislang mcp-serve: pre-serve RAG build error (continuing to serve): {e}");
+    }
+}
+
+/// Poll LiteLLM's `host:port` (from an `http://host:port[/…]` URL) until a TCP
+/// connection succeeds or `secs` elapse.  Best-effort: on timeout we build
+/// anyway (the embeds just fail tolerantly).  Raw TCP so no HTTP dep is
+/// needed in the CLI.
+fn wait_for_litellm(url: &str, secs: u64) {
+    use std::net::ToSocketAddrs;
+    let hostport = url.trim_start_matches("http://").trim_start_matches("https://");
+    let hostport = hostport.split('/').next().unwrap_or(hostport).to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    eprintln!("aislang mcp-serve: waiting up to {secs}s for LiteLLM at {hostport} …");
+    while std::time::Instant::now() < deadline {
+        if let Ok(addrs) = hostport.to_socket_addrs() {
+            for addr in addrs {
+                if std::net::TcpStream::connect_timeout(
+                    &addr, std::time::Duration::from_secs(2)).is_ok()
+                {
+                    eprintln!("  LiteLLM reachable ✓");
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    eprintln!("  LiteLLM not reachable within {secs}s — building RAG anyway (best-effort)");
+}
+
 fn run_rag_build_all(project: PathBuf, litellm_url: String) -> Result<()> {
     let loaded = match load_project_input(&project) {
         Ok(l) => l,
