@@ -88,6 +88,36 @@ pub const AGENT_RUNTIME_DEFAULT_PORT: u16 = 8080;
 pub const PROVIDERS_SECRET_NAME: &str = "aislang-providers";
 
 // ============================================================================
+// Self-hosted OSS inference pool (W26) — shared in-cluster Ollama on GPU nodes.
+// ============================================================================
+
+/// Default in-cluster base URL for the SHARED Ollama inference pool.  The
+/// LiteLLM config renders `ollama/*` models with `api_base:
+/// os.environ/OLLAMA_API_BASE`, so setting this env on the LiteLLM pod points
+/// every `provider = ollama` model at the shared GPU-backed pool.  One pool
+/// serves all tenants (OSS weights carry no tenant data → sharing the model
+/// server is the whole cost win); the pool lives in its own namespace with a
+/// NetworkPolicy that admits the tenant + control-plane namespaces.
+///
+/// Only emitted when a project actually references an `ollama/` model, so
+/// frontier-only stacks stay byte-identical (no spurious rollout).
+pub const OLLAMA_DEFAULT_API_BASE: &str =
+    "http://ollama.aislang-inference.svc.cluster.local:11434";
+
+/// Operator override for [`OLLAMA_DEFAULT_API_BASE`] — point LiteLLM at a
+/// different endpoint (e.g. an external vLLM / TGI server) without a rebuild.
+pub const OLLAMA_API_BASE_ENV_VAR: &str = "AISLANG_OLLAMA_API_BASE";
+
+/// The Ollama pool base URL: the operator override if set + non-empty, else
+/// the in-cluster default.
+fn ollama_api_base() -> String {
+    std::env::var(OLLAMA_API_BASE_ENV_VAR).ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OLLAMA_DEFAULT_API_BASE.to_string())
+}
+
+// ============================================================================
 // OpenTelemetry pod-wiring (Phase 2 Week 15 Tue)
 // ============================================================================
 
@@ -226,6 +256,17 @@ pub fn build_litellm(
                 value: resolved.catalog_version.clone(),
             }];
             env.extend(otel_env_vars("litellm", deploy_label));
+            // W26 — when the project uses any `ollama/` model, point LiteLLM
+            // at the shared in-cluster OSS inference pool.  The router config
+            // already renders those models with `api_base:
+            // os.environ/OLLAMA_API_BASE`; this supplies it.  Gated on actual
+            // ollama usage so frontier-only stacks stay byte-identical.
+            if router_yaml.contains("ollama/") {
+                env.push(EnvVar {
+                    name:  "OLLAMA_API_BASE".to_string(),
+                    value: ollama_api_base(),
+                });
+            }
             env
         }),
         // Provider creds via envFrom (Decision 43.5).

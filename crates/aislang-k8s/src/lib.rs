@@ -1600,6 +1600,34 @@ mod tests {
             "AISLANG_CATALOG_VERSION must still be present alongside OTEL vars");
     }
 
+    #[test] fn litellm_gets_ollama_api_base_only_when_project_uses_ollama() {
+        use aislang_core::ast::ModelId;
+        let catalog = aislang_catalog::bundled().expect("bundled");
+
+        // (a) frontier-only stack → NO OLLAMA_API_BASE (byte-stable).
+        let mut frontier = resolved_with_k8s_deploy("prod");
+        frontier.model_bindings.insert("fast".into(),
+            ModelId { provider: "anthropic".into(), name: "claude_haiku_4_5".into() });
+        let arts = emit(&frontier, &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&arts).into_iter()
+            .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "Deployment")
+            .expect("litellm Deployment");
+        assert!(!container_env(&dep.2).contains_key("OLLAMA_API_BASE"),
+            "a frontier-only stack must not get OLLAMA_API_BASE");
+
+        // (b) stack with an `ollama.*` model → OLLAMA_API_BASE points at pool.
+        let mut oss = resolved_with_k8s_deploy("prod");
+        oss.model_bindings.insert("cheap".into(),
+            ModelId { provider: "ollama".into(), name: "llama_3_1_8b".into() });
+        let arts = emit(&oss, &catalog, &empty_sources()).expect("emit");
+        let dep = all_resources(&arts).into_iter()
+            .find(|(f, k, _)| f == LITELLM_MANIFEST_FILENAME && k == "Deployment")
+            .expect("litellm Deployment");
+        assert_eq!(container_env(&dep.2).get("OLLAMA_API_BASE").map(String::as_str),
+            Some(services::OLLAMA_DEFAULT_API_BASE),
+            "an ollama-using stack must point LiteLLM at the inference pool");
+    }
+
     #[test] fn agent_runtime_pod_carries_otel_env_vars() {
         let catalog = aislang_catalog::bundled().expect("bundled");
         let resolved = resolved_with_k8s_deploy("staging");
