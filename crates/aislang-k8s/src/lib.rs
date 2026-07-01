@@ -1022,21 +1022,27 @@ mod tests {
         let cport = container["ports"][0]["containerPort"].as_i64()
             .expect("containerPort is int");
         assert_eq!(cport, 9000, "containerPort must match expose.port");
-        // W26 — the entrypoint is now an `sh -c` wrapper that builds RAG
-        // indexes then `exec`s mcp-serve.  Assert on the script string.
-        let cmd: Vec<&str> = container["command"].as_sequence().expect("command list")
+        // W26 — the entrypoint is the image's `aislang` ENTRYPOINT (NO shell:
+        // the distroless image has no `sh`), with the pre-serve RAG build done
+        // in-process via `mcp-serve --rag-build-dir`.  So `command` is unset
+        // and `args` is the argv list (NOT a shell script string).
+        assert!(container["command"].is_null(),
+            "must NOT override the image entrypoint with a shell; got: {:?}",
+            container["command"]);
+        let args: Vec<&str> = container["args"].as_sequence().expect("args list")
             .iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(cmd, vec!["sh", "-c"], "entrypoint wraps via `sh -c`");
-        let script = container["args"][0].as_str()
-            .expect("args[0] is the entrypoint script");
-        assert!(script.contains("mcp-serve --http 0.0.0.0:9000"),
-            "entrypoint must serve mcp on 0.0.0.0:9000; got: {script}");
-        // **No trailing positional path arg to mcp-serve** — it crashes the
-        // pod with 'unexpected argument'.  mcp-serve is the final command, so
-        // the script must END with the bind (nothing after it).
-        assert!(script.trim_end().ends_with("mcp-serve --http 0.0.0.0:9000"),
-            "mcp-serve must be the final command with NO source-path positional; \
-             got: {script}");
+        assert_eq!(args.first(), Some(&"mcp-serve"),
+            "argv must start with the mcp-serve subcommand; got: {args:?}");
+        // Serves on the expose port; no shell tokens; no positional source path.
+        let joined = args.join(" ");
+        assert!(joined.contains("--http 0.0.0.0:9000"),
+            "must serve mcp on 0.0.0.0:9000; got: {args:?}");
+        assert!(joined.contains("--rag-build-dir /etc/aislang"),
+            "must trigger the in-process pre-serve RAG build; got: {args:?}");
+        assert!(!args.contains(&"sh") && !args.contains(&"-c"),
+            "no shell wrapper (distroless has no sh); got: {args:?}");
+        assert!(!joined.contains("/etc/aislang/project.ais"),
+            "no source-path positional to mcp-serve; got: {args:?}");
     }
 
     #[test] fn agent_runtime_defaults_to_port_8080_when_expose_absent() {
@@ -1793,21 +1799,20 @@ mod tests {
 
         let dep_yaml = artifacts.manifests.get("agent-runtime.yaml")
             .expect("agent-runtime Deployment must be emitted");
-        // W26 — the entrypoint is an `sh -c` wrapper (build RAG indexes, then
-        // exec mcp-serve).  The serve command must appear with NO positional
-        // source path after the bind (which crashes the pod).
-        assert!(dep_yaml.contains("mcp-serve --http 0.0.0.0:"),
-            "agent-runtime entrypoint must exec mcp-serve --http <bind>; \
+        // W26 — the pod runs the image `aislang` ENTRYPOINT (no shell), with
+        // the pre-serve RAG build done in-process via `mcp-serve
+        // --rag-build-dir`.  Serve command present; no shell; no positional
+        // source path after the bind.
+        assert!(dep_yaml.contains("- mcp-serve") && dep_yaml.contains("0.0.0.0:"),
+            "agent-runtime must run mcp-serve --http <bind> as argv; got:\n{dep_yaml}");
+        assert!(dep_yaml.contains("--rag-build-dir"),
+            "agent-runtime must trigger the in-process pre-serve RAG build; \
              got:\n{dep_yaml}");
         assert!(!dep_yaml.contains("/etc/aislang/project.ais"),
             "agent-runtime must NOT pass a .ais file-path positional to \
              mcp-serve; got:\n{dep_yaml}");
-        // The build-all step legitimately references /etc/aislang as its
-        // project dir, but mcp-serve itself must not be handed a positional —
-        // it's the final `exec`, so nothing follows the bind.
-        assert!(dep_yaml.contains("rag build-all /etc/aislang"),
-            "agent-runtime entrypoint must build RAG indexes before serving; \
-             got:\n{dep_yaml}");
+        assert!(!dep_yaml.contains("\"sh\"") && !dep_yaml.contains("- sh"),
+            "no shell wrapper — the distroless image has no sh; got:\n{dep_yaml}");
     }
 
     #[test] fn agent_runtime_ships_writable_vector_volume_and_env() {

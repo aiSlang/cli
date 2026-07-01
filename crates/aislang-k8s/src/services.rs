@@ -1061,21 +1061,28 @@ pub fn build_agent_runtime_with_sources(
         // (`/etc/aislang/`); MCP clients send that path explicitly
         // in their chat_turn args.  See `aislang-runtime::mcp_server::
         // chat_turn` for the per-call source_path/dir contract.
-        // W26 — wrap the entrypoint: wait for LiteLLM, build RAG indexes for
-        // any declared knowledge sources (e.g. `git:` corpora) into the
-        // writable vector volume, THEN serve.  `rag build-all` is tolerant
-        // (per-store failures don't block serving), so a project with no
-        // RAG (or an unreachable source) still comes up.  `exec` so mcp-serve
-        // is PID 1's child + receives signals.
-        command: Some(vec!["sh".to_string(), "-c".to_string()]),
-        args: Some(vec![format!(
-            "LURL=\"${{AISLANG_LITELLM_URL:-http://litellm:4000}}\"; \
-             i=0; until curl -s -o /dev/null \"$LURL/\" 2>/dev/null || \
-             [ \"$i\" -ge 30 ]; do i=$((i+1)); sleep 2; done; \
-             aislang rag build-all {mount} --litellm-url \"$LURL\" || true; \
-             exec aislang mcp-serve --http 0.0.0.0:{port}",
-            mount = PROJECT_MOUNT_DIR)],
-        ),
+        // W26 — pre-serve RAG build is done IN-PROCESS by `mcp-serve`
+        // (`--rag-build-dir`), NOT a shell wrapper.  The published/CI image
+        // is distroless (no `sh`/`curl`), so the old `command: ["sh","-c",
+        // "… rag build-all … exec mcp-serve"]` crashed the pod with
+        // `exec: "sh": executable file not found` → CrashLoopBackOff →
+        // helm --wait timeout.  Now the pod runs the image's `aislang`
+        // ENTRYPOINT directly: `mcp-serve` waits for LiteLLM, builds the
+        // (tolerant) RAG indexes into the vector volume when the project
+        // declares any vector_stores, then binds `:<port>`.  No shell.
+        //
+        // **No trailing positional source-path argument** to `mcp-serve` —
+        // clients pass `source_path` per `chat_turn`; an extra positional
+        // crashes with "unexpected argument".  The CM-mounted project lives
+        // at PROJECT_MOUNT_DIR (`/etc/aislang/`).
+        command: None,   // use the image ENTRYPOINT (`aislang`)
+        args: Some(vec![
+            "mcp-serve".to_string(),
+            "--http".to_string(),        format!("0.0.0.0:{port}"),
+            "--rag-build-dir".to_string(), PROJECT_MOUNT_DIR.to_string(),
+            "--litellm-url".to_string(), "http://litellm:4000".to_string(),
+            "--wait-litellm-secs".to_string(), "60".to_string(),
+        ]),
         volume_mounts: Some(vec![
             VolumeMount {
                 name:       "project".to_string(),
