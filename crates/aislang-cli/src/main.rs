@@ -3591,18 +3591,52 @@ fn auto_build_rag_indexes(project: &Path) {
 /// LiteLLM, then runs the tolerant `rag build-all` (a build failure never
 /// blocks serving).
 fn prestart_rag_build(dir: &Path, litellm_url: &str, wait_secs: u64) {
-    // Peek: any vector_stores to build?  If not, don't wait — serve at once.
-    let has_stores = load_project_input(dir).ok()
-        .map(|l| !l.resolved.project.vector_stores.is_empty())
-        .unwrap_or(false);
-    if !has_stores {
+    // Peek: which vector_stores must be built?  If none, serve at once.
+    let stores: Vec<String> = load_project_input(dir).ok()
+        .map(|l| l.resolved.project.vector_stores.iter()
+            .map(|v| v.label.clone()).collect())
+        .unwrap_or_default();
+    if stores.is_empty() {
         return;
     }
     if wait_secs > 0 {
         wait_for_litellm(litellm_url, wait_secs);
     }
-    if let Err(e) = run_rag_build_all(dir.to_path_buf(), litellm_url.to_string()) {
-        eprintln!("aislang mcp-serve: pre-serve RAG build error (continuing to serve): {e}");
+
+    // `rag build-all` embeds via LiteLLM — which may still be warming up even
+    // after its port opens.  RETRY the build until every declared store has an
+    // index (the corpus-hash cache means a store built on an earlier attempt is
+    // skipped, so only the failed ones re-embed).  Bounded, so a genuinely
+    // broken corpus/key doesn't loop forever.  Missing at the end → LOUD
+    // warning (not silent): agents run WITHOUT retrieval grounding otherwise.
+    const MAX_ATTEMPTS: u32 = 4;
+    let vec_dir = aislang_runtime::rag::vector_index_dir(dir);
+    let missing = |labels: &[String]| -> Vec<String> {
+        labels.iter()
+            .filter(|l| !vec_dir.join(format!("{l}.bin")).exists())
+            .cloned().collect()
+    };
+    for attempt in 1..=MAX_ATTEMPTS {
+        if let Err(e) = run_rag_build_all(dir.to_path_buf(), litellm_url.to_string()) {
+            eprintln!("aislang mcp-serve: RAG build error (attempt {attempt}): {e}");
+        }
+        let still = missing(&stores);
+        if still.is_empty() {
+            eprintln!("aislang mcp-serve: RAG ready — {} store(s) built.", stores.len());
+            return;
+        }
+        if attempt < MAX_ATTEMPTS {
+            eprintln!("aislang mcp-serve: {} RAG index(es) still missing after \
+                attempt {attempt} — LiteLLM may still be warming up; retrying in 15s: {still:?}",
+                still.len());
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        } else {
+            eprintln!("aislang mcp-serve: WARNING — {} RAG store(s) UNBUILT after \
+                {MAX_ATTEMPTS} attempts: {still:?}.  Agents will run WITHOUT retrieval \
+                grounding.  Once LiteLLM is reachable, rebuild with:\n    \
+                aislang rag build-all {} --litellm-url {litellm_url}",
+                still.len(), dir.display());
+        }
     }
 }
 
