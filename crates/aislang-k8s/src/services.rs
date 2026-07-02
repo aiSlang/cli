@@ -1081,7 +1081,11 @@ pub fn build_agent_runtime_with_sources(
             "--http".to_string(),        format!("0.0.0.0:{port}"),
             "--rag-build-dir".to_string(), PROJECT_MOUNT_DIR.to_string(),
             "--litellm-url".to_string(), "http://litellm:4000".to_string(),
-            "--wait-litellm-secs".to_string(), "60".to_string(),
+            // Generous: the LiteLLM image is large; on a cold node it can take
+            // 1-2 min to pull + become ready.  Too short a wait → the pre-serve
+            // RAG build races ahead, embeds fail, and RAG is silently empty
+            // (mcp-serve retries the build, but starting past readiness helps).
+            "--wait-litellm-secs".to_string(), "180".to_string(),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {
