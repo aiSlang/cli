@@ -8,7 +8,7 @@ members = [
     "crates/aislang-compose",
     "crates/aislang-k8s",       # Phase 2 Week 14 Mon — K8s emitter
     "crates/aislang-runtime",
-    "crates/aislang-cloud",     # v0.4 Week 22 Mon — Track C control plane
+    "crates/aislang-remote",    # v0.4 Week 25 Mon — remote control-plane HTTP/SSE client
 ]
 
 [workspace.package]
@@ -27,7 +27,7 @@ aislang-resolver = { path = "crates/aislang-resolver", version = "0.2.0-dev" }
 aislang-compose  = { path = "crates/aislang-compose",  version = "0.2.0-dev" }
 aislang-k8s      = { path = "crates/aislang-k8s",      version = "0.2.0-dev" }   # Phase 2 Week 14 Mon
 aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.2.0-dev" }
-aislang-cloud    = { path = "crates/aislang-cloud",    version = "0.2.0-dev" }   # v0.4 Week 22 Mon — Track C control plane
+aislang-remote   = { path = "crates/aislang-remote",   version = "0.2.0-dev" }   # v0.4 Week 25 Mon — remote control-plane HTTP/SSE client
 
 # External
 clap        = { version = "4.5", features = ["derive"] }

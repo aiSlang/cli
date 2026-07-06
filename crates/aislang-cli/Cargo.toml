@@ -22,7 +22,12 @@ aislang-compose  = { workspace = true }
 # emit path stays the default for projects without a k8s deploy.
 aislang-k8s      = { workspace = true }
 aislang-runtime  = { workspace = true }   # in-CLI agent runtime (week 6 Tue/Wed)
-aislang-cloud    = { workspace = true }   # v0.4 Week 22 Mon — Track C control plane
+aislang-remote   = { workspace = true }   # v0.4 Week 25 Mon — `aislang remote --target` client
+# v0.4 Week 25 Mon: `aislang remote` auto-loads the nearest `.env.cloud`
+# (walking up from cwd) so `AISLANG_CLOUD_TOKEN` / `AISLANG_TENANT`
+# resolve from a file the same way shell-exported vars do.  Existing
+# process env vars take precedence over file values.
+dotenvy          = { workspace = true }
 clap             = { workspace = true }
 anyhow           = { workspace = true }
 serde            = { workspace = true }   # week 10 Thu: derive for docker compose ps json

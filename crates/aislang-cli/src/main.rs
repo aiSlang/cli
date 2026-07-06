@@ -304,16 +304,6 @@ enum Command {
         #[command(subcommand)]
         action: RagCommand,
     },
-    /// v0.4 Track C — `aislang-cloud` managed control plane
-    /// (Decision 46.1).  Today's `serve` subcommand boots the REST
-    /// endpoint surface against the in-memory project store; Tue's
-    /// Postgres schema-per-tenant swap stays inside the cloud
-    /// crate so this CLI surface is byte-stable across the
-    /// W22 Phase 1 days.
-    Cloud {
-        #[command(subcommand)]
-        action: CloudCommand,
-    },
     /// v0.4 Week 25 Mon — delegate a CLI verb to a remote control
     /// plane (Decision 46.9, mission deliverable #2).  The same
     /// `aislang` binary self-hosted + cloud users already run; only
@@ -352,7 +342,7 @@ enum Command {
 
 /// v0.4 Week 25 Mon — `aislang remote` verbs.  Each delegates to the
 /// control plane over the Decision-46.1 REST surface; see the
-/// per-verb endpoint map in `aislang_cloud::remote`.
+/// per-verb endpoint map in `aislang_remote`.
 #[derive(Subcommand, Debug)]
 enum RemoteCommand {
     /// Parse + typecheck + resolve a project server-side.  FREE — not
@@ -465,210 +455,6 @@ enum RagCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum CloudCommand {
-    /// Boot the REST endpoint surface — `axum::serve` against the
-    /// configured port.  Reads the bearer token from
-    /// `AISLANG_CLOUD_TOKEN` and refuses to start with an empty
-    /// token (server would otherwise accept unauthenticated
-    /// requests).
-    ///
-    /// Quick smoke test:
-    ///
-    /// ```sh
-    /// AISLANG_CLOUD_TOKEN=hunter2 aislang cloud serve &
-    /// curl -H 'Authorization: Bearer hunter2' \
-    ///      -H 'X-Aislang-Tenant: alpha' \
-    ///      http://127.0.0.1:4001/v1/projects
-    /// # → {"projects":[]}
-    /// ```
-    Serve {
-        /// Bind host (default 127.0.0.1 — does NOT bind 0.0.0.0
-        /// by default to avoid accidentally exposing an
-        /// unhardened control plane to the network).
-        #[arg(long, value_name = "HOST", default_value = "127.0.0.1")]
-        host: String,
-        /// Bind port (default 4001 from
-        /// `aislang_cloud::DEFAULT_PORT`).
-        #[arg(long, value_name = "PORT",
-              default_value_t = aislang_cloud::DEFAULT_PORT)]
-        port: u16,
-    },
-    /// v0.4 W22 Tue follow-up — provision a tenant's Postgres
-    /// schema + tenant-migrations.  Idempotent (re-running against
-    /// an already-provisioned tenant is a no-op).
-    ///
-    /// Without this step, `GET /v1/projects` against an
-    /// un-provisioned tenant returns 500 (`relation "projects"
-    /// does not exist`) because the per-tenant schema hasn't been
-    /// created yet.  Future Phase 2 Week 23 signup flow will call
-    /// this automatically on first signup; for now, operators run
-    /// it explicitly per tenant (mirrors the `aislang apply` posture
-    /// where operator action provisions infrastructure).
-    ///
-    /// Requires `AISLANG_CLOUD_DB_URL` (the in-memory store has no
-    /// schema to provision; running this against the fallback store
-    /// surfaces a clear error).
-    ///
-    /// ```sh
-    /// AISLANG_CLOUD_DB_URL=postgres://... \
-    ///   aislang cloud provision alpha
-    /// ```
-    Provision {
-        /// Tenant slug to provision.  Must match
-        /// `^[a-z0-9][a-z0-9-]{0,63}$` (validated against the same
-        /// regex `public.tenants.slug`'s CHECK constraint enforces
-        /// at the DB layer).
-        tenant: String,
-    },
-    /// v0.4 W25 — fully tear down a tenant + ALL of its data: drop
-    /// the tenant schema (projects / applied_stacks / idempotency_keys
-    /// / audit_log) + delete its shared-schema rows (`public.tenants`
-    /// / `tenant_members` / `project_repos` / `signups`).
-    ///
-    /// The inverse of `provision`.  **Destructive + irreversible** —
-    /// use for offboarding a customer or cleaning up test tenants.
-    /// Idempotent: deprovisioning an unknown tenant is a no-op.
-    ///
-    /// Requires `AISLANG_CLOUD_DB_URL`.
-    ///
-    /// ```sh
-    /// AISLANG_CLOUD_DB_URL=postgres://... \
-    ///   aislang cloud deprovision acme
-    /// ```
-    Deprovision {
-        /// Tenant slug to tear down.
-        tenant: String,
-    },
-    /// v0.4 W23 Mon — Stripe metering API spike (Decision 46.3,
-    /// risk-3 mitigation per §"Three v0.4 risks worth pre-
-    /// mitigating").  Submits a single meter event to the Stripe
-    /// Billing meter-events API + prints the server-echoed
-    /// response.
-    ///
-    /// Two meter kinds per Decision 46.3:
-    ///   - `tokens`  per-1k-tokens for inference (mirrors v0.1
-    ///               `spend.json` micro-units field shape)
-    ///   - `sp`      per-SP-equivalent for control-plane operations
-    ///               (`apply`/`destroy`/`plan` = 1 SP-equivalent
-    ///               for billing)
-    ///
-    /// Both meter names must be pre-created in your Stripe
-    /// dashboard before submitting events — see
-    /// `docs/stripe-integration-notes.md` § "Meter must exist
-    /// before events".
-    ///
-    /// Requires `STRIPE_SECRET_KEY` env var (use `sk_test_...` for
-    /// sandbox; `sk_live_...` for production).  Optional
-    /// `STRIPE_API_BASE` override for sandbox-mocks +
-    /// stripe-mock locally.
-    ///
-    /// ```sh
-    /// STRIPE_SECRET_KEY=sk_test_... \
-    ///   aislang cloud meter-event \
-    ///     --customer cus_xxx \
-    ///     --kind tokens \
-    ///     --quantity 1000
-    /// ```
-    MeterEvent {
-        /// Stripe customer id (`cus_...`) to charge for this event.
-        /// In production this comes from the per-tenant Stripe
-        /// customer record persisted at signup; the spike CLI
-        /// takes it as a flag.
-        #[arg(long, value_name = "CUSTOMER_ID")]
-        customer: String,
-        /// Meter kind: `tokens` (per-1k-tokens inference) OR `sp`
-        /// (per-SP-equivalent control-plane operation).  See
-        /// Decision 46.3.
-        #[arg(long, value_name = "KIND")]
-        kind: String,
-        /// Quantity to record.  Stripe accumulates these across
-        /// events for the billing period.
-        #[arg(long, value_name = "N")]
-        quantity: u64,
-        /// Override the Stripe `identifier` field for idempotency
-        /// testing.  Defaults to a server-generated unique value.
-        /// Re-submitting the same identifier + same payload is a
-        /// no-op on Stripe's side (idempotent retry).
-        #[arg(long, value_name = "ID")]
-        identifier: Option<String>,
-    },
-    /// v0.4 W23 Mon follow-up — write `.env.cloud.example` to cwd.
-    ///
-    /// The template lists every operator-facing env var the
-    /// `aislang-cloud` crate reads at startup (control-plane
-    /// bearer auth, Postgres, Stripe Billing).  Copy to
-    /// `.env.cloud`, fill in the values, and re-run any
-    /// `aislang cloud <subcommand>` — each subcommand auto-loads
-    /// the nearest `.env.cloud` from cwd / parent dirs BEFORE
-    /// reading env vars.
-    ///
-    /// This template is SEPARATE from the per-project
-    /// `.env.example` that `aislang plan` emits — those cover the
-    /// project's provider credentials (consumed by docker
-    /// compose); this one covers the cloud OPERATOR's
-    /// control-plane secrets (consumed by the aislang binary
-    /// directly).
-    ///
-    /// ```sh
-    /// aislang cloud init                  # writes .env.cloud.example to cwd
-    /// cp .env.cloud.example .env.cloud
-    /// # edit .env.cloud and fill in AISLANG_CLOUD_TOKEN etc.
-    /// echo .env.cloud >> .gitignore
-    /// aislang cloud serve                 # auto-loads .env.cloud
-    /// ```
-    Init {
-        /// Overwrite an existing `.env.cloud.example` if present.
-        /// Default: refuse + print a clear message so we don't
-        /// stomp operator edits.
-        #[arg(long, default_value_t = false)]
-        force: bool,
-    },
-    /// v0.4 W23 Tue — map a tenant slug to its Stripe customer
-    /// id (Decision 46.3 metering pipeline).
-    ///
-    /// Phase 2 Thu W23 signup flow will set this automatically
-    /// after a successful Stripe Checkout; today the operator
-    /// runs it explicitly per tenant (mirrors `aislang cloud
-    /// provision`'s explicit-action posture).
-    ///
-    /// Tenants without a Stripe customer mapping accumulate
-    /// meter events in the in-process queue but the flusher
-    /// drops them (with a logged warning) on each tick — no
-    /// silent revenue loss, but no Stripe-side accounting
-    /// either.  Re-running this subcommand after the fact does
-    /// NOT replay dropped events; v0.5+ may add explicit
-    /// backfill.
-    ///
-    /// Requires `AISLANG_CLOUD_DB_URL`.  Customer ids must
-    /// match `^cus_[A-Za-z0-9]{1,60}$` (matches Stripe's actual
-    /// shape + the DB-layer CHECK constraint at
-    /// `migrations/20260609000000_tenants_stripe_customer.sql`).
-    SetCustomer {
-        /// Tenant slug (must already be provisioned).
-        tenant: String,
-        /// Stripe customer id, e.g. `cus_OrK5jdN5VbcM9G`.
-        stripe_customer_id: String,
-    },
-    /// v0.4 W23 Wed — set a tenant's billing plan (Decision 46.3
-    /// free-tier rate-limiting).
-    ///
-    /// `free` (default for new tenants) rate-limits control-plane
-    /// SP-equivalent operations (`apply` etc.) at 50/day; `paid`
-    /// is unrate-limited.  Phase 2 Thu W23 signup flow flips a
-    /// tenant to `paid` automatically after payment requisites
-    /// are confirmed; today the operator runs it explicitly.
-    ///
-    /// Requires `AISLANG_CLOUD_DB_URL` (the plan must persist
-    /// across `aislang cloud serve` restarts).
-    SetPlan {
-        /// Tenant slug (must already be provisioned).
-        tenant: String,
-        /// Plan: `free` (rate-limited 50 SP-equivalents/day) or
-        /// `paid` (unlimited).
-        plan: String,
-    },
-}
 
 fn main() -> ExitCode {
     match run() {
@@ -724,24 +510,6 @@ fn run() -> Result<ExitCode> {
                 run_rag_verify(project, strict)?,
             RagCommand::BuildAll { project, litellm_url } =>
                 run_rag_build_all(project, litellm_url).map(|_| ExitCode::SUCCESS)?,
-        },
-        Command::Cloud { action } => match action {
-            CloudCommand::Serve { host, port } =>
-                run_cloud_serve(host, port).map(|_| ExitCode::SUCCESS)?,
-            CloudCommand::Provision { tenant } =>
-                run_cloud_provision(tenant).map(|_| ExitCode::SUCCESS)?,
-            CloudCommand::Deprovision { tenant } =>
-                run_cloud_deprovision(tenant).map(|_| ExitCode::SUCCESS)?,
-            CloudCommand::MeterEvent { customer, kind, quantity, identifier } =>
-                run_cloud_meter_event(customer, kind, quantity, identifier)
-                    .map(|_| ExitCode::SUCCESS)?,
-            CloudCommand::Init { force } =>
-                run_cloud_init(force).map(|_| ExitCode::SUCCESS)?,
-            CloudCommand::SetCustomer { tenant, stripe_customer_id } =>
-                run_cloud_set_customer(tenant, stripe_customer_id)
-                    .map(|_| ExitCode::SUCCESS)?,
-            CloudCommand::SetPlan { tenant, plan } =>
-                run_cloud_set_plan(tenant, plan).map(|_| ExitCode::SUCCESS)?,
         },
         Command::Remote { target, tenant, token, action } =>
             run_remote(target, tenant, token, action)?,
@@ -3858,518 +3626,49 @@ fn run_rag_verify(project: PathBuf, _strict: bool) -> Result<ExitCode> {
     }
 }
 
-/// v0.4 W23 Mon follow-up — auto-load `.env.cloud` from the
-/// nearest parent dir BEFORE any cloud subcommand reads env vars.
-/// Prints a one-line banner so the operator sees which file (if
-/// any) populated their env.  Process env vars set in the shell
-/// keep precedence over file values (standard dotenv semantics).
+/// Walk up from cwd looking for a `.env.cloud` file (NOT `.env` — the
+/// project-level template stays separate).  Returns the first match,
+/// including cwd itself.
+fn find_cloud_dotenv_walking_up(start: &Path) -> Option<PathBuf> {
+    let mut cur: PathBuf = start.to_path_buf();
+    loop {
+        let candidate = cur.join(".env.cloud");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// v0.4 W25 Mon — auto-load `.env.cloud` from the nearest parent dir
+/// BEFORE `aislang remote` reads env vars.  Prints a one-line banner
+/// so the operator sees which file (if any) populated their env.
+/// Process env vars set in the shell keep precedence over file values
+/// (`dotenvy::from_path` doesn't overwrite already-set vars — standard
+/// dotenv semantics).
 fn load_cloud_dotenv_with_banner() {
-    use aislang_cloud::env_template::{load_cloud_dotenv, DotenvLoadResult};
-    match load_cloud_dotenv() {
-        DotenvLoadResult::Loaded(path) => {
-            eprintln!("aislang cloud: loaded env from {}",
-                path.display());
-        }
-        DotenvLoadResult::NoFile => {
-            // Quiet by default — operator may legitimately be
-            // running via shell-exported vars (CI, `cargo test`,
-            // production systemd unit).
-        }
-        DotenvLoadResult::LoadError(msg) => {
-            // Non-fatal — env vars may still be set via shell.
-            // Surface as a warning so operator can fix the file.
-            eprintln!("aislang cloud: warning: dotenv load failed: {msg}");
-        }
-    }
-}
-
-/// v0.4 W22 Mon follow-up — `aislang cloud serve` thin wrapper
-/// around `aislang_cloud::serve`.  Reads the bearer token from
-/// `AISLANG_CLOUD_TOKEN`, binds a TcpListener on
-/// `<host>:<port>`, calls `aislang_cloud::serve`.  Refuses to
-/// start without a token (would otherwise accept every
-/// unauthenticated request + leak the store).
-fn run_cloud_serve(host: String, port: u16) -> Result<()> {
-    load_cloud_dotenv_with_banner();
-    let config = aislang_cloud::ServerConfig::from_env().ok_or_else(|| {
-        anyhow::anyhow!(
-            "AISLANG_CLOUD_TOKEN is unset or empty — refusing to start the \
-             control plane without a bearer token (Decision 46.1).  Set it \
-             before launching:\n  \
-             AISLANG_CLOUD_TOKEN=<token> aislang cloud serve")
-    })?;
-    // v0.4 W22 Tue: AppState now carries `Arc<dyn Store>`; the
-    // in-memory ProjectStore is the W22-Mon scaffold default.
-    // PgStore swap lives behind `AISLANG_CLOUD_DB_URL` — when set,
-    // the CLI binds the Postgres pool; absent → fall back to the
-    // in-memory store so `aislang cloud serve` still works for
-    // local-dev smoke tests without a Postgres.
-    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
-        .filter(|s| !s.is_empty());
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-
-    rt.block_on(async move {
-        let public_base_url = config.public_base_url.clone();
-        let mut state = if let Some(url) = db_url {
-            eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
-            let pg = aislang_cloud::db::PgStore::connect(&url).await
-                .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
-            // v0.4 W25 — reconcile every existing tenant schema to the
-            // current per-tenant DDL on startup (idempotent ALTER ...
-            // ADD COLUMN IF NOT EXISTS / CREATE TABLE IF NOT EXISTS), so
-            // a schema change shipped in this build (e.g. the `repo`
-            // column / `audit_log` table) backfills onto pre-existing
-            // tenants WITHOUT a manual per-tenant re-provision.
-            match pg.reconcile_all_tenant_schemas().await {
-                Ok((ok, failed)) => eprintln!(
-                    "aislang cloud: reconciled {ok} tenant schema(s) to current \
-                     DDL ({failed} failed)"),
-                Err(e) => eprintln!(
-                    "aislang cloud: WARN tenant-schema reconcile skipped: {e}"),
-            }
-            aislang_cloud::AppState::new(config, std::sync::Arc::new(pg))
-        } else {
-            eprintln!("aislang cloud: AISLANG_CLOUD_DB_URL unset \
-                       — using in-memory store (local dev only; \
-                       no data persists across restarts)");
-            aislang_cloud::AppState::with_in_memory_store(config)
-        };
-
-        // v0.4 W23 Tue (Decision 46.3) — spawn the metering
-        // background flusher.  Only fires when STRIPE_SECRET_KEY
-        // is present; otherwise the queue still accepts events
-        // (so handlers don't need to branch) but they just sit
-        // there until the operator wires Stripe up + restarts.
-        match aislang_cloud::billing::StripeClient::from_env() {
-            Ok(stripe) => {
-                let interval = std::time::Duration::from_secs(
-                    aislang_cloud::billing::DEFAULT_FLUSH_INTERVAL_SECS);
-                state.meter.spawn_flusher(
-                    stripe, state.store.clone(), interval);
-                eprintln!("aislang cloud: metering pipeline enabled \
-                           (flush every {}s)",
-                    aislang_cloud::billing::DEFAULT_FLUSH_INTERVAL_SECS);
-            }
-            Err(_) => {
-                eprintln!("aislang cloud: STRIPE_SECRET_KEY unset — \
-                           metering pipeline DISABLED (events still \
-                           enqueued + buffered, but never flushed to \
-                           Stripe until you set STRIPE_SECRET_KEY + \
-                           restart)");
-            }
-        }
-
-        // v0.4 W23 Thu follow-up — swap in the REAL Stripe Checkout
-        // Session creator when STRIPE_PRICE_ID is set; otherwise the
-        // signup flow uses MockCheckoutCreator (whose checkout_url
-        // is a non-payable mock that 404s on Stripe).
-        match aislang_cloud::signup::StripeCheckoutCreator::from_env(&public_base_url) {
-            Ok(Some(creator)) => {
-                state.checkout_creator = std::sync::Arc::new(creator);
-                eprintln!("aislang cloud: live Stripe Checkout enabled \
-                           (STRIPE_PRICE_ID set) — signup checkout_url is \
-                           a real payable session");
-            }
-            Ok(None) => {
-                eprintln!("aislang cloud: STRIPE_PRICE_ID unset — signup \
-                           uses MOCK checkout (checkout_url is NOT payable; \
-                           set STRIPE_PRICE_ID to a recurring price to \
-                           enable real Stripe Checkout)");
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Stripe Checkout misconfigured: {e}"));
-            }
-        }
-
-        // v0.4 W24 Tue — swap in the REAL GitHub PR commenter when
-        // GITHUB_TOKEN is set; otherwise the GitOps flow logs the
-        // plan comment instead of posting it.
-        match aislang_cloud::gitops::GithubPrCommenter::from_env() {
-            Ok(Some(commenter)) => {
-                state.pr_commenter = std::sync::Arc::new(commenter);
-                eprintln!("aislang cloud: GitOps PR comments ENABLED \
-                           (GITHUB_TOKEN set) — plan results post to PRs");
-            }
-            Ok(None) => {
-                eprintln!("aislang cloud: GITHUB_TOKEN unset — GitOps plan \
-                           comments are LOGGED only (not posted to GitHub; \
-                           set GITHUB_TOKEN to a PAT/installation token to \
-                           enable PR comments)");
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "GitHub PR commenter misconfigured: {e}"));
-            }
-        }
-
-        // v0.4 W25 Tue follow-up — swap in the REAL AWS SES email
-        // sender when AISLANG_EMAIL_FROM is set; otherwise signup
-        // verify-emails are LOGGED only (LoggingEmailSender default).
-        match aislang_cloud::signup::SesEmailSender::from_env() {
-            Ok(Some(sender)) => {
-                state.email_sender = std::sync::Arc::new(sender);
-                eprintln!("aislang cloud: live email ENABLED via AWS SES \
-                           (AISLANG_EMAIL_FROM set) — signup verify links \
-                           are emailed to users");
-            }
-            Ok(None) => {
-                eprintln!("aislang cloud: AISLANG_EMAIL_FROM unset — signup \
-                           verify emails are LOGGED only (not sent; set \
-                           AISLANG_EMAIL_FROM + AISLANG_SES_REGION + \
-                           AISLANG_SES_SMTP_USER + AISLANG_SES_SMTP_PASSWORD \
-                           to enable AWS SES)");
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "SES email sender misconfigured: {e}"));
-            }
-        }
-
-        let addr = format!("{host}:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr).await
-            .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-        eprintln!("aislang cloud: listening on http://{addr}");
-        eprintln!("aislang cloud: bearer auth enabled (AISLANG_CLOUD_TOKEN)");
-        eprintln!("aislang cloud: smoke test:");
-        eprintln!("  curl -H 'Authorization: Bearer <token>' \\");
-        eprintln!("       -H 'X-Aislang-Tenant: alpha' \\");
-        eprintln!("       http://{addr}/v1/projects");
-        aislang_cloud::serve(listener, state).await
-            .map_err(|e| anyhow::anyhow!("axum serve: {e}"))
-    })?;
-    Ok(())
-}
-
-/// v0.4 W22 Tue follow-up — `aislang cloud provision <tenant>`.
-///
-/// Closes the UX gap surfaced by the live-Postgres e2e smoke: hitting
-/// `GET /v1/projects` against an un-provisioned tenant returned 500
-/// (`relation "projects" does not exist`) because the per-tenant
-/// schema hadn't been created.  This subcommand calls
-/// `PgStore::ensure_tenant_schema` to create the schema + replay the
-/// per-tenant migrations, so the next API call against that tenant
-/// hits a populated schema.
-///
-/// Idempotent — running it twice against the same tenant is a
-/// no-op (Postgres `CREATE SCHEMA IF NOT EXISTS` + `INSERT ... ON
-/// CONFLICT DO NOTHING` on the tenants registry).
-///
-/// Requires `AISLANG_CLOUD_DB_URL`.  The in-memory fallback has no
-/// schema to provision; running against it would silently succeed
-/// without doing useful work, so we refuse explicitly instead.
-fn run_cloud_provision(tenant: String) -> Result<()> {
-    load_cloud_dotenv_with_banner();
-    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
-             provision` only makes sense against Postgres.  Set it before \
-             running:\n  \
-             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud provision <tenant>"))?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-
-    // Validate the slug client-side BEFORE opening the Postgres
-    // connection so a clear "malformed slug" error doesn't get
-    // preceded by misleading "provisioning schema `t_BAD;DROP`"
-    // banner output.  Mirrors the `public.tenants.slug` CHECK
-    // constraint at the DB layer (belt-and-suspenders).
-    if !aislang_cloud::db::is_valid_slug(&tenant) {
-        anyhow::bail!(
-            "tenant slug `{tenant}` is malformed — must match \
-             `^[a-z0-9][a-z0-9-]{{0,63}}$` (lowercase alnum + hyphens, \
-             starts with alnum, ≤64 chars)");
-    }
-
-    rt.block_on(async move {
-        use aislang_cloud::Store;
-        eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
-        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
-            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
-        eprintln!("aislang cloud: provisioning tenant `{tenant}` \
-                   (schema `t_{tenant}` + per-tenant migrations)");
-        pg.ensure_tenant_schema(&tenant).await
-            .map_err(|e| anyhow::anyhow!("ensure_tenant_schema: {e}"))?;
-        eprintln!("aislang cloud: tenant `{tenant}` provisioned ✓");
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
-}
-
-/// v0.4 W25 — `aislang cloud deprovision <tenant>`.  The inverse of
-/// `provision`: drops the tenant schema + deletes all of its
-/// shared-schema rows.  Destructive + irreversible.  Idempotent — a
-/// no-op (with a clear message) when the tenant doesn't exist.
-fn run_cloud_deprovision(tenant: String) -> Result<()> {
-    load_cloud_dotenv_with_banner();
-    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
-             deprovision` only makes sense against Postgres.  Set it before \
-             running:\n  \
-             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud deprovision <tenant>"))?;
-
-    if !aislang_cloud::db::is_valid_slug(&tenant) {
-        anyhow::bail!(
-            "tenant slug `{tenant}` is malformed — must match \
-             `^[a-z0-9][a-z0-9-]{{0,63}}$`");
-    }
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-
-    rt.block_on(async move {
-        use aislang_cloud::Store;
-        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
-            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
-        eprintln!("aislang cloud: deprovisioning tenant `{tenant}` \
-                   (DROP SCHEMA t_{tenant} CASCADE + delete shared rows)");
-        let existed = pg.deprovision_tenant(&tenant).await
-            .map_err(|e| anyhow::anyhow!("deprovision_tenant: {e}"))?;
-        if existed {
-            eprintln!("aislang cloud: tenant `{tenant}` deprovisioned ✓");
-        } else {
-            eprintln!("aislang cloud: tenant `{tenant}` did not exist — nothing \
-                       to do");
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
-}
-
-/// v0.4 W23 Mon — `aislang cloud meter-event` Stripe metering spike.
-///
-/// Submits one meter event to the Stripe Billing meter-events API
-/// + prints the server-echoed response.  Demonstrates the full
-/// wire path the Phase 2 Tue automated emission will use (token
-/// + SP-equivalent meter events fire on every chat-turn + every
-/// `apply`/`destroy`/`plan`).
-///
-/// Reads `STRIPE_SECRET_KEY` (required) + optionally
-/// `STRIPE_API_BASE` (defaults to `https://api.stripe.com`) from
-/// env.  Refuses to start without a secret key — mirrors the
-/// `AISLANG_CLOUD_TOKEN` empty-check posture from W22 Mon.
-fn run_cloud_meter_event(
-    customer:   String,
-    kind:       String,
-    quantity:   u64,
-    identifier: Option<String>,
-) -> Result<()> {
-    load_cloud_dotenv_with_banner();
-    use aislang_cloud::billing::{
-        MeterEvent, MeterEventKind, StripeClient, generate_smoke_identifier,
-        PINNED_API_VERSION,
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return,
     };
-
-    let kind = MeterEventKind::parse_cli_value(&kind)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let identifier = identifier.unwrap_or_else(generate_smoke_identifier);
-    let event = MeterEvent {
-        kind,
-        stripe_customer_id: customer.clone(),
-        quantity,
-        identifier: identifier.clone(),
-        timestamp_secs: None,
+    let Some(path) = find_cloud_dotenv_walking_up(&cwd) else {
+        // Quiet by default — operator may legitimately be running via
+        // shell-exported vars.
+        return;
     };
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-
-    rt.block_on(async move {
-        eprintln!("aislang cloud: building Stripe client (API version: {PINNED_API_VERSION})");
-        let client = StripeClient::from_env()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        eprintln!("aislang cloud: submitting meter event \
-                   customer={customer} kind={} quantity={quantity} identifier={identifier}",
-            kind.as_event_name());
-        let resp = client.submit_meter_event(&event).await
-            .map_err(|e| anyhow::anyhow!("submit_meter_event: {e}"))?;
-        eprintln!("aislang cloud: Stripe accepted the event ✓");
-        eprintln!("  event_name = {}", resp.event_name);
-        eprintln!("  identifier = {}", resp.identifier);
-        if let Some(ts) = resp.timestamp {
-            eprintln!("  timestamp  = {ts}");
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
-}
-
-/// v0.4 W23 Mon follow-up — `aislang cloud init`.  Writes
-/// `.env.cloud.example` to cwd listing every operator env var the
-/// `aislang-cloud` crate reads (see
-/// `aislang_cloud::env_template::CLOUD_ENV_VARS` for the
-/// canonical registry).
-///
-/// Refuses to overwrite an existing file unless `--force` is
-/// passed, so we don't stomp operator edits when re-run during
-/// an upgrade.
-fn run_cloud_init(force: bool) -> Result<()> {
-    use aislang_cloud::env_template::{
-        generate_cloud_env_example, CLOUD_ENV_EXAMPLE_FILENAME,
-    };
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
-    let path = cwd.join(CLOUD_ENV_EXAMPLE_FILENAME);
-    if path.exists() && !force {
-        anyhow::bail!(
-            "{} already exists — pass --force to overwrite",
-            path.display());
+    match dotenvy::from_path(&path) {
+        Ok(_) => eprintln!("aislang remote: loaded env from {}", path.display()),
+        // Non-fatal — env vars may still be set via shell.
+        Err(e) => eprintln!("aislang remote: warning: dotenv load failed: {e}"),
     }
-    std::fs::write(&path, generate_cloud_env_example())
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-    eprintln!("aislang cloud: wrote {} ✓", path.display());
-    eprintln!("  next steps:");
-    eprintln!("    cp {} .env.cloud", path.display());
-    eprintln!("    # edit .env.cloud + fill in AISLANG_CLOUD_TOKEN etc.");
-    eprintln!("    echo .env.cloud >> .gitignore");
-    eprintln!("    aislang cloud serve   # auto-loads .env.cloud");
-    Ok(())
-}
-
-/// v0.4 W23 Tue — `aislang cloud set-customer <tenant>
-/// <stripe_customer_id>`.
-///
-/// Maps a provisioned tenant slug to its Stripe customer record
-/// so the metering pipeline (Decision 46.3) can submit meter
-/// events against the right billable account.  Requires
-/// `AISLANG_CLOUD_DB_URL` — the in-memory fallback store doesn't
-/// persist across restarts so a mapping set there would
-/// disappear when `aislang cloud serve` cycles.
-///
-/// Customer-id validation:
-/// - Client-side: `^cus_[A-Za-z0-9]{1,60}$` regex (matches
-///   Stripe's actual format + the DB CHECK constraint).
-/// - DB-side: same regex enforced at insert.
-/// - Failure mode: malformed input fails fast BEFORE opening
-///   the Postgres connection (clear error, no transient DB
-///   noise in logs).
-fn run_cloud_set_customer(
-    tenant:             String,
-    stripe_customer_id: String,
-) -> Result<()> {
-    load_cloud_dotenv_with_banner();
-    // Client-side slug + customer-id validation.  Slug
-    // validation is reused from db.rs; the customer-id regex
-    // is duplicated here so the error fires before we open a
-    // Postgres connection.
-    if !aislang_cloud::db::is_valid_slug(&tenant) {
-        anyhow::bail!("tenant slug `{tenant}` is malformed — must match \
-                       `^[a-z0-9][a-z0-9-]{{0,63}}$`");
-    }
-    if !is_valid_stripe_customer_id(&stripe_customer_id) {
-        anyhow::bail!("stripe customer id `{stripe_customer_id}` is malformed \
-                       — must match `^cus_[A-Za-z0-9]{{1,60}}$`");
-    }
-
-    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
-             set-customer` only makes sense against Postgres (the \
-             in-memory fallback doesn't persist).  Set it before \
-             running:\n  \
-             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud \
-             set-customer <tenant> <cus_id>"))?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-
-    rt.block_on(async move {
-        use aislang_cloud::Store;
-        eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
-        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
-            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
-        eprintln!("aislang cloud: mapping tenant `{tenant}` → \
-                   stripe_customer_id `{stripe_customer_id}`");
-        pg.set_tenant_stripe_customer(&tenant, &stripe_customer_id).await
-            .map_err(|e| anyhow::anyhow!("set_tenant_stripe_customer: {e}"))?;
-        eprintln!("aislang cloud: customer mapping persisted ✓");
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
-}
-
-/// Client-side Stripe customer-id validator — mirrors the
-/// `tenants_stripe_customer_id_format` CHECK constraint defined
-/// in `migrations/20260609000000_tenants_stripe_customer.sql`.
-/// Belt-and-suspenders with the DB constraint so malformed ids
-/// fail fast with a clear error before any SQL fires.
-fn is_valid_stripe_customer_id(s: &str) -> bool {
-    if !s.starts_with("cus_") { return false; }
-    let rest = &s[4..];
-    if rest.is_empty() || rest.len() > 60 { return false; }
-    rest.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
-/// v0.4 W23 Wed — `aislang cloud set-plan <tenant> <free|paid>`.
-///
-/// Sets a tenant's billing plan (Decision 46.3 free-tier rate-
-/// limiting).  `free` rate-limits SP-equivalent operations at
-/// 50/day; `paid` is unlimited.  Requires `AISLANG_CLOUD_DB_URL`
-/// — the plan must persist across `aislang cloud serve` restarts
-/// (the in-process rate-limit COUNTER resets on restart, but the
-/// PLAN config is durable).
-fn run_cloud_set_plan(tenant: String, plan: String) -> Result<()> {
-    load_cloud_dotenv_with_banner();
-    if !aislang_cloud::db::is_valid_slug(&tenant) {
-        anyhow::bail!("tenant slug `{tenant}` is malformed — must match \
-                       `^[a-z0-9][a-z0-9-]{{0,63}}$`");
-    }
-    let parsed_plan = aislang_cloud::rate_limit::TenantPlan::parse_cli_value(&plan)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let db_url = std::env::var("AISLANG_CLOUD_DB_URL").ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!(
-            "AISLANG_CLOUD_DB_URL is unset or empty — `aislang cloud \
-             set-plan` only makes sense against Postgres (the in-memory \
-             fallback doesn't persist).  Set it before running:\n  \
-             AISLANG_CLOUD_DB_URL=postgres://... aislang cloud set-plan \
-             <tenant> <free|paid>"))?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
-
-    rt.block_on(async move {
-        use aislang_cloud::Store;
-        eprintln!("aislang cloud: connecting to Postgres at AISLANG_CLOUD_DB_URL");
-        let pg = aislang_cloud::db::PgStore::connect(&db_url).await
-            .map_err(|e| anyhow::anyhow!("PgStore connect: {e}"))?;
-        eprintln!("aislang cloud: setting tenant `{tenant}` plan → `{}`",
-            parsed_plan.as_str());
-        pg.set_tenant_plan(&tenant, parsed_plan).await
-            .map_err(|e| anyhow::anyhow!("set_tenant_plan: {e}"))?;
-        eprintln!("aislang cloud: plan persisted ✓");
-        if parsed_plan == aislang_cloud::rate_limit::TenantPlan::Free {
-            eprintln!("  note: free tier rate-limited at {} SP-equivalents/day",
-                aislang_cloud::rate_limit::FREE_TIER_DAILY_SP_CAP);
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
 }
 
 /// v0.4 W25 Mon — `aislang remote --target` (Decision 46.9, mission
 /// deliverable #2).  Resolve the bearer token + tenant, build a
-/// [`aislang_cloud::remote::RemoteClient`], and delegate the chosen
+/// [`aislang_remote::RemoteClient`], and delegate the chosen
 /// verb to the control plane.  Returns the process exit code:
 ///   - validate: 0 valid / 2 invalid source / (errors propagate)
 ///   - plan / status: 0 on success
@@ -4397,8 +3696,8 @@ fn run_remote(
     }
 
     // Auto-load `.env.cloud` so `AISLANG_CLOUD_TOKEN` / `AISLANG_TENANT`
-    // resolve the same way the `aislang cloud serve` operator surface
-    // already does.
+    // resolve from a file the same way shell-exported vars do (existing
+    // process env vars keep precedence — standard dotenv semantics).
     load_cloud_dotenv_with_banner();
 
     let token = token
@@ -4419,7 +3718,7 @@ fn run_remote(
         .map_err(|e| anyhow::anyhow!("init tokio runtime: {e}"))?;
 
     rt.block_on(async move {
-        use aislang_cloud::remote::{RemoteClient, RemoteError, SseTerminal};
+        use aislang_remote::{RemoteClient, RemoteError, SseTerminal};
         let client = RemoteClient::new(&target, &token, &tenant);
         eprintln!("aislang remote: target={target} tenant={tenant}");
 
@@ -4440,7 +3739,7 @@ fn run_remote(
         };
 
         // Map a streaming outcome → exit code + a billing summary line.
-        let summarise_stream = |verb: &str, outcome: aislang_cloud::remote::SseOutcome| {
+        let summarise_stream = |verb: &str, outcome: aislang_remote::SseOutcome| {
             match outcome.terminal {
                 SseTerminal::Done(d) => {
                     if let Some(q) = d["billing"]["quantity"].as_u64() {
