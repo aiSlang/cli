@@ -1,0 +1,18 @@
+[package]
+name = "aislang-remote"
+description = "aiSlang remote control-plane HTTP + SSE client (`aislang remote --target`)"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+# v0.4 Week 25 Mon: self-contained reqwest HTTP + SSE client for the
+# `aislang remote --target=<URL> <verb>` CLI surface.  `reqwest`'s
+# `stream` feature (enabled workspace-wide) powers the chunk-by-chunk
+# SSE read; `serde_json` parses each event's data payload.
+reqwest    = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
