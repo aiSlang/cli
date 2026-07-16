@@ -77,10 +77,9 @@ enum Command {
         /// port 4000, runs one real `/v1/chat/completions` against
         /// the first resolved model alias, then `down -v` (always,
         /// even on failure). Catches boot-time bugs that
-        /// `--smoke-test` (config-only) misses — see PLAN week 6
-        /// retrospective. Requires Docker on PATH + a populated
-        /// `.env` in the output dir (for provider creds the chat
-        /// call will use). Implies `--smoke-test`.
+        /// `--smoke-test` (config-only) misses. Requires Docker on
+        /// PATH + a populated `.env` in the output dir (for provider
+        /// creds the chat call will use). Implies `--smoke-test`.
         #[arg(long)]
         smoke_test_live: bool,
     },
@@ -91,8 +90,8 @@ enum Command {
     /// Tear down the deployed stack and free resources
     ///
     /// Idempotent: re-running destroy on an already-torn-down stack
-    /// exits 0 with a "nothing to destroy" message (week 10 Wed,
-    /// Decision 27). The state file at `.aislang/state.json` is the
+    /// exits 0 with a "nothing to destroy" message. The state file at
+    /// `.aislang/state.json` is the
     /// source of truth — its `applied_at` field flips to null after
     /// a successful tear-down. Re-applying recreates state.json with
     /// a fresh timestamp.
@@ -102,7 +101,7 @@ enum Command {
         /// the state file is absent or marked as torn down. Useful for
         /// users who manually edited `.aislang/` away or who want to
         /// re-run cleanup as a belt-and-suspenders measure on a
-        /// torn-down stack (Decision 29).
+        /// torn-down stack.
         #[arg(long)]
         force: bool,
     },
@@ -111,7 +110,7 @@ enum Command {
     /// `aislang eval [<eval-label>] <file>`. Label optional: without
     /// it, every `eval` block in the project runs. With it, only the
     /// named one. Overall exit code = 0 only when every eval passes
-    /// its threshold (per Decision 16).
+    /// its threshold.
     Eval {
         /// Optional eval label to run. When omitted, all evals run.
         #[arg(long = "eval", short = 'e')]
@@ -124,8 +123,8 @@ enum Command {
     ///
     /// Reads `~/.aislang/spend.json` (the persistent per-day spend
     /// tracker written during `aislang chat` / `aislang eval` runs)
-    /// and renders today's UTC total alongside the per-model breakdown
-    /// (week 10 Tue's `by_model` attribution). Compares against the
+    /// and renders today's UTC total alongside the per-model breakdown.
+    /// Compares against the
     /// `budget { hard_cap_per_run, hard_cap_per_day }` from the
     /// project's .ais source. No network calls — read-only.
     Cost {
@@ -139,12 +138,11 @@ enum Command {
     /// With no flags: renders stack status (state file + docker compose
     /// ps). With `--spend`: appends today's UTC total. With
     /// `--model-spend [MODEL]`: appends today's by-model breakdown,
-    /// optionally filtered to one model id.  With `--main-spend`
-    /// (week 13 Thu): appends today's by-`main`-block breakdown
-    /// (currently empty pending v0.3's OpenAI-compat adapter that
-    /// would auto-record principal-LLM tokens).
+    /// optionally filtered to one model id.  With `--main-spend`:
+    /// appends today's by-`main`-block breakdown (currently empty
+    /// until principal-LLM token auto-recording lands).
     ///
-    /// Exit codes (Decision 28):
+    /// Exit codes:
     ///   0  stack matches state (or no flags + state present + applied_at Some)
     ///   1  drift — state missing, applied_at is None, or compose ps disagrees
     ///   2  docker unavailable when a stack check was attempted
@@ -163,12 +161,11 @@ enum Command {
               require_equals = true)]
         model_spend: Option<String>,
         /// Append today's by-`main`-block spend breakdown — the
-        /// principal-LLM side of the Track-A2 cost model.  Week 13
-        /// Thu adds the schema + read path; auto-recording requires
-        /// v0.3's OpenAI-compat `mcp-serve` adapter (until then the
-        /// section reports an empty state + the v0.3 carry-over
-        /// pointer, same shape `--model-spend` uses for Open-WebUI
-        /// users whose chats bypass the SpendTracker).
+        /// principal-LLM side of the cost model.  Auto-recording
+        /// requires the OpenAI-compat `mcp-serve` adapter; until then
+        /// this section reports an empty state (the same shape
+        /// `--model-spend` uses for Open WebUI users whose chats
+        /// bypass the spend tracker).
         ///
         /// Source-conditional output: `main` entries whose declared
         /// `model.source = subscription` render `subscription
@@ -179,54 +176,48 @@ enum Command {
     },
     /// Open a CLI chat session against a deployed agent
     ///
-    /// v0.1 (week 6 Mon): validates the agent exists in the source
-    /// project and prints a placeholder line. Chat loop (LiteLLM +
-    /// MCP) lands Wednesday; tool-use loop lands Thursday.
+    /// Validates the agent exists in the source project, then opens an
+    /// interactive chat loop (LiteLLM + MCP tool use) against it.
     Chat {
         /// Agent label (e.g. `support`)
         agent: String,
         /// Path to the .ais project file. v0.2 may infer this from
         /// `aislang.lock` in the current directory.
         file:  PathBuf,
-        /// v0.3 Week 20 Tue: pause between pipeline steps so the
-        /// user can hand-edit the previous step's persisted output
-        /// before the next step picks it up.  Every step's reply
-        /// is ALWAYS persisted under `<project_root>/.aislang/
-        /// pipeline/<pipeline_label>/step_<N>_<agent>.md`
-        /// regardless of this flag — the flag controls whether the
-        /// CLI pauses + re-reads the file as the next step's
-        /// input.  Without `--interactive`, the orchestrator
-        /// runs unchanged from the Mon/W17-Thu pipe-forward
-        /// behaviour.  No-op for single-agent + router branches.
+        /// Pause between pipeline steps so the user can hand-edit
+        /// the previous step's persisted output before the next step
+        /// picks it up.  Every step's reply is ALWAYS persisted under
+        /// `<project_root>/.aislang/pipeline/<pipeline_label>/
+        /// step_<N>_<agent>.md` regardless of this flag — the flag
+        /// controls whether the CLI pauses + re-reads the file as the
+        /// next step's input.  Without `--interactive`, the
+        /// orchestrator runs the standard pipe-forward behaviour.
+        /// No-op for single-agent + router branches.
         #[arg(long, default_value_t = false)]
         interactive: bool,
-        /// v0.4 Week 21 Mon: keep `<project>/.aislang/pipeline/
-        /// <pipeline_label>/` from the previous chat session.
-        /// Default behaviour wipes that dir at session start so
-        /// each chat session leaves a clean trace (user-reported
-        /// bug 4 — old + new chat artifacts mixed in the dir).
-        /// `--keep-history` opts out.  No-op for single-agent +
-        /// router paths (no persistence dir).
+        /// Keep `<project>/.aislang/pipeline/<pipeline_label>/` from
+        /// the previous chat session.  Default behaviour wipes that
+        /// dir at session start so each chat session leaves a clean
+        /// trace.  `--keep-history` opts out.  No-op for single-agent
+        /// + router paths (no persistence dir).
         #[arg(long, default_value_t = false)]
         keep_history: bool,
     },
-    /// Run the aiSlang MCP server (v0.2 Track A — week 12 Mon scaffold)
+    /// Run the aiSlang MCP server
     ///
     /// Starts an MCP server that exposes the aislang CLI surface as
     /// MCP tools, so MCP-aware LLM clients (Claude Desktop, Cursor,
     /// ChatGPT-with-MCP, custom rmcp clients) can author and operate
     /// aiSlang stacks without learning the DSL.
     ///
-    /// **Week 12 Mon (this commit):** scaffolding only — registers a
-    /// single `aislang_ping` health-check tool that returns "pong".
-    /// The substantive tool surface (lang_spec / examples / describe /
-    /// validate / plan / apply / destroy / status / chat_turn / eval)
-    /// lands Tue–Thu per PLAN-90-days-v0_2.md Phase 1 Week 12.
+    /// **Tool surface:** exposes the aiSlang CLI as MCP tools —
+    /// lang_spec / examples / describe / validate / plan / apply /
+    /// destroy / status / chat_turn / eval.
     ///
     /// **Transports:** `--stdio` (default — for parent-spawned use by
-    /// Claude Desktop, Cursor, etc.) is wired week 12 Mon.  `--http
-    /// <ADDR>` (week 13 Mon) hosts the same tool surface over rmcp's
-    /// Streamable-HTTP transport at `http://ADDR/mcp`; suitable for
+    /// Claude Desktop, Cursor, etc.).  `--http <ADDR>` hosts the same
+    /// tool surface over rmcp's Streamable-HTTP transport at
+    /// `http://ADDR/mcp`; suitable for
     /// k8s/cloud deployments where the server is reached by N
     /// independent MCP clients over the network.  The Session pool
     /// (chat_turn / eval) is shared across HTTP clients — two
@@ -253,13 +244,11 @@ enum Command {
         /// `http://<host>:<port>/mcp`.
         #[arg(long, value_name = "ADDR", conflicts_with = "stdio")]
         http: Option<SocketAddr>,
-        /// W26: build the project's RAG indexes BEFORE serving (the
-        /// in-cluster agent-runtime startup step).  Given the project dir
-        /// (e.g. `/etc/aislang`), runs the same logic as `aislang rag
-        /// build-all` — tolerant of per-store failures — then serves.  This
-        /// replaces the old `sh -c "… rag build-all … exec mcp-serve"`
-        /// entrypoint, which required a shell the distroless image lacks
-        /// (`exec: "sh": not found` → CrashLoopBackOff).
+        /// Build the project's RAG indexes BEFORE serving (the
+        /// in-cluster agent-runtime startup step).  Given the project
+        /// dir (e.g. `/etc/aislang`), runs the same logic as `aislang
+        /// rag build-all` — tolerant of per-store failures — then
+        /// serves.
         #[arg(long, value_name = "DIR")]
         rag_build_dir: Option<PathBuf>,
         /// LiteLLM base URL the pre-serve RAG build embeds against
@@ -273,8 +262,8 @@ enum Command {
         wait_litellm_secs: u64,
     },
     /// Run a declared `skill { … }` block against the runtime.
-    /// v0.3 Week 18 Thu follow-up — gives `.ais` authors a CLI
-    /// for end-to-end skill testing without writing Rust glue.
+    /// Gives `.ais` authors a CLI for end-to-end skill testing
+    /// without writing Rust glue.
     ///
     /// Shell-exec skills (`exec = "<cmd>"`) run directly through
     /// `aislang-runtime::skills::run_shell_skill` against the
@@ -297,15 +286,13 @@ enum Command {
         action: SkillCommand,
     },
     /// RAG runtime operations against declared `vector_store`
-    /// blocks (Decision 44.6).  v0.3 Week 19 Wed follow-up —
-    /// gives `.ais` authors a CLI for end-to-end RAG testing
-    /// without writing Rust glue.
+    /// blocks.  Gives `.ais` authors a CLI for end-to-end RAG
+    /// testing without writing Rust glue.
     Rag {
         #[command(subcommand)]
         action: RagCommand,
     },
-    /// v0.4 Week 25 Mon — delegate a CLI verb to a remote control
-    /// plane (Decision 46.9, mission deliverable #2).  The same
+    /// Delegate a CLI verb to a remote control plane.  The same
     /// `aislang` binary self-hosted + cloud users already run; only
     /// `--target` differs.  Verbs operate on a project by its
     /// server-stamped id (create projects via the REST API or the
@@ -325,7 +312,7 @@ enum Command {
         /// (trailing slash optional).
         #[arg(long, value_name = "URL")]
         target: String,
-        /// Tenant slug sent as `X-Aislang-Tenant` (Decision 46.5).
+        /// Tenant slug sent as `X-Aislang-Tenant`.
         /// Defaults to the `AISLANG_TENANT` env var, else `default`
         /// (the self-hosted single-tenant convention).
         #[arg(long, value_name = "SLUG")]
@@ -340,20 +327,19 @@ enum Command {
     },
 }
 
-/// v0.4 Week 25 Mon — `aislang remote` verbs.  Each delegates to the
-/// control plane over the Decision-46.1 REST surface; see the
-/// per-verb endpoint map in `aislang_remote`.
+/// `aislang remote` verbs.  Each delegates to the control plane over
+/// the REST surface; see the per-verb endpoint map in `aislang_remote`.
 #[derive(Subcommand, Debug)]
 enum RemoteCommand {
     /// Parse + typecheck + resolve a project server-side.  FREE — not
-    /// metered, not rate-limited (Decision 46.10).  Exit 0 if valid,
-    /// 2 if the source fails to load.
+    /// metered, not rate-limited.  Exit 0 if valid, 2 if the source
+    /// fails to load.
     Validate {
         /// Server-stamped project id (e.g. `p-abc123`).
         id: String,
     },
     /// Plan a project server-side + print the generated Compose YAML
-    /// to stdout.  Billed 1 SP-equivalent (Decision 46.3 / 46.10).
+    /// to stdout.  Billed 1 SP-equivalent.
     Plan { id: String },
     /// Apply a project server-side — streams progress events.  Billed
     /// 1 SP-equivalent.  Exit 0 on `done`, 1 on an `error` event.
@@ -422,15 +408,13 @@ enum RagCommand {
         #[arg(long, value_name = "URL", default_value = "http://localhost:4000")]
         litellm_url: String,
     },
-    /// v0.4 W21 Tue — scan every `vector_store` declared in a
-    /// project + report chunk counts per persisted index.  Exits
-    /// non-zero when any index is empty (0 chunks) or missing
-    /// from disk; exits 0 when every declared store has a healthy
-    /// index.  Closes the W20 Thu dogfood-finding gap (silent
-    /// empty-RAG indexes masked the Coder hallucination root
-    /// cause); pairs with the chat-time empty-RAG warning that
-    /// fires when a user starts a chat against an agent whose
-    /// `knowledge` refs a store with 0 chunks.
+    /// Scan every `vector_store` declared in a project + report
+    /// chunk counts per persisted index.  Exits non-zero when any
+    /// index is empty (0 chunks) or missing from disk; exits 0 when
+    /// every declared store has a healthy index.  Pairs with the
+    /// chat-time empty-RAG warning that fires when a user starts a
+    /// chat against an agent whose `knowledge` refs a store with 0
+    /// chunks.
     Verify {
         /// Path to the .ais project file or project root dir.
         project: PathBuf,
@@ -441,11 +425,11 @@ enum RagCommand {
         #[arg(long, default_value_t = false)]
         strict: bool,
     },
-    /// v0.4 W26 — build EVERY declared `vector_store`'s index in one go,
-    /// tolerating per-store failures (logs them, exits 0 so a stack still
-    /// comes up).  Indexes land in `AISLANG_VECTOR_DIR` if set, else
-    /// `<project>/.aislang/vector/`.  Used by the managed-cloud agent-runtime
-    /// entrypoint to build `git:` knowledge corpora in-pod before serving.
+    /// Build EVERY declared `vector_store`'s index in one go,
+    /// tolerating per-store failures (logs them, exits 0 so a stack
+    /// still comes up).  Indexes land in `AISLANG_VECTOR_DIR` if set,
+    /// else `<project>/.aislang/vector/`.  Used by the agent-runtime
+    /// entrypoint to build `git:` knowledge corpora before serving.
     BuildAll {
         /// Path to the .ais project file or project root dir.
         project: PathBuf,
@@ -2498,7 +2482,7 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
 fn preflight_warn_missing_secret(referenced_vars: &std::collections::BTreeSet<String>) {
     eprintln!();
     eprintln!("!  preflight WARNING: required Secret `aislang-providers` not found");
-    eprintln!("   (Decision 43.5 — provider creds Secret is user-created)");
+    eprintln!("   (the provider-credentials Secret is user-created)");
     eprintln!();
     eprintln!("   The chart's litellm + agent-runtime pods envFrom this Secret;");
     eprintln!("   without it the pods will install but stay Pending with a");
@@ -2683,9 +2667,8 @@ fn run_cost(file: PathBuf) -> Result<()> {
     println!("today's spend ({}):", aislang_runtime::spend::utc_today());
     println!("  total:   {}", format_money(&today_total));
     if today_by_model.is_empty() {
-        println!("  by model: (no per-model attribution yet — \
-                   spend.json may predate week-10 Tue, or no chat/eval \
-                   run has recorded a cost today)");
+        println!("  by model: (no per-model attribution yet — no \
+                   chat/eval run has recorded a cost today)");
     } else {
         println!("  by model:");
         // Find the longest key for column alignment — keeps the
@@ -3004,14 +2987,13 @@ fn print_main_spend_empty_hint(project: &aislang_core::ast::Project) {
     if has_subscription {
         println!("        Subscription-source `main` entries (Claude Pro, Cursor Team) by");
         println!("        design have no API cost — the empty-state above is correct for them.");
-        println!("        Token-count observability for subscription mains requires v0.3's");
+        println!("        Token-count observability for subscription mains requires an");
     } else {
         println!("        Principal-LLM inference happens inside the host chat app (Claude");
         println!("        Desktop, Cursor, etc.); aislang has no visibility into those tokens.");
-        println!("        Closing this gap requires v0.3's");
+        println!("        Closing this gap requires an");
     }
-    println!("        OpenAI-compatible adapter for `aislang mcp-serve` (see PLAN");
-    println!("        v0.3 carry-overs for the design sketch).");
+    println!("        OpenAI-compatible adapter for `aislang mcp-serve`.");
 }
 
 /// Print a hint about the v0.2 spend-tracking gap when the project
@@ -3050,8 +3032,8 @@ fn print_external_client_spend_hint(project: &aislang_core::ast::Project) {
     println!("  note: only spend from `aislang chat` / `aislang mcp-serve` is tracked here.");
     println!("        Open WebUI talks to LiteLLM directly, bypassing the SpendTracker.");
     println!("        see `docker logs $(docker ps -qf label=aislang.component=litellm)`");
-    println!("        for per-request model resolutions; unified counting is a v0.3");
-    println!("        carry-over (LiteLLM callback or `/spend/logs` query — see PLAN).");
+    println!("        for per-request model resolutions; unified counting is a");
+    println!("        planned enhancement (LiteLLM callback or `/spend/logs` query).");
 }
 
 /// Display the first 12 hex chars of the source hash for the status
@@ -5693,7 +5675,7 @@ fn emit_grammar_level_note() {
     eprintln!();
     eprintln!("diagnostic: grammar-level parse error — no partial AST available.");
     eprintln!("the main error above carries the most specific information chumsky produced.");
-    eprintln!("(line/column highlighting is not yet implemented — see PLAN week-3+)");
+    eprintln!("(line/column highlighting is not yet implemented)");
 }
 
 fn print_summary(project: &aislang_core::ast::Project) {
