@@ -760,6 +760,9 @@ impl Session {
                 tools:      self.tools.as_litellm_tools(),
                 timeout:    None,
                 max_tokens: None,
+                // Set by the streaming wrapper (send_chat_full_streaming);
+                // the base request is non-streaming so it stays None here.
+                stream_options: None,
             };
             // Stream by default (W26): forward each content fragment as a
             // `Token` progress event so a long completion keeps the host's

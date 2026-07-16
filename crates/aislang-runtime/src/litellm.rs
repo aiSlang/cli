@@ -66,6 +66,21 @@ pub struct ChatRequest {
     /// the OTel-GenAI span when v0.2 plumbs it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Streaming-only opt-in for a final usage chunk.  OpenAI/LiteLLM
+    /// only emit token counts on the SSE path when the request carries
+    /// `stream_options: { include_usage: true }`; without it a streamed
+    /// turn returns no `usage`, so cost can't be computed and spend
+    /// tracking silently stays at $0.  Omitted (via skip) on the
+    /// non-streaming path — some providers reject the field there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// `stream_options` sub-object — currently only carries `include_usage`
+/// so the terminal SSE frame reports token counts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 /// One message in a chat exchange.
@@ -659,7 +674,14 @@ impl LiteLlmClient {
 
         // Build the request with stream:true (clone so the caller's req — which
         // the tool-use loop reuses across iterations — stays stream:false).
-        let stream_req = ChatRequest { stream: true, ..req.clone() };
+        // Opt into the terminal usage frame so streamed turns still
+        // report token counts — without this, cost + spend tracking
+        // stay at $0 on the (now-default) streaming path.
+        let stream_req = ChatRequest {
+            stream: true,
+            stream_options: Some(StreamOptions { include_usage: true }),
+            ..req.clone()
+        };
         let mut request = self.http.post(&url).json(&stream_req);
         for (k, v) in &carrier { request = request.header(k, v); }
 
@@ -929,6 +951,7 @@ pub fn one_turn_request(model: &str, system: &str, user: &str) -> ChatRequest {
         tools:      None,
         timeout:    None,
         max_tokens: None,
+        stream_options: None,
     }
 }
 
@@ -1524,6 +1547,38 @@ mod tests {
             "content concatenated in order");
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
         assert!(resp.choices[0].message.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_opts_into_and_captures_usage_for_spend() {
+        // Regression: the streaming path must request `stream_options:
+        // {include_usage: true}` AND carry the resulting terminal usage
+        // frame back into `ChatResponse.usage`.  Without the opt-in the
+        // provider omits token counts on the SSE path, so cost can't be
+        // computed and `~/.aislang/spend.json` silently stays at $0.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path, body_string_contains};
+        let server = MockServer::start().await;
+        // OpenAI's include_usage shape: a final frame with empty choices
+        // carrying the usage block, then [DONE].
+        let sse = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            // If the opt-in is missing this matcher won't match → the call
+            // errors → the test fails, pinning the fix in place.
+            .and(body_string_contains("\"include_usage\":true"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse))
+            .mount(&server).await;
+
+        let client = LiteLlmClient::new(server.uri()).unwrap();
+        let req    = one_turn_request("fast", "sys", "hi");
+        let resp = client.send_chat_full_streaming(&req, |_| {})
+            .await.expect("streaming ok");
+        let usage = resp.usage.expect("usage captured from the final stream frame");
+        assert_eq!(usage.total_tokens, 14, "token counts survive the SSE path");
     }
 
     #[tokio::test]
