@@ -1,0 +1,16 @@
+[book]
+title = "aiSlang CLI"
+authors = ["aiSlang"]
+description = "Declarative multi-agent AI systems — describe the whole system in one .ais file, then validate, run, and deploy it with a single CLI. Quickstart, language guide, and CLI reference."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/aiSlang/cli"
+edit-url-template = "https://github.com/aiSlang/cli/edit/main/docs-site/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
