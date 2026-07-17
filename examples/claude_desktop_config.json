@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "aislang": {
+      "command": "/absolute/path/to/aislang",
+      "args": ["mcp-serve", "--stdio"],
+      "env": {
+        "AISLANG_LITELLM_URL": "http://127.0.0.1:4000"
+      }
+    }
+  }
+}

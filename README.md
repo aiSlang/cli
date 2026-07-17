@@ -319,32 +319,43 @@ See `examples/support-agent-k8s.ais` for the canonical K8s demo and PLAN-90-days
 
 > **Heads-up on `ollama.*` models under K8s**: under `target = compose`, LiteLLM dials the user's host-side Ollama via `OLLAMA_API_BASE=http://host.docker.internal:11434` + an `extra_hosts: host.docker.internal:host-gateway` mapping (Linux needs the explicit mapping; Mac/Windows wire it via Docker Desktop).  K8s has no equivalent — `host.docker.internal` isn't resolvable inside pods on most clusters.  Symptom: LiteLLM fallback to `ollama.*` fails with `OllamaException - Cannot connect to host localhost:11434`.  For Thu's K8s demo, recommended workarounds: (i) drop `ollama.*` from `prefer`/`fallback` when running `target = kubernetes` (the canonical demo uses `anthropic.claude_haiku_4_5` as primary + `openai.gpt_4o_mini` as fallback); (ii) deploy Ollama into the cluster too as a sibling Deployment; (iii) on kind specifically, configure `extraPortMappings` so `host.docker.internal` resolves inside the cluster.  v0.3 may emit an Ollama Deployment automatically when the chart detects an `ollama.*` model id — see PLAN §"Other v0.3 carry-overs".
 
-### MCP integration — drive aiSlang from Claude Desktop / Cursor (v0.2 Thu, Track A)
+### MCP integration — drive aiSlang from Claude Desktop / Cursor
 
-`aislang mcp-serve` exposes the whole CLI surface as an MCP server, so MCP-aware LLM hosts can author, deploy, and chat with .ais agents without you touching a terminal.
+`aislang mcp-serve` exposes the whole CLI surface as an MCP server, so MCP-aware LLM hosts can author, deploy, and chat with .ais agents without you touching a terminal. The **local (stdio) variant** is what desktop hosts spawn as a child process.
 
-**Claude Desktop one-time setup** — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent on Linux/Windows:
+**Claude Desktop one-time setup** — add the block below to your `claude_desktop_config.json` (a ready-to-edit copy lives at [`examples/claude_desktop_config.json`](examples/claude_desktop_config.json)). The config file lives at:
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
     "aislang": {
-      "command": "aislang",
-      "args": ["mcp-serve", "--stdio"]
+      "command": "/absolute/path/to/aislang",
+      "args": ["mcp-serve", "--stdio"],
+      "env": {
+        "AISLANG_LITELLM_URL": "http://127.0.0.1:4000"
+      }
     }
   }
 }
 ```
 
+> **Use an absolute `command` path.** Desktop apps don't inherit your shell `PATH`, so a bare `"aislang"` almost always fails with "server disconnected". Point `command` at the real binary — e.g. `~/.local/bin/aislang` after `install.sh`, or `target/release/aislang` (or `target/debug/aislang`) in a source checkout. Find it with `command -v aislang` / `realpath target/release/aislang`.
+>
+> The `env` block is optional: the authoring tools (`validate` / `plan` / `describe` / `lang_spec`) need nothing, while the conversational tools (`chat_turn` / `eval`) POST to your running LiteLLM proxy — set `AISLANG_LITELLM_URL` only if it isn't the `http://127.0.0.1:4000` default (provider keys live in LiteLLM, not here). Because the host launches the server with an arbitrary working directory, pass **absolute** `source_path`s to the tools.
+
 Restart Claude Desktop. The aislang tools appear under the 🔌 icon. Try:
 
 - *"Validate /path/to/my.ais"* → calls `aislang_validate`, shows source-aware diagnostics.
 - *"Apply the support-agent stack at examples/support-agent.ais"* → calls `aislang_apply` (Claude Desktop renders the destructive-hint confirmation dialog before bringing up the Compose stack).
-- *"Run a chat turn against the support agent — ask it: what's the return policy?"* → calls `aislang_chat_turn` → progress notifications (week 13 Wed) render as the tool-use iterations unfold → final reply lands as the tool's response.
+- *"Run a chat turn against the support agent — ask it: what's the return policy?"* → calls `aislang_chat_turn` → progress notifications render as the tool-use iterations unfold → final reply lands as the tool's response.
 
-This is the **principal-pattern demo**: Claude Desktop is the orchestrator (`pattern = orchestrator`), the deployed agent (`agent "support"`) is one of its tools, mcp-serve glues them. The `main` block in your .ais source declares this topology explicitly (week 12 Fri); `aislang status --main-spend` (week 13 Thu) surfaces the cost-split between the host LLM's tokens and the deployed agents' tokens.
+This is the **principal-pattern demo**: Claude Desktop is the orchestrator (`pattern = orchestrator`), the deployed agent (`agent "support"`) is one of its tools, mcp-serve glues them. The `main` block in your .ais source declares this topology explicitly; `aislang status --main-spend` surfaces the cost-split between the host LLM's tokens and the deployed agents' tokens.
 
-For HTTP-MCP hosts (k8s deployments, ChatGPT-with-MCP, custom rmcp clients): `aislang mcp-serve --http 0.0.0.0:8080` mounts the same toolset at `http://host:8080/mcp` (week 13 Mon).
+For HTTP-MCP hosts (k8s deployments, ChatGPT-with-MCP, custom rmcp clients): `aislang mcp-serve --http 0.0.0.0:8080` mounts the same toolset at `http://host:8080/mcp`.
 
 ### Observability
 
