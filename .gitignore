@@ -42,3 +42,9 @@ stack.yml
 
 # mdbook build output (docs.aislang.cloud)
 docs-site/book/
+
+# `aislang plan` regenerates these per project — build artifacts, not
+# source (like stack.yml above).  The shipped examples are meant to be
+# (re)built with `aislang plan` / `aislang apply`, which recreates both.
+aislang.lock
+litellm_config.yaml
