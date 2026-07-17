@@ -6,6 +6,9 @@ knowledge, evals, budgets, and deploy target. The syntax is HCL-like — labeled
 blocks, `key = value` assignments, and nested blocks — and every value is
 typed, so mistakes are caught at `aislang validate` rather than at runtime.
 
+> This chapter is a practical guide. For the complete formal grammar and typed
+> semantics, see the [aiSlang language reference (`LANGUAGE-SPEC-v0.md`)](https://github.com/aiSlang/cli/blob/main/LANGUAGE-SPEC-v0.md).
+
 Typed literals use suffixes: money is `$50` / `$0.001`, sizes and token counts
 are `32k` / `8GB`, durations are `5s` / `2m`, and percentages are `85%`.
 Comments start with `#` or `//`.

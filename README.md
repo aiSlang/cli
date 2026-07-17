@@ -2,7 +2,7 @@
 
 **aiSlang is a declarative language and CLI for building multi-agent AI systems.** You describe the whole system — agents, capability-selected models with fallback and spend caps, prompts, MCP tools, RAG knowledge, evals, and how the agents compose — in one `.ais` file. The CLI type-checks it, resolves models against a bundled catalog, runs it locally, and emits the Docker Compose or Kubernetes stack (a LiteLLM router + Jaeger tracing + budget enforcement + your agents) that serves it.
 
-> This repo is the **local + self-hosted `aislang` CLI**. It can also delegate operations to a managed control plane via `aislang remote --target …`; that control plane lives in a separate repo, [aiSlang/cloud](https://github.com/aiSlang/cloud).
+> This repo is the **local + self-hosted `aislang` CLI**. It can also delegate operations to **aiSlang Cloud**, a managed control plane, via `aislang remote --target …`.
 
 ## Why aiSlang
 

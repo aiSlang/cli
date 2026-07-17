@@ -255,8 +255,8 @@ aislang rag build-all examples/support-agent.ais
 
 Delegate a CLI verb to a managed control plane instead of running it locally.
 It is the same `aislang` binary self-hosted users run — only `--target`
-differs. The control plane itself lives in a separate repository, `aiSlang/cloud`,
-and is out of scope for these local, self-hosted docs; this command is simply
+differs. The control plane itself is **aiSlang Cloud**, a separate managed
+service out of scope for these local, self-hosted docs; this command is simply
 the client that talks to it. Verbs operate on a project by its server-stamped
 id.
 

@@ -4,7 +4,7 @@ This is the five-minute path from a `.ais` file to a running, chattable agent st
 
 ## 1. Write a `.ais` file
 
-Save this as `support-agent.ais`. It declares one model (selected by capability, with a local Ollama fallback), a versioned prompt, an MCP filesystem tool over a knowledge directory, one agent, an eval, and a local Compose deploy target:
+Save this as `support-agent.ais`. It declares one model (selected by capability, with a local Ollama fallback), a versioned prompt, an MCP filesystem tool over a knowledge directory, one agent, an eval, and a local Compose deploy target. (Every construct here is covered in [The aiSlang language](./language.md), and the full grammar is in the [language reference (`LANGUAGE-SPEC-v0.md`)](https://github.com/aiSlang/cli/blob/main/LANGUAGE-SPEC-v0.md).)
 
 ```hcl
 project "support-agent" {
