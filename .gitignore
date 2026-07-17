@@ -48,3 +48,6 @@ docs-site/book/
 # (re)built with `aislang plan` / `aislang apply`, which recreates both.
 aislang.lock
 litellm_config.yaml
+
+# NFS silly-rename artifacts (created when a file is deleted while open)
+.nfs*

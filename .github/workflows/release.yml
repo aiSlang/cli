@@ -253,7 +253,7 @@ jobs:
           echo "Promote to published after cold-VM install rehearsal (PLAN §Week 11 Decision 38)."
 
   # ──────────────────────────────────────────────────────────────
-  # Publish ghcr.io/<owner>/aislang:<tag> — Phase 2 Week 14 Mon
+  # Publish ghcr.io/<owner>/cli:<tag> — Phase 2 Week 14 Mon
   # (Track B) — the K8s emitter's chart references this image as
   # the agent-runtime pod's container (`aislang mcp-serve --http
   # 0.0.0.0:8080 /etc/aislang/project.ais`).  Without this, the
@@ -359,6 +359,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ghcr image paths MUST be lowercase, but the org (`aiSlang`) is
+      # mixed-case — lowercase the owner so the published image matches
+      # the emitter default (`ghcr.io/aislang/cli`, see aislang-k8s
+      # services::AGENT_RUNTIME_IMAGE).  Forks publish under their own
+      # lowercased owner + override via the chart's image.repository.
+      - name: Compute lowercase image base
+        id: img
+        run: echo "base=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cli" >> "$GITHUB_OUTPUT"
+
       - name: Build + push multi-arch image
         uses: docker/build-push-action@v5
         with:
@@ -367,8 +376,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/aislang:${{ steps.tag.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/aislang:latest
+            ${{ steps.img.outputs.base }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.img.outputs.base }}:latest
           provenance: false
           # Tag-only push — no `latest`-on-main posture.  v0.3+ may
           # add a `:dev` tag on main; for now releases drive the
@@ -378,10 +387,10 @@ jobs:
         run: |
           echo
           echo "Image pushed:"
-          echo "  ghcr.io/${{ github.repository_owner }}/aislang:${{ steps.tag.outputs.tag }}"
-          echo "  ghcr.io/${{ github.repository_owner }}/aislang:latest"
+          echo "  ${{ steps.img.outputs.base }}:${{ steps.tag.outputs.tag }}"
+          echo "  ${{ steps.img.outputs.base }}:latest"
           echo
           echo "Use in Helm chart values.yaml:"
           echo "  image:"
-          echo "    repository: ghcr.io/${{ github.repository_owner }}/aislang"
+          echo "    repository: ${{ steps.img.outputs.base }}"
           echo "    tag:        ${{ steps.tag.outputs.tag }}"

@@ -27,14 +27,14 @@
 #   pwsh -ExecutionPolicy Bypass -File install.ps1
 #
 #   # one-liner (v0.3+, when the public URL goes live):
-#   irm https://github.com/aislang/aislang/releases/latest/download/install.ps1 | iex
+#   irm https://github.com/aiSlang/cli/releases/latest/download/install.ps1 | iex
 #
 #   # with environment overrides (PowerShell syntax):
 #   $env:VERSION = 'v0.2.0'; $env:PREFIX = '/usr/local/bin'
 #   pwsh -ExecutionPolicy Bypass -File install.ps1
 #
 # Environment-variable overrides (mirror install.sh):
-#   REPO                    -- github "<owner>/<repo>" (default: aislang/aislang)
+#   REPO                    -- github "<owner>/<repo>" (default: aiSlang/cli)
 #   VERSION                 -- tag to install            (default: latest)
 #   PREFIX                  -- install dir inside WSL    (default: $HOME/.local/bin)
 #   BASE_URL                -- release-asset base URL    (default: derived from REPO)
@@ -163,7 +163,7 @@ function Resolve-EnvPrefix {
 # Defaults match install.sh's defaults; allow per-flag overrides
 # at PowerShell scope to keep parity.
 function Resolve-InstallShUrl {
-    $repo    = if ($env:REPO)    { $env:REPO }    else { 'aislang/aislang' }
+    $repo    = if ($env:REPO)    { $env:REPO }    else { 'aiSlang/cli' }
     $version = if ($env:VERSION) { $env:VERSION } else { 'latest' }
     $base    = if ($env:BASE_URL) {
         # Caller-supplied base, used by the cold-VM rehearsal

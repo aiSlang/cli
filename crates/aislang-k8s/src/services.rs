@@ -52,14 +52,14 @@ const BUDGET_COUNTER_IMAGE: &str = "alpine:3.19";
 /// this to `values.yaml::image.{repository,tag}` so users can
 /// override per-deploy without touching the manifest.
 ///
-/// Why `aislang/aislang` even though the actual ghcr owner varies
+/// Why `aislang/cli` even though the actual ghcr owner varies
 /// per-fork: the chart override path is the supported way to point
 /// at a fork's own image; the manifest-only path (`kubectl apply
 /// -f manifests/`) is a power-user fallback that's expected to
 /// `sed -i` the image line.  Decision 43.7: the chart wraps four
 /// templating points (image.tag, ingress.enabled, openwebui.
 /// persistence, litellm.replicas); this is one of them.
-pub const AGENT_RUNTIME_IMAGE: &str = "ghcr.io/aislang/aislang:latest";
+pub const AGENT_RUNTIME_IMAGE: &str = "ghcr.io/aislang/cli:latest";
 
 /// Default port for the agent-runtime mcp-serve --http binding when
 /// the `deploy { expose { port = N } }` field is absent.  8080 matches

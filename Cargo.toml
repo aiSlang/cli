@@ -15,7 +15,7 @@ members = [
 version = "0.4.0-dev"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/aislang/aislang"
+repository = "https://github.com/aiSlang/cli"
 authors = ["aiSlang contributors"]
 rust-version = "1.78"
 

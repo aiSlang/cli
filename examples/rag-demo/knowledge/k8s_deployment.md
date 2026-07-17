@@ -14,6 +14,6 @@ default applies: `standard` on kind, `local-path` on k3s).
 destroy <project>` runs `helm uninstall` + waits for full pod
 termination before asserting clean.
 
-Production image: `ghcr.io/aislang/aislang:<tag>` built on
+Production image: `ghcr.io/aislang/cli:<tag>` built on
 `gcr.io/distroless/cc-debian13` (glibc 2.41 — covers symbols the
 ubuntu-24.04 GitHub runner links against).

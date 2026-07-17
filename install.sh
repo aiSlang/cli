@@ -13,7 +13,7 @@
 # `sha256sum` (Linux) or `shasum` (macOS).  No bash, no jq.
 #
 # Environment-variable overrides:
-#   REPO         — github "<owner>/<repo>"  (default: aislang/aislang)
+#   REPO         — github "<owner>/<repo>"  (default: aiSlang/cli)
 #   VERSION      — tag to install           (default: latest)
 #   PREFIX       — install dir              (default: $HOME/.local/bin)
 #   BASE_URL     — release-asset base URL   (default: https://github.com/$REPO/releases/download)
@@ -46,7 +46,7 @@
 #
 # Usage:
 #   # public repo (no token):
-#   curl -sSfL https://github.com/aislang/aislang/releases/latest/download/install.sh | sh
+#   curl -sSfL https://github.com/aiSlang/cli/releases/latest/download/install.sh | sh
 #   PREFIX=/usr/local/bin sudo sh install.sh
 #   VERSION=v0.1.0 sh install.sh
 #   sh install.sh --check-deps        # probe-only, no install
@@ -73,7 +73,7 @@
 set -eu
 
 # ── Defaults / env overrides ────────────────────────────────────
-REPO="${REPO:-aislang/aislang}"
+REPO="${REPO:-aiSlang/cli}"
 VERSION="${VERSION:-latest}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 BASE_URL="${BASE_URL:-}"   # empty → derived from REPO in fetch_assets

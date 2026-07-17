@@ -4448,14 +4448,14 @@ mod project_tests {
         let src = project_with_composition_body(r#"
           vector_store "repo_kb" {
             embedding  = embedding.openai_small
-            source     = "git:aislang/aislang#crates/aislang-core/src"
+            source     = "git:aiSlang/cli#crates/aislang-core/src"
             chunk_size = 2k
           }
         "#);
         let p = assert_parse_ok(&src);
         assert!(matches!(&p.vector_stores[0].source,
             SourceUri::Git { repo, path }
-                if repo == "aislang/aislang"
+                if repo == "aiSlang/cli"
                 && path.as_deref() == Some("crates/aislang-core/src")),
             "got: {:?}", p.vector_stores[0].source);
     }

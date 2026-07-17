@@ -279,7 +279,7 @@ jobs:
   #   1. Download the aislang binary artifact.
   #   2. Stand up the cluster (kind OR k3s via k3d).
   #   3. Wrap the binary in a local `aislang:ci` Docker image
-  #      (the published `ghcr.io/aislang/aislang:latest` may not
+  #      (the published `ghcr.io/aislang/cli:latest` may not
   #      exist on every commit — pre-release branches especially).
   #   4. Side-load the image (cluster-specific: `kind load
   #      docker-image` vs. `k3d image import`).
@@ -459,7 +459,7 @@ jobs:
         env:
           # Override the agent-runtime image to point at the
           # locally-side-loaded `aislang:ci` instead of the
-          # default `ghcr.io/aislang/aislang:latest` (which may
+          # default `ghcr.io/aislang/cli:latest` (which may
           # not exist for the current commit).  Done via
           # `helm upgrade --install --set image.…` after the
           # chart is rendered + written; aislang apply doesn't

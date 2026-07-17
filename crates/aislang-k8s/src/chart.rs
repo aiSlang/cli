@@ -66,7 +66,7 @@ pub const TEMPLATES_DIRNAME:   &str = "templates";
 // Template substitution placeholders
 // ============================================================================
 
-/// Raw `ghcr.io/aislang/aislang:latest` literal in the agent-runtime
+/// Raw `ghcr.io/aislang/cli:latest` literal in the agent-runtime
 /// manifest, replaced with `{{ .Values.image.repository }}:{{ .Values
 /// .image.tag }}` when the manifest lands under `chart/templates/`.
 /// Lets `helm install --set image.tag=v0.2.0-rc2` swap the image
@@ -164,7 +164,7 @@ pub fn build_values_yaml(ingress_host: Option<&str>) -> String {
         Some(h) => format!("  host: \"{h}\"\n"),
         None    => "  host: \"\"  # set when expose.ingress is declared\n".to_string(),
     };
-    // Extract `ghcr.io/aislang/aislang` from `<that>:latest`.
+    // Extract `ghcr.io/aislang/cli` from `<that>:latest`.
     let (image_repo, image_tag) = AGENT_RUNTIME_IMAGE
         .rsplit_once(':')
         .unwrap_or((AGENT_RUNTIME_IMAGE, "latest"));
