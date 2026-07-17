@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0-dev"
+version = "0.4.0-dev"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/aislang/aislang"
@@ -21,13 +21,13 @@ rust-version = "1.78"
 
 [workspace.dependencies]
 # Internal crates
-aislang-core     = { path = "crates/aislang-core",     version = "0.2.0-dev" }
-aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.2.0-dev" }
-aislang-resolver = { path = "crates/aislang-resolver", version = "0.2.0-dev" }
-aislang-compose  = { path = "crates/aislang-compose",  version = "0.2.0-dev" }
-aislang-k8s      = { path = "crates/aislang-k8s",      version = "0.2.0-dev" }   # Phase 2 Week 14 Mon
-aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.2.0-dev" }
-aislang-remote   = { path = "crates/aislang-remote",   version = "0.2.0-dev" }   # v0.4 Week 25 Mon — remote control-plane HTTP/SSE client
+aislang-core     = { path = "crates/aislang-core",     version = "0.4.0-dev" }
+aislang-catalog  = { path = "crates/aislang-catalog",  version = "0.4.0-dev" }
+aislang-resolver = { path = "crates/aislang-resolver", version = "0.4.0-dev" }
+aislang-compose  = { path = "crates/aislang-compose",  version = "0.4.0-dev" }
+aislang-k8s      = { path = "crates/aislang-k8s",      version = "0.4.0-dev" }   # Phase 2 Week 14 Mon
+aislang-runtime  = { path = "crates/aislang-runtime",  version = "0.4.0-dev" }
+aislang-remote   = { path = "crates/aislang-remote",   version = "0.4.0-dev" }   # v0.4 Week 25 Mon — remote control-plane HTTP/SSE client
 
 # External
 clap        = { version = "4.5", features = ["derive"] }
