@@ -20,7 +20,7 @@
           "symbol": {"type": "string", "description": "Ticker, or 'CASH' / an asset-class name for sleeve-level moves."},
           "action": {"type": "string", "enum": ["trim", "add", "exit", "hedge", "hold"]},
           "size": {"type": ["string", "null"],
-            "description": "Optional magnitude, e.g. '-2% weight' or '+0.5% to short bonds'."},
+            "description": "Move expressed as a change in PORTFOLIO WEIGHT (percentage points) or a target weight, e.g. '-3 to -4 pts' or 'to ~22%'. Never a dollar amount or a fraction of the position; the app converts weight to dollars deterministically."},
           "rationale": {"type": "string"}
         }
       }

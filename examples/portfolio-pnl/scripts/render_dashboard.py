@@ -525,7 +525,7 @@ def render_instruments(a, history) -> str:
             f'<span class="iac">{esc(p.get("asset_class"))}</span>'
             f'<span class="iprice">{fmt_money(p.get("price"))}</span>'
             f'<span class="ipct" style="color:{sign_color(upct)}">{signed_pct(upct)}</span>')
-        blocks += f"""<details class="instrument">
+        blocks += f"""<details class="instrument" id="instrument-{esc(sym)}">
       <summary>{summary}</summary>
       <div class="ichart">{chart}</div>
       <div class="imeta">
@@ -596,15 +596,99 @@ def render_risk(a, s, vseries) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# recommendation section (latest orchestrator advice)
+# ─────────────────────────────────────────────────────────────────────
+def _action_color(action) -> str:
+    a = (action or "").strip().lower()
+    if a in ("trim", "exit", "hedge", "reduce", "sell"):
+        return RED
+    if a in ("add", "buy", "increase"):
+        return GREEN
+    if a in ("hold", "keep"):
+        return MUTED
+    return TEXT
+
+
+def render_recommendation(reco, reco_ts, held_symbols) -> str:
+    if reco is None:
+        return f"""<section class="panel reco reco-empty">
+  <h2>Recommendation</h2>
+  <div class="reco-placeholder">No recommendation yet — run <code>./run.sh</code>
+    (or <code>aislang chat advise portfolio.ais</code>) to generate one.</div>
+</section>"""
+
+    verdict = (reco.get("verdict") or "").strip().lower()
+    if verdict == "rebalance":
+        v_color, v_text = AMBER, "REBALANCE"
+    elif verdict == "keep":
+        v_color, v_text = GREEN, "KEEP"
+    else:
+        v_color, v_text = MUTED, esc(reco.get("verdict") or DASH).upper()
+
+    confidence = reco.get("confidence")
+    conf_tag = (f'<span class="reco-conf">{esc(confidence)}</span>'
+                if confidence else "")
+    ts_tag = (f'<span class="reco-ts muted">{esc(reco_ts)}</span>'
+              if reco_ts else "")
+    badge = (f'<div class="reco-head"><span class="reco-badge" '
+             f'style="background:{v_color};color:{BG}">{v_text}</span>'
+             f'{conf_tag}{ts_tag}</div>')
+
+    summary = reco.get("summary")
+    summary_html = f'<p class="reco-summary">{esc(summary)}</p>' if summary else ""
+    fragility = reco.get("fragility_read")
+    fragility_html = (f'<p class="reco-fragility muted">{esc(fragility)}</p>'
+                      if fragility else "")
+
+    held = set(held_symbols or [])
+    actions = reco.get("actions") or []
+    actions_html = ""
+    if actions:
+        rows = ""
+        for act in actions:
+            action = act.get("action")
+            symbol = act.get("symbol")
+            size = act.get("size")
+            rationale = act.get("rationale")
+            ac = _action_color(action)
+            if symbol in held:
+                sym_cell = f'<a href="#instrument-{esc(symbol)}">{esc(symbol)}</a>'
+            else:
+                sym_cell = esc(symbol)
+            rows += f"""<tr>
+      <td class="reco-act" style="color:{ac}">{esc(action)}</td>
+      <td class="reco-sym">{sym_cell}</td>
+      <td class="reco-size">{esc(size)}</td>
+      <td class="reco-rat">{esc(rationale)}</td>
+    </tr>"""
+        actions_html = f"""<div class="tablewrap"><table class="reco-actions">
+    <thead><tr>
+      <th>Action</th><th>Symbol</th><th>Size</th><th>Rationale</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table></div>"""
+
+    return f"""<section class="panel reco">
+  <h2>Recommendation</h2>
+  {badge}
+  {summary_html}
+  {fragility_html}
+  {actions_html}
+</section>"""
+
+
+# ─────────────────────────────────────────────────────────────────────
 # page
 # ─────────────────────────────────────────────────────────────────────
-def render_page(holdings, report, vseries, history) -> str:
+def render_page(holdings, report, vseries, history, reco=None, reco_ts=None) -> str:
     a, s = report["analytic"], report["strategic"]
     name = holdings.get("name") or "Portfolio"
     ccy = holdings.get("base_currency", "USD")
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     css = _css()
+    held_symbols = [p["symbol"] for p in a["positions"]]
+    recommendation = render_recommendation(reco, reco_ts, held_symbols)
     overview = render_overview(a, s, vseries)
     positions = render_positions(a)
     instruments = render_instruments(a, history)
@@ -630,6 +714,7 @@ def render_page(holdings, report, vseries, history) -> str:
       <div class="muted">base currency {esc(ccy)}</div>
     </div>
   </header>
+  {recommendation}
   {overview}
   {positions}
   {instruments}
@@ -681,6 +766,28 @@ code {{ background: {PANEL2}; padding: 1px 5px; border-radius: 4px; font-size: 1
 .panel h3 {{ margin: 0 0 10px; font-size: 13px; font-weight: 600; color: {MUTED};
   text-transform: uppercase; letter-spacing: .5px; }}
 .hint {{ font-size: 12px; font-weight: 400; color: {MUTED}; text-transform: none; letter-spacing: 0; }}
+
+/* ── recommendation ── */
+.reco-head {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }}
+.reco-badge {{ display: inline-block; padding: 3px 12px; border-radius: 6px;
+  font-size: 13px; font-weight: 700; letter-spacing: .5px; }}
+.reco-conf {{ display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+  font-weight: 600; color: {MUTED}; background: {PANEL2}; border: 1px solid {BORDER};
+  text-transform: capitalize; }}
+.reco-ts {{ font-size: 12px; font-variant-numeric: tabular-nums; }}
+.reco-summary {{ margin: 0 0 6px; font-size: 14px; }}
+.reco-fragility {{ margin: 0 0 12px; font-size: 13px; }}
+table.reco-actions {{ width: 100%; border-collapse: collapse; margin-top: 6px; }}
+table.reco-actions th, table.reco-actions td {{ padding: 9px 12px; text-align: left;
+  border-bottom: 1px solid {BORDER}; vertical-align: top; }}
+table.reco-actions th {{ font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: {MUTED}; font-weight: 600; }}
+td.reco-act {{ font-weight: 700; text-transform: capitalize; white-space: nowrap; }}
+td.reco-sym {{ font-weight: 600; white-space: nowrap; }}
+td.reco-size {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
+td.reco-rat {{ color: {MUTED}; font-size: 13px; }}
+.reco-placeholder {{ color: {MUTED}; font-size: 13px; background: {PANEL2};
+  border: 1px dashed {BORDER}; border-radius: 8px; padding: 14px 16px; }}
 
 /* ── overview hero ── */
 .hero {{ display: flex; gap: 28px; flex-wrap: wrap; align-items: center; }}
@@ -805,7 +912,13 @@ def main() -> int:
     vseries = pf.portfolio_value_series(
         {k: history.get(k, []) for k in quantities}, quantities, holdings.get("cash", 0.0))
 
-    page = render_page(holdings, report, vseries, history)
+    import json
+    _rr = conn.execute(
+        "SELECT ts, actions_json FROM recommendations ORDER BY ts DESC LIMIT 1").fetchone()
+    reco = json.loads(_rr["actions_json"]) if _rr else None      # None when none saved yet
+    reco_ts = _rr["ts"] if _rr else None
+
+    page = render_page(holdings, report, vseries, history, reco=reco, reco_ts=reco_ts)
 
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out), exist_ok=True)

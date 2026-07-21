@@ -47,7 +47,7 @@ no commentary. It must match this shape exactly:
     {
       "symbol": "ticker or CASH or asset-class",
       "action": "trim" | "add" | "exit" | "hedge" | "hold",
-      "size": "optional magnitude like '-2% weight', or null",
+      "size": "the move as a change in PORTFOLIO WEIGHT in percentage points, or a target weight — e.g. '-3 to -4 pts' or 'to ~22%'. NOT a dollar amount and NOT a fraction of the position. null if unsized.",
       "rationale": "why this move, tied to a metric or principle"
     }
   ],
@@ -58,4 +58,12 @@ no commentary. It must match this shape exactly:
 
 `actions` is an empty array when the verdict is "keep". `verdict`, `summary`, and `actions` are
 required; `fragility_read`, `confidence`, and `grounded_refs` should be filled whenever the brief
-supports them. Emit only the JSON object.
+supports them.
+
+**Sizing rule — do NOT do arithmetic.** Express every `size` as a change in the name's
+share of the *whole portfolio*, in percentage points (or a target weight): "trim 3–4 pts"
+means lowering SPY from 26% toward ~22% of the portfolio. Never state a dollar amount and
+never compute one — you are given weights, not asked to calculate; the app converts weights
+to dollars deterministically. Keep every number you mention a copy of a value from the brief.
+
+Emit only the JSON object.

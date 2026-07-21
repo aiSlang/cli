@@ -62,7 +62,13 @@ done
 
 echo "==> asking the advisor (Strategic -> Orchestrator)…"
 echo
-printf '%s\n' "$REPORT" | "$AISLANG" chat advise portfolio.ais
+ADVICE="$(printf '%s\n' "$REPORT" | "$AISLANG" chat advise portfolio.ais || true)"
+printf '%s\n' "$ADVICE"
+
+# Persist the recommendation + refresh the dashboard so it appears on top.
+printf '%s\n' "$ADVICE" | python3 scripts/persist_recommendation.py || true
+python3 scripts/render_dashboard.py >/dev/null && \
+  echo "==> dashboard.html refreshed with the recommendation."
 
 echo
 echo "Open dashboard.html in a browser for the full view.  Tear the stack down"
