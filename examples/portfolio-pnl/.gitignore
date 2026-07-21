@@ -1,0 +1,8 @@
+# runtime artifacts (regenerated) — not source
+portfolio.db
+portfolio.db-*
+dashboard.html
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
