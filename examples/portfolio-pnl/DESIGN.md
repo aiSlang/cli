@@ -60,7 +60,7 @@ outputs.
 
 | Agent | Role |
 |---|---|
-| **Fetcher** | Pulls fresh prices and writes them to SQLite. Default key-free sources: **Stooq** for equities and ETFs, **CoinGecko** for crypto. For sources without an API, a **Playwright MCP** fallback scrapes the quote. |
+| **Fetcher** | Pulls fresh prices and writes them to SQLite. Each position selects its adapter via its `source` field. Default key-free sources: **Stooq** for equities and ETFs, **CoinGecko** for crypto. For symbols the APIs miss, a **Playwright MCP** fallback renders the quote from a **TradingView** widget (`source: "tradingview"` + a `tv_symbol` like `NASDAQ:INTC`). |
 | **Analytic** | Computes P&L, returns, and risk metrics from holdings + prices; persists per-position and portfolio snapshots to SQLite. |
 | **Strategic** | Computes anti-fragility metrics (convexity / stress asymmetry, barbell structure, tail shape) and interprets them. Grounded by the RAG knowledge corpus under `knowledge/`. |
 | **Visualizer** | Renders a single self-contained `dashboard.html` with a top-to-detail drill-down. |
@@ -177,6 +177,31 @@ set at the top.
 Two indexes support the common access patterns: `idx_prices_symbol_ts` on
 `prices(symbol, ts)` and `idx_posmetrics_ts` on `position_metrics(ts)`.
 
+### Holdings ↔ DB sync
+
+`holdings.json` is the source of truth for *what you own*; the `instruments` and
+`lots` tables are a **re-projection** of it, not a second copy you edit by hand.
+`db.sync_holdings()` runs at the top of every analyze/agent run and, idempotently,
+UPSERTs `instruments` and does `DELETE FROM lots; INSERT` the file's lots — so the
+DB is always in sync with the file:
+
+- **Add an instrument** → append a position → next run it appears (the Fetcher
+  starts pulling its price; history-based risk metrics degrade gracefully until
+  enough bars accrue).
+- **Buy more** → append a lot `{quantity, cost_basis, date}` to that position →
+  next run re-syncs, with FIFO lot order preserved.
+- `prices` are independent (upserted by the Fetcher, keyed by `(symbol, ts)`), so
+  changing holdings never disturbs price history — historical bars are kept even
+  after you exit a position.
+
+Each `lots` entry is one **acquisition event** (quantity + per-unit cost + date);
+several buys of the same symbol = several lots. This models **open** positions.
+Sells / **realized** P&L are not auto-recorded: on a sale you trim the lots (FIFO)
+and realized gain is computed on demand via `portfolio.realized_pnl()`. The clean
+upgrade for a full audit trail is an append-only **transactions log** (buys/sells)
+from which both open lots and realized P&L are *derived* — deferred to a later
+increment; v1 keeps `holdings.json` as the current open positions.
+
 ---
 
 ## Inter-agent JSON contracts
@@ -287,7 +312,7 @@ and reliable:
 | Area | Default (v1) |
 |---|---|
 | Asset classes | Equities, ETFs, and crypto (no options yet). |
-| Price sources | Stooq (equities / ETFs) and CoinGecko (crypto) — both key-free; Playwright MCP as a fallback. |
+| Price sources | Stooq (equities / ETFs) and CoinGecko (crypto) — both key-free; a Playwright MCP fallback that renders a TradingView widget (`source: "tradingview"` + `tv_symbol`) for symbols the APIs miss. |
 | Base currency | USD. |
 | Cost basis | FIFO. |
 | Benchmark | SPY. |
