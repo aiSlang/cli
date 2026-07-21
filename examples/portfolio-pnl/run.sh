@@ -35,7 +35,7 @@ REPORT="$(python3 scripts/analyze.py --persist --compact)"
 
 echo "==> rendering dashboard.html…"
 python3 scripts/render_dashboard.py
-echo "    $(printf '%s' "$REPORT" | python3 -c 'import json,sys; r=json.load(sys.stdin); t=r["analytic"]["totals"]; s=r["strategic"]; print(f"value {t[\"total_value\"]:.0f}  P&L {t[\"unrealized_pnl\"]:+.0f}  fragility {s[\"fragility_score\"]} ({s[\"classification\"]})")')"
+echo "    $(printf '%s' "$REPORT" | python3 -c 'import json,sys; r=json.load(sys.stdin); t=r["analytic"]["totals"]; s=r["strategic"]; tv=t["total_value"]; pnl=t["unrealized_pnl"]; fs=s["fragility_score"]; cl=s["classification"]; print(f"value {tv:.0f}  P&L {pnl:+.0f}  fragility {fs} ({cl})")')"
 
 echo "==> asking the advisor (Strategic -> Orchestrator)…"
 echo
