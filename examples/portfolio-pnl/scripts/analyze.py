@@ -104,6 +104,8 @@ def main() -> int:
     ap.add_argument("--db", default=dbmod.DEFAULT_DB)
     ap.add_argument("--holdings", default=os.path.join(dbmod.ROOT, "holdings.json"))
     ap.add_argument("--persist", action="store_true", help="write a metric snapshot to the DB")
+    ap.add_argument("--compact", action="store_true",
+                    help="emit single-line JSON (pipe straight into one agent chat turn)")
     args = ap.parse_args()
 
     holdings = dbmod.load_holdings(args.holdings)
@@ -128,7 +130,10 @@ def main() -> int:
         dbmod.write_fragility_metrics(conn, ts, report["strategic"])
         report["persisted_ts"] = ts
 
-    print(json.dumps(report, indent=2, default=float))
+    if args.compact:
+        print(json.dumps(report, default=float))
+    else:
+        print(json.dumps(report, indent=2, default=float))
     return 0
 
 

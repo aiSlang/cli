@@ -1,20 +1,26 @@
 ## portfolio-pnl — a local-first, multi-agent portfolio analysis app.
 ##
-## Topology (see DESIGN.md): the deterministic stages are aiSlang
-## `skill` blocks — the language model never does the fetching or the
-## math. The judgement stages (Strategic, Orchestrator) are LLM agents
-## that interpret the computed JSON, grounded by a RAG knowledge corpus;
-## they land in the next increments.
+## Topology (see DESIGN.md § "Skills vs. agents"): the deterministic
+## stages are aiSlang `skill` blocks — the language model never fetches
+## or does the math. The judgement stages are LLM agents that INTERPRET
+## the computed JSON, grounded by a RAG knowledge corpus (Taleb
+## anti-fragility + re-balancing heuristics under ./knowledge/):
 ##
-## The skills here wrap the Python compute core under scripts/.  Run one
-## directly:
+##   • Strategic    — reads the analyze JSON, assesses anti-fragility.
+##   • Orchestrator — turns that brief into a keep/rebalance call.
 ##
+## ── Run it ───────────────────────────────────────────────────────────
+##
+## Deterministic core (no LLM needed):
 ##   aislang skill run fetch_prices examples/portfolio-pnl/portfolio.ais
 ##   aislang skill run analyze      examples/portfolio-pnl/portfolio.ais
+##   # or fully offline:  python3 scripts/seed_demo.py && python3 scripts/analyze.py --persist
 ##
-## or, for a full offline demo without the network:
-##
-##   python3 scripts/seed_demo.py && python3 scripts/analyze.py --persist
+## The agents (needs a chat model + Ollama bge-m3 for the RAG index):
+##   ./run.sh                       # fetch → analyze → pipe into `advise`
+##   # or by hand:
+##   aislang chat advise examples/portfolio-pnl/portfolio.ais
+##   # then paste the analyze JSON as the first turn.
 
 project "portfolio-pnl" {
   budget {
@@ -22,11 +28,46 @@ project "portfolio-pnl" {
     hard_cap_per_run = $0.20
   }
 
+  ## Reasoning model for the judgement agents.  Haiku primary (needs
+  ## ANTHROPIC_API_KEY); Qwen3-8B local fallback for offline/GPU runs.
+  model "reasoner" {
+    requires    = [chat, reasoning]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_4_5]
+    fallback    = [ollama.qwen3_8b]
+  }
+
+  ## RAG grounding: the strategy knowledge corpus (Taleb principles,
+  ## barbell strategy, fragility detection, re-balancing heuristics, and
+  ## a "reading the metrics" guide).  Drop your own research / thesis
+  ## notes into ./knowledge/ to extend it.  Indexed at `aislang apply`
+  ## (or first chat) via bge-m3 embeddings.
+  embedding "local_bge" {
+    provider = ollama
+    model    = "bge-m3:latest"
+  }
+
+  vector_store "strategy_kb" {
+    embedding     = embedding.local_bge
+    source        = "./knowledge/"
+    chunk_size    = 768
+    chunk_overlap = 96
+  }
+
+  prompt "strategic_sys" {
+    file    = "./prompts/strategic.md"
+    version = "1.0.0"
+  }
+
+  prompt "orchestrator_sys" {
+    file    = "./prompts/orchestrator.md"
+    version = "1.0.0"
+  }
+
   ## ── Deterministic pipeline stages = skills ───────────────────────
   ## Shell-exec skills run from a per-skill sandbox dir
-  ## (<project>/.aislang/skills/<label>/), so the scripts are addressed
-  ## relative to it; each script self-locates holdings.json + the DB via
-  ## its own file path, so the working directory doesn't matter.
+  ## (<project>/.aislang/skills/<label>/); each script self-locates
+  ## holdings.json + the DB via its own file path, so cwd doesn't matter.
 
   ## Fetcher — pull fresh prices into portfolio.db (Yahoo / CoinGecko).
   ## Prints a fetch_report (see _schemas/fetch_report.schema.json).
@@ -37,9 +78,44 @@ project "portfolio-pnl" {
 
   ## Analytic — compute P&L, risk, and anti-fragility from holdings +
   ## prices and persist a metric snapshot.  Prints the analytic +
-  ## strategic JSON the judgement agents will interpret.
+  ## strategic JSON the agents interpret (see _schemas/*_output.schema.json).
   skill "analyze" {
     exec        = "python3 ../../../scripts/analyze.py --persist"
     output_type = json
+  }
+
+  ## ── Judgement stages = LLM agents ────────────────────────────────
+
+  ## Strategic — reads the analyze JSON, recaps the salient numbers, and
+  ## assesses anti-fragility (fragile / robust / antifragile) grounded in
+  ## the knowledge corpus.  Emits a prose brief + risk flags.
+  agent "strategic" {
+    model         = model.reasoner
+    system_prompt = prompt.strategic_sys
+    tools         = []
+    knowledge     = [vector_store.strategy_kb]
+  }
+
+  ## Orchestrator — turns the Strategic brief into an advisory
+  ## keep/rebalance recommendation (JSON per _schemas/recommendation.
+  ## schema.json).  Advisory only — it never trades.
+  agent "orchestrator" {
+    model         = model.reasoner
+    system_prompt = prompt.orchestrator_sys
+    tools         = []
+    knowledge     = [vector_store.strategy_kb]
+  }
+
+  ## The two-step judgement chain: Strategic assesses, Orchestrator
+  ## decides.  Pipeline input is the analyze JSON; Strategic's brief
+  ## carries the numbers forward to the Orchestrator.
+  pipeline "advise" {
+    steps  = [agent.strategic, agent.orchestrator]
+    input  = "the analyze JSON (analytic + strategic metric blocks)"
+    output = "a keep/rebalance recommendation with rationale"
+  }
+
+  deploy "local" {
+    target = compose
   }
 }

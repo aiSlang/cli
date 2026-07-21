@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "analytic_output",
+  "description": "Deterministic P&L + risk block produced by scripts/analyze.py (the `analytic` key). The Strategic and Orchestrator agents read this; they never recompute it.",
+  "type": "object",
+  "required": ["totals", "positions", "risk", "n_price_points"],
+  "properties": {
+    "totals": {
+      "type": "object",
+      "required": ["total_value", "invested_value", "cash", "total_cost", "unrealized_pnl", "pnl_pct"],
+      "properties": {
+        "total_value": {"type": "number"},
+        "invested_value": {"type": "number"},
+        "cash": {"type": "number"},
+        "cash_weight": {"type": "number"},
+        "total_cost": {"type": "number"},
+        "unrealized_pnl": {"type": "number"},
+        "pnl_pct": {"type": ["number", "null"]}
+      }
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "quantity", "price", "value", "cost", "weight", "unrealized_pnl"],
+        "properties": {
+          "symbol": {"type": "string"},
+          "asset_class": {"type": ["string", "null"]},
+          "quantity": {"type": "number"},
+          "price": {"type": "number"},
+          "value": {"type": "number"},
+          "cost": {"type": "number"},
+          "weight": {"type": "number"},
+          "unrealized_pnl": {"type": "number"},
+          "unrealized_pct": {"type": ["number", "null"]}
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "description": "All fractions (e.g. max_drawdown -0.23 = -23%). Nulls when history is too short.",
+      "properties": {
+        "vol_ann": {"type": ["number", "null"]},
+        "sharpe": {"type": ["number", "null"]},
+        "sortino": {"type": ["number", "null"]},
+        "max_drawdown": {"type": ["number", "null"]},
+        "var95": {"type": ["number", "null"]},
+        "cvar95": {"type": ["number", "null"]},
+        "hhi": {"type": ["number", "null"]},
+        "eff_n": {"type": ["number", "null"]},
+        "beta": {"type": ["number", "null"]}
+      }
+    },
+    "correlation": {
+      "type": "object",
+      "description": "symbol -> symbol -> Pearson correlation of daily returns."
+    },
+    "missing": {"type": "array", "items": {"type": "string"}},
+    "n_price_points": {"type": "integer", "minimum": 0}
+  }
+}

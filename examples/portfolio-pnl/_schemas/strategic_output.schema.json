@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "strategic_output",
+  "description": "Deterministic anti-fragility (Taleb) metric block produced by scripts/analyze.py (the `strategic` key). The Strategic agent interprets these numbers against the RAG knowledge corpus; it never recomputes them.",
+  "type": "object",
+  "required": ["fragility_score", "classification", "barbell_safe", "barbell_mid", "barbell_aggr"],
+  "properties": {
+    "fragility_score": {"type": "number", "minimum": 0, "maximum": 100,
+      "description": "Composite 0..100; higher = more fragile."},
+    "classification": {"type": "string", "enum": ["fragile", "robust", "antifragile"]},
+    "convexity": {"type": ["number", "null"],
+      "description": "Payoff convexity to a symmetric price shock; ~0 for a linear long book."},
+    "stress_asymmetry": {"type": ["number", "null"],
+      "description": "Mean best-tail + mean worst-tail return. <0 = left tail deeper (concave/fragile)."},
+    "barbell_safe": {"type": "number", "description": "Weight fraction in the safe sleeve (cash + short bonds)."},
+    "barbell_mid": {"type": "number", "description": "Weight fraction in the fragile middle."},
+    "barbell_aggr": {"type": "number", "description": "Weight fraction in the aggressive/convex sleeve."},
+    "skew": {"type": ["number", "null"]},
+    "excess_kurtosis": {"type": ["number", "null"]},
+    "tail_ratio": {"type": ["number", "null"], "description": "|p95 return| / |p05 return|; >1 favours the upside."},
+    "es95": {"type": ["number", "null"], "description": "Expected shortfall at 95% (== cvar95)."},
+    "details": {
+      "type": "object",
+      "properties": {
+        "convexity_curve": {
+          "type": "array",
+          "items": {"type": "object", "properties": {
+            "shock": {"type": "number"}, "convexity": {"type": "number"}}}
+        },
+        "drivers": {
+          "type": "object",
+          "description": "Per-driver 0..1 fragility contributions feeding the composite score.",
+          "properties": {
+            "concentration": {"type": "number"}, "tail": {"type": "number"},
+            "asymmetry": {"type": "number"}, "barbell": {"type": "number"},
+            "drawdown": {"type": "number"}, "skew": {"type": "number"}
+          }
+        }
+      }
+    }
+  }
+}

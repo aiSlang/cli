@@ -5,10 +5,12 @@ A local-first, multi-agent portfolio analysis app built on
 investment portfolio and make deliberate re-balancing decisions — and it runs
 **entirely on your own machine**.
 
-> **Work in progress.** The scaffolding, the SQLite schema, and the Python
-> compute core (with tests) have landed. The aiSlang agents that drive the
-> pipeline are the next increment. See [DESIGN.md](./DESIGN.md) for the full
-> architecture and the build plan.
+> **Work in progress.** Landed: the SQLite store, the Python compute core (with
+> tests), the **Fetcher** and **Analytic** skills (live prices via Yahoo /
+> CoinGecko), and the **Strategic** + **Orchestrator** LLM agents with their
+> Taleb RAG corpus and the `advise` pipeline. Still to come: the **Visualizer**
+> (`dashboard.html`) and an eval suite. See [DESIGN.md](./DESIGN.md) for the full
+> architecture and build plan.
 
 ## What it is
 
@@ -71,21 +73,38 @@ The first version keeps the scope narrow and reliable:
 Options and derivatives, a deployable compute layer, and scheduled runs are
 planned for a later version.
 
-## How it will work
+## How to run it
 
-Once the agents land, using the app follows the standard aiSlang loop against
-the orchestrator project:
+The deterministic core needs nothing but `python3` (stdlib only):
 
 ```sh
-aislang validate .        # parse + type-check the project (no network, no writes)
-aislang plan     .        # resolve models, emit the local stack + .env.example
-aislang chat     orchestrator .   # run the pipeline and get a recommendation
+python3 scripts/seed_demo.py            # synthetic prices (offline), OR:
+python3 scripts/fetch.py                # live prices (Yahoo / CoinGecko, key-free)
+python3 scripts/analyze.py --persist    # P&L / risk / anti-fragility -> JSON + DB
+python3 -m pytest tests -q              # 24 unit tests over the compute core
 ```
 
-A run walks the pipeline **Fetcher → Analytic → Strategic → Visualizer**, then
-the orchestrator synthesizes the analytic and strategic findings — grounded by
-the knowledge corpus — into a **keep** or **rebalance** verdict, and the
-Visualizer produces a `dashboard.html` you can open locally.
+The same skills run through aiSlang:
+
+```sh
+aislang validate portfolio.ais
+aislang skill run fetch_prices portfolio.ais
+aislang skill run analyze      portfolio.ais
+```
+
+The full advisory pipeline — fetch → analyze → **Strategic → Orchestrator** — is
+one command (needs a chat model via `ANTHROPIC_API_KEY` or local Ollama
+`qwen3_8b`, plus Ollama `bge-m3` for the RAG index):
+
+```sh
+./run.sh              # live prices
+./run.sh --offline    # seed synthetic prices instead
+```
+
+It prints the Orchestrator's **keep / rebalance** recommendation (JSON per
+[`_schemas/recommendation.schema.json`](./_schemas/recommendation.schema.json)),
+grounded by the Taleb knowledge corpus under `knowledge/`. The **Visualizer**
+(`dashboard.html`) is the next increment.
 
 ## Sample portfolio
 

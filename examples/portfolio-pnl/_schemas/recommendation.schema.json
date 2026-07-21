@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "recommendation",
+  "description": "The Orchestrator agent's final output: an advisory keep-or-rebalance call synthesized from the analytic + strategic metrics and the Strategic agent's assessment, grounded by the RAG knowledge corpus. It is never executed automatically — the owner decides.",
+  "type": "object",
+  "required": ["verdict", "summary", "actions"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["keep", "rebalance"]},
+    "summary": {"type": "string",
+      "description": "A few sentences: portfolio health, the main risk, and the headline call."},
+    "fragility_read": {"type": "string",
+      "description": "One-line plain-language read of the anti-fragility posture (fragile/robust/antifragile and why)."},
+    "actions": {
+      "type": "array",
+      "description": "Concrete, advisory adjustments (empty when verdict = keep).",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "action", "rationale"],
+        "properties": {
+          "symbol": {"type": "string", "description": "Ticker, or 'CASH' / an asset-class name for sleeve-level moves."},
+          "action": {"type": "string", "enum": ["trim", "add", "exit", "hedge", "hold"]},
+          "size": {"type": ["string", "null"],
+            "description": "Optional magnitude, e.g. '-2% weight' or '+0.5% to short bonds'."},
+          "rationale": {"type": "string"}
+        }
+      }
+    },
+    "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+    "grounded_refs": {
+      "type": "array", "items": {"type": "string"},
+      "description": "Knowledge-corpus snippets the recommendation leaned on."
+    }
+  }
+}

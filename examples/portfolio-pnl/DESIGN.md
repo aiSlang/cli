@@ -350,14 +350,14 @@ agents and their supporting artifacts come next.
 
 | # | Increment | Delivers | Status |
 |---|---|---|---|
-| 0 | Scaffolding | Project layout, config stubs, `.env.example`. | **Landing now** |
-| 1 | SQLite schema + `db.py` | `db/schema.sql` and the database access layer. | **Landing now** |
-| 2 | Python compute core + tests | `portfolio.py` (P&L / risk / fragility math) plus `tests/`. | **Landing now** |
-| 3 | Fetcher agent | Price fetching + writes, `fetch_report` schema. | Next |
-| 4 | Analytic agent | P&L / risk compute + snapshots, `analytic_output` schema. | Next |
-| 5 | Strategic agent + RAG | Anti-fragility compute, `knowledge/` corpus, `strategic_output` schema. | Next |
-| 6 | Visualizer agent | `dashboard.html` drill-down renderer. | Next |
-| 7 | Orchestrator | Full pipeline + recommendation synthesis, `recommendation` schema. | Next |
+| 0 | Scaffolding | Project layout, config stubs, `.env.example`. | **Done** |
+| 1 | SQLite schema + `db.py` | `db/schema.sql` and the database access layer. | **Done** |
+| 2 | Python compute core + tests | `portfolio.py` (P&L / risk / fragility math) plus `tests/`. | **Done** |
+| 3 | Fetcher (skill) | `fetch.py` (Yahoo / CoinGecko) + `fetch_report` schema, wired as an aiSlang skill. | **Done** |
+| 4 | Analytic (skill) | `analyze.py` compute + snapshots; `analytic_output` + `strategic_output` schemas. | **Done** |
+| 5 | Strategic agent + RAG | LLM agent + `knowledge/` corpus (Taleb) grounding the anti-fragility read. | **Done** |
+| 6 | Visualizer (skill) | `dashboard.html` drill-down renderer. | Next |
+| 7 | Orchestrator agent | `advise` pipeline (Strategic -> Orchestrator) + `recommendation` schema + `run.sh`. | **Done** |
 | 8 | Evals | Graded checks over the compute and agent outputs. | Next |
 | 9 | Packaging | Final polish and distribution. | Next |
 
