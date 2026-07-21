@@ -356,7 +356,7 @@ agents and their supporting artifacts come next.
 | 3 | Fetcher (skill) | `fetch.py` (Yahoo / CoinGecko) + `fetch_report` schema, wired as an aiSlang skill. | **Done** |
 | 4 | Analytic (skill) | `analyze.py` compute + snapshots; `analytic_output` + `strategic_output` schemas. | **Done** |
 | 5 | Strategic agent + RAG | LLM agent + `knowledge/` corpus (Taleb) grounding the anti-fragility read. | **Done** |
-| 6 | Visualizer (skill) | `dashboard.html` drill-down renderer. | Next |
+| 6 | Visualizer (skill) | `render_dashboard.py` -> self-contained `dashboard.html` (L1-L4 drill-down). | **Done** |
 | 7 | Orchestrator agent | `advise` pipeline (Strategic -> Orchestrator) + `recommendation` schema + `run.sh`. | **Done** |
 | 8 | Evals | Graded checks over the compute and agent outputs. | Next |
 | 9 | Packaging | Final polish and distribution. | Next |

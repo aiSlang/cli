@@ -84,6 +84,14 @@ project "portfolio-pnl" {
     output_type = json
   }
 
+  ## Visualizer — render a self-contained dashboard.html (open it in a
+  ## browser): L1 overview, L2 positions, L3 per-instrument price charts,
+  ## L4 risk & anti-fragility.  Prints the output path.
+  skill "visualize" {
+    exec        = "python3 ../../../scripts/render_dashboard.py"
+    output_type = string
+  }
+
   ## ── Judgement stages = LLM agents ────────────────────────────────
 
   ## Strategic — reads the analyze JSON, recaps the salient numbers, and

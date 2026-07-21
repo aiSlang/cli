@@ -7,10 +7,10 @@ investment portfolio and make deliberate re-balancing decisions — and it runs
 
 > **Work in progress.** Landed: the SQLite store, the Python compute core (with
 > tests), the **Fetcher** and **Analytic** skills (live prices via Yahoo /
-> CoinGecko), and the **Strategic** + **Orchestrator** LLM agents with their
-> Taleb RAG corpus and the `advise` pipeline. Still to come: the **Visualizer**
-> (`dashboard.html`) and an eval suite. See [DESIGN.md](./DESIGN.md) for the full
-> architecture and build plan.
+> CoinGecko), the **Visualizer** skill (a self-contained `dashboard.html`), and
+> the **Strategic** + **Orchestrator** LLM agents with their Taleb RAG corpus and
+> the `advise` pipeline. Still to come: an eval suite. See
+> [DESIGN.md](./DESIGN.md) for the full architecture and build plan.
 
 ## What it is
 
@@ -81,6 +81,7 @@ The deterministic core needs nothing but `python3` (stdlib only):
 python3 scripts/seed_demo.py            # synthetic prices (offline), OR:
 python3 scripts/fetch.py                # live prices (Yahoo / CoinGecko, key-free)
 python3 scripts/analyze.py --persist    # P&L / risk / anti-fragility -> JSON + DB
+python3 scripts/render_dashboard.py     # -> dashboard.html (open it in a browser)
 python3 -m pytest tests -q              # 24 unit tests over the compute core
 ```
 
@@ -90,6 +91,7 @@ The same skills run through aiSlang:
 aislang validate portfolio.ais
 aislang skill run fetch_prices portfolio.ais
 aislang skill run analyze      portfolio.ais
+aislang skill run visualize    portfolio.ais   # -> dashboard.html
 ```
 
 The full advisory pipeline — fetch → analyze → **Strategic → Orchestrator** — is
@@ -103,8 +105,9 @@ one command (needs a chat model via `ANTHROPIC_API_KEY` or local Ollama
 
 It prints the Orchestrator's **keep / rebalance** recommendation (JSON per
 [`_schemas/recommendation.schema.json`](./_schemas/recommendation.schema.json)),
-grounded by the Taleb knowledge corpus under `knowledge/`. The **Visualizer**
-(`dashboard.html`) is the next increment.
+grounded by the Taleb knowledge corpus under `knowledge/`. `run.sh` also renders
+`dashboard.html` — a self-contained, drill-down view (overview → positions →
+per-instrument prices → risk & anti-fragility) you open in a browser.
 
 ## Sample portfolio
 

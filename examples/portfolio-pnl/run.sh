@@ -32,6 +32,9 @@ fi
 echo "==> computing P&L / risk / anti-fragility metrics…"
 # compact single-line JSON so it lands as a single chat turn.
 REPORT="$(python3 scripts/analyze.py --persist --compact)"
+
+echo "==> rendering dashboard.html…"
+python3 scripts/render_dashboard.py
 echo "    $(printf '%s' "$REPORT" | python3 -c 'import json,sys; r=json.load(sys.stdin); t=r["analytic"]["totals"]; s=r["strategic"]; print(f"value {t[\"total_value\"]:.0f}  P&L {t[\"unrealized_pnl\"]:+.0f}  fragility {s[\"fragility_score\"]} ({s[\"classification\"]})")')"
 
 echo "==> asking the advisor (Strategic -> Orchestrator)…"
