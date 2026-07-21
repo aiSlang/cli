@@ -94,14 +94,22 @@ aislang skill run analyze      portfolio.ais
 aislang skill run visualize    portfolio.ais   # -> dashboard.html
 ```
 
-The full advisory pipeline — fetch → analyze → **Strategic → Orchestrator** — is
-one command (needs a chat model via `ANTHROPIC_API_KEY` or local Ollama
-`qwen3_8b`, plus Ollama `bge-m3` for the RAG index):
+The full advisory pipeline — fetch → analyze → render → **Strategic →
+Orchestrator** — is one command. `run.sh` calls `aislang apply` to start the
+LiteLLM model router (a Docker Compose service the agents route through) and
+build the RAG index, then chats the `advise` pipeline:
 
 ```sh
-./run.sh              # live prices
-./run.sh --offline    # seed synthetic prices instead
+./run.sh                 # live prices
+./run.sh --offline       # seed synthetic prices instead
+SKIP_APPLY=1 ./run.sh    # skip `apply` when LiteLLM is already up
 ```
+
+Prerequisites for the advisor step: **Docker** running, a chat model
+(`ANTHROPIC_API_KEY` in `./.env`, or local Ollama `qwen3_8b`), and — *optional* —
+Ollama serving `bge-m3` so the Taleb RAG index builds (without it the agents
+still run, just **ungrounded**). Tear the stack down afterwards with
+`aislang destroy portfolio.ais`.
 
 It prints the Orchestrator's **keep / rebalance** recommendation (JSON per
 [`_schemas/recommendation.schema.json`](./_schemas/recommendation.schema.json)),
