@@ -63,11 +63,19 @@ done
 # The keep/rebalance decision is already made — deterministically, by the rule
 # engine in analyze.py — and was persisted to the DB and rendered on top of the
 # dashboard above.  The advisor stage only *explains* that fixed recommendation
-# in plain prose (Strategic brief -> Orchestrator explanation); it does not
-# decide, and there is nothing further to persist or re-render.
+# and emits it back as JSON (Strategic brief -> Orchestrator).  We then MERGE
+# that explanation onto the canonical row (engine keeps the verdict/actions/
+# sizes; the LLM contributes only the prose) and refresh the dashboard.
 echo "==> asking the advisor to explain the recommendation (Strategic -> Orchestrator)…"
 echo
-printf '%s\n' "$REPORT" | "$AISLANG" chat advise portfolio.ais || true
+ADVICE="$(printf '%s\n' "$REPORT" | "$AISLANG" chat advise portfolio.ais || true)"
+printf '%s\n' "$ADVICE"
+
+echo
+echo "==> persisting the explained recommendation (engine decision + LLM prose)…"
+printf '%s\n' "$ADVICE" | python3 scripts/persist_recommendation.py >/dev/null || true
+python3 scripts/render_dashboard.py >/dev/null && \
+  echo "    dashboard.html refreshed with the explained recommendation."
 
 echo
 echo "Open dashboard.html in a browser for the full view.  Tear the stack down"

@@ -176,6 +176,10 @@ def fetch_all(conn, holdings: dict, days: int) -> dict:
         dbmod.ensure_instrument(conn, symbol, p.get("asset_class", "equity"),
                                 source, p.get("name"), p.get("currency", "USD"))
         dbmod.upsert_prices(conn, ((symbol, ts, price, source) for ts, price in rows))
+        # Keep this symbol's series single-source: drop any stale bars from a
+        # different source (e.g. leftover synthetic days) so the live feed
+        # doesn't interleave into a sawtooth chart.
+        dbmod.purge_other_sources(conn, symbol, source)
         latest_ts, latest_price = rows[-1]
         fetched.append({"symbol": symbol, "source": source, "points": len(rows),
                         "latest_ts": latest_ts, "latest_price": round(latest_price, 6)})

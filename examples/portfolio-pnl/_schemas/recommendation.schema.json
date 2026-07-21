@@ -11,6 +11,8 @@
       "description": "A few sentences: portfolio health, the main risk, and the headline call. Emitted by the engine."},
     "fragility_read": {"type": "string",
       "description": "One-line plain-language read of the anti-fragility posture (fragile/robust/antifragile and why)."},
+    "explanation": {"type": "string",
+      "description": "Optional owner-facing paragraph added by the Orchestrator LLM when it explains the fixed recommendation. It never changes the verdict/actions/sizes — only elaborates the 'why', grounded in the metrics and the Taleb corpus."},
     "actions": {
       "type": "array",
       "description": "Concrete, advisory adjustments computed by the engine (empty when verdict = keep). Neither LLM adds, drops, re-orders, or resizes these.",

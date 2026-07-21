@@ -492,7 +492,7 @@ def render_positions(a) -> str:
       <td class="num" style="color:{sign_color(upct)}">{signed_pct(upct)}</td>
     </tr>"""
     t = a["totals"]
-    rows += f"""<tr class="cashrow">
+    rows += f"""<tr class="cashrow" id="instrument-CASH">
       <td class="sym">cash</td><td class="ac">cash</td>
       <td class="num">{fmt_pct(t.get("cash_weight"),1)}<div class="rowbar">{weight_bar(t.get("cash_weight"), color=NEUTRAL)}</div></td>
       <td class="num">{fmt_money(t.get("cash"))}</td>
@@ -651,7 +651,8 @@ def render_recommendation(reco, reco_ts, held_symbols) -> str:
             size = act.get("size")
             rationale = act.get("rationale")
             ac = _action_color(action)
-            if symbol in held:
+            # CASH anchors to the cash row in the positions table.
+            if symbol in held or (symbol or "").upper() == "CASH":
                 sym_cell = f'<a href="#instrument-{esc(symbol)}">{esc(symbol)}</a>'
             else:
                 sym_cell = esc(symbol)
@@ -784,8 +785,11 @@ table.reco-actions th {{ font-size: 11px; text-transform: uppercase; letter-spac
   color: {MUTED}; font-weight: 600; }}
 td.reco-act {{ font-weight: 700; text-transform: capitalize; white-space: nowrap; }}
 td.reco-sym {{ font-weight: 600; white-space: nowrap; }}
-td.reco-size {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
-td.reco-rat {{ color: {MUTED}; font-size: 13px; }}
+/* Cap the Size column so a long size string wraps instead of squeezing the
+   Rationale column into a tall, unreadable block. */
+td.reco-size {{ font-variant-numeric: tabular-nums; white-space: normal;
+  overflow-wrap: anywhere; max-width: 168px; }}
+td.reco-rat {{ color: {MUTED}; font-size: 13px; min-width: 220px; }}
 .reco-placeholder {{ color: {MUTED}; font-size: 13px; background: {PANEL2};
   border: 1px dashed {BORDER}; border-radius: 8px; padding: 14px 16px; }}
 

@@ -66,7 +66,7 @@ outputs.
 | **Analytic** | Computes P&L, returns, and risk metrics from holdings + prices; persists per-position and portfolio snapshots to SQLite. |
 | **Strategic** | Computes anti-fragility metrics (convexity / stress asymmetry, barbell structure, tail shape) and interprets them. Grounded by the RAG knowledge corpus under `knowledge/`. |
 | **Visualizer** | Renders a single self-contained `dashboard.html` with a top-to-detail drill-down. |
-| **Orchestrator** | Reads the **deterministic** keep / rebalance recommendation (decided by the `recommend()` rule engine over the Analytic + Strategic metrics) and writes a clear, RAG-grounded **explanation** of it for the owner. It does not decide the verdict. |
+| **Orchestrator** | Reads the **deterministic** keep / rebalance recommendation (decided by the `recommend()` rule engine over the Analytic + Strategic metrics) and emits a clear, RAG-grounded **explanation** of it as JSON. That JSON is merged back onto the canonical row (the engine keeps the verdict / actions / sizes; the LLM contributes only the prose). It does not decide the verdict. |
 
 The recommendation is advisory and rule-decided. It never places or simulates a
 live trade — the owner reviews the suggested actions and decides.
@@ -120,10 +120,10 @@ v1.)*
                │        │ Visualizer │              │Orchestrator│  reads the fixed
                │        │  (skill)   │              │  + Strateg.│  recommendation,
                │        └─────┬──────┘              │(LLM agents)│  RAG-grounded, and
-               │              │                     └─────┬──────┘  writes a PROSE
-               ▼              ▼                           ▼         EXPLANATION of it
-          knowledge/    dashboard.html            plain-prose brief
-          (RAG corpus)  (L1 → L4 drill-down)      (owner-facing, no JSON)
+               │              │                     └─────┬──────┘  emits a JSON
+               ▼              ▼                           ▼         EXPLANATION,
+          knowledge/    dashboard.html            JSON explanation  merged back onto
+          (RAG corpus)  (L1 → L4 drill-down)      (persisted to DB) the canonical row
 ```
 
 The keep/rebalance **verdict, actions, and sizes are decided by the deterministic
@@ -189,10 +189,14 @@ aiSlang exposes no temperature knob, so LLM prose will always vary — which is
 exactly why the *decision* must be code. `analyze.py` runs the engine, persists
 the result to the `recommendations` table, and the dashboard renders it with no
 model in the loop. The **Strategic** and **Orchestrator** agents then read that
-fixed recommendation and write an owner-facing *explanation* of it, grounded in
-the Taleb corpus — they never re-derive, re-order, add, drop, or resize an
-action. Judgement-flavoured prose stays with the LLM; the number that matters
-stays deterministic.
+fixed recommendation and produce an owner-facing *explanation* of it, grounded in
+the Taleb corpus — the Orchestrator emits it as JSON (downstream-consumable),
+which `persist_recommendation.py` merges back onto the canonical row: the engine
+keeps the verdict, actions, and sizes; the LLM contributes only the prose
+(summary, per-action rationale, explanation). The agents never re-derive,
+re-order, add, drop, or resize an action. Judgement-flavoured prose stays with
+the LLM; the number that matters stays deterministic — so it is safe to *apply*
+the persisted actions to a virtual portfolio downstream.
 
 ---
 

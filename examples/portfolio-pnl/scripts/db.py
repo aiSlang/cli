@@ -89,6 +89,22 @@ def upsert_prices(conn, rows: Iterable[tuple]) -> int:
     return n
 
 
+def purge_other_sources(conn, symbol: str, keep_source: str | None) -> int:
+    """Delete a symbol's price rows that came from a *different* source.
+
+    Keeps each symbol's series single-source, so a live feed (yahoo /
+    coingecko, trading days only) and offline synthetic bars (calendar
+    days) never interleave into a sawtooth "snow" chart.  The incoming
+    source's rows — and same-source history — are preserved.
+    """
+    cur = conn.execute(
+        "DELETE FROM prices WHERE symbol=? AND IFNULL(source,'') <> IFNULL(?, '')",
+        (symbol, keep_source),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def price_history(conn, symbol: str) -> list[tuple]:
     cur = conn.execute("SELECT ts, price FROM prices WHERE symbol=? ORDER BY ts", (symbol,))
     return [(r["ts"], r["price"]) for r in cur.fetchall()]

@@ -506,12 +506,17 @@ def recommend(analytic: Mapping, strategic: Mapping, buckets: Mapping,
 
     freed = sum(min(trim.get(r["symbol"], 0.0), r["weight"] * 0.9) for r in rows)
     if freed > 0.005:
+        # Freed weight rotates into CASH, so size the move against CASH's OWN
+        # weight (what the allocation donut shows) — not the whole safe sleeve.
+        cash_w = (analytic.get("totals", {}).get("cash_weight") or 0.0)
+        new_cash = cash_w + freed
         new_safe = safe + freed
         actions.append({
             "symbol": "CASH", "action": "add",
-            "size": f"+{freed*100:.1f} pts ({safe*100:.1f}% → {new_safe*100:.1f}% safe)",
+            "size": f"+{freed*100:.1f} pts ({cash_w*100:.1f}% → {new_cash*100:.1f}% cash)",
             "rationale": "Move the trimmed weight into cash / short bonds to thicken the "
-                         "safe sleeve and restore the barbell (heavy safe, thin middle).",
+                         f"safe sleeve (now ~{new_safe*100:.0f}%) and restore the barbell "
+                         "(heavy safe, thin middle).",
         })
         if new_safe < rules["min_safe"]:
             flags.append(f"safe sleeve still below the {rules['min_safe']*100:.0f}% floor "

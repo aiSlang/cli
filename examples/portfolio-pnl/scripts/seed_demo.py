@@ -55,8 +55,15 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     today = datetime.date.today()
-    dates = [(today - datetime.timedelta(days=args.days - 1 - i)).isoformat()
-             for i in range(args.days)]
+    # Trading-day cadence (skip weekends) so the synthetic series matches the
+    # shape of a real feed; walk back until we have `--days` business days.
+    dates: list[str] = []
+    d = today
+    while len(dates) < args.days:
+        if d.weekday() < 5:               # Mon–Fri
+            dates.append(d.isoformat())
+        d -= datetime.timedelta(days=1)
+    dates.reverse()
 
     # start each walk near the earliest lot cost basis so P&L is plausible.
     seeds = {}
@@ -74,8 +81,12 @@ def main() -> int:
             rows.append((symbol, ts, round(price, 6), "synthetic"))
 
     n = dbmod.upsert_prices(conn, rows)
+    # Keep each symbol single-source: drop any prior live bars so synthetic
+    # and real prices never interleave into a sawtooth chart.
+    purged = sum(dbmod.purge_other_sources(conn, sym, "synthetic") for sym in seeds)
     print(f"seeded {n} price points across {len(seeds)} symbols "
-          f"({args.days} days, {dates[0]}..{dates[-1]})")
+          f"({args.days} days, {dates[0]}..{dates[-1]}); "
+          f"purged {purged} stale non-synthetic bars")
     return 0
 
 
