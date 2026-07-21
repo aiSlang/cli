@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "fetch_report",
+  "description": "Fetcher -> Analytic handoff. Reports which symbols were priced into the SQLite store, from which source, and any per-symbol failures or pending (fallback-needed) symbols. Produced by scripts/fetch.py.",
+  "type": "object",
+  "required": ["run_ts", "fetched", "failures", "pending", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "run_ts": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of the fetch run."
+    },
+    "fetched": {
+      "type": "array",
+      "description": "Symbols whose price history was fetched and upserted.",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "source", "points", "latest_ts", "latest_price"],
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {"type": "string"},
+          "source": {"type": "string", "enum": ["yahoo", "coingecko", "stooq", "tradingview", "manual"]},
+          "points": {"type": "integer", "minimum": 1},
+          "latest_ts": {"type": "string"},
+          "latest_price": {"type": "number"}
+        }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "description": "Symbols that could not be fetched (network/source error).",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "source", "error"],
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {"type": "string"},
+          "source": {"type": "string"},
+          "error": {"type": "string"}
+        }
+      }
+    },
+    "pending": {
+      "type": "array",
+      "description": "Symbols deferred to a fallback adapter (e.g. TradingView via Playwright).",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "source", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {"type": "string"},
+          "source": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["ok", "failed", "pending"],
+      "additionalProperties": false,
+      "properties": {
+        "ok": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "pending": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

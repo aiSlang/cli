@@ -1,0 +1,45 @@
+## portfolio-pnl — a local-first, multi-agent portfolio analysis app.
+##
+## Topology (see DESIGN.md): the deterministic stages are aiSlang
+## `skill` blocks — the language model never does the fetching or the
+## math. The judgement stages (Strategic, Orchestrator) are LLM agents
+## that interpret the computed JSON, grounded by a RAG knowledge corpus;
+## they land in the next increments.
+##
+## The skills here wrap the Python compute core under scripts/.  Run one
+## directly:
+##
+##   aislang skill run fetch_prices examples/portfolio-pnl/portfolio.ais
+##   aislang skill run analyze      examples/portfolio-pnl/portfolio.ais
+##
+## or, for a full offline demo without the network:
+##
+##   python3 scripts/seed_demo.py && python3 scripts/analyze.py --persist
+
+project "portfolio-pnl" {
+  budget {
+    hard_cap_per_day = $2
+    hard_cap_per_run = $0.20
+  }
+
+  ## ── Deterministic pipeline stages = skills ───────────────────────
+  ## Shell-exec skills run from a per-skill sandbox dir
+  ## (<project>/.aislang/skills/<label>/), so the scripts are addressed
+  ## relative to it; each script self-locates holdings.json + the DB via
+  ## its own file path, so the working directory doesn't matter.
+
+  ## Fetcher — pull fresh prices into portfolio.db (Yahoo / CoinGecko).
+  ## Prints a fetch_report (see _schemas/fetch_report.schema.json).
+  skill "fetch_prices" {
+    exec        = "python3 ../../../scripts/fetch.py"
+    output_type = json
+  }
+
+  ## Analytic — compute P&L, risk, and anti-fragility from holdings +
+  ## prices and persist a metric snapshot.  Prints the analytic +
+  ## strategic JSON the judgement agents will interpret.
+  skill "analyze" {
+    exec        = "python3 ../../../scripts/analyze.py --persist"
+    output_type = json
+  }
+}

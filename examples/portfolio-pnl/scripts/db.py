@@ -57,6 +57,20 @@ def sync_holdings(conn: sqlite3.Connection, holdings: Mapping) -> None:
 
 
 # ─── prices ──────────────────────────────────────────────────────────
+def ensure_instrument(conn, symbol: str, asset_class: str = "equity",
+                      source: str | None = None, name: str | None = None,
+                      currency: str = "USD") -> None:
+    """Idempotently register an instrument so its prices satisfy the FK.
+
+    Used for symbols that aren't holdings positions (e.g. the benchmark).
+    """
+    conn.execute(
+        "INSERT INTO instruments(symbol, name, asset_class, currency, source) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(symbol) DO UPDATE SET source=COALESCE(excluded.source, instruments.source)",
+        (symbol, name, asset_class, currency, source),
+    )
+
+
 def upsert_price(conn, symbol: str, ts: str, price: float, source: str | None = None) -> None:
     conn.execute(
         "INSERT INTO prices(symbol, ts, price, source) VALUES(?,?,?,?) "

@@ -60,7 +60,7 @@ outputs.
 
 | Agent | Role |
 |---|---|
-| **Fetcher** | Pulls fresh prices and writes them to SQLite. Each position selects its adapter via its `source` field. Default key-free sources: **Stooq** for equities and ETFs, **CoinGecko** for crypto. For symbols the APIs miss, a **Playwright MCP** fallback renders the quote from a **TradingView** widget (`source: "tradingview"` + a `tv_symbol` like `NASDAQ:INTC`). |
+| **Fetcher** *(skill)* | Pulls fresh prices and writes them to SQLite. Each position selects its adapter via its `source` field. Default key-free sources: **Yahoo Finance** for equities and ETFs, **CoinGecko** for crypto. For symbols the APIs miss, a **Playwright MCP** fallback renders the quote from a **TradingView** widget (`source: "tradingview"` + a `tv_symbol` like `NASDAQ:INTC`). *(Stooq was the original default; its public endpoint now sits behind a browser challenge, so it's kept only as a legacy adapter.)* |
 | **Analytic** | Computes P&L, returns, and risk metrics from holdings + prices; persists per-position and portfolio snapshots to SQLite. |
 | **Strategic** | Computes anti-fragility metrics (convexity / stress asymmetry, barbell structure, tail shape) and interprets them. Grounded by the RAG knowledge corpus under `knowledge/`. |
 | **Visualizer** | Renders a single self-contained `dashboard.html` with a top-to-detail drill-down. |
@@ -70,6 +70,21 @@ The orchestrator is the only component that produces a recommendation, and its
 recommendation is advisory. It never places or simulates a live trade — the
 owner reviews the suggested actions and decides.
 
+### Skills vs. agents
+
+In aiSlang an *agent* is a language-model node whose tools are MCP servers; a
+*skill* is a standalone deterministic unit. So the deterministic stages here —
+**Fetcher**, **Analytic**, and **Visualizer** — are aiSlang **skills** (the
+`exec` Python under `scripts/`, wired in `portfolio.ais`), not language-model
+agents: there is nothing for a model to decide when fetching a quote or computing
+a Sharpe ratio, and keeping them as skills is what guarantees the arithmetic is
+correct (decision 2). The **Strategic** and **Orchestrator** stages are the
+actual **LLM agents**, because that is where judgement and RAG-grounded reasoning
+live. The orchestrator runs the deterministic skills in order and then reasons
+over their JSON output. *(A later increment can package the skills as an MCP tool
+server so a single agent calls them in a tool-use loop; skills-plus-agents is the
+local-first v1.)*
+
 ---
 
 ## Data flow
@@ -78,7 +93,7 @@ owner reviews the suggested actions and decides.
                        holdings.json (symbols, lots, asset_class, source)
                              │
                              ▼
-          knowledge/    ┌──────────┐   Stooq / CoinGecko / Playwright MCP
+          knowledge/    ┌──────────┐   Yahoo / CoinGecko / Playwright MCP
           (RAG corpus)  │ Fetcher  │◄──────── public price sources
                │        └────┬─────┘
                │             │ writes prices
@@ -312,7 +327,7 @@ and reliable:
 | Area | Default (v1) |
 |---|---|
 | Asset classes | Equities, ETFs, and crypto (no options yet). |
-| Price sources | Stooq (equities / ETFs) and CoinGecko (crypto) — both key-free; a Playwright MCP fallback that renders a TradingView widget (`source: "tradingview"` + `tv_symbol`) for symbols the APIs miss. |
+| Price sources | Yahoo Finance (equities / ETFs) and CoinGecko (crypto) — both key-free; a Playwright MCP fallback that renders a TradingView widget (`source: "tradingview"` + `tv_symbol`) for symbols the APIs miss. |
 | Base currency | USD. |
 | Cost basis | FIFO. |
 | Benchmark | SPY. |

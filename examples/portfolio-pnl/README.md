@@ -61,7 +61,7 @@ The first version keeps the scope narrow and reliable:
 | Area | Default |
 |---|---|
 | Asset classes | Equities, ETFs, and crypto (no options yet) |
-| Price sources | Stooq (equities / ETFs) and CoinGecko (crypto) — both key-free; Playwright as a fallback |
+| Price sources | Yahoo Finance (equities / ETFs) and CoinGecko (crypto) — both key-free; Playwright as a fallback |
 | Base currency | USD |
 | Cost basis | FIFO |
 | Benchmark | SPY |
