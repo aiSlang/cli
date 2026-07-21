@@ -8,9 +8,11 @@ of your portfolio (what you own, at what cost, since when) stays local.
 
 The system is a pipeline of specialized agents that fetch prices, compute P&L
 and risk, evaluate anti-fragility (in the Nassim Taleb sense), render a
-dashboard, and finally synthesize a **keep-or-rebalance recommendation**. The
-orchestrator recommends; it never trades. A human stays in the loop for every
-decision.
+dashboard, and finally present a **keep-or-rebalance recommendation**. That
+recommendation is decided **deterministically, by a rule engine** — the same
+metrics always yield the same verdict and the same sized actions; the language
+model only *explains* it in plain prose (decision 4). The system recommends; it
+never trades. A human stays in the loop for every decision.
 
 ---
 
@@ -19,7 +21,7 @@ decision.
 1. [Overview](#overview)
 2. [The agent pipeline](#the-agent-pipeline)
 3. [Data flow](#data-flow)
-4. [Three key architecture decisions](#three-key-architecture-decisions)
+4. [Four key architecture decisions](#four-key-architecture-decisions)
 5. [Persistence](#persistence)
 6. [Inter-agent JSON contracts](#inter-agent-json-contracts)
 7. [Metrics catalog](#metrics-catalog)
@@ -64,11 +66,10 @@ outputs.
 | **Analytic** | Computes P&L, returns, and risk metrics from holdings + prices; persists per-position and portfolio snapshots to SQLite. |
 | **Strategic** | Computes anti-fragility metrics (convexity / stress asymmetry, barbell structure, tail shape) and interprets them. Grounded by the RAG knowledge corpus under `knowledge/`. |
 | **Visualizer** | Renders a single self-contained `dashboard.html` with a top-to-detail drill-down. |
-| **Orchestrator** | Runs Fetcher → Analytic → Strategic → Visualizer, then combines the Analytic and Strategic outputs (RAG-grounded) into a **keep / rebalance** recommendation. |
+| **Orchestrator** | Reads the **deterministic** keep / rebalance recommendation (decided by the `recommend()` rule engine over the Analytic + Strategic metrics) and writes a clear, RAG-grounded **explanation** of it for the owner. It does not decide the verdict. |
 
-The orchestrator is the only component that produces a recommendation, and its
-recommendation is advisory. It never places or simulates a live trade — the
-owner reviews the suggested actions and decides.
+The recommendation is advisory and rule-decided. It never places or simulates a
+live trade — the owner reviews the suggested actions and decides.
 
 ### Skills vs. agents
 
@@ -79,11 +80,12 @@ In aiSlang an *agent* is a language-model node whose tools are MCP servers; a
 agents: there is nothing for a model to decide when fetching a quote or computing
 a Sharpe ratio, and keeping them as skills is what guarantees the arithmetic is
 correct (decision 2). The **Strategic** and **Orchestrator** stages are the
-actual **LLM agents**, because that is where judgement and RAG-grounded reasoning
-live. The orchestrator runs the deterministic skills in order and then reasons
-over their JSON output. *(A later increment can package the skills as an MCP tool
-server so a single agent calls them in a tool-use loop; skills-plus-agents is the
-local-first v1.)*
+actual **LLM agents**, because that is where RAG-grounded *interpretation* lives —
+but note the keep/rebalance **decision itself is also code** (the `recommend()`
+rule engine, decision 4): the agents explain that fixed recommendation, they do
+not make it. *(A later increment can package the skills as an MCP tool server so a
+single agent calls them in a tool-use loop; skills-plus-agents is the local-first
+v1.)*
 
 ---
 
@@ -104,36 +106,36 @@ local-first v1.)*
                │        │  position_metrics · risk_metrics          │
                │        │  fragility_metrics · recommendations      │
                │        └──────────────────────────────────────────┘
-               │             ▲            ▲             ▲
-               │             │ writes     │ writes      │ reads
-               │        ┌────┴─────┐ ┌────┴──────┐      │
-               │        │ Analytic │ │ Strategic │◄─────┘ (+ RAG)
-               │        └────┬─────┘ └────┬──────┘
-               │             │            │
-               │  analytic_output   strategic_output   (compact JSON summaries)
-               │             │            │
-               ▼             ▼            ▼
-          ┌───────────────────────────────────┐
-          │           Orchestrator            │  synthesizes Analytic +
-          │  (RAG-grounded recommendation)    │  Strategic, grounded by
-          └────────────────┬──────────────────┘  knowledge/ → verdict
-                           │
-                           ▼
-                    recommendation  ──►  written to SQLite (recommendations)
-                           │
-                           ▼
-                    ┌────────────┐
-                    │ Visualizer │──►  dashboard.html  (L1 → L4 drill-down)
-                    └────────────┘
+               │             ▲            ▲            ▲        ▲
+               │             │ writes     │ writes     │ writes │ reads
+               │        ┌────┴─────┐ ┌────┴──────┐ ┌───┴──────┐ │
+               │        │ Analytic │ │ Strategic │ │ recommend│ │
+               │        │ (skill)  │ │ (skill)   │ │ () engine│ │
+               │        └────┬─────┘ └────┬──────┘ └───┬──────┘ │
+               │             │            │            │        │
+               │  analytic_output  strategic_output  recommendation
+               │             │            │            │ (deterministic verdict)
+               │             ▼            ▼            ▼        │
+               │        ┌────────────┐              ┌──────────┴─┐
+               │        │ Visualizer │              │Orchestrator│  reads the fixed
+               │        │  (skill)   │              │  + Strateg.│  recommendation,
+               │        └─────┬──────┘              │(LLM agents)│  RAG-grounded, and
+               │              │                     └─────┬──────┘  writes a PROSE
+               ▼              ▼                           ▼         EXPLANATION of it
+          knowledge/    dashboard.html            plain-prose brief
+          (RAG corpus)  (L1 → L4 drill-down)      (owner-facing, no JSON)
 ```
 
-The SQLite database is the shared source of truth. Agents read from and write to
-it directly (via the compute skills), and pass each other only compact JSON
-summaries — never full datasets.
+The keep/rebalance **verdict, actions, and sizes are decided by the deterministic
+`recommend()` engine** (in `scripts/portfolio.py`), run inside `analyze.py`, which
+persists them to the `recommendations` table and feeds them to the dashboard. The
+SQLite database is the shared source of truth. The Strategic and Orchestrator LLM
+agents read that fixed recommendation and the metrics and only *explain* it — they
+pass each other compact summaries, never full datasets, and never change the call.
 
 ---
 
-## Three key architecture decisions
+## Four key architecture decisions
 
 ### 1. SQLite for prices and metrics; the vector store is only for knowledge
 
@@ -169,6 +171,29 @@ config — rather than embedding it in a system prompt — means the compute ski
 can parse it exactly, cost basis can be tracked per lot for FIFO accounting,
 and updating a position is a data edit rather than a prompt rewrite.
 
+### 4. The recommendation is decided by a rule engine; the LLM only explains it
+
+Extending decision 2 from *arithmetic* to the *decision itself*: the
+keep/rebalance verdict, the specific actions, and their sizes are produced by a
+deterministic rule engine — `portfolio.recommend(analytic, strategic, buckets)`
+in `scripts/portfolio.py` — a pure function with tunable thresholds (`REC_RULES`:
+single-name concentration cap, fragile-middle target, minimum safe / maximum
+aggressive sleeve, and a fragility-score trip). The same metrics in always yield
+the same recommendation out; it is unit-tested and reproducible.
+
+This was a direct fix for observed **non-determinism**: when the language model
+made the call, identical inputs drifted between `rebalance` (~80% of runs) and
+`keep` (~20%) over a 10–15-minute window, and it occasionally invented sizes
+(e.g. quoting a dollar figure for what was a percentage-of-portfolio move).
+aiSlang exposes no temperature knob, so LLM prose will always vary — which is
+exactly why the *decision* must be code. `analyze.py` runs the engine, persists
+the result to the `recommendations` table, and the dashboard renders it with no
+model in the loop. The **Strategic** and **Orchestrator** agents then read that
+fixed recommendation and write an owner-facing *explanation* of it, grounded in
+the Taleb corpus — they never re-derive, re-order, add, drop, or resize an
+action. Judgement-flavoured prose stays with the LLM; the number that matters
+stays deterministic.
+
 ---
 
 ## Persistence
@@ -187,7 +212,7 @@ set at the top.
 | `position_metrics` | Per-position metrics at a snapshot: `quantity`, `price`, `value`, `cost`, `weight`, `unrealized_pnl`, `unrealized_pct`, `contrib_to_risk`, keyed by `(ts, symbol)`. |
 | `risk_metrics` | Portfolio risk at a snapshot: `vol_ann`, `sharpe`, `sortino`, `max_drawdown`, `var95`, `cvar95`, `hhi`, `eff_n`, `beta`, keyed by `ts`. |
 | `fragility_metrics` | Anti-fragility metrics at a snapshot: `convexity`, `stress_asymmetry`, `fragility_score`, `classification`, the three barbell weights, `skew`, `excess_kurtosis`, `tail_ratio`, `es95`, and a `details_json` (convexity curve, per-shock stress), keyed by `ts`. |
-| `recommendations` | Orchestrator output: `verdict` (`keep` / `rebalance`), `summary`, `actions_json`, `grounded_refs`, keyed by `ts`. |
+| `recommendations` | The deterministic `recommend()` engine's output (written by `analyze.py`, not the LLM): `verdict` (`keep` / `rebalance`), `summary`, `actions_json`, `grounded_refs`, keyed by `ts`. |
 
 Two indexes support the common access patterns: `idx_prices_symbol_ts` on
 `prices(symbol, ts)` and `idx_posmetrics_ts` on `position_metrics(ts)`.
@@ -228,9 +253,9 @@ schema-validated tool-call output. There is one schema per handoff, stored under
 | Schema | Producer → consumer | Carries |
 |---|---|---|
 | `fetch_report` | Fetcher → Analytic | Which symbols were priced, from which sources, freshness / any failures. |
-| `analytic_output` | Analytic → Orchestrator | Compact P&L and risk summary for the run. |
-| `strategic_output` | Strategic → Orchestrator | Compact anti-fragility summary and interpretation. |
-| `recommendation` | Orchestrator → owner | The `keep` / `rebalance` verdict, summary, suggested actions, and grounding references. |
+| `analytic_output` | Analytic → Strategic / engine | Compact P&L and risk summary for the run. |
+| `strategic_output` | Strategic → Orchestrator / engine | Compact anti-fragility summary and interpretation. |
+| `recommendation` | `recommend()` engine → owner | The `keep` / `rebalance` verdict, summary, sized actions, and the rule flags that fired — decided deterministically; the Orchestrator explains it, never changes it. |
 
 Because the SQLite database is the shared source of truth, these payloads are
 **compact summaries**, not full datasets. An agent that needs detail reads it
@@ -295,6 +320,27 @@ the tables noted above. Formulas are sketched briefly.
 - **Composite fragility score** (`fragility_score`) — a `0..100` roll-up where
   higher means more fragile — plus a `classification` of **fragile**,
   **robust**, or **antifragile**.
+
+### Recommendation (`recommendations`) — the rule engine
+
+`portfolio.recommend()` turns the metrics above into a keep/rebalance call
+deterministically. The tunable thresholds live in `REC_RULES`:
+
+- **`concentration_cap`** (0.25) — a single *middle-sleeve* name above this
+  weight is trimmed back toward it. (Applied only to the fragile middle; a large
+  *safe* sleeve is exactly what the barbell wants, so the cap does not touch it.)
+- **`target_mid_max`** (0.40) — a fragile middle heavier than this is trimmed
+  proportionally across its names.
+- **`min_safe` / `max_aggr`** (0.25 / 0.35) — sleeve guardrails; an aggressive
+  sleeve above `max_aggr` gets its biggest name trimmed, and freed weight rotates
+  to `CASH` (the safe sleeve).
+- **`fragility_rebalance`** (55.0) — a `fragility_score` at or above this trips a
+  `rebalance` on its own.
+
+The verdict is `rebalance` when a material sized action fires or the fragility
+trip hits, else `keep` (with an empty `actions` list). Each action's `size` is a
+change in **portfolio weight** (percentage points, plus the from→to weights),
+never a dollar amount — the app converts weight to dollars deterministically.
 
 ---
 

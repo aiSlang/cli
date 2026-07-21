@@ -91,7 +91,11 @@ def build_report(holdings: dict, latest: dict, history: dict) -> dict:
         "missing": pnl["missing"],
         "n_price_points": len(values),
     }
-    return {"analytic": analytic, "strategic": strategic}
+    # Deterministic recommendation (rule engine — NOT the LLM). Same
+    # metrics in, same recommendation out; the LLM only explains it.
+    recommendation = pf.recommend(analytic, strategic, buckets)
+    return {"analytic": analytic, "strategic": strategic,
+            "recommendation": recommendation}
 
 
 def _snapshot_ts(history: dict, quantities: dict) -> str:
@@ -128,6 +132,16 @@ def main() -> int:
         dbmod.write_position_metrics(conn, ts, report["analytic"]["positions"])
         dbmod.write_risk_metrics(conn, ts, report["analytic"]["risk"])
         dbmod.write_fragility_metrics(conn, ts, report["strategic"])
+        # Persist the whole deterministic recommendation (the dashboard reads
+        # it back from the recommendations table — no LLM required).
+        rec = report["recommendation"]
+        conn.execute(
+            "INSERT OR REPLACE INTO recommendations"
+            "(ts, verdict, summary, actions_json, grounded_refs) VALUES(?,?,?,?,?)",
+            (ts, rec["verdict"], rec["summary"], json.dumps(rec),
+             json.dumps(rec.get("grounded_refs", []))),
+        )
+        conn.commit()
         report["persisted_ts"] = ts
 
     if args.compact:

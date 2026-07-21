@@ -408,3 +408,150 @@ def fragility_assessment(*, hhi_val, cvar95, stress_asym, barbell_mid,
     return {"fragility_score": round(score, 1),
             "classification": classification,
             "drivers": {k: round(v, 3) for k, v in parts.items()}}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# recommendation — DETERMINISTIC rule engine (not the LLM)
+# ─────────────────────────────────────────────────────────────────────
+# The keep/rebalance decision and the sizing are mechanical given the
+# metrics, so they live in code — same metrics in, same recommendation
+# out, every run.  The LLM only *explains* this; it never decides it.
+# Thresholds are explicit and tunable.
+REC_RULES = {
+    "concentration_cap": 0.25,   # no single position above this weight
+    "target_mid_max":    0.40,   # the fragile middle should sit at/below this
+    "min_safe":          0.25,   # safe sleeve floor (informational flag)
+    "max_aggr":          0.35,   # convex/aggressive sleeve ceiling
+    "fragility_rebalance": 55.0,  # score at/above this always rebalances
+}
+
+
+def _bucket_of(asset_class, buckets) -> str:
+    if asset_class in set(buckets.get("safe", [])):
+        return "safe"
+    if asset_class in set(buckets.get("aggressive", [])):
+        return "aggr"
+    return "mid"
+
+
+def recommend(analytic: Mapping, strategic: Mapping, buckets: Mapping,
+              rules: Mapping = REC_RULES) -> dict:
+    """Deterministic keep/rebalance recommendation from the metrics.
+
+    Returns a dict matching _schemas/recommendation.schema.json, with
+    verdict + actions (weight-based sizes) + reason strings decided by
+    rule.  Reproducible: identical inputs -> identical output.
+    """
+    positions = analytic.get("positions", [])
+    rows = [{"symbol": p["symbol"], "weight": p.get("weight", 0.0),
+             "bucket": _bucket_of(p.get("asset_class"), buckets)} for p in positions]
+    by_sym = {r["symbol"]: r for r in rows}
+
+    safe = strategic.get("barbell_safe", 0.0) or 0.0
+    mid = strategic.get("barbell_mid", 0.0) or 0.0
+    aggr = strategic.get("barbell_aggr", 0.0) or 0.0
+    frag = strategic.get("fragility_score", 0.0) or 0.0
+    classification = strategic.get("classification", "robust")
+
+    trim: dict[str, float] = {}     # symbol -> weight points to trim
+    flags: list[str] = []
+
+    def add_trim(sym, pts):
+        trim[sym] = trim.get(sym, 0.0) + max(0.0, pts)
+
+    # 1. single-name concentration — only in the fragile MIDDLE. A large
+    # safe sleeve (cash / short bonds) is what a barbell wants, and the
+    # aggressive sleeve is governed by its own ceiling below.
+    for r in rows:
+        if r["bucket"] != "mid":
+            continue
+        over = r["weight"] - rules["concentration_cap"]
+        if over > 0.005:
+            add_trim(r["symbol"], over)
+            flags.append(f"{r['symbol']} at {r['weight']*100:.0f}% exceeds the "
+                         f"{rules['concentration_cap']*100:.0f}% single-name cap")
+
+    # 2. fragile middle too heavy -> proportional trim of middle names to target
+    excess_mid = mid - rules["target_mid_max"]
+    if excess_mid > 0.005 and mid > 0:
+        for r in rows:
+            if r["bucket"] == "mid":
+                add_trim(r["symbol"], excess_mid * (r["weight"] / mid))
+        flags.append(f"fragile middle at {mid*100:.0f}% exceeds the "
+                     f"{rules['target_mid_max']*100:.0f}% target")
+
+    # 3. aggressive/convex sleeve ceiling
+    aggr_rows = [r for r in rows if r["bucket"] == "aggr"]
+    over_aggr = aggr - rules["max_aggr"]
+    if over_aggr > 0.005 and aggr_rows:
+        big = max(aggr_rows, key=lambda r: r["weight"])
+        add_trim(big["symbol"], over_aggr)
+        flags.append(f"aggressive sleeve at {aggr*100:.0f}% exceeds the "
+                     f"{rules['max_aggr']*100:.0f}% ceiling")
+
+    # realize trims into actions (bounded to 90% of the position)
+    actions = []
+    for r in sorted(rows, key=lambda r: -trim.get(r["symbol"], 0.0)):
+        t = min(trim.get(r["symbol"], 0.0), r["weight"] * 0.9)
+        if t > 0.005:
+            new_w = r["weight"] - t
+            reason = ("single-name concentration" if r["weight"] > rules["concentration_cap"]
+                      else "reduce the fragile middle" if r["bucket"] == "mid"
+                      else "cap the convex sleeve")
+            actions.append({
+                "symbol": r["symbol"], "action": "trim",
+                "size": f"-{t*100:.1f} pts ({r['weight']*100:.1f}% → {new_w*100:.1f}%)",
+                "rationale": f"Trim {r['symbol']} — {reason}; rotate the weight to the safe sleeve.",
+            })
+
+    freed = sum(min(trim.get(r["symbol"], 0.0), r["weight"] * 0.9) for r in rows)
+    if freed > 0.005:
+        new_safe = safe + freed
+        actions.append({
+            "symbol": "CASH", "action": "add",
+            "size": f"+{freed*100:.1f} pts ({safe*100:.1f}% → {new_safe*100:.1f}% safe)",
+            "rationale": "Move the trimmed weight into cash / short bonds to thicken the "
+                         "safe sleeve and restore the barbell (heavy safe, thin middle).",
+        })
+        if new_safe < rules["min_safe"]:
+            flags.append(f"safe sleeve still below the {rules['min_safe']*100:.0f}% floor "
+                         f"after trimming")
+
+    # keep the convex sleeve when it isn't the thing being trimmed
+    if aggr_rows and over_aggr <= 0.005:
+        big = max(aggr_rows, key=lambda r: r["weight"])
+        actions.append({
+            "symbol": big["symbol"], "action": "hold", "size": None,
+            "rationale": "The convex / aggressive sleeve is the antifragile engine "
+                         "(capped weight, asymmetric upside) — hold it; do not trim.",
+        })
+
+    material = any(a["action"] in ("trim", "add", "exit", "hedge") for a in actions)
+    verdict = "rebalance" if (material or frag >= rules["fragility_rebalance"]) else "keep"
+    if verdict == "keep":
+        actions = []   # schema: no actions on a keep
+
+    if verdict == "keep":
+        summary = (f"Keep. The book is {classification} (fragility {frag:.0f}/100) and sits "
+                   f"within the barbell and concentration guardrails — safe {safe*100:.0f}%, "
+                   f"middle {mid*100:.0f}%, aggressive {aggr*100:.0f}%. No action needed.")
+    else:
+        why = "; ".join(flags[:3]) if flags else "the barbell is drifting from target"
+        summary = (f"Rebalance. {classification.capitalize()} overall (fragility {frag:.0f}/100), "
+                   f"but {why}. Trim the flagged names and rotate the weight into the safe "
+                   f"sleeve to restore the barbell.")
+
+    sa = strategic.get("stress_asymmetry")
+    skew = strategic.get("skew")
+    frag_read = (f"{classification.capitalize()} (fragility {frag:.0f}/100). Barbell "
+                 f"{safe*100:.0f}% safe / {mid*100:.0f}% middle / {aggr*100:.0f}% aggressive"
+                 + (f"; stress asymmetry {sa:+.4f}" if sa is not None else "")
+                 + (f", skew {skew:+.2f}" if skew is not None else "")
+                 + (". Concave/left-tail-heavy shape." if (sa is not None and sa < 0)
+                    else "."))
+
+    return {
+        "verdict": verdict, "summary": summary, "fragility_read": frag_read,
+        "actions": actions, "confidence": "high",
+        "grounded_refs": flags or ["within barbell / concentration / fragility guardrails"],
+    }

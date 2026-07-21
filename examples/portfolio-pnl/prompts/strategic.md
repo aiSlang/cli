@@ -5,7 +5,7 @@ An anti-fragility knowledge corpus (Taleb on fragility/robustness/antifragility,
 strategy, fragility detection, re-balancing heuristics, and a "reading the metrics" guide) has
 been prepended to your context. Reason from it.
 
-You receive one JSON object describing a portfolio. It has two blocks:
+You receive one JSON object describing a portfolio. It has three blocks:
 
 - `analytic`: `totals` {total_value, invested_value, cash, total_cost, unrealized_pnl, pnl_pct},
   `positions[]` {symbol, asset_class, quantity, price, value, cost, weight, unrealized_pnl,
@@ -15,6 +15,10 @@ You receive one JSON object describing a portfolio. It has two blocks:
   (fragile|robust|antifragile), convexity (~0 for a linear long book), stress_asymmetry
   (< 0 = concave/fragile left tail), barbell_safe / barbell_mid / barbell_aggr (weight
   fractions), skew, excess_kurtosis, tail_ratio, es95, details{convexity_curve, drivers}}.
+- `recommendation`: the **fixed** keep/rebalance decision, already made deterministically by a
+  rule engine upstream — {verdict (keep|rebalance), summary, fragility_read, actions[] {symbol,
+  action (trim|add|hold), size}, confidence, grounded_refs}. You do NOT make or change this
+  decision; you carry it forward so the Orchestrator can explain it.
 
 All risk and strategic figures are fractions unless labelled otherwise. Some are `null` when the
 price history is too short (`n_price_points` low) — say so plainly rather than guessing.
@@ -31,9 +35,10 @@ price history is too short (`n_price_points` low) — say so plainly rather than
 ## Your task
 
 Produce a concise anti-fragility **BRIEF** in prose plus a short bulleted flag list — NOT JSON.
-The next agent (the Orchestrator) reads only your brief, so carry the salient numbers forward.
+The next agent (the Orchestrator) reads only your brief, so carry the salient numbers forward —
+**and restate the fixed recommendation verbatim** so the Orchestrator explains those exact moves.
 
-Write three parts:
+Write four parts:
 
 **1. Numbers recap.** Restate the load-bearing figures so the Orchestrator has them:
 total_value, pnl_pct, the two or three biggest position weights (symbol + weight),
@@ -55,5 +60,11 @@ Examples of the *form* (use the real input values, not these):
 - Concentration: effective-N only 2.1 (hhi = 0.42) — two names dominate.
 - Negative skew (skew = -0.8) with a deep left tail (stress_asymmetry = -0.03).
 
+**4. The recommendation (restate verbatim).** Copy the `recommendation` block through unchanged so
+the Orchestrator has it exactly: the `verdict`, then one line per entry in `actions[]` giving the
+`symbol`, `action`, and `size` exactly as written. Do NOT re-derive, re-order, add, drop, or
+resize anything — this decision was fixed deterministically upstream. If `verdict` is `keep` and
+`actions` is empty, say so plainly.
+
 Keep the whole brief tight and readable. Lead with the numbers, ground the interpretation in the
-corpus, and make the flags specific enough that the Orchestrator can act on them.
+corpus, make the flags specific, and pass the fixed recommendation through untouched.

@@ -60,15 +60,14 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 
-echo "==> asking the advisor (Strategic -> Orchestrator)…"
+# The keep/rebalance decision is already made — deterministically, by the rule
+# engine in analyze.py — and was persisted to the DB and rendered on top of the
+# dashboard above.  The advisor stage only *explains* that fixed recommendation
+# in plain prose (Strategic brief -> Orchestrator explanation); it does not
+# decide, and there is nothing further to persist or re-render.
+echo "==> asking the advisor to explain the recommendation (Strategic -> Orchestrator)…"
 echo
-ADVICE="$(printf '%s\n' "$REPORT" | "$AISLANG" chat advise portfolio.ais || true)"
-printf '%s\n' "$ADVICE"
-
-# Persist the recommendation + refresh the dashboard so it appears on top.
-printf '%s\n' "$ADVICE" | python3 scripts/persist_recommendation.py || true
-python3 scripts/render_dashboard.py >/dev/null && \
-  echo "==> dashboard.html refreshed with the recommendation."
+printf '%s\n' "$REPORT" | "$AISLANG" chat advise portfolio.ais || true
 
 echo
 echo "Open dashboard.html in a browser for the full view.  Tear the stack down"

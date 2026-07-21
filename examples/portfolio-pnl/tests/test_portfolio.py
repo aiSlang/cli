@@ -147,3 +147,52 @@ def test_fragility_monotonic_and_classification():
     assert fragile["classification"] == "fragile"
     assert robust["classification"] in ("robust", "antifragile")
     assert 0.0 <= robust["fragility_score"] <= 100.0
+
+
+# ── recommendation (deterministic rule engine) ─────────────────────
+_BUCKETS = {"safe": ["cash", "tbill", "bond_short"], "aggressive": ["crypto", "option"]}
+
+
+def _fragile_case():
+    analytic = {"totals": {"total_value": 34500.0},
+                "positions": [
+                    {"symbol": "SPY", "asset_class": "etf", "weight": 0.26},
+                    {"symbol": "AAPL", "asset_class": "equity", "weight": 0.14},
+                    {"symbol": "MSFT", "asset_class": "equity", "weight": 0.07},
+                    {"symbol": "SHY", "asset_class": "bond_short", "weight": 0.24},
+                    {"symbol": "BTC-USD", "asset_class": "crypto", "weight": 0.29}]}
+    strategic = {"barbell_safe": 0.24, "barbell_mid": 0.47, "barbell_aggr": 0.29,
+                 "fragility_score": 35.1, "classification": "robust",
+                 "stress_asymmetry": -0.0015, "skew": -0.145}
+    return analytic, strategic
+
+
+def test_recommend_is_deterministic():
+    a, s = _fragile_case()
+    r1 = pf.recommend(a, s, _BUCKETS)
+    r2 = pf.recommend(a, s, _BUCKETS)
+    assert r1 == r2                       # pure function — no sampling, no mutation
+
+
+def test_recommend_fragile_rebalances_with_trim_and_cash():
+    a, s = _fragile_case()
+    r = pf.recommend(a, s, _BUCKETS)
+    assert r["verdict"] == "rebalance"
+    acts = {x["symbol"]: x for x in r["actions"]}
+    assert acts["SPY"]["action"] == "trim"       # > 25% cap AND fragile middle
+    assert acts["CASH"]["action"] == "add"       # freed weight rotates to safe
+    assert acts["BTC-USD"]["action"] == "hold"   # convex sleeve held (29% < 35% ceiling)
+
+
+def test_recommend_healthy_keeps_with_no_actions():
+    a = {"totals": {"total_value": 10000.0},
+         "positions": [
+             {"symbol": "SHY", "asset_class": "bond_short", "weight": 0.55},
+             {"symbol": "SPY", "asset_class": "etf", "weight": 0.20},
+             {"symbol": "BTC-USD", "asset_class": "crypto", "weight": 0.20}]}
+    s = {"barbell_safe": 0.60, "barbell_mid": 0.20, "barbell_aggr": 0.20,
+         "fragility_score": 22.0, "classification": "robust",
+         "stress_asymmetry": 0.01, "skew": 0.2}
+    r = pf.recommend(a, s, _BUCKETS)
+    assert r["verdict"] == "keep"
+    assert r["actions"] == []
