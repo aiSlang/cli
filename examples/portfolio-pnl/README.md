@@ -81,8 +81,8 @@ The deterministic core needs nothing but `python3` (stdlib only):
 python3 scripts/seed_demo.py            # synthetic prices (offline), OR:
 python3 scripts/fetch.py                # live prices (Yahoo / CoinGecko, key-free)
 python3 scripts/analyze.py --persist    # P&L / risk / anti-fragility -> JSON + DB
-python3 scripts/render_dashboard.py     # -> dashboard.html (open it in a browser)
-python3 -m pytest tests -q              # 24 unit tests over the compute core
+python3 scripts/render_dashboard.py     # -> generated/dashboard.html (open in a browser)
+python3 -m pytest tests -q              # unit tests over the compute core
 ```
 
 The same skills run through aiSlang:
@@ -91,7 +91,7 @@ The same skills run through aiSlang:
 aislang validate portfolio.ais
 aislang skill run fetch_prices portfolio.ais
 aislang skill run analyze      portfolio.ais
-aislang skill run visualize    portfolio.ais   # -> dashboard.html
+aislang skill run visualize    portfolio.ais   # -> generated/dashboard.html
 ```
 
 The full advisory pipeline — fetch → analyze → render → **Strategic →
@@ -114,8 +114,11 @@ still run, just **ungrounded**). Tear the stack down afterwards with
 It prints the Orchestrator's **keep / rebalance** recommendation (JSON per
 [`_schemas/recommendation.schema.json`](./_schemas/recommendation.schema.json)),
 grounded by the Taleb knowledge corpus under `knowledge/`. `run.sh` also renders
-`dashboard.html` — a self-contained, drill-down view (overview → positions →
-per-instrument prices → risk & anti-fragility) you open in a browser.
+`generated/dashboard.html` — a self-contained, drill-down view (overview →
+positions → per-instrument prices → risk & anti-fragility) you open in a browser.
+
+All regenerable artifacts (the SQLite DB, the rendered dashboard) are written
+under `generated/` (git-ignored), keeping the project root to source only.
 
 ## Sample portfolio
 

@@ -14,11 +14,17 @@ from typing import Iterable, Mapping
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_DB = os.path.join(ROOT, "portfolio.db")
+# All regenerable artifacts (the SQLite DB, the rendered dashboard) live under
+# a single ignored folder so they don't pollute the project root.
+GEN_DIR = os.path.join(ROOT, "generated")
+DEFAULT_DB = os.path.join(GEN_DIR, "portfolio.db")
 SCHEMA_PATH = os.path.join(ROOT, "db", "schema.sql")
 
 
 def connect(path: str = DEFAULT_DB) -> sqlite3.Connection:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

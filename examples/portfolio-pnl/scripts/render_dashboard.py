@@ -440,11 +440,13 @@ def render_overview(a, s, vseries) -> str:
                       s.get("barbell_safe"), s.get("barbell_mid"), s.get("barbell_aggr")) + "</div>"),
     ])
 
-    # top movers
+    # top movers — split by sign so a name shows up in exactly one column
+    # (a gainer never also appears under losers, and vice-versa).
     movers = [p for p in a["positions"] if p.get("unrealized_pct") is not None]
-    movers.sort(key=lambda p: p["unrealized_pct"], reverse=True)
-    best = movers[:3]
-    worst = list(reversed(movers[-3:])) if len(movers) >= 1 else []
+    best = sorted([p for p in movers if p["unrealized_pct"] > 0],
+                  key=lambda p: p["unrealized_pct"], reverse=True)[:3]
+    worst = sorted([p for p in movers if p["unrealized_pct"] < 0],
+                   key=lambda p: p["unrealized_pct"])[:3]
     def mover_rows(rows):
         return "".join(
             f'<div class="mover"><span class="msym">{esc(p["symbol"])}</span>'
@@ -492,7 +494,7 @@ def render_positions(a) -> str:
       <td class="num" style="color:{sign_color(upct)}">{signed_pct(upct)}</td>
     </tr>"""
     t = a["totals"]
-    rows += f"""<tr class="cashrow" id="instrument-CASH">
+    rows += f"""<tr class="cashrow">
       <td class="sym">cash</td><td class="ac">cash</td>
       <td class="num">{fmt_pct(t.get("cash_weight"),1)}<div class="rowbar">{weight_bar(t.get("cash_weight"), color=NEUTRAL)}</div></td>
       <td class="num">{fmt_money(t.get("cash"))}</td>
@@ -533,6 +535,27 @@ def render_instruments(a, history) -> str:
         <span>avg cost {fmt_money(avg_cost)}</span>
         <span>value {fmt_money(p.get("value"))}</span>
         <span style="color:{sign_color(p.get("unrealized_pnl"))}">P&amp;L {signed_money(p.get("unrealized_pnl"))}</span>
+      </div>
+    </details>"""
+
+    # Cash sleeve — a real holding (the barbell's safe anchor), but not a priced
+    # instrument, so it gets an entry without a price chart.  This is the anchor
+    # the Recommendation's CASH action links to.
+    t = a.get("totals", {})
+    cash_val = t.get("cash") or 0.0
+    cash_w = t.get("cash_weight")
+    if cash_val:
+        cash_summary = (
+            f'<span class="isym">CASH</span>'
+            f'<span class="iac">cash</span>'
+            f'<span class="iprice">{fmt_money(cash_val)}</span>'
+            f'<span class="ipct muted">{fmt_pct(cash_w, 1)}</span>')
+        blocks += f"""<details class="instrument" id="instrument-CASH">
+      <summary>{cash_summary}</summary>
+      <div class="imeta">
+        <span>weight {fmt_pct(cash_w, 1)}</span>
+        <span>value {fmt_money(cash_val)}</span>
+        <span class="muted">risk-free safe sleeve — no price series</span>
       </div>
     </details>"""
     return f"""<section class="panel">
@@ -785,11 +808,11 @@ table.reco-actions th {{ font-size: 11px; text-transform: uppercase; letter-spac
   color: {MUTED}; font-weight: 600; }}
 td.reco-act {{ font-weight: 700; text-transform: capitalize; white-space: nowrap; }}
 td.reco-sym {{ font-weight: 600; white-space: nowrap; }}
-/* Cap the Size column so a long size string wraps instead of squeezing the
-   Rationale column into a tall, unreadable block. */
-td.reco-size {{ font-variant-numeric: tabular-nums; white-space: normal;
-  overflow-wrap: anywhere; max-width: 168px; }}
-td.reco-rat {{ color: {MUTED}; font-size: 13px; min-width: 220px; }}
+td.reco-size {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
+/* Rationale carries the long prose, so give it ~40% of the table and let the
+   Action / Symbol / Size columns take the rest — Size then fits on one line. */
+td.reco-rat, table.reco-actions th:last-child {{ color: {MUTED}; font-size: 13px;
+  width: 40%; white-space: normal; }}
 .reco-placeholder {{ color: {MUTED}; font-size: 13px; background: {PANEL2};
   border: 1px dashed {BORDER}; border-radius: 8px; padding: 14px 16px; }}
 
@@ -896,7 +919,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Render a self-contained portfolio dashboard.html")
     ap.add_argument("--db", default=dbmod.DEFAULT_DB)
     ap.add_argument("--holdings", default=os.path.join(dbmod.ROOT, "holdings.json"))
-    ap.add_argument("--out", default=os.path.join(dbmod.ROOT, "dashboard.html"))
+    ap.add_argument("--out", default=os.path.join(dbmod.GEN_DIR, "dashboard.html"))
     args = ap.parse_args()
 
     holdings = dbmod.load_holdings(args.holdings)

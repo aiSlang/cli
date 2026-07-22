@@ -40,7 +40,7 @@ echo "==> computing P&L / risk / anti-fragility metrics…"
 # compact single-line JSON so it lands as a single chat turn.
 REPORT="$(python3 scripts/analyze.py --persist --compact)"
 
-echo "==> rendering dashboard.html…"
+echo "==> rendering generated/dashboard.html…"
 python3 scripts/render_dashboard.py
 echo "    $(printf '%s' "$REPORT" | python3 -c 'import json,sys; r=json.load(sys.stdin); t=r["analytic"]["totals"]; s=r["strategic"]; tv=t["total_value"]; pnl=t["unrealized_pnl"]; fs=s["fragility_score"]; cl=s["classification"]; print(f"value {tv:.0f}  P&L {pnl:+.0f}  fragility {fs} ({cl})")')"
 
@@ -75,8 +75,8 @@ echo
 echo "==> persisting the explained recommendation (engine decision + LLM prose)…"
 printf '%s\n' "$ADVICE" | python3 scripts/persist_recommendation.py >/dev/null || true
 python3 scripts/render_dashboard.py >/dev/null && \
-  echo "    dashboard.html refreshed with the explained recommendation."
+  echo "    generated/dashboard.html refreshed with the explained recommendation."
 
 echo
-echo "Open dashboard.html in a browser for the full view.  Tear the stack down"
+echo "Open generated/dashboard.html in a browser for the full view.  Tear the stack down"
 echo "when you're done:  aislang destroy portfolio.ais"
