@@ -1,3 +1,12 @@
-{"id": "reads_fragile_middle", "input": "analytic + strategic JSON: total_value 34500, positions SPY(etf) weight 0.34, BTC-USD(crypto) 0.30, SHY(bond_short) 0.10; strategic { fragility_score 36, classification robust, barbell_safe 0.20, barbell_mid 0.50, barbell_aggr 0.30, stress_asymmetry -0.0015, skew -0.145 }. Give the anti-fragility brief.", "expected_substring": "barbell"}
-{"id": "reads_concentration", "input": "analytic + strategic JSON: positions SPY 0.34 and BTC-USD 0.30 dominate; risk { hhi 0.28, eff_n 3.6 }; strategic { fragility_score 36, classification robust }. Assess the anti-fragility posture.", "expected_substring": "fragility"}
-{"id": "reads_negative_skew", "input": "analytic + strategic JSON: strategic { skew -1.1, excess_kurtosis 2.3, tail_ratio 0.7, stress_asymmetry -0.03, fragility_score 62, classification fragile }. Read the tail shape and posture.", "expected_substring": "skew"}
+# Eval dataset for the Strategic agent (grounded anti-fragility read).
+#
+# Each case is one (input, expected) pair. `input` is a compact analytic +
+# strategic metric summary; `expected` is the gold-standard short answer — the
+# anti-fragility vocabulary a grounded brief should use for that posture.
+# metric=f1 (bag-of-tokens): the brief should interpret the metrics in Taleb
+# terms (barbell / fragility / skew / tails / concentration), not just echo
+# numbers.
+
+{"id": "reads_fragile_middle", "input": "analytic + strategic JSON: total_value 34500, positions SPY(etf) weight 0.34, BTC-USD(crypto) 0.30, SHY(bond_short) 0.10; strategic { fragility_score 36, classification robust, barbell_safe 0.20, barbell_mid 0.50, barbell_aggr 0.30, stress_asymmetry -0.0015, skew -0.145 }. Give the anti-fragility brief.", "expected": "barbell fragile middle 50% thin safe sleeve robust concentration"}
+{"id": "reads_concentration", "input": "analytic + strategic JSON: positions SPY 0.34 and BTC-USD 0.30 dominate; risk { hhi 0.28, eff_n 3.6 }; strategic { fragility_score 36, classification robust }. Assess the anti-fragility posture.", "expected": "concentration effective-N hhi two names dominate fragility robust"}
+{"id": "reads_negative_skew", "input": "analytic + strategic JSON: strategic { skew -1.1, excess_kurtosis 2.3, tail_ratio 0.7, stress_asymmetry -0.03, fragility_score 62, classification fragile }. Read the tail shape and posture.", "expected": "negative skew fat tails left tail fragile concave downside"}
