@@ -1,0 +1,1750 @@
+{
+  "generated_at": "2026-07-22T11:59:02+00:00",
+  "root": "examples",
+  "count": 16,
+  "entries": [
+    {
+      "models": [
+        {
+          "name": "architect_brain",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        },
+        {
+          "name": "reviewer_brain",
+          "requires": [
+            "chat",
+            "reasoning"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        },
+        {
+          "name": "coder_brain",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen2_5_coder_7b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        },
+        {
+          "name": "tester_brain",
+          "requires": [
+            "chat",
+            "reasoning"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "architect_sys",
+          "file": "./prompts/architect.md",
+          "version": "1.4.0"
+        },
+        {
+          "name": "reviewer_sys",
+          "file": "./prompts/code_reviewer.md",
+          "version": "1.4.0"
+        },
+        {
+          "name": "coder_sys",
+          "file": "./prompts/coder.md",
+          "version": "1.3.0"
+        },
+        {
+          "name": "tester_sys",
+          "file": "./prompts/tester.md",
+          "version": "1.4.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "architect",
+          "model": "architect_brain",
+          "system_prompt": "architect_sys",
+          "tools": [],
+          "knowledge": [
+            "architect_kb"
+          ],
+          "module": "architect"
+        },
+        {
+          "name": "code_reviewer",
+          "model": "reviewer_brain",
+          "system_prompt": "reviewer_sys",
+          "tools": [],
+          "knowledge": [
+            "reviewer_kb"
+          ],
+          "module": "code_reviewer"
+        },
+        {
+          "name": "coder",
+          "model": "coder_brain",
+          "system_prompt": "coder_sys",
+          "tools": [],
+          "knowledge": [
+            "coder_kb"
+          ],
+          "module": "coder"
+        },
+        {
+          "name": "tester",
+          "model": "tester_brain",
+          "system_prompt": "tester_sys",
+          "tools": [],
+          "knowledge": [
+            "tester_kb"
+          ],
+          "module": "tester"
+        }
+      ],
+      "skills": [
+        {
+          "name": "run_tests",
+          "kind": "exec",
+          "exec": "cargo test --workspace --no-fail-fast",
+          "mcp": null,
+          "output_type": "string",
+          "scripts": []
+        }
+      ],
+      "pipelines": [
+        {
+          "name": "review_once",
+          "steps": [
+            "code_reviewer"
+          ],
+          "input": "Coder-emitted Patch + Test coverage markdown",
+          "output": "ACCEPT or specific revision feedback"
+        },
+        {
+          "name": "from_locked_design",
+          "steps": [
+            "coder"
+          ],
+          "input": "5-section markdown design (Architect's output)",
+          "output": "fenced Rust patch + test coverage bullets"
+        },
+        {
+          "name": "full_design",
+          "steps": [
+            "use architect.architect",
+            "use coder.coder",
+            "use code_reviewer.code_reviewer",
+            "use tester.tester"
+          ],
+          "input": "natural-language feature spec for a new resource block",
+          "output": "Tester's Test plan + cargo test invocation + ACCEPT-or-FAIL verdict"
+        },
+        {
+          "name": "coder_review_cycle",
+          "steps": [
+            "use coder.coder",
+            "use code_reviewer.code_reviewer"
+          ],
+          "input": "Architect's 5-section design markdown",
+          "output": "Reviewer's verdict (ACCEPT or revision feedback)"
+        },
+        {
+          "name": "test_once",
+          "steps": [
+            "tester"
+          ],
+          "input": "Coder's Patch + Test coverage + Reviewer's verdict",
+          "output": "Test plan + per-skill recommended invocations"
+        }
+      ],
+      "loops": [
+        {
+          "name": "review_cycle",
+          "body": "coder_review_cycle",
+          "condition": "{{ output | startswith('ACCEPT') | not }}",
+          "max_iter": "3"
+        }
+      ],
+      "vector_stores": [
+        {
+          "name": "architect_kb",
+          "source": "./knowledge/"
+        },
+        {
+          "name": "reviewer_kb",
+          "source": "./knowledge/"
+        },
+        {
+          "name": "coder_kb",
+          "source": "./knowledge/"
+        },
+        {
+          "name": "tester_kb",
+          "source": "./knowledge/"
+        }
+      ],
+      "mcp_servers": [],
+      "evals": [
+        {
+          "name": "structured_output",
+          "dataset": "./evals/architect_specs.jsonl",
+          "metric": "f1",
+          "threshold": "80%"
+        },
+        {
+          "name": "verdict_shape",
+          "dataset": "./evals/reviewer_patches.jsonl",
+          "metric": "f1",
+          "threshold": "80%"
+        },
+        {
+          "name": "rust_patch_format",
+          "dataset": "./evals/coder_designs.jsonl",
+          "metric": "f1",
+          "threshold": "80%"
+        },
+        {
+          "name": "test_plan_shape",
+          "dataset": "./evals/tester_inputs.jsonl",
+          "metric": "f1",
+          "threshold": "80%"
+        }
+      ],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        },
+        {
+          "name": "local",
+          "target": "compose"
+        },
+        {
+          "name": "local",
+          "target": "compose"
+        },
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "kind": "multi-module",
+      "path": "examples/agents/orchestrator",
+      "entry_file": "examples/agents/orchestrator/aislang.toml",
+      "modules": [
+        {
+          "name": "architect",
+          "file": "examples/agents/architect/architect.ais",
+          "project": "architect-agent",
+          "agents": [
+            "architect"
+          ]
+        },
+        {
+          "name": "code_reviewer",
+          "file": "examples/agents/code_reviewer/code_reviewer.ais",
+          "project": "code-reviewer-agent",
+          "agents": [
+            "code_reviewer"
+          ]
+        },
+        {
+          "name": "coder",
+          "file": "examples/agents/coder/coder.ais",
+          "project": "coder-agent",
+          "agents": [
+            "coder"
+          ]
+        },
+        {
+          "name": "orchestrator",
+          "file": "examples/agents/orchestrator/orchestrator.ais",
+          "project": "orchestrator-module",
+          "agents": []
+        },
+        {
+          "name": "tester",
+          "file": "examples/agents/tester/tester.ais",
+          "project": "tester-agent",
+          "agents": [
+            "tester"
+          ]
+        }
+      ],
+      "name": "orchestrator-agent",
+      "id": "orchestrator-agent",
+      "version": "0.1.0",
+      "docs": {
+        "header": "v0.3 Week 20 Mon — Orchestrator agent (multi-module project).\n\nTop-level entry-point that takes a natural-language feature\nspec + runs the full Architect → Coder → Code-reviewer chain\nend-to-end.  This is the v0.3 headline demo: a single\n`aislang chat full_design examples/agents/orchestrator/`\ninvocation drives a 3-agent pipeline against the user's\nlocal Ollama (qwen3:8b + qwen2.5-coder:7b) + emits a\nstructured design + Rust patch + reviewer verdict.\n\n## Direct chat\n\n```\naislang chat full_design examples/agents/orchestrator/\n> Design a `dataset` block for declaring training data\n  (path + format fields, fits the existing v0.3 grammar).\n```\n\nThe CLI's pipeline-label dispatch (Week 17 Thu) drives the\nruntime patterns::orchestrator::run — each step's output\nfeeds the next step's input verbatim.\n\n## Coder ↔ Reviewer reflector loop (grammar layer)\n\n`loop.review_cycle` wraps `pipeline.coder_review_cycle` with a\n`condition` that re-runs the pipeline while the reviewer's\nverdict does NOT start with `ACCEPT`, hard-capped at 3 retries.\nThis is the FIRST .ais-grammar-layer expression of the\nreflector pattern from Week 17 Fri — runtime dispatch via\n`loop`-block label is a follow-up (today Mon ships the\ngrammar + a runtime integration test exercising the parsed\nloop AST through `patterns::reflector::run` with mocked\nsub-agent dispatch + the `max_iter` hard-cap honoured).\n\n## Cross-module composition\n\nSibling modules under `../architect/`, `../coder/`,\n`../code_reviewer/` are referenced via `use <module>.<label>`\n(Decision 44.1).  Each sibling is a self-contained\n`project { … }` block (the Week 19 single-file agents);\nthe multi-module resolver merges all four projects' resource\nnamespaces at validate time + this module's pipelines refer\nto the merged labels with the `use` prefix."
+      },
+      "prompt_files": [],
+      "knowledge_files": [],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "rag",
+        "skills",
+        "pipeline",
+        "reflector-loop",
+        "deploy-compose",
+        "evals"
+      ],
+      "description": "v0.3 Week 20 Mon — Orchestrator agent (multi-module project)."
+    },
+    {
+      "models": [
+        {
+          "name": "thinker",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "system",
+          "file": "./system.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "system",
+          "file": "./system.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "architect",
+          "model": "thinker",
+          "system_prompt": "system",
+          "tools": [],
+          "knowledge": [],
+          "module": "architect"
+        },
+        {
+          "name": "coder",
+          "model": "thinker",
+          "system_prompt": "system",
+          "tools": [
+            "docs"
+          ],
+          "knowledge": [],
+          "module": "coder"
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "../knowledge/"
+        },
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "../knowledge/"
+        }
+      ],
+      "evals": [],
+      "deploy": [],
+      "kind": "multi-module",
+      "path": "examples/multi-module-demo",
+      "entry_file": "examples/multi-module-demo/aislang.toml",
+      "modules": [
+        {
+          "name": "architect",
+          "file": "examples/multi-module-demo/agents/architect.ais",
+          "project": "architect-module",
+          "agents": [
+            "architect"
+          ]
+        },
+        {
+          "name": "coder",
+          "file": "examples/multi-module-demo/agents/coder.ais",
+          "project": "coder-module",
+          "agents": [
+            "coder"
+          ]
+        }
+      ],
+      "name": "multi-module-demo",
+      "id": "multi-module-demo",
+      "version": "0.1.0",
+      "docs": {
+        "header": "v0.3 Week 16 Mon scaffold — see the sibling `aislang.toml`.\n\nToday this is a self-contained single-module .ais (carries its own\nouter `project { … }` block).  Week 16 Wed (multi-file resolver)\nswitches multi-module modules to module-shape (drop the project\nkeyword block; the module body contributes resources directly to\nthe project named in `aislang.toml`)."
+      },
+      "prompt_files": [],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "mcp-tools"
+      ],
+      "description": "v0.3 Week 16 Mon scaffold — see the sibling `aislang.toml`."
+    },
+    {
+      "models": [
+        {
+          "name": "thinker",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "classifier_sys",
+          "file": "./prompts/router_classifier.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "billing_sys",
+          "file": "./prompts/billing_agent.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "technical_sys",
+          "file": "./prompts/technical_agent.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "general_sys",
+          "file": "./prompts/general_agent.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "classifier",
+          "model": "thinker",
+          "system_prompt": "classifier_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "billing",
+          "model": "thinker",
+          "system_prompt": "billing_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "technical",
+          "model": "thinker",
+          "system_prompt": "technical_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "general",
+          "model": "thinker",
+          "system_prompt": "general_sys",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [
+        {
+          "name": "handle_billing",
+          "steps": [
+            "billing"
+          ],
+          "input": "the user's billing question",
+          "output": "a 1-3 sentence billing reply"
+        },
+        {
+          "name": "handle_technical",
+          "steps": [
+            "technical"
+          ],
+          "input": "the user's technical question",
+          "output": "a 2-4 sentence technical reply"
+        },
+        {
+          "name": "handle_general",
+          "steps": [
+            "general"
+          ],
+          "input": "the user's general/greeting question",
+          "output": "a 1-2 sentence conversational reply"
+        }
+      ],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "./knowledge/"
+        }
+      ],
+      "evals": [],
+      "deploy": [],
+      "id": "patterns-router-demo",
+      "name": "patterns-router-demo",
+      "kind": "single-file",
+      "path": "examples/patterns/router-demo",
+      "entry_file": "examples/patterns/router-demo/router-demo.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.05"
+      },
+      "docs": {
+        "header": "v0.3 Week 17 Fri — worked router-pattern demo.\n\nThree-way customer-support router: each user message goes through\na classifier agent that picks one of {billing, technical, general},\nand the matched case's pipeline handles the actual reply.\n\n  user → classifier → case key → matched pipeline → answer\n\n## Why router (not orchestrator)?\n\nOrchestrator chains agents UNCONDITIONALLY — every message visits\nevery step.  Router DISPATCHES: each message visits exactly ONE\ncase-pipeline (chosen by the classifier), keeping latency + cost\ndown when the case-pipelines are heavyweight.  Use the router\nwhen handling distinct workloads under one chat surface (a\ncustomer-support intake, a routing dispatcher, a question-typing\ntriage).\n\n## v0.3 classifier-agent convention\n\nv0.3 Fri's CLI uses the project's FIRST declared agent as the\nrouter's classifier.  We declare `agent \"classifier\"` first\nhere for that reason; it's a toolless agent whose prompt is\ntuned to emit the case key only.  (v0.5+ may add an explicit\n`classifier = agent.<label>` field in the `branch { … }` block;\nuntil then the source-order convention rules.)\n\n## Run it\n\n```\naislang apply examples/patterns/router-demo/router-demo.ais       # bring stack up\naislang chat triage examples/patterns/router-demo/router-demo.ais\n\n> How do I reset my password?\n · router classifying via agent `classifier` against cases [billing, general, technical]\n · router → case `technical` (1 steps)\n · orchestrator step 1/1 → agent `technical`\nYou can reset your password from the login page → \"Forgot password\"\nlink.  We'll email you a reset link valid for 30 minutes.\n\n> How do I update my payment method?\n · router → case `billing` (1 steps)\n · orchestrator step 1/1 → agent `billing`\nYou can update your payment method in your account settings under\nBilling → Payment Methods.  Changes apply to your next invoice.\n\n> Hi!\n · router → case `general` (1 steps)\n · orchestrator step 1/1 → agent `general`\nHello!  How can I help today?\n```"
+      },
+      "prompt_files": [
+        "billing_agent.md",
+        "general_agent.md",
+        "router_classifier.md",
+        "technical_agent.md"
+      ],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "mcp-tools",
+        "pipeline"
+      ],
+      "description": "v0.3 Week 17 Fri — worked router-pattern demo."
+    },
+    {
+      "models": [
+        {
+          "name": "thinker",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "researcher_sys",
+          "file": "./prompts/researcher.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "summarizer_sys",
+          "file": "./prompts/summarizer.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "researcher",
+          "model": "thinker",
+          "system_prompt": "researcher_sys",
+          "tools": [
+            "docs"
+          ],
+          "knowledge": []
+        },
+        {
+          "name": "summarizer",
+          "model": "thinker",
+          "system_prompt": "summarizer_sys",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [
+        {
+          "name": "research_then_summarize",
+          "steps": [
+            "researcher",
+            "summarizer"
+          ],
+          "input": "the user's question — e.g. 'Where is Acme HQ?'",
+          "output": "one-sentence answer drawn from the knowledge base"
+        }
+      ],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "./knowledge/"
+        }
+      ],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "patterns-orchestrator-demo",
+      "name": "patterns-orchestrator-demo",
+      "kind": "single-file",
+      "path": "examples/patterns/orchestrator-demo",
+      "entry_file": "examples/patterns/orchestrator-demo/orchestrator-demo.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.05"
+      },
+      "docs": {
+        "header": "v0.3 Week 17 Thu — worked orchestrator-pattern demo.\n\nTwo-agent pipeline that exercises the orchestrator composition\nprimitive end-to-end:\n\n  1. `researcher` — reads /data/company-info.md (via mcp_server.docs\n     bind-mounted from ./knowledge/) and returns the raw fact set.\n  2. `summarizer` — takes the researcher's raw output and produces\n     ONE concise sentence.\n\nThe pipeline `research_then_summarize` chains them sequentially:\neach user message dispatches step 1 with the user's query → step 1's\nreply becomes step 2's input → step 2 produces the final answer.\n\nRun it:\n\n```\naislang apply examples/patterns/orchestrator-demo/orchestrator-demo.ais   # bring stack up\naislang chat research_then_summarize examples/patterns/orchestrator-demo/orchestrator-demo.ais\n> Where is Acme headquartered?\n · orchestrator step 1/2 → agent `researcher`\n   [researcher reads company-info.md, returns relevant facts]\n · orchestrator step 2/2 → agent `summarizer`\n   [summarizer condenses to one sentence]\nAcme Demo Company is headquartered in Berlin, Germany.\n```\n\nYou can also chat the individual agents directly:\n\n```\naislang chat researcher  examples/patterns/orchestrator-demo/orchestrator-demo.ais\naislang chat summarizer  examples/patterns/orchestrator-demo/orchestrator-demo.ais\n```\n\n— useful for debugging which step's behaviour you want to tune."
+      },
+      "prompt_files": [
+        "researcher.md",
+        "summarizer.md"
+      ],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "mcp-tools",
+        "pipeline",
+        "deploy-compose"
+      ],
+      "description": "v0.3 Week 17 Thu — worked orchestrator-pattern demo."
+    },
+    {
+      "models": [
+        {
+          "name": "reasoner",
+          "requires": [
+            "chat",
+            "reasoning"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "strategic_sys",
+          "file": "./prompts/strategic.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "orchestrator_sys",
+          "file": "./prompts/orchestrator.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "strategic",
+          "model": "reasoner",
+          "system_prompt": "strategic_sys",
+          "tools": [],
+          "knowledge": [
+            "strategy_kb"
+          ]
+        },
+        {
+          "name": "orchestrator",
+          "model": "reasoner",
+          "system_prompt": "orchestrator_sys",
+          "tools": [],
+          "knowledge": [
+            "strategy_kb"
+          ]
+        }
+      ],
+      "skills": [
+        {
+          "name": "fetch_prices",
+          "kind": "exec",
+          "exec": "python3 ../../../scripts/fetch.py",
+          "mcp": null,
+          "output_type": "json",
+          "scripts": [
+            "fetch.py"
+          ]
+        },
+        {
+          "name": "analyze",
+          "kind": "exec",
+          "exec": "python3 ../../../scripts/analyze.py --persist",
+          "mcp": null,
+          "output_type": "json",
+          "scripts": [
+            "analyze.py"
+          ]
+        },
+        {
+          "name": "visualize",
+          "kind": "exec",
+          "exec": "python3 ../../../scripts/render_dashboard.py",
+          "mcp": null,
+          "output_type": "string",
+          "scripts": [
+            "render_dashboard.py"
+          ]
+        }
+      ],
+      "pipelines": [
+        {
+          "name": "advise",
+          "steps": [
+            "strategic",
+            "orchestrator"
+          ],
+          "input": "the analyze JSON (analytic + strategic metric blocks)",
+          "output": "a keep/rebalance recommendation with rationale"
+        }
+      ],
+      "loops": [],
+      "vector_stores": [
+        {
+          "name": "strategy_kb",
+          "source": "./knowledge/"
+        }
+      ],
+      "mcp_servers": [],
+      "evals": [
+        {
+          "name": "explanation_faithful",
+          "dataset": "./evals/advise.jsonl",
+          "metric": "f1",
+          "threshold": "30%"
+        },
+        {
+          "name": "brief_grounded",
+          "dataset": "./evals/strategic_reads.jsonl",
+          "metric": "f1",
+          "threshold": "30%"
+        }
+      ],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "portfolio-pnl",
+      "name": "portfolio-pnl",
+      "kind": "single-file",
+      "path": "examples/portfolio-pnl",
+      "entry_file": "examples/portfolio-pnl/portfolio.ais",
+      "budget": {
+        "hard_cap_per_day": "$2",
+        "hard_cap_per_run": "$0.20"
+      },
+      "docs": {
+        "header": "portfolio-pnl — a local-first, multi-agent portfolio analysis app.\n\nTopology (see DESIGN.md § \"Skills vs. agents\"): the deterministic\nstages are aiSlang `skill` blocks — the language model never fetches\nor does the math. The judgement stages are LLM agents that INTERPRET\nthe computed JSON, grounded by a RAG knowledge corpus (Taleb\nanti-fragility + re-balancing heuristics under ./knowledge/):\n\n  • Strategic    — reads the analyze JSON, assesses anti-fragility.\n  • Orchestrator — turns that brief into a keep/rebalance call.\n\n── Run it ───────────────────────────────────────────────────────────\n\nDeterministic core (no LLM needed):\n  aislang skill run fetch_prices examples/portfolio-pnl/portfolio.ais\n  aislang skill run analyze      examples/portfolio-pnl/portfolio.ais\n  # or fully offline:  python3 scripts/seed_demo.py && python3 scripts/analyze.py --persist\n\nThe agents (needs a chat model + Ollama bge-m3 for the RAG index):\n  ./run.sh                       # fetch → analyze → pipe into `advise`\n  # or by hand:\n  aislang chat advise examples/portfolio-pnl/portfolio.ais\n  # then paste the analyze JSON as the first turn.",
+        "readme": {
+          "path": "examples/portfolio-pnl/README.md",
+          "title": "portfolio-pnl",
+          "summary": "A local-first, multi-agent portfolio analysis app built on [aiSlang](../../README.md). It helps one person understand a personal investment portfolio and make deliberate re-balancing decisions — and it runs **entirely on your own machine**."
+        },
+        "design": {
+          "path": "examples/portfolio-pnl/DESIGN.md",
+          "title": "portfolio-pnl — Design",
+          "summary": "A local-first, multi-agent portfolio analysis app built on aiSlang. It helps one person understand a personal investment portfolio and make deliberate re-balancing decisions — **entirely on your own machine**. Your holdings never leave your computer: prices are fetched from public sources, but the composition of your portfolio (what you own, at what cost, since when) stays local."
+        }
+      },
+      "prompt_files": [
+        "orchestrator.md",
+        "strategic.md"
+      ],
+      "knowledge_files": [
+        "01_antifragility.md",
+        "02_barbell.md",
+        "03_fragility_detection.md",
+        "04_rebalancing.md",
+        "05_reading_the_metrics.md"
+      ],
+      "has_scripts": true,
+      "tags": [
+        "multi-agent",
+        "rag",
+        "skills",
+        "pipeline",
+        "deploy-compose",
+        "evals"
+      ],
+      "description": "A local-first, multi-agent portfolio analysis app built on [aiSlang](../../README.md). It helps one person understand a personal investment portfolio and make deliberate re-balancing decisions — and it runs **entirely on your own machine**."
+    },
+    {
+      "models": [
+        {
+          "name": "qwen3",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "ollama.qwen3_8b"
+          ],
+          "fallback": [],
+          "context_min": "32k",
+          "cost_max": null
+        },
+        {
+          "name": "qwen2_5_coder",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "ollama.qwen2_5_coder_7b"
+          ],
+          "fallback": [],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "qwen3_sys",
+          "file": "./prompts/qwen3_sys.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "coder_sys",
+          "file": "./prompts/coder_sys.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "thinker",
+          "model": "qwen3",
+          "system_prompt": "qwen3_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "coder",
+          "model": "qwen2_5_coder",
+          "system_prompt": "coder_sys",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "qwen-smoke",
+      "name": "qwen-smoke",
+      "kind": "single-file",
+      "path": "examples/qwen-smoke",
+      "entry_file": "examples/qwen-smoke/qwen-smoke.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.01"
+      },
+      "docs": {
+        "header": "v0.3 Week 18 Fri — worked Qwen-on-Ollama smoke demo.\n\nPins the two new local-LLM catalog entries shipped Fri:\n\n  - `ollama.qwen3_8b`           → litellm tag `ollama/qwen3:8b`\n  - `ollama.qwen2_5_coder_7b`   → litellm tag `ollama/qwen2.5-coder:7b`\n\nBoth are FREE (local) — no API key needed; the Compose stack only\nneeds `OLLAMA_API_BASE` pointing at an Ollama daemon that's\nalready pulled the matching tag.  On the development rig this\nresolves to `http://server.local:11434` (see `.env`); on a\nlaptop with `ollama` running locally it's `http://host.docker.\ninternal:11434`.\n\n## Why Qwen3 8B and not 7B (per the PLAN row)\n\nOllama publishes qwen3 in 0.6b / 1.7b / 4b / 8b / 14b / 32b\nsizes — NO 7b tag.  The closest cousin still on a consumer-GPU\nVRAM budget (q4_K_M ≈ 4.5 GB) is 8b.  Decision 44.8 notes\n\"Both fit on consumer GPUs (12-24 GB VRAM)\"; 8b is well under\nthe lower end of that range so the spirit of the choice is\npreserved.\n\n## Two agents — same model class, different role\n\n  - `agent.thinker` uses `model.qwen3` — general-purpose\n    analytical chat (reasoning-capable per the catalog entry).\n  - `agent.coder`   uses `model.qwen2_5_coder` — coding-focused\n    fine-tune of Qwen2.5 (HumanEval leader at the 7B scale per\n    Decision 44.8).\n\n## Run it\n\n```\naislang apply examples/qwen-smoke/qwen-smoke.ais\n\n# Reasoning smoke against Qwen3:\naislang chat thinker examples/qwen-smoke/qwen-smoke.ais\n> Say hello in 5 words.\n> /exit\n\n# Coding smoke against Qwen2.5-Coder:\naislang chat coder examples/qwen-smoke/qwen-smoke.ais\n> Write a Rust fn that returns the sum of integers from 1 to n.\n> /exit\n\naislang destroy examples/qwen-smoke/qwen-smoke.ais\n```"
+      },
+      "prompt_files": [
+        "coder_sys.md",
+        "qwen3_sys.md"
+      ],
+      "knowledge_files": [],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "deploy-compose"
+      ],
+      "description": "v0.3 Week 18 Fri — worked Qwen-on-Ollama smoke demo."
+    },
+    {
+      "models": [
+        {
+          "name": "thinker",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "static_sys",
+          "file": "./prompts/static_sys.md",
+          "version": "1.0.0"
+        },
+        {
+          "name": "dynamic_sys",
+          "file": "./prompts/dynamic_sys.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "static_explainer",
+          "model": "thinker",
+          "system_prompt": "static_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "dynamic_explainer",
+          "model": "thinker",
+          "system_prompt": "dynamic_sys",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "template-demo",
+      "name": "template-demo",
+      "kind": "single-file",
+      "path": "examples/template-demo",
+      "entry_file": "examples/template-demo/template-demo.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.05"
+      },
+      "docs": {
+        "header": "v0.3 Week 18 Tue — worked dynamic-prompts demo.\n\nPins the `prompt \"<l>\" { template = true }` flag end-to-end:\n\n  1. `agent.static_explainer`  uses `prompt.static_sys`  — plain\n     text body; passed to the LLM verbatim (v0.2-equivalent path).\n  2. `agent.dynamic_explainer` uses `prompt.dynamic_sys` — body\n     contains `{{ agent }}`, `{{ model }}`, `{{ prompt }}`\n     variables AND a `{% if model == \"thinker\" %}…{% endif %}`\n     control-flow block.  The runtime renders the file as a\n     MiniJinja template at chat-turn time, substituting the\n     built-in context built from the (agent, prompt, model)\n     triple.\n\n## What this demo proves at runtime\n\n  - `aislang chat dynamic_explainer …` → system prompt the LLM\n    sees has `agent=dynamic_explainer`, `model=thinker`,\n    `prompt=dynamic_sys` substituted into the body (verifiable\n    via Jaeger: open the `aislang.turn` span, inspect the\n    `aislang.system_prompt` attribute — substitutions visible).\n  - `aislang chat static_explainer …` → byte-stable v0.2\n    behaviour; the LLM sees `prompts/static_sys.md` verbatim.\n  - The control-flow `{% if model == \"thinker\" %}` block emits\n    a different paragraph depending on which model the agent\n    resolves to — change the agent's `model = model.X` ref to\n    try both arms without editing the prompt.\n\n## Run it\n\n```\naislang apply examples/template-demo/template-demo.ais\n\n# Template-enabled agent — ask about its identity:\naislang chat dynamic_explainer examples/template-demo/template-demo.ais\n> Which model are you running on?\nI'm running on model `thinker`.\n> Which agent are you?\nI'm the `dynamic_explainer` agent.\n\n# Static-prompt agent — same question, doesn't know:\naislang chat static_explainer examples/template-demo/template-demo.ais\n> Which model are you running on?\nI don't know — my system prompt is plain static text...\n```"
+      },
+      "prompt_files": [
+        "dynamic_sys.md",
+        "static_sys.md"
+      ],
+      "knowledge_files": [],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "deploy-compose"
+      ],
+      "description": "v0.3 Week 18 Tue — worked dynamic-prompts demo."
+    },
+    {
+      "models": [
+        {
+          "name": "clamp_brain",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": "$0.005 per 1k_tokens"
+        }
+      ],
+      "prompts": [
+        {
+          "name": "clamp_sys",
+          "file": "./prompts/comment_clamper.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "comment_clamper",
+          "model": "clamp_brain",
+          "system_prompt": "clamp_sys",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [
+        {
+          "name": "clamp_once",
+          "steps": [
+            "comment_clamper"
+          ],
+          "input": "one verbose Rust doc-comment / module header",
+          "output": "the clamped comment, same prefix, code untouched"
+        }
+      ],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "comment-clamper-agent",
+      "name": "comment-clamper-agent",
+      "kind": "single-file",
+      "path": "examples/agents/comment_clamper",
+      "entry_file": "examples/agents/comment_clamper/comment_clamper.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.20",
+        "optimize_for": "cost"
+      },
+      "docs": {
+        "header": "v0.4 Week 26 Mon — comment-clamper dogfood agent.\n\nMission soft-pref \"agents author v0.4 code\": an aiSlang agent that\nCLAMPS the codebase's verbose doc-comments (the long Decision-46.x\nnarrations + PLAN-style day-row notes that accreted across the build)\ndown to a budget, WITHOUT changing code or losing load-bearing\nmeaning (Decision refs, invariants, the \"why\" behind a non-obvious\nchoice).  Run over `crates/aislang-cloud/` as the W26 Mon refactor's\ncomment pass.\n\n## Direct chat (one comment block at a time)\n\n```\naislang chat comment_clamper \\\n  examples/agents/comment_clamper/comment_clamper.ais\n> <paste a verbose /// doc-comment or //! module header>\n```\n\nThe agent returns ONLY the clamped comment (same `///` / `//!` / `//`\nprefix), ready to paste back over the original.  It never emits code,\nnever invents Decision numbers, and keeps every reference that was in\nthe input.\n\n## Model choice\n\nanthropic.claude_haiku_4_5 primary — clamping is a bounded\nsummarization task (fast tier is plenty); ollama qwen3:8b fallback\nfor the offline/CI case."
+      },
+      "prompt_files": [
+        "comment_clamper.md"
+      ],
+      "knowledge_files": [],
+      "has_scripts": false,
+      "tags": [
+        "pipeline",
+        "deploy-compose"
+      ],
+      "description": "v0.4 Week 26 Mon — comment-clamper dogfood agent."
+    },
+    {
+      "models": [
+        {
+          "name": "db_brain",
+          "requires": [
+            "chat",
+            "reasoning"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "db_sys",
+          "file": "./prompts/db.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "db",
+          "model": "db_brain",
+          "system_prompt": "db_sys",
+          "tools": [],
+          "knowledge": [
+            "db_kb"
+          ]
+        }
+      ],
+      "skills": [],
+      "pipelines": [
+        {
+          "name": "brief_once",
+          "steps": [
+            "db"
+          ],
+          "input": "high-level migration goal (string)",
+          "output": "Feature spec (5-section markdown matching Architect's input shape)"
+        }
+      ],
+      "loops": [],
+      "vector_stores": [
+        {
+          "name": "db_kb",
+          "source": "./knowledge/"
+        }
+      ],
+      "mcp_servers": [],
+      "evals": [
+        {
+          "name": "feature_spec_shape",
+          "dataset": "./evals/db_briefs.jsonl",
+          "metric": "f1",
+          "threshold": "80%"
+        }
+      ],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "db-agent",
+      "name": "db-agent",
+      "kind": "single-file",
+      "path": "examples/agents/db",
+      "entry_file": "examples/agents/db/db.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.50"
+      },
+      "docs": {
+        "header": "v0.3 Week 20 Wed — DB agent.\n\nFrames the v0.3 dogfood target — SQLite-based unification of\nthe v0.2 plain-files store (`~/.aislang/spend.json` +\n`<source_dir>/.aislang/state.json` + per-project\n`aislang.lock` mirrors) into a single `~/.aislang/store.db`.\nOriginally tracked as v0.2 DoD #7 (Centralized\n`~/.aislang/store.json`) + scope-revised at v0.2 close to\nland via the DB-agent dogfood here.  See PLAN-v0_3.md\nWeek 20 Wed row + PLAN-90-days-v0_2.md DoD #7 note.\n\n## Direct chat (refine the migration brief)\n\n```\naislang chat db examples/agents/db/db.ais\n> Outline the v0.3 SQLite store migration.  Cover the three\n  current plain-file sources + the reversibility contract.\n```\n\nThe DB agent emits a **Feature spec** in the same shape the\nArchitect expects as input — the standalone chat is for\niterating on the migration brief before handing it to the\norchestrator.\n\n## Hand off to the orchestrator (Thu dogfood)\n\nOnce the Feature spec is shaped to your liking:\n\n```\naislang chat full_design examples/agents/orchestrator/\n> /paste\n<paste the DB-agent's Feature spec output>\n/end\n```\n\n…and the orchestrator chain runs Architect → Coder →\nCode-reviewer → Tester end-to-end against the migration\nspec.  Wed ships the DB agent + the migration brief\ncorpus; Thu's dogfood-validation row exercises the full\nchain (see PLAN-v0_3.md Week 20 Thu).\n\n## RAG context\n\n`knowledge = [vector_store.db_kb]` — current spend.json /\nstate.json / aislang.lock schemas + the proposed SQLite\ntables + the Decision-44.4 byte-stability + reversibility\ncontracts.  Grounds the agent so it doesn't invent a\nschema that loses today's audit-trail fields.\n\n## Model choice\n\nCloud-tier reasoning model (Haiku) primary, matching the\nArchitect / Reviewer / Tester choice from Mon-Tue.  Brief-\nwriting is judgement work (which fields are load-bearing\nfor v0.2 round-trip?  which v0.5+ extensions should we\nleave hooks for?), not code emission.  qwen3:8b stays as\nthe local fallback for the GPU case."
+      },
+      "prompt_files": [
+        "db.md"
+      ],
+      "knowledge_files": [
+        "01_current_schemas.md",
+        "02_proposed_sqlite_schema.md",
+        "03_reversibility_contract.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "rag",
+        "pipeline",
+        "deploy-compose",
+        "evals"
+      ],
+      "description": "v0.3 Week 20 Wed — DB agent."
+    },
+    {
+      "models": [
+        {
+          "name": "fast",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5",
+            "openai.gpt_4o_mini"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": "$0.001 per 1k_tokens"
+        }
+      ],
+      "prompts": [
+        {
+          "name": "system",
+          "file": "./prompts/system.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "support",
+          "model": "fast",
+          "system_prompt": "system",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "prod",
+          "target": "kubernetes"
+        }
+      ],
+      "id": "e2e-stack",
+      "name": "e2e-stack",
+      "kind": "single-file",
+      "path": "examples/e2e-stack",
+      "entry_file": "examples/e2e-stack/main.ais",
+      "budget": {
+        "hard_cap_per_day": "$50",
+        "hard_cap_per_run": "$0.50",
+        "optimize_for": "cost"
+      },
+      "docs": {
+        "header": "examples/e2e-stack/main.ais — self-contained K8s stack for the\nmanaged-cloud multi-tenant e2e (deploy/eks/40-e2e-two-tenants.sh).\n\nNamed `main.ais` because the cloud repo-loader looks for `main.ais`\n(or `aislang.toml`) at the repo root / repo_path subdir.\n\nDeliberately minimal + SELF-CONTAINED (one .ais + one prompt file, no\nknowledge dir / eval dataset / mcp_server mounts) so it deploys cleanly\nfrom a fresh git clone.  Push this directory to two throwaway repos to\ndrive the two-tenant isolation run (a repo is globally 1:1, so each\ntenant needs its own repo)."
+      },
+      "prompt_files": [
+        "system.md"
+      ],
+      "knowledge_files": [],
+      "has_scripts": false,
+      "tags": [
+        "deploy-kubernetes"
+      ],
+      "description": "examples/e2e-stack/main.ais — self-contained K8s stack for the managed-cloud multi-tenant e2e (deploy/eks/40-e2e-two-tenants.sh)."
+    },
+    {
+      "models": [
+        {
+          "name": "local",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "ollama.llama_3_1_8b"
+          ],
+          "fallback": [],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "system",
+          "file": "./prompts/system.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "assistant",
+          "model": "local",
+          "system_prompt": "system",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "free-local",
+      "name": "free-local",
+      "kind": "single-file",
+      "path": "examples",
+      "entry_file": "examples/free-local.ais",
+      "budget": {
+        "hard_cap_per_day": "unlimited",
+        "hard_cap_per_run": "unlimited",
+        "optimize_for": "cost"
+      },
+      "docs": {
+        "header": "examples/free-local.ais — the \"no caps, free local model\" demo.\n\nCompanion to support-agent.ais (cloud-first, capped budget). This file\nshowcases:\n  1. `hard_cap_per_day = unlimited` + `hard_cap_per_run = unlimited`\n     (Decision 10, week 7 Mon) — the Money::Unlimited literal.\n  2. Pin to ollama.llama_3_1_8b — zero-cost in the v0.1 catalog\n     ($0/$0), so even with caps, this would never trigger them.\n  3. Tool-less agent (`tools = []`) — no MCP children spawned by\n     `aislang chat`, so the live path works without Docker pulling\n     mcp/filesystem.\n\nRun:\n  aislang validate examples/free-local.ais\n  aislang apply examples/free-local.ais\n  echo \"say hi\" | aislang chat assistant examples/free-local.ais\n\nPrereqs: Ollama running on the host with llama3.1:8b downloaded.\nSet `OLLAMA_API_BASE=http://host.docker.internal:11434` in the\ngenerated .env (or copy from .env.example)."
+      },
+      "prompt_files": [
+        "system.md"
+      ],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "deploy-compose"
+      ],
+      "description": "examples/free-local.ais — the \"no caps, free local model\" demo."
+    },
+    {
+      "models": [
+        {
+          "name": "thinker",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "doc_helper_sys",
+          "file": "./prompts/doc_helper.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "doc_helper",
+          "model": "thinker",
+          "system_prompt": "doc_helper_sys",
+          "tools": [],
+          "knowledge": [
+            "aislang_docs"
+          ]
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [
+        {
+          "name": "aislang_docs",
+          "source": "./knowledge/"
+        }
+      ],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "rag-demo",
+      "name": "rag-demo",
+      "kind": "single-file",
+      "path": "examples/rag-demo",
+      "entry_file": "examples/rag-demo/rag-demo.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.01"
+      },
+      "docs": {
+        "header": "v0.3 Week 19 Wed — worked RAG demo end-to-end against bge-m3.\n\nPins the Mon→Tue→Wed Decision-44.6 chain via four pieces:\n\n  1. `embedding \"local_bge\"` — declares Ollama's bge-m3\n     embedding model (1024-dim dense output, 8k ctx).\n  2. `vector_store \"aislang_docs\"` — bind-mounts `./knowledge/`,\n     chunks at 512 chars with 64-char overlap, embeds via\n     embedding.local_bge.\n  3. `agent \"doc_helper\"` — declares\n     `knowledge = [vector_store.aislang_docs]` so Phase 2's\n     chat-time prepend hook will auto-include retrieved chunks\n     in the system prompt.\n  4. (Today) `aislang rag query aislang_docs <demo> \"<question>\"`\n     drives the build_index + query round-trip directly + prints\n     the top-K matching chunks.\n\n## Run it\n\nPrereqs: `ollama pull bge-m3:latest`; LiteLLM stack up\n(`aislang apply examples/rag-demo/rag-demo.ais`).\n\n```\n# Build the index (chunks ./knowledge/, embeds each chunk via\n# ollama/bge-m3 through LiteLLM, persists to .aislang/vector/\n# aislang_docs.bin):\naislang rag build aislang_docs examples/rag-demo/rag-demo.ais\n\n# Query — embeds the question + returns top-3 chunks by cosine\n# similarity:\naislang rag query aislang_docs examples/rag-demo/rag-demo.ais \\\n    \"How does aislang ship RAG?\"\n# → [0] score=0.78  | # RAG resources (v0.3 Week 19) ...\n# → [1] score=0.42  | ...\n# → [2] score=0.31  | ...\n\naislang rag query aislang_docs examples/rag-demo/rag-demo.ais \\\n    \"What runs on Kubernetes?\"\n# → [0] score=0.71  | # Kubernetes deployment (v0.2 Phase 2) ...\n```\n\n## v0.3 limitations exercised by this demo\n\n  - **chunk_size is CHARACTERS, not tokens** (v0.3\n    simplification — see LANGUAGE-SPEC §4.15).  bge-m3's 8k\n    context window is more than enough for our 512-char chunks.\n  - **Brute-force cosine scan** instead of usearch (Decision\n    44.4 deviation; documented in rag.rs module head).\n    Performance is fine for this 4-doc corpus + would scale to\n    thousands of chunks before the linear scan matters.\n  - **No agent.knowledge wiring in chat path yet** — the\n    `doc_helper` agent declares `knowledge = …` but the chat-\n    time auto-prepend of retrieved chunks to the system prompt\n    lands in Phase 2 alongside the dogfood agent inventory.\n    For now, `aislang rag query` exposes the retrieval surface\n    directly."
+      },
+      "prompt_files": [
+        "doc_helper.md"
+      ],
+      "knowledge_files": [
+        "aislang_overview.md",
+        "composition_primitives.md",
+        "k8s_deployment.md",
+        "rag.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "rag",
+        "deploy-compose"
+      ],
+      "description": "v0.3 Week 19 Wed — worked RAG demo end-to-end against bge-m3."
+    },
+    {
+      "models": [
+        {
+          "name": "fast",
+          "requires": [
+            "chat",
+            "tool_use"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5"
+          ],
+          "fallback": [
+            "openai.gpt_4o_mini"
+          ],
+          "context_min": "32k",
+          "cost_max": "$0.005 per 1k_tokens"
+        }
+      ],
+      "prompts": [
+        {
+          "name": "system",
+          "file": "./prompts/system.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "support",
+          "model": "fast",
+          "system_prompt": "system",
+          "tools": [
+            "docs"
+          ],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "./knowledge/"
+        }
+      ],
+      "evals": [
+        {
+          "name": "factual_accuracy",
+          "dataset": "./evals/qa.jsonl",
+          "metric": "f1",
+          "threshold": "75%"
+        }
+      ],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "support-agent-paid",
+      "name": "support-agent",
+      "kind": "single-file",
+      "path": "examples",
+      "entry_file": "examples/support-agent-paid.ais",
+      "budget": {
+        "hard_cap_per_day": "$50",
+        "hard_cap_per_run": "$0.50",
+        "optimize_for": "quality"
+      },
+      "docs": {
+        "header": "examples/support-agent-paid.ais — the v0.1 paid-tier demo variant.\n\nCompanion to support-agent.ais (free-local Llama). This file\npins the model to Anthropic Claude Haiku for clean tool-use\nbehavior, faster responses, and demo-gif-quality answers.\nLlama 3.1 8B on CPU works for free-local dev but its tool-use\nadherence is shaky (see week 8 retrospective in PLAN-90-days.md);\nthis file is what you want for end-of-week-12 launch demos.\n\nRun:\n  export ANTHROPIC_API_KEY=sk-ant-...\n  aislang apply examples/support-agent-paid.ais\n  aislang eval examples/support-agent-paid.ais\n  aislang chat support examples/support-agent-paid.ais\n\nCost: Haiku is currently ~$0.0008 in / $0.004 out per 1k tokens.\nA 100-case eval should run for well under $1 total. The per-day\n$50 cap below leaves plenty of headroom."
+      },
+      "prompt_files": [
+        "system.md"
+      ],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "mcp-tools",
+        "deploy-compose",
+        "evals"
+      ],
+      "description": "examples/support-agent-paid.ais — the v0.1 paid-tier demo variant."
+    },
+    {
+      "models": [
+        {
+          "name": "fast",
+          "requires": [
+            "chat",
+            "tool_use"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5",
+            "openai.gpt_4o_mini"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": "$0.001 per 1k_tokens"
+        }
+      ],
+      "prompts": [
+        {
+          "name": "system",
+          "file": "./prompts/system.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "support",
+          "model": "fast",
+          "system_prompt": "system",
+          "tools": [
+            "docs"
+          ],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "./knowledge/"
+        }
+      ],
+      "evals": [
+        {
+          "name": "factual_accuracy",
+          "dataset": "./evals/qa.jsonl",
+          "metric": "f1",
+          "threshold": "50%"
+        }
+      ],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "support-agent",
+      "name": "support-agent",
+      "kind": "single-file",
+      "path": "examples",
+      "entry_file": "examples/support-agent.ais",
+      "budget": {
+        "hard_cap_per_day": "$50",
+        "hard_cap_per_run": "$0.50",
+        "optimize_for": "cost"
+      },
+      "docs": {
+        "header": "examples/support-agent.ais — the v0.1 canonical reference example.\n\nThree jobs at once:\n  1. Demo: the .ais file shown on the landing page and in `aislang --help`.\n  2. Acceptance gate: if `aislang apply` doesn't produce a working stack\n     from this file in <60s on a clean machine, v0.1 is not done\n     (see PLAN-90-days.md §Definition of done).\n  3. Parser fixture: paired with `examples/support-agent.expected-ast.json`,\n     which is the AST the parser must produce. Tested in\n     `crates/aislang-core/tests/parser_fixtures.rs`.\n\nTreat any change to this file as a fixture migration: regenerate the\nexpected-AST JSON in the same commit (see test header for the procedure)."
+      },
+      "prompt_files": [
+        "system.md"
+      ],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "mcp-tools",
+        "deploy-compose",
+        "evals"
+      ],
+      "description": "examples/support-agent.ais — the v0.1 canonical reference example."
+    },
+    {
+      "models": [
+        {
+          "name": "fast",
+          "requires": [
+            "chat",
+            "tool_use"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_4_5",
+            "openai.gpt_4o_mini"
+          ],
+          "fallback": [
+            "ollama.llama_3_1_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": "$0.001 per 1k_tokens"
+        }
+      ],
+      "prompts": [
+        {
+          "name": "system",
+          "file": "./prompts/system.md",
+          "version": "1.0.0"
+        }
+      ],
+      "agents": [
+        {
+          "name": "support",
+          "model": "fast",
+          "system_prompt": "system",
+          "tools": [
+            "docs"
+          ],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "./knowledge/"
+        }
+      ],
+      "evals": [
+        {
+          "name": "factual_accuracy",
+          "dataset": "./evals/qa.jsonl",
+          "metric": "f1",
+          "threshold": "50%"
+        }
+      ],
+      "deploy": [
+        {
+          "name": "prod",
+          "target": "kubernetes"
+        }
+      ],
+      "id": "support-agent-k8s",
+      "name": "support-agent-k8s",
+      "kind": "single-file",
+      "path": "examples",
+      "entry_file": "examples/support-agent-k8s.ais",
+      "budget": {
+        "hard_cap_per_day": "$50",
+        "hard_cap_per_run": "$0.50",
+        "optimize_for": "cost"
+      },
+      "docs": {
+        "header": "examples/support-agent-k8s.ais — Phase 2 Week 14 Tue.\n\nSibling to `support-agent.ais` (the Compose-target canonical demo)\nflipped to `target = kubernetes` so the v0.2 K8s emitter has its\nown fixture without having to toggle the Compose-target one back\nand forth.  Same business logic — support agent over knowledge\nbase — different deploy substrate.\n\nRun it:\n\n    aislang validate examples/support-agent-k8s.ais\n    aislang plan      examples/support-agent-k8s.ais\n\n`aislang plan` writes:\n  - examples/manifests/litellm.yaml\n  - examples/manifests/jaeger.yaml\n  - examples/manifests/budget-counter.yaml\n  - examples/litellm_config.yaml  (embedded in the litellm-config\n                                   ConfigMap; standalone copy for\n                                   eyeball-debugging)\n  - examples/aislang.lock         (re-used from support-agent.ais\n                                   when both have matching content)\n\n`aislang plan ... | kubectl apply -f -` will work end-to-end once\n`aislang apply` lands Thu (shells out to `helm upgrade --install`\nagainst the chart wrapper).  For now, do the dry-run:\n\n    aislang plan examples/support-agent-k8s.ais > /tmp/stack.yaml\n    kubectl --dry-run=client apply -f /tmp/stack.yaml\n\nWed adds:\n  - examples/manifests/agent-runtime.yaml         (mcp-serve pod)\n  - examples/manifests/aislang-project-config.yaml (.ais + lockfile + prompts CM)\n\nThu adds:\n  - examples/manifests/openwebui.yaml (when `expose { web_ui = true }`)\n  - examples/chart/                  (Helm chart wrapper)\n\nFri:\n  - CI `k8s-smoke` axis runs this exact file against kind, applies\n    the chart, port-forwards to litellm:4000, hits /health/liveliness."
+      },
+      "prompt_files": [
+        "system.md"
+      ],
+      "knowledge_files": [
+        "README.md",
+        "company-info.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "mcp-tools",
+        "deploy-kubernetes",
+        "evals"
+      ],
+      "description": "examples/support-agent-k8s.ais — Phase 2 Week 14 Tue."
+    },
+    {
+      "models": [],
+      "prompts": [],
+      "agents": [],
+      "skills": [
+        {
+          "name": "echo_greeting",
+          "kind": "exec",
+          "exec": "echo 'hello from the aislang skill runtime'",
+          "mcp": null,
+          "output_type": "string",
+          "scripts": []
+        },
+        {
+          "name": "describe_self",
+          "kind": "exec",
+          "exec": "echo eyJydW50aW1lIjoiYWlzbGFuZyIsIm1vZGUiOiJzaGVsbCJ9 | base64 -d",
+          "mcp": null,
+          "output_type": "json",
+          "scripts": []
+        },
+        {
+          "name": "list_cwd_files",
+          "kind": "exec",
+          "exec": "ls -1",
+          "mcp": null,
+          "output_type": "list_string",
+          "scripts": []
+        },
+        {
+          "name": "evil_sudo",
+          "kind": "exec",
+          "exec": "sudo cat /etc/shadow",
+          "mcp": null,
+          "output_type": "string",
+          "scripts": []
+        },
+        {
+          "name": "read_notes",
+          "kind": "mcp",
+          "exec": null,
+          "mcp": "docs.tool.read_text_file",
+          "output_type": "string",
+          "scripts": []
+        }
+      ],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [
+        {
+          "name": "docs",
+          "image": "docker.io/mcp/filesystem:1.0.2",
+          "mount": "./knowledge/"
+        }
+      ],
+      "evals": [],
+      "deploy": [],
+      "id": "skill-demo",
+      "name": "skill-demo",
+      "kind": "single-file",
+      "path": "examples/skill-demo",
+      "entry_file": "examples/skill-demo/skill-demo.ais",
+      "budget": {
+        "hard_cap_per_day": "$1",
+        "hard_cap_per_run": "$0.01"
+      },
+      "docs": {
+        "header": "v0.3 Week 18 Wed-Thu — worked `skill { … }` block demo.\n\nWed shipped the grammar (parser + checker + LANGUAGE-SPEC §4.12);\nThu shipped the runtime (`aislang-runtime::skills::{run_shell_skill,\nrun_mcp_skill}`).  This file exercises BOTH execution modes end-\nto-end via the new `aislang skill run` CLI subcommand.\n\n## Skill blocks declared here\n\n  - **`echo_greeting`** — shell-exec; output_type = string.\n    Trivial round-trip — prints a fixed greeting.  Useful as a\n    smoke test that the per-skill sandbox is wired (cwd, scrubbed\n    PATH).\n\n  - **`describe_self`** — shell-exec; output_type = json.\n    Emits a JSON object via stdout; runtime parses + surfaces\n    as `SkillOutput::Json`.\n\n  - **`list_cwd_files`** — shell-exec; output_type = list_string.\n    Lists everything in the per-skill sandbox cwd (`<project>/\n    .aislang/skills/list_cwd_files/`).  First run shows the dir\n    empty; rerun-after-touching-a-file shows the new entries.\n    Demonstrates that the sandbox dir is persistent across runs\n    (useful for skills that want to cache state).\n\n  - **`evil_sudo`** — shell-exec; output_type = string.\n    Tries to run `sudo cat /etc/shadow`.  The runtime's pre-flight\n    denylist (`SkillError::DeniedCommand`) blocks it BEFORE\n    spawning — no process ever runs.  Demonstrates the v0.3 Thu\n    sandbox's deny posture.  Expected to FAIL with exit 1.\n\n  - **`read_notes`** — MCP delegate; output_type = string.\n    Calls `read_text_file` on the bundled `mcp/filesystem` MCP\n    server (same image agent.tools = [mcp_server.docs] would\n    use).  Demonstrates that an `mcp_server` block can back BOTH\n    an agent's tool fleet AND a skill — single container, no\n    duplicate spawn.  Requires Docker.\n\n## Run them\n\nBuild the binary first (release):\n\n```\ncargo build --release --bin aislang\n```\n\n### Shell-exec skills (no infra needed)\n\n```\n./target/release/aislang skill run echo_greeting    examples/skill-demo/skill-demo.ais\n# → hello from the aislang skill runtime\n\n./target/release/aislang skill run describe_self    examples/skill-demo/skill-demo.ais\n# → {\"runtime\":\"aislang\",\"mode\":\"shell\",\"sandbox\":\"per-skill\"}\n\n./target/release/aislang skill run list_cwd_files   examples/skill-demo/skill-demo.ais\n# → (empty list on first run; populates after touching files\n#    in `.aislang/skills/list_cwd_files/`)\n\n./target/release/aislang skill run evil_sudo        examples/skill-demo/skill-demo.ais\n# → ERROR (exit 1): skill `evil_sudo` shell command denied: matched\n#   pattern `sudo ` (denylist policy — v0.3 Thu sandbox; ...)\n```\n\n### MCP-delegate skill (requires Docker)\n\nThe `mcp/filesystem:1.0.2` image bind-mounts `./knowledge/` from\nthe project into the container's `/projects/`; pass the path the\ntool sees as JSON args:\n\n```\n./target/release/aislang skill run read_notes \\\n    examples/skill-demo/skill-demo.ais \\\n    --args '{\"path\":\"/data/notes.md\"}'\n# → <the contents of examples/skill-demo/knowledge/notes.md>\n\n(The aislang `mcp_server.mount` field bind-mounts `./knowledge/`\nat `/data/` inside the container — see `aislang-runtime::mcp::\nconfig` for the wire shape.)\n```"
+      },
+      "prompt_files": [],
+      "knowledge_files": [
+        "notes.md"
+      ],
+      "has_scripts": false,
+      "tags": [
+        "skills",
+        "mcp-tools"
+      ],
+      "description": "v0.3 Week 18 Wed-Thu — worked `skill { … }` block demo."
+    }
+  ]
+}

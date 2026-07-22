@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "recommendation",
+  "description": "The advisory keep-or-rebalance call. It is produced by a DETERMINISTIC rule engine (portfolio.recommend() in scripts/portfolio.py), not by the language model: the same metrics in always yield the same verdict, actions, and sizes out. analyze.py --persist writes it to the recommendations table; the dashboard renders it directly. The Strategic and Orchestrator LLM agents only EXPLAIN this fixed recommendation in prose — they never re-derive or change the verdict, the actions, or their sizes. It is never executed automatically — the owner decides.",
+  "type": "object",
+  "required": ["verdict", "summary", "actions"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["keep", "rebalance"],
+      "description": "Fixed by the rule engine: 'rebalance' when a material weight breach or a fragility-score trip fires, else 'keep'."},
+    "summary": {"type": "string",
+      "description": "A few sentences: portfolio health, the main risk, and the headline call. Emitted by the engine."},
+    "fragility_read": {"type": "string",
+      "description": "One-line plain-language read of the anti-fragility posture (fragile/robust/antifragile and why)."},
+    "explanation": {"type": "string",
+      "description": "Optional owner-facing paragraph added by the Orchestrator LLM when it explains the fixed recommendation. It never changes the verdict/actions/sizes — only elaborates the 'why', grounded in the metrics and the Taleb corpus."},
+    "actions": {
+      "type": "array",
+      "description": "Concrete, advisory adjustments computed by the engine (empty when verdict = keep). Neither LLM adds, drops, re-orders, or resizes these.",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "action", "size"],
+        "properties": {
+          "symbol": {"type": "string", "description": "Ticker, or 'CASH' / an asset-class name for sleeve-level moves."},
+          "action": {"type": "string", "enum": ["trim", "add", "exit", "hedge", "hold"]},
+          "size": {"type": ["string", "null"],
+            "description": "Move expressed as a change in PORTFOLIO WEIGHT (percentage points) or a target weight, e.g. '-3.4 pts (26% -> 22%)'. Never a dollar amount or a fraction of the position; the app converts weight to dollars deterministically."},
+          "rationale": {"type": "string", "description": "Optional short reason string from the engine; the Orchestrator expands on it in prose."}
+        }
+      }
+    },
+    "confidence": {"type": "string", "enum": ["low", "medium", "high"],
+      "description": "Engine confidence; 'high' because the decision is rule-based and reproducible."},
+    "grounded_refs": {
+      "type": "array", "items": {"type": "string"},
+      "description": "The rule flags that fired (e.g. concentration cap, fragile middle), carried for grounding and for the dashboard."
+    }
+  }
+}

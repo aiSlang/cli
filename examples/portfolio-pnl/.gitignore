@@ -1,0 +1,20 @@
+# regenerable artifacts (not source) — all under generated/
+generated/
+
+# aiSlang runtime output from `aislang apply` (regenerated)
+.aislang/
+aislang.lock
+litellm_config.yaml
+stack.yml
+
+# python / tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+
+# legacy locations (kept ignored in case an old run wrote them at the root)
+portfolio.db
+portfolio.db-*
+dashboard.html

@@ -1,0 +1,12 @@
+# Eval dataset for the Orchestrator agent (faithful explanation).
+#
+# Each case is one (input, expected) pair. `input` is a Strategic-style brief
+# that ends with the FIXED, rule-decided recommendation; `expected` is the
+# gold-standard short answer — the key tokens a faithful explanation must carry
+# through (the verdict + the action symbols). metric=f1 (bag-of-tokens), so
+# paraphrases score well as long as the verdict/symbols overlap; the point is
+# that the Orchestrator never drops or changes the fixed decision.
+
+{"id": "rebalance_faithful", "input": "Anti-fragility brief. Total value $34,500; robust overall (fragility_score 36/100). Barbell split: 20% safe / 50% middle / 30% aggressive. Flags: SPY at 34% exceeds the 25% single-name cap; fragile middle at 50% exceeds the 40% target. RECOMMENDATION (fixed, decided by rule — do not change it): verdict = rebalance; trim SPY -15.8 pts (34% -> 18%); add CASH +18.9 pts; hold BTC-USD. Write the owner-facing explanation as JSON.", "expected": "rebalance trim SPY add CASH hold BTC-USD fragile middle single-name cap"}
+{"id": "keep_faithful", "input": "Anti-fragility brief. Total value $10,000; robust (fragility_score 22/100). Barbell split: 60% safe / 20% middle / 20% aggressive — heavy safe sleeve, thin middle, capped aggressive. No guardrail breached. RECOMMENDATION (fixed, decided by rule — do not change it): verdict = keep; no actions. Write the owner-facing explanation as JSON.", "expected": "keep no action within barbell guardrails robust safe sleeve"}
+{"id": "trim_symbol_faithful", "input": "Anti-fragility brief. Aggressive sleeve at 45% exceeds the 35% ceiling; robust (fragility_score 40/100). RECOMMENDATION (fixed, decided by rule — do not change it): verdict = rebalance; trim BTC-USD -10 pts; add CASH +10 pts. Explain this recommendation to the owner as JSON, keeping the verdict and every action verbatim.", "expected": "rebalance trim BTC-USD add CASH aggressive sleeve ceiling"}
