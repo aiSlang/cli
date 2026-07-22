@@ -3,7 +3,7 @@
 > **Generated** — do not edit by hand. Rebuild with:
 > `python3 tools/catalog/scan_catalog.py && python3 tools/catalog/render_catalog.py`.
 
-Scanned `examples/` on 2026-07-22T11:46:10+00:00 — **16 agents / multi-agent projects**, **26 agents** in total.
+Scanned `examples/` on 2026-07-22T11:59:02+00:00 — **16 agents / multi-agent projects**, **26 agents** in total.
 
 Each entry is a self-contained aiSlang project: declarative capability-based model selection, prompts, agents, deterministic compute skills, RAG knowledge, MCP tools, evals, and a deploy target — all reconstructed straight from the `.ais` / `aislang.toml` source.
 
@@ -15,7 +15,7 @@ Each entry is a self-contained aiSlang project: declarative capability-based mod
 | [**multi-module-demo**](#multi-module-demo) | multi-module | 2 | 0 | 🤝 multi-agent 🔌 MCP tools |
 | [**patterns-router-demo**](#patterns-router-demo) | single-file | 4 | 0 | 🤝 multi-agent 🔌 MCP tools ➡️ pipeline |
 | [**patterns-orchestrator-demo**](#patterns-orchestrator-demo) | single-file | 2 | 0 | 🤝 multi-agent 🔌 MCP tools ➡️ pipeline 🐳 compose |
-| [**portfolio-pnl**](#portfolio-pnl) | single-file | 2 | 3 | 🤝 multi-agent 📚 RAG 🛠 skills ➡️ pipeline 🐳 compose |
+| [**portfolio-pnl**](#portfolio-pnl) | single-file | 2 | 3 | 🤝 multi-agent 📚 RAG 🛠 skills ➡️ pipeline 🐳 compose ✅ evals |
 | [**qwen-smoke**](#qwen-smoke) | single-file | 2 | 0 | 🤝 multi-agent 🐳 compose |
 | [**template-demo**](#template-demo) | single-file | 2 | 0 | 🤝 multi-agent 🐳 compose |
 | [**comment-clamper-agent**](#comment-clamper-agent) | single-file | 1 | 0 | ➡️ pipeline 🐳 compose |
@@ -216,7 +216,7 @@ v0.3 Week 17 Thu — worked orchestrator-pattern demo.
 <a id="portfolio-pnl"></a>
 ## portfolio-pnl
 
-*single-file* · 🤝 multi-agent 📚 RAG 🛠 skills ➡️ pipeline 🐳 compose
+*single-file* · 🤝 multi-agent 📚 RAG 🛠 skills ➡️ pipeline 🐳 compose ✅ evals
 
 A local-first, multi-agent portfolio analysis app built on [aiSlang](../../README.md). It helps one person understand a personal investment portfolio and make deliberate re-balancing decisions — and it runs **entirely on your own machine**.
 
@@ -253,6 +253,7 @@ A local-first, multi-agent portfolio analysis app built on [aiSlang](../../READM
 
 **Tooling & delivery**
 
+- Evals: `explanation_faithful` (f1 ≥ 30%), `brief_grounded` (f1 ≥ 30%)
 - Deploy: `compose`
 - Prompts: `orchestrator.md`, `strategic.md`
 

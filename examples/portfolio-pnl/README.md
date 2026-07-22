@@ -82,7 +82,8 @@ python3 scripts/seed_demo.py            # synthetic prices (offline), OR:
 python3 scripts/fetch.py                # live prices (Yahoo / CoinGecko, key-free)
 python3 scripts/analyze.py --persist    # P&L / risk / anti-fragility -> JSON + DB
 python3 scripts/render_dashboard.py     # -> generated/dashboard.html (open in a browser)
-python3 -m pytest tests -q              # unit tests over the compute core
+python3 scripts/eval_recommend.py       # golden eval: grade the deterministic recommendation engine
+python3 -m pytest tests -q              # unit tests + the golden eval
 ```
 
 The same skills run through aiSlang:
@@ -92,7 +93,20 @@ aislang validate portfolio.ais
 aislang skill run fetch_prices portfolio.ais
 aislang skill run analyze      portfolio.ais
 aislang skill run visualize    portfolio.ais   # -> generated/dashboard.html
+aislang eval  portfolio.ais                    # score the agent explanations (needs the model stack up)
 ```
+
+### Evals
+
+Two layers of graded checks:
+
+- **Deterministic** — `scripts/eval_recommend.py` runs golden scenarios
+  (`evals/recommend_cases.jsonl`) through the rule engine and checks the verdict
+  + sized actions exactly. No LLM, no network; also runs inside `pytest`.
+- **Agent** — `aislang eval portfolio.ais` scores the LLM explanations: the
+  Orchestrator must carry the fixed verdict / action symbols through faithfully
+  (`evals/advise.jsonl`), and the Strategic brief must ground its read in the
+  anti-fragility vocabulary (`evals/strategic_reads.jsonl`).
 
 The full advisory pipeline — fetch → analyze → render → **Strategic →
 Orchestrator** — is one command. `run.sh` calls `aislang apply` to start the

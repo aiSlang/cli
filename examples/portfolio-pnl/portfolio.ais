@@ -123,6 +123,39 @@ project "portfolio-pnl" {
     output = "a keep/rebalance recommendation with rationale"
   }
 
+  ## ── Evals ────────────────────────────────────────────────────────
+  ## Two layers of graded checks:
+  ##
+  ##  1. The DETERMINISTIC decision — graded exactly by a golden harness
+  ##     (`scripts/eval_recommend.py` over `evals/recommend_cases.jsonl`),
+  ##     runnable offline with no LLM.  Run it with:
+  ##         python3 scripts/eval_recommend.py
+  ##     (also wired into pytest: tests/test_eval_recommend.py).
+  ##
+  ##  2. The AGENT explanations below — `aislang eval portfolio.ais` scores
+  ##     each agent's output against the datasets.  The Orchestrator must
+  ##     echo the FIXED verdict / action symbols faithfully (never invent);
+  ##     the Strategic agent must ground its read in the anti-fragility
+  ##     vocabulary (barbell / fragility / skew).
+
+  ## Orchestrator faithfulness — the explanation must carry the fixed
+  ## verdict + action symbols through verbatim.
+  eval "explanation_faithful" {
+    dataset   = "./evals/advise.jsonl"
+    metric    = f1
+    threshold = 30%
+    agent     = agent.orchestrator
+  }
+
+  ## Strategic grounding — the brief must interpret the metrics in the
+  ## Taleb anti-fragility vocabulary it was given.
+  eval "brief_grounded" {
+    dataset   = "./evals/strategic_reads.jsonl"
+    metric    = f1
+    threshold = 30%
+    agent     = agent.strategic
+  }
+
   deploy "local" {
     target = compose
   }
