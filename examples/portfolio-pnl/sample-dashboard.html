@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Portfolio — portfolio dashboard</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: #0d1117; color: #c9d1d9;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px; line-height: 1.5;
+}
+.wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px; }
+a { color: #f0883e; }
+.muted { color: #8b949e; }
+.amber { color: #f0883e; }
+code { background: #1c2230; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+.topbar { display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 16px; padding-bottom: 18px; border-bottom: 1px solid #30363d; margin-bottom: 22px; }
+.brand { font-size: 12px; letter-spacing: 1px; text-transform: uppercase; color: #8b949e; }
+.topbar h1 { margin: 4px 0 0; font-size: 26px; font-weight: 650; }
+.gen { text-align: right; font-size: 12px; color: #c9d1d9; }
+
+.panel { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+  padding: 20px 22px; margin-bottom: 20px; }
+.panel h2 { margin: 0 0 16px; font-size: 17px; font-weight: 600; }
+.panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: #8b949e;
+  text-transform: uppercase; letter-spacing: .5px; }
+.hint { font-size: 12px; font-weight: 400; color: #8b949e; text-transform: none; letter-spacing: 0; }
+
+/* ── recommendation ── */
+.reco-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.reco-badge { display: inline-block; padding: 3px 12px; border-radius: 6px;
+  font-size: 13px; font-weight: 700; letter-spacing: .5px; }
+.reco-conf { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+  font-weight: 600; color: #8b949e; background: #1c2230; border: 1px solid #30363d;
+  text-transform: capitalize; }
+.reco-ts { font-size: 12px; font-variant-numeric: tabular-nums; }
+.reco-summary { margin: 0 0 6px; font-size: 14px; }
+.reco-fragility { margin: 0 0 12px; font-size: 13px; }
+table.reco-actions { width: 100%; border-collapse: collapse; margin-top: 6px; }
+table.reco-actions th, table.reco-actions td { padding: 9px 12px; text-align: left;
+  border-bottom: 1px solid #30363d; vertical-align: top; }
+table.reco-actions th { font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: #8b949e; font-weight: 600; }
+td.reco-act { font-weight: 700; text-transform: capitalize; white-space: nowrap; }
+td.reco-sym { font-weight: 600; white-space: nowrap; }
+td.reco-size { font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Rationale carries the long prose, so give it ~40% of the table and let the
+   Action / Symbol / Size columns take the rest — Size then fits on one line. */
+td.reco-rat, table.reco-actions th:last-child { color: #8b949e; font-size: 13px;
+  width: 40%; white-space: normal; }
+.reco-placeholder { color: #8b949e; font-size: 13px; background: #1c2230;
+  border: 1px dashed #30363d; border-radius: 8px; padding: 14px 16px; }
+
+/* ── overview hero ── */
+.hero { display: flex; gap: 28px; flex-wrap: wrap; align-items: center; }
+.hero-main { flex: 1 1 380px; min-width: 300px; }
+.hero-label { color: #8b949e; font-size: 13px; }
+.hero-value { font-size: 40px; font-weight: 700; letter-spacing: -1px; margin: 2px 0; }
+.hero-pnl { font-size: 16px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.hero-pnl .muted { font-weight: 400; font-size: 13px; }
+.hero-pnl-pct { font-size: 14px; }
+.spark { margin-top: 14px; }
+.hero-donut { flex: 0 0 auto; display: flex; gap: 16px; align-items: center; }
+.legend { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.leg { display: flex; align-items: center; gap: 6px; }
+.leg-pct { color: #8b949e; }
+.dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+/* ── scorecards ── */
+.scorecards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 20px; }
+.card { background: #1c2230; border: 1px solid #30363d; border-radius: 10px; padding: 14px 16px; }
+.card-label { font-size: 12px; color: #8b949e; }
+.card-value { font-size: 24px; font-weight: 700; margin: 4px 0; }
+.card-value .u { font-size: 13px; color: #8b949e; font-weight: 500; }
+.card-sub { font-size: 12px; color: #8b949e; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+  text-transform: capitalize; font-weight: 600; }
+.gauge { margin-top: 8px; }
+
+/* ── movers ── */
+.movers-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
+.movers-col { background: #1c2230; border: 1px solid #30363d; border-radius: 10px; padding: 12px 14px; }
+.movers-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+.mover { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #30363d22; }
+.mover.muted { color: #8b949e; }
+.msym { font-weight: 600; }
+.mpct { font-variant-numeric: tabular-nums; }
+
+/* ── positions table ── */
+.tablewrap { overflow-x: auto; }
+table.positions { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+table.positions th, table.positions td { padding: 9px 12px; text-align: left;
+  border-bottom: 1px solid #30363d; }
+table.positions th { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: #8b949e; font-weight: 600; }
+table.positions td.num, table.positions th.num { text-align: right; }
+table.positions td.sym { font-weight: 600; }
+table.positions td.ac { color: #8b949e; font-size: 12px; }
+.rowbar { margin-top: 3px; }
+.cashrow td { color: #8b949e; }
+
+/* ── instruments ── */
+details.instrument { background: #1c2230; border: 1px solid #30363d; border-radius: 9px;
+  margin-bottom: 8px; padding: 0 14px; }
+details.instrument summary { cursor: pointer; padding: 11px 0; display: flex; align-items: center;
+  gap: 12px; list-style: none; }
+details.instrument summary::-webkit-details-marker { display: none; }
+details.instrument summary::before { content: "▸"; color: #f0883e; font-size: 12px; }
+details.instrument[open] summary::before { content: "▾"; }
+.isym { font-weight: 700; min-width: 72px; }
+.iac { color: #8b949e; font-size: 12px; flex: 1; }
+.iprice { font-variant-numeric: tabular-nums; }
+.ipct { font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; }
+.ichart { padding: 6px 0 4px; }
+.imeta { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: #8b949e;
+  padding: 6px 0 12px; border-top: 1px solid #30363d; }
+
+/* ── risk ── */
+.risk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.chart-box { background: #1c2230; border: 1px solid #30363d; border-radius: 10px; padding: 14px 16px; }
+.cap { font-size: 11px; color: #8b949e; margin: 8px 0 0; line-height: 1.4; }
+.frag-h { margin-top: 20px; }
+.drivers { display: grid; gap: 6px; max-width: 560px; }
+.drow { display: grid; grid-template-columns: 120px 1fr 44px; align-items: center; gap: 10px; font-size: 12px; }
+.dk { color: #8b949e; text-transform: capitalize; }
+.dbar { background: #30363d; border-radius: 4px; height: 8px; overflow: hidden; }
+.dfill { display: block; height: 100%; background: linear-gradient(90deg, #3fb950, #f0883e, #f85149); }
+.dv { text-align: right; font-variant-numeric: tabular-nums; }
+.stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.stat { background: #1c2230; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; }
+.stat-k { font-size: 11px; color: #8b949e; }
+.stat-v { font-size: 17px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+.foot { font-size: 12px; color: #8b949e; margin-top: 8px; padding: 16px 4px; line-height: 1.6; }
+.foot strong { color: #f0883e; }
+
+/* ── responsive ── */
+@media (max-width: 820px) {
+  .scorecards { grid-template-columns: repeat(2, 1fr); }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .risk-grid { grid-template-columns: 1fr; }
+  .movers-wrap { grid-template-columns: 1fr; }
+  .hero-value { font-size: 32px; }
+  .drow { grid-template-columns: 90px 1fr 40px; }
+  .topbar { flex-direction: column; }
+  .gen { text-align: left; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <div>
+      <div class="brand">portfolio<span class="amber">-pnl</span></div>
+      <h1>Portfolio</h1>
+    </div>
+    <div class="gen">
+      <div>generated 2026-07-22 13:48:28</div>
+      <div class="muted">base currency USD</div>
+    </div>
+  </header>
+  <section class="panel reco">
+  <h2>Recommendation</h2>
+  <div class="reco-head"><span class="reco-badge" style="background:#f0883e;color:#0d1117">REBALANCE</span><span class="reco-conf">high</span><span class="reco-ts muted">2026-07-22</span></div>
+  <p class="reco-summary">Rebalance. Robust overall (fragility 36/100), but SPY at 34% exceeds the 25% single-name cap; fragile middle at 50% exceeds the 40% target. Trim the flagged names and rotate the weight into the safe sleeve to restore the barbell.</p>
+  <p class="reco-fragility muted">Robust (fragility 36/100). Barbell 40% safe / 50% middle / 10% aggressive; stress asymmetry -0.0027, skew -0.06. Concave/left-tail-heavy shape.</p>
+  <div class="tablewrap"><table class="reco-actions">
+    <thead><tr>
+      <th>Action</th><th>Symbol</th><th>Size</th><th>Rationale</th>
+    </tr></thead>
+    <tbody><tr>
+      <td class="reco-act" style="color:#f85149">trim</td>
+      <td class="reco-sym"><a href="#instrument-SPY">SPY</a></td>
+      <td class="reco-size">-15.8 pts (34.0% → 18.2%)</td>
+      <td class="reco-rat">Trim SPY — single-name concentration; rotate the weight to the safe sleeve.</td>
+    </tr><tr>
+      <td class="reco-act" style="color:#f85149">trim</td>
+      <td class="reco-sym"><a href="#instrument-MSFT">MSFT</a></td>
+      <td class="reco-size">-1.6 pts (8.0% → 6.4%)</td>
+      <td class="reco-rat">Trim MSFT — reduce the fragile middle; rotate the weight to the safe sleeve.</td>
+    </tr><tr>
+      <td class="reco-act" style="color:#f85149">trim</td>
+      <td class="reco-sym"><a href="#instrument-AAPL">AAPL</a></td>
+      <td class="reco-size">-1.6 pts (8.0% → 6.4%)</td>
+      <td class="reco-rat">Trim AAPL — reduce the fragile middle; rotate the weight to the safe sleeve.</td>
+    </tr><tr>
+      <td class="reco-act" style="color:#3fb950">add</td>
+      <td class="reco-sym"><a href="#instrument-CASH">CASH</a></td>
+      <td class="reco-size">+18.9 pts (23.9% → 42.9% cash)</td>
+      <td class="reco-rat">Move the trimmed weight into cash / short bonds to thicken the safe sleeve (now ~59%) and restore the barbell (heavy safe, thin middle).</td>
+    </tr><tr>
+      <td class="reco-act" style="color:#8b949e">hold</td>
+      <td class="reco-sym"><a href="#instrument-BTC-USD">BTC-USD</a></td>
+      <td class="reco-size"></td>
+      <td class="reco-rat">The convex / aggressive sleeve is the antifragile engine (capped weight, asymmetric upside) — hold it; do not trim.</td>
+    </tr></tbody>
+  </table></div>
+</section>
+  <section class="panel overview">
+  <div class="hero">
+    <div class="hero-main">
+      <div class="hero-label">Total portfolio value</div>
+      <div class="hero-value">$20,902.19</div>
+      <div class="hero-pnl">
+        <span style="color:#f85149">-$3,815.41</span>
+        <span class="hero-pnl-pct" style="color:#f85149">(-19.35%)</span>
+        <span class="muted">unrealized</span>
+      </div>
+      <div class="spark"><svg viewBox="0 0 560 90" width="100%" height="90" preserveAspectRatio="none" role="img" aria-label="value sparkline">
+  <defs><linearGradient id="spark_dn" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#f85149" stop-opacity="0.28"/>
+    <stop offset="1" stop-color="#f85149" stop-opacity="0"/>
+  </linearGradient></defs>
+  <polygon points="6,84 6.00,16.35 9.06,6.00 12.12,6.79 15.18,18.23 18.25,24.36 21.31,16.44 24.37,15.61 27.43,16.42 30.49,14.64 33.55,12.74 36.61,19.51 39.68,26.00 42.74,33.67 45.80,28.59 48.86,25.26 51.92,27.67 54.98,29.51 58.04,25.28 61.11,20.52 64.17,23.47 67.23,17.17 70.29,14.98 73.35,17.79 76.41,20.00 79.47,22.54 82.54,16.24 85.60,17.29 88.66,21.60 91.72,25.21 94.78,26.33 97.84,24.76 100.91,19.78 103.97,22.28 107.03,35.70 110.09,33.41 113.15,35.81 116.21,41.19 119.27,44.74 122.34,44.65 125.40,47.77 128.46,42.10 131.52,44.70 134.58,49.25 137.64,47.83 140.70,42.83 143.77,39.23 146.83,43.55 149.89,44.81 152.95,44.94 156.01,38.53 159.07,37.27 162.13,37.07 165.20,36.94 168.26,40.54 171.32,42.16 174.38,30.70 177.44,23.43 180.50,21.79 183.56,23.44 186.63,17.71 189.69,11.60 192.75,17.71 195.81,21.74 198.87,25.64 201.93,26.53 204.99,19.68 208.06,30.13 211.12,27.53 214.18,22.21 217.24,29.46 220.30,24.49 223.36,31.82 226.42,31.65 229.49,28.67 232.55,28.05 235.61,26.82 238.67,29.55 241.73,25.27 244.79,28.04 247.85,24.15 250.92,25.95 253.98,27.73 257.04,23.25 260.10,16.29 263.16,16.96 266.22,16.47 269.28,14.96 272.35,21.01 275.41,17.55 278.47,23.42 281.53,23.81 284.59,26.02 287.65,25.74 290.72,29.41 293.78,33.34 296.84,32.58 299.90,24.87 302.96,17.73 306.02,16.45 309.08,17.40 312.15,24.22 315.21,29.79 318.27,26.06 321.33,22.07 324.39,33.91 327.45,35.09 330.51,33.79 333.58,40.26 336.64,42.60 339.70,35.98 342.76,39.41 345.82,43.78 348.88,42.04 351.94,47.96 355.01,45.48 358.07,50.73 361.13,47.90 364.19,45.66 367.25,41.17 370.31,36.56 373.37,37.01 376.44,39.41 379.50,42.98 382.56,40.12 385.62,46.15 388.68,43.92 391.74,47.27 394.80,47.42 397.87,43.44 400.93,45.48 403.99,52.96 407.05,51.48 410.11,49.93 413.17,53.55 416.23,58.35 419.30,56.72 422.36,58.63 425.42,60.14 428.48,57.56 431.54,58.17 434.60,59.59 437.66,65.22 440.73,62.79 443.79,64.13 446.85,62.10 449.91,61.32 452.97,65.11 456.03,64.18 459.09,62.32 462.16,66.78 465.22,66.64 468.28,68.24 471.34,69.06 474.40,67.51 477.46,62.65 480.53,66.11 483.59,67.96 486.65,65.75 489.71,67.92 492.77,71.51 495.83,72.06 498.89,74.24 501.96,72.41 505.02,70.40 508.08,76.77 511.14,74.77 514.20,76.21 517.26,78.82 520.32,78.83 523.39,81.59 526.45,81.48 529.51,84.00 532.57,82.83 535.63,82.30 538.69,82.08 541.75,83.66 544.82,81.08 547.88,81.67 550.94,78.82 554.00,82.15 554,84" fill="url(#spark_dn)"/>
+  <polyline points="6.00,16.35 9.06,6.00 12.12,6.79 15.18,18.23 18.25,24.36 21.31,16.44 24.37,15.61 27.43,16.42 30.49,14.64 33.55,12.74 36.61,19.51 39.68,26.00 42.74,33.67 45.80,28.59 48.86,25.26 51.92,27.67 54.98,29.51 58.04,25.28 61.11,20.52 64.17,23.47 67.23,17.17 70.29,14.98 73.35,17.79 76.41,20.00 79.47,22.54 82.54,16.24 85.60,17.29 88.66,21.60 91.72,25.21 94.78,26.33 97.84,24.76 100.91,19.78 103.97,22.28 107.03,35.70 110.09,33.41 113.15,35.81 116.21,41.19 119.27,44.74 122.34,44.65 125.40,47.77 128.46,42.10 131.52,44.70 134.58,49.25 137.64,47.83 140.70,42.83 143.77,39.23 146.83,43.55 149.89,44.81 152.95,44.94 156.01,38.53 159.07,37.27 162.13,37.07 165.20,36.94 168.26,40.54 171.32,42.16 174.38,30.70 177.44,23.43 180.50,21.79 183.56,23.44 186.63,17.71 189.69,11.60 192.75,17.71 195.81,21.74 198.87,25.64 201.93,26.53 204.99,19.68 208.06,30.13 211.12,27.53 214.18,22.21 217.24,29.46 220.30,24.49 223.36,31.82 226.42,31.65 229.49,28.67 232.55,28.05 235.61,26.82 238.67,29.55 241.73,25.27 244.79,28.04 247.85,24.15 250.92,25.95 253.98,27.73 257.04,23.25 260.10,16.29 263.16,16.96 266.22,16.47 269.28,14.96 272.35,21.01 275.41,17.55 278.47,23.42 281.53,23.81 284.59,26.02 287.65,25.74 290.72,29.41 293.78,33.34 296.84,32.58 299.90,24.87 302.96,17.73 306.02,16.45 309.08,17.40 312.15,24.22 315.21,29.79 318.27,26.06 321.33,22.07 324.39,33.91 327.45,35.09 330.51,33.79 333.58,40.26 336.64,42.60 339.70,35.98 342.76,39.41 345.82,43.78 348.88,42.04 351.94,47.96 355.01,45.48 358.07,50.73 361.13,47.90 364.19,45.66 367.25,41.17 370.31,36.56 373.37,37.01 376.44,39.41 379.50,42.98 382.56,40.12 385.62,46.15 388.68,43.92 391.74,47.27 394.80,47.42 397.87,43.44 400.93,45.48 403.99,52.96 407.05,51.48 410.11,49.93 413.17,53.55 416.23,58.35 419.30,56.72 422.36,58.63 425.42,60.14 428.48,57.56 431.54,58.17 434.60,59.59 437.66,65.22 440.73,62.79 443.79,64.13 446.85,62.10 449.91,61.32 452.97,65.11 456.03,64.18 459.09,62.32 462.16,66.78 465.22,66.64 468.28,68.24 471.34,69.06 474.40,67.51 477.46,62.65 480.53,66.11 483.59,67.96 486.65,65.75 489.71,67.92 492.77,71.51 495.83,72.06 498.89,74.24 501.96,72.41 505.02,70.40 508.08,76.77 511.14,74.77 514.20,76.21 517.26,78.82 520.32,78.83 523.39,81.59 526.45,81.48 529.51,84.00 532.57,82.83 535.63,82.30 538.69,82.08 541.75,83.66 544.82,81.08 547.88,81.67 550.94,78.82 554.00,82.15" fill="none" stroke="#f85149" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="554.00" cy="82.15" r="3" fill="#f85149"/>
+</svg></div>
+    </div>
+    <div class="hero-donut">
+      <svg viewBox="0 0 180 180" width="180" height="180" role="img" aria-label="allocation donut">
+  <circle cx="90.0" cy="90.0" r="73.0" fill="none" stroke="#30363d" stroke-width="34" opacity="0.35"/>
+  <path d="M 90.00 17.00 A 73.00 73.00 0 0 1 152.56 52.37" fill="none" stroke="#f0883e" stroke-width="34"><title>SHY: 16.4%</title></path><path d="M 152.56 52.37 A 73.00 73.00 0 0 1 88.25 162.98" fill="none" stroke="#3fb950" stroke-width="34"><title>SPY: 34.0%</title></path><path d="M 88.25 162.98 A 73.00 73.00 0 0 1 53.46 153.19" fill="none" stroke="#58a6ff" stroke-width="34"><title>AAPL: 8.0%</title></path><path d="M 53.46 153.19 A 73.00 73.00 0 0 1 27.57 127.84" fill="none" stroke="#bc8cff" stroke-width="34"><title>MSFT: 8.0%</title></path><path d="M 27.57 127.84 A 73.00 73.00 0 0 1 17.17 85.05" fill="none" stroke="#d29922" stroke-width="34"><title>BTC-USD: 9.8%</title></path><path d="M 17.17 85.05 A 73.00 73.00 0 0 1 90.00 17.00" fill="none" stroke="#6e7681" stroke-width="34"><title>cash: 23.9%</title></path>
+  <text x="90.0" y="86.0" text-anchor="middle" fill="#c9d1d9" font-size="15" font-weight="600">Alloc</text>
+  <text x="90.0" y="104.0" text-anchor="middle" fill="#8b949e" font-size="11">by weight</text>
+</svg>
+      <div class="legend"><div class="leg"><span class="dot" style="background:#f0883e"></span>SHY <span class="leg-pct">16.4%</span></div><div class="leg"><span class="dot" style="background:#3fb950"></span>SPY <span class="leg-pct">34.0%</span></div><div class="leg"><span class="dot" style="background:#58a6ff"></span>AAPL <span class="leg-pct">8.0%</span></div><div class="leg"><span class="dot" style="background:#bc8cff"></span>MSFT <span class="leg-pct">8.0%</span></div><div class="leg"><span class="dot" style="background:#d29922"></span>BTC-USD <span class="leg-pct">9.8%</span></div><div class="leg"><span class="dot" style="background:#6e7681"></span>cash <span class="leg-pct">23.9%</span></div></div>
+    </div>
+  </div>
+  <div class="scorecards"><div class="card">
+    <div class="card-label">Sharpe (ann.)</div>
+    <div class="card-value" style="color:#f0883e">-1.37</div>
+    <div class="card-sub">risk-adjusted return</div>
+    
+  </div><div class="card">
+    <div class="card-label">Max drawdown</div>
+    <div class="card-value" style="color:#f85149">-17.3%</div>
+    <div class="card-sub">peak-to-trough</div>
+    
+  </div><div class="card">
+    <div class="card-label">Fragility</div>
+    <div class="card-value" style="color:#f0883e">36.0<span class='u'>/100</span></div>
+    <div class="card-sub"><span class="pill" style="background:#f0883e22;color:#f0883e;border:1px solid #f0883e55">robust</span></div>
+    
+  </div><div class="card">
+    <div class="card-label">Barbell adherence</div>
+    <div class="card-value" style="color:#c9d1d9"></div>
+    <div class="card-sub">safe / mid / aggr</div>
+    <div class="gauge"><svg viewBox="0 0 340 46" width="100%" height="46" role="img" aria-label="barbell allocation">
+  <rect x="2.00" y="2" width="135.42" height="26" fill="#3fb950" rx="2"><title>safe: 40.3%</title></rect><rect x="137.42" y="2" width="167.82" height="26" fill="#f0883e" rx="2"><title>mid: 49.9%</title></rect><rect x="305.23" y="2" width="32.77" height="26" fill="#f85149" rx="2"><title>aggr: 9.8%</title></rect>
+  <text x="69.71" y="42" text-anchor="middle" fill="#8b949e" font-size="10">safe 40%</text><text x="221.32" y="42" text-anchor="middle" fill="#8b949e" font-size="10">mid 50%</text><text x="321.62" y="42" text-anchor="middle" fill="#8b949e" font-size="10">aggr 10%</text>
+</svg></div>
+  </div></div>
+  <div class="movers-wrap">
+    <div class="movers-col"><div class="movers-title" style="color:#3fb950">▲ Top gainers</div><div class="mover"><span class="msym">SPY</span><span class="mpct" style="color:#3fb950">+24.60%</span></div><div class="mover"><span class="msym">SHY</span><span class="mpct" style="color:#3fb950">+4.27%</span></div></div>
+    <div class="movers-col"><div class="movers-title" style="color:#f85149">▼ Top losers</div><div class="mover"><span class="msym">BTC-USD</span><span class="mpct" style="color:#f85149">-67.64%</span></div><div class="mover"><span class="msym">AAPL</span><span class="mpct" style="color:#f85149">-32.06%</span></div><div class="mover"><span class="msym">MSFT</span><span class="mpct" style="color:#f85149">-15.73%</span></div></div>
+  </div>
+</section>
+  <section class="panel">
+  <h2>Positions</h2>
+  <div class="tablewrap"><table class="positions">
+    <thead><tr>
+      <th>Symbol</th><th>Class</th><th class="num">Weight</th><th class="num">Value</th>
+      <th class="num">Cost</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th>
+    </tr></thead>
+    <tbody><tr>
+      <td class="sym">SHY</td>
+      <td class="ac">bond_short</td>
+      <td class="num">16.4%<div class="rowbar"><svg viewBox="0 0 90 10" width="90" height="10" class="wbar"><rect x="0" y="0" width="90" height="10" fill="#30363d" rx="2" opacity="0.5"/><rect x="0" y="0" width="14.74" height="10" fill="#f0883e" rx="2"/></svg></div></td>
+      <td class="num">$3,424.11</td>
+      <td class="num">$3,284.00</td>
+      <td class="num" style="color:#3fb950">+$140.11</td>
+      <td class="num" style="color:#3fb950">+4.27%</td>
+    </tr><tr>
+      <td class="sym">SPY</td>
+      <td class="ac">etf</td>
+      <td class="num">34.0%<div class="rowbar"><svg viewBox="0 0 90 10" width="90" height="10" class="wbar"><rect x="0" y="0" width="90" height="10" fill="#30363d" rx="2" opacity="0.5"/><rect x="0" y="0" width="30.60" height="10" fill="#f0883e" rx="2"/></svg></div></td>
+      <td class="num">$7,106.65</td>
+      <td class="num">$5,703.60</td>
+      <td class="num" style="color:#3fb950">+$1,403.05</td>
+      <td class="num" style="color:#3fb950">+24.60%</td>
+    </tr><tr>
+      <td class="sym">AAPL</td>
+      <td class="ac">equity</td>
+      <td class="num">8.0%<div class="rowbar"><svg viewBox="0 0 90 10" width="90" height="10" class="wbar"><rect x="0" y="0" width="90" height="10" fill="#30363d" rx="2" opacity="0.5"/><rect x="0" y="0" width="7.17" height="10" fill="#f0883e" rx="2"/></svg></div></td>
+      <td class="num">$1,664.45</td>
+      <td class="num">$2,450.00</td>
+      <td class="num" style="color:#f85149">-$785.55</td>
+      <td class="num" style="color:#f85149">-32.06%</td>
+    </tr><tr>
+      <td class="sym">MSFT</td>
+      <td class="ac">equity</td>
+      <td class="num">8.0%<div class="rowbar"><svg viewBox="0 0 90 10" width="90" height="10" class="wbar"><rect x="0" y="0" width="90" height="10" fill="#30363d" rx="2" opacity="0.5"/><rect x="0" y="0" width="7.18" height="10" fill="#f0883e" rx="2"/></svg></div></td>
+      <td class="num">$1,668.54</td>
+      <td class="num">$1,980.00</td>
+      <td class="num" style="color:#f85149">-$311.46</td>
+      <td class="num" style="color:#f85149">-15.73%</td>
+    </tr><tr>
+      <td class="sym">BTC-USD</td>
+      <td class="ac">crypto</td>
+      <td class="num">9.8%<div class="rowbar"><svg viewBox="0 0 90 10" width="90" height="10" class="wbar"><rect x="0" y="0" width="90" height="10" fill="#30363d" rx="2" opacity="0.5"/><rect x="0" y="0" width="8.78" height="10" fill="#f0883e" rx="2"/></svg></div></td>
+      <td class="num">$2,038.43</td>
+      <td class="num">$6,300.00</td>
+      <td class="num" style="color:#f85149">-$4,261.57</td>
+      <td class="num" style="color:#f85149">-67.64%</td>
+    </tr><tr class="cashrow">
+      <td class="sym">cash</td><td class="ac">cash</td>
+      <td class="num">23.9%<div class="rowbar"><svg viewBox="0 0 90 10" width="90" height="10" class="wbar"><rect x="0" y="0" width="90" height="10" fill="#30363d" rx="2" opacity="0.5"/><rect x="0" y="0" width="21.53" height="10" fill="#6e7681" rx="2"/></svg></div></td>
+      <td class="num">$5,000.00</td>
+      <td class="num">—</td><td class="num">—</td><td class="num">—</td>
+    </tr></tbody>
+  </table></div>
+</section>
+  <section class="panel">
+  <h2>Instruments <span class="hint">(click to expand)</span></h2>
+  <details class="instrument" id="instrument-SHY">
+      <summary><span class="isym">SHY</span><span class="iac">bond_short</span><span class="iprice">$85.60</span><span class="ipct" style="color:#3fb950">+4.27%</span></summary>
+      <div class="ichart"><svg viewBox="0 0 520 200" width="100%" height="200" role="img" aria-label="price line chart">
+  <polyline points="8.00,79.82 10.82,75.92 13.63,75.06 16.45,73.53 19.26,65.88 22.08,69.89 24.89,78.24 27.71,73.87 30.53,71.10 33.34,67.66 36.16,66.78 38.97,67.55 41.79,67.30 44.60,64.92 47.42,58.34 50.23,61.16 53.05,61.77 55.87,68.55 58.68,72.69 61.50,64.13 64.31,63.51 67.13,64.56 69.94,68.23 72.76,61.51 75.58,51.67 78.39,52.44 81.21,50.42 84.02,42.80 86.84,37.41 89.65,43.77 92.47,48.55 95.28,48.99 98.10,54.35 100.92,49.65 103.73,50.11 106.55,58.00 109.36,60.49 112.18,66.90 114.99,72.78 117.81,78.80 120.63,81.84 123.44,78.41 126.26,77.19 129.07,77.37 131.89,75.28 134.70,74.76 137.52,72.38 140.34,73.23 143.15,66.55 145.97,69.17 148.78,65.58 151.60,64.39 154.41,60.61 157.23,54.21 160.04,56.50 162.86,58.39 165.68,59.88 168.49,59.95 171.31,62.38 174.12,72.13 176.94,62.36 179.75,65.80 182.57,70.01 185.39,73.23 188.20,81.00 191.02,80.18 193.83,83.14 196.65,78.97 199.46,77.89 202.28,77.95 205.09,74.54 207.91,65.50 210.73,68.50 213.54,70.86 216.36,64.44 219.17,72.19 221.99,65.72 224.80,68.91 227.62,67.70 230.44,67.30 233.25,61.13 236.07,61.33 238.88,54.99 241.70,50.98 244.51,53.48 247.33,50.14 250.15,34.18 252.96,35.90 255.78,35.74 258.59,33.32 261.41,32.38 264.22,37.79 267.04,43.37 269.85,44.55 272.67,43.48 275.49,54.47 278.30,43.81 281.12,55.56 283.93,57.49 286.75,56.76 289.56,57.01 292.38,57.99 295.20,64.52 298.01,67.75 300.83,68.29 303.64,69.41 306.46,70.85 309.27,75.17 312.09,72.89 314.91,63.65 317.72,66.04 320.54,66.21 323.35,60.54 326.17,55.87 328.98,46.44 331.80,43.49 334.61,46.02 337.43,49.78 340.25,54.32 343.06,49.57 345.88,42.88 348.69,50.35 351.51,52.01 354.32,51.88 357.14,51.62 359.96,51.74 362.77,50.64 365.59,41.83 368.40,45.62 371.22,43.39 374.03,46.54 376.85,37.42 379.66,33.77 382.48,31.63 385.30,31.98 388.11,33.44 390.93,32.99 393.74,32.18 396.56,39.74 399.37,35.83 402.19,31.75 405.01,34.91 407.82,35.74 410.64,32.09 413.45,35.28 416.27,33.62 419.08,27.75 421.90,27.85 424.72,30.63 427.53,36.05 430.35,21.78 433.16,24.42 435.98,28.15 438.79,30.19 441.61,30.16 444.42,29.21 447.24,24.77 450.06,27.33 452.87,28.80 455.69,28.18 458.50,26.15 461.32,28.13 464.13,30.29 466.95,22.40 469.77,27.25 472.58,23.88 475.40,22.12 478.21,23.40 481.03,25.92 483.84,18.32 486.66,10.00 489.47,14.45 492.29,16.43 495.11,14.32 497.92,22.25 500.74,21.20 503.55,18.96 506.37,23.08 509.18,20.75 512.00,27.79" fill="none" stroke="#3fb950" stroke-width="1.8" stroke-linejoin="round"/>
+  <line x1="8" y1="178.00" x2="512" y2="178.00" stroke="#f0883e" stroke-width="1.3" stroke-dasharray="5 4" opacity="0.9"/><text x="11" y="174.00" fill="#f0883e" font-size="10">cost $82.10</text><circle cx="512.00" cy="27.79" r="3" fill="#3fb950"/><text x="8" y="194" fill="#8b949e" font-size="10">2025-11-13</text><text x="512" y="194" text-anchor="end" fill="#8b949e" font-size="10">2026-07-22</text>
+</svg></div>
+      <div class="imeta">
+        <span>qty 40.0000</span>
+        <span>avg cost $82.10</span>
+        <span>value $3,424.11</span>
+        <span style="color:#3fb950">P&amp;L +$140.11</span>
+      </div>
+    </details><details class="instrument" id="instrument-SPY">
+      <summary><span class="isym">SPY</span><span class="iac">etf</span><span class="iprice">$592.22</span><span class="ipct" style="color:#3fb950">+24.60%</span></summary>
+      <div class="ichart"><svg viewBox="0 0 520 200" width="100%" height="200" role="img" aria-label="price line chart">
+  <polyline points="8.00,154.32 10.82,151.90 13.63,148.67 16.45,148.78 19.26,153.58 22.08,149.88 24.89,146.40 27.71,150.10 30.53,147.21 33.34,140.13 36.16,144.78 38.97,142.00 41.79,141.78 44.60,126.02 47.42,138.64 50.23,133.68 53.05,135.58 55.87,136.07 58.68,122.73 61.50,122.59 64.31,106.58 67.13,109.52 69.94,106.82 72.76,110.11 75.58,114.79 78.39,114.14 81.21,115.93 84.02,114.30 86.84,128.81 89.65,114.62 92.47,115.59 95.28,103.01 98.10,109.98 100.92,107.70 103.73,84.62 106.55,90.76 109.36,101.36 112.18,105.07 114.99,101.48 117.81,96.28 120.63,86.68 123.44,88.35 126.26,99.75 129.07,102.67 131.89,93.52 134.70,89.93 137.52,103.85 140.34,103.89 143.15,93.61 145.97,77.82 148.78,73.44 151.60,70.92 154.41,79.91 157.23,85.90 160.04,85.34 162.86,81.44 165.68,76.94 168.49,80.26 171.31,88.50 174.12,93.95 176.94,102.08 179.75,97.24 182.57,113.54 185.39,115.69 188.20,112.31 191.02,101.26 193.83,100.54 196.65,93.10 199.46,95.78 202.28,100.94 205.09,105.56 207.91,94.37 210.73,86.92 213.54,83.14 216.36,58.05 219.17,58.08 221.99,53.14 224.80,50.57 227.62,52.05 230.44,33.92 233.25,21.83 236.07,32.63 238.88,35.53 241.70,31.96 244.51,25.57 247.33,35.92 250.15,53.10 252.96,67.30 255.78,67.62 258.59,68.18 261.41,65.37 264.22,70.92 267.04,79.79 269.85,94.38 272.67,91.78 275.49,88.87 278.30,81.38 281.12,75.32 283.93,76.52 286.75,66.24 289.56,67.05 292.38,71.77 295.20,75.43 298.01,79.55 300.83,95.17 303.64,93.82 306.46,91.80 309.27,94.22 312.09,99.17 314.91,96.28 317.72,83.56 320.54,83.07 323.35,86.58 326.17,90.68 328.98,90.98 331.80,99.92 334.61,100.61 337.43,99.96 340.25,86.37 343.06,79.22 345.88,71.33 348.69,76.42 351.51,71.22 354.32,79.47 357.14,76.95 359.96,73.62 362.77,79.09 365.59,63.96 368.40,59.46 371.22,73.53 374.03,69.18 376.85,72.01 379.66,71.79 382.48,68.09 385.30,64.94 388.11,79.92 390.93,88.21 393.74,82.34 396.56,72.49 399.37,57.96 402.19,43.94 405.01,59.44 407.82,53.37 410.64,67.64 413.45,55.23 416.27,53.08 419.08,61.53 421.90,45.98 424.72,40.78 427.53,55.09 430.35,52.63 433.16,57.98 435.98,56.91 438.79,60.22 441.61,49.54 444.42,60.16 447.24,57.54 450.06,43.42 452.87,49.56 455.69,47.72 458.50,45.95 461.32,51.02 464.13,45.83 466.95,44.86 469.77,51.88 472.58,38.07 475.40,31.67 478.21,32.75 481.03,37.49 483.84,43.35 486.66,33.56 489.47,34.48 492.29,30.66 495.11,31.88 497.92,26.81 500.74,27.49 503.55,21.23 506.37,22.45 509.18,15.62 512.00,10.00" fill="none" stroke="#3fb950" stroke-width="1.8" stroke-linejoin="round"/>
+  <line x1="8" y1="178.00" x2="512" y2="178.00" stroke="#f0883e" stroke-width="1.3" stroke-dasharray="5 4" opacity="0.9"/><text x="11" y="174.00" fill="#f0883e" font-size="10">cost $475.30</text><circle cx="512.00" cy="10.00" r="3" fill="#3fb950"/><text x="8" y="194" fill="#8b949e" font-size="10">2025-11-13</text><text x="512" y="194" text-anchor="end" fill="#8b949e" font-size="10">2026-07-22</text>
+</svg></div>
+      <div class="imeta">
+        <span>qty 12.0000</span>
+        <span>avg cost $475.30</span>
+        <span>value $7,106.65</span>
+        <span style="color:#3fb950">P&amp;L +$1,403.05</span>
+      </div>
+    </details><details class="instrument" id="instrument-AAPL">
+      <summary><span class="isym">AAPL</span><span class="iac">equity</span><span class="iprice">$110.96</span><span class="ipct" style="color:#f85149">-32.06%</span></summary>
+      <div class="ichart"><svg viewBox="0 0 520 200" width="100%" height="200" role="img" aria-label="price line chart">
+  <polyline points="8.00,29.75 10.82,34.06 13.63,23.28 16.45,31.47 19.26,31.91 22.08,37.43 24.89,40.22 27.71,40.19 30.53,40.50 33.34,31.11 36.16,35.65 38.97,38.11 41.79,51.17 44.60,54.67 47.42,61.17 50.23,50.36 53.05,45.10 55.87,48.37 58.68,42.01 61.50,34.22 64.31,44.83 67.13,46.86 69.94,40.02 72.76,46.84 75.58,42.18 78.39,43.24 81.21,38.97 84.02,55.75 86.84,46.43 89.65,53.98 92.47,69.09 95.28,73.83 98.10,77.97 100.92,78.04 103.73,77.97 106.55,79.67 109.36,71.67 112.18,81.26 114.99,86.38 117.81,94.01 120.63,92.16 123.44,90.14 126.26,81.79 129.07,70.61 131.89,78.40 134.70,76.72 137.52,73.77 140.34,84.29 143.15,85.18 145.97,92.02 148.78,80.06 151.60,79.84 154.41,90.85 157.23,89.93 160.04,84.92 162.86,79.22 165.68,78.21 168.49,92.41 171.31,90.05 174.12,83.02 176.94,79.44 179.75,82.70 182.57,86.14 185.39,88.87 188.20,96.81 191.02,96.28 193.83,85.40 196.65,72.65 199.46,72.07 202.28,71.47 205.09,74.94 207.91,79.02 210.73,76.74 213.54,67.64 216.36,69.94 219.17,64.20 221.99,62.21 224.80,57.01 227.62,63.97 230.44,60.12 233.25,70.96 236.07,60.35 238.88,61.02 241.70,44.78 244.51,49.92 247.33,59.46 250.15,67.45 252.96,81.71 255.78,81.99 258.59,96.90 261.41,101.33 264.22,101.52 267.04,109.44 269.85,109.62 272.67,104.17 275.49,111.84 278.30,120.68 281.12,129.95 283.93,131.07 286.75,131.36 289.56,128.59 292.38,129.66 295.20,124.32 298.01,127.76 300.83,119.98 303.64,116.64 306.46,112.67 309.27,116.29 312.09,126.20 314.91,119.68 317.72,116.79 320.54,123.51 323.35,125.24 326.17,123.23 328.98,116.21 331.80,108.44 334.61,113.54 337.43,117.99 340.25,130.44 343.06,129.68 345.88,136.00 348.69,129.73 351.51,129.37 354.32,128.97 357.14,141.73 359.96,135.10 362.77,136.95 365.59,136.96 368.40,144.98 371.22,148.45 374.03,151.03 376.85,149.63 379.66,142.81 382.48,136.91 385.30,135.72 388.11,138.47 390.93,144.29 393.74,140.49 396.56,134.05 399.37,127.47 402.19,120.56 405.01,113.63 407.82,112.33 410.64,113.70 413.45,114.21 416.27,116.42 419.08,119.20 421.90,121.21 424.72,120.57 427.53,123.85 430.35,120.49 433.16,125.70 435.98,115.33 438.79,123.51 441.61,115.50 444.42,112.77 447.24,117.24 450.06,115.93 452.87,115.13 455.69,142.94 458.50,149.56 461.32,154.79 464.13,147.30 466.95,145.37 469.77,154.26 472.58,153.74 475.40,168.58 478.21,168.09 481.03,166.82 483.84,164.91 486.66,162.22 489.47,165.90 492.29,172.52 495.11,170.57 497.92,161.30 500.74,160.79 503.55,164.35 506.37,172.02 509.18,178.00 512.00,169.69" fill="none" stroke="#f85149" stroke-width="1.8" stroke-linejoin="round"/>
+  <line x1="8" y1="10.00" x2="512" y2="10.00" stroke="#f0883e" stroke-width="1.3" stroke-dasharray="5 4" opacity="0.9"/><text x="11" y="6.00" fill="#f0883e" font-size="10">cost $163.33</text><circle cx="512.00" cy="169.69" r="3" fill="#f85149"/><text x="8" y="194" fill="#8b949e" font-size="10">2025-11-13</text><text x="512" y="194" text-anchor="end" fill="#8b949e" font-size="10">2026-07-22</text>
+</svg></div>
+      <div class="imeta">
+        <span>qty 15.0000</span>
+        <span>avg cost $163.33</span>
+        <span>value $1,664.45</span>
+        <span style="color:#f85149">P&amp;L -$785.55</span>
+      </div>
+    </details><details class="instrument" id="instrument-MSFT">
+      <summary><span class="isym">MSFT</span><span class="iac">equity</span><span class="iprice">$278.09</span><span class="ipct" style="color:#f85149">-15.73%</span></summary>
+      <div class="ichart"><svg viewBox="0 0 520 200" width="100%" height="200" role="img" aria-label="price line chart">
+  <polyline points="8.00,75.36 10.82,66.54 13.63,65.13 16.45,63.96 19.26,67.95 22.08,57.70 24.89,50.35 27.71,52.17 30.53,52.68 33.34,55.42 36.16,59.07 38.97,68.42 41.79,58.27 44.60,50.51 47.42,44.35 50.23,52.45 53.05,36.51 55.87,20.77 58.68,19.12 61.50,26.19 64.31,32.86 67.13,29.44 69.94,36.41 72.76,36.54 75.58,27.89 78.39,39.48 81.21,23.65 84.02,10.85 86.84,20.73 89.65,31.77 92.47,33.84 95.28,41.66 98.10,43.53 100.92,62.61 103.73,64.13 106.55,50.72 109.36,58.86 112.18,60.73 114.99,71.35 117.81,66.64 120.63,68.13 123.44,53.83 126.26,52.15 129.07,54.78 131.89,50.55 134.70,54.19 137.52,63.88 140.34,61.55 143.15,62.70 145.97,61.35 148.78,58.47 151.60,62.07 154.41,58.85 157.23,45.76 160.04,53.93 162.86,40.69 165.68,42.40 168.49,48.08 171.31,29.26 174.12,27.89 176.94,16.81 179.75,10.00 182.57,23.44 185.39,22.33 188.20,26.36 191.02,36.72 193.83,50.07 196.65,49.16 199.46,44.57 202.28,41.45 205.09,43.65 207.91,49.55 210.73,56.75 213.54,60.70 216.36,68.05 219.17,69.38 221.99,69.41 224.80,75.64 227.62,77.15 230.44,82.32 233.25,82.23 236.07,78.57 238.88,77.20 241.70,73.74 244.51,85.14 247.33,87.61 250.15,85.59 252.96,81.04 255.78,91.86 258.59,90.66 261.41,82.27 264.22,83.38 267.04,83.91 269.85,80.66 272.67,78.81 275.49,73.94 278.30,73.30 281.12,72.09 283.93,77.48 286.75,78.55 289.56,69.56 292.38,70.88 295.20,71.96 298.01,75.31 300.83,69.59 303.64,75.53 306.46,68.93 309.27,75.46 312.09,82.72 314.91,81.16 317.72,80.13 320.54,77.93 323.35,70.28 326.17,73.09 328.98,69.81 331.80,76.13 334.61,67.04 337.43,62.33 340.25,58.27 343.06,56.75 345.88,62.38 348.69,64.62 351.51,60.84 354.32,60.85 357.14,59.81 359.96,69.52 362.77,68.09 365.59,72.90 368.40,80.39 371.22,81.34 374.03,93.90 376.85,89.05 379.66,83.08 382.48,83.32 385.30,90.01 388.11,96.25 390.93,97.14 393.74,112.84 396.56,111.57 399.37,107.17 402.19,109.07 405.01,112.13 407.82,110.85 410.64,108.47 413.45,101.20 416.27,100.96 419.08,105.37 421.90,108.25 424.72,106.95 427.53,96.58 430.35,98.59 433.16,105.40 435.98,110.91 438.79,124.02 441.61,121.86 444.42,130.13 447.24,137.45 450.06,148.91 452.87,155.17 455.69,151.85 458.50,159.14 461.32,168.64 464.13,167.58 466.95,169.32 469.77,166.88 472.58,162.73 475.40,162.68 478.21,169.65 481.03,170.22 483.84,167.42 486.66,170.47 489.47,178.00 492.29,172.07 495.11,174.18 497.92,176.25 500.74,176.07 503.55,170.49 506.37,168.97 509.18,170.67 512.00,166.88" fill="none" stroke="#f85149" stroke-width="1.8" stroke-linejoin="round"/>
+  <line x1="8" y1="109.35" x2="512" y2="109.35" stroke="#f0883e" stroke-width="1.3" stroke-dasharray="5 4" opacity="0.9"/><text x="11" y="105.35" fill="#f0883e" font-size="10">cost $330.00</text><circle cx="512.00" cy="166.88" r="3" fill="#f85149"/><text x="8" y="194" fill="#8b949e" font-size="10">2025-11-13</text><text x="512" y="194" text-anchor="end" fill="#8b949e" font-size="10">2026-07-22</text>
+</svg></div>
+      <div class="imeta">
+        <span>qty 6.0000</span>
+        <span>avg cost $330.00</span>
+        <span>value $1,668.54</span>
+        <span style="color:#f85149">P&amp;L -$311.46</span>
+      </div>
+    </details><details class="instrument" id="instrument-BTC-USD">
+      <summary><span class="isym">BTC-USD</span><span class="iac">crypto</span><span class="iprice">$13,589.56</span><span class="ipct" style="color:#f85149">-67.64%</span></summary>
+      <div class="ichart"><svg viewBox="0 0 520 200" width="100%" height="200" role="img" aria-label="price line chart">
+  <polyline points="8.00,30.75 10.82,10.00 13.63,15.21 16.45,39.02 19.26,50.27 22.08,35.05 24.89,35.08 27.71,35.43 30.53,32.40 33.34,31.91 36.16,43.62 38.97,56.30 41.79,72.86 44.60,67.93 47.42,56.77 50.23,63.95 53.05,71.77 55.87,64.79 58.68,60.14 61.50,66.97 64.31,54.94 67.13,49.47 69.94,56.22 72.76,58.91 75.58,66.05 78.39,49.72 81.21,55.71 84.02,65.47 86.84,68.53 89.65,71.61 92.47,64.31 95.28,54.92 98.10,56.71 100.92,83.03 103.73,85.25 106.55,90.75 109.36,98.81 112.18,102.89 114.99,100.41 117.81,108.29 120.63,98.91 123.44,107.61 126.26,115.88 129.07,113.41 131.89,104.89 134.70,97.74 137.52,101.26 140.34,102.44 143.15,105.94 145.97,95.90 148.78,97.64 151.60,97.33 154.41,92.80 157.23,101.93 160.04,104.83 162.86,84.80 165.68,70.08 168.49,61.43 171.31,66.72 174.12,53.64 176.94,40.97 179.75,56.65 182.57,56.48 185.39,63.93 188.20,64.32 191.02,50.84 193.83,73.16 196.65,72.71 199.46,61.28 202.28,76.29 205.09,62.85 207.91,80.89 210.73,81.77 213.54,77.30 216.36,82.39 219.17,80.23 221.99,88.45 224.80,79.46 227.62,83.44 230.44,80.52 233.25,86.58 236.07,89.77 238.88,79.36 241.70,69.28 244.51,69.34 247.33,62.61 250.15,53.14 252.96,59.91 255.78,49.84 258.59,60.02 261.41,62.76 264.22,65.33 267.04,59.94 269.85,63.84 272.67,74.81 275.49,73.25 278.30,57.59 281.12,41.92 283.93,37.29 286.75,42.50 289.56,59.64 292.38,69.80 295.20,60.97 298.01,49.36 300.83,72.94 303.64,75.31 306.46,75.23 309.27,86.40 312.09,86.54 314.91,74.88 317.72,87.29 320.54,96.21 323.35,92.74 326.17,104.36 328.98,101.20 331.80,110.06 334.61,104.48 337.43,99.78 340.25,92.66 343.06,85.52 345.88,86.93 348.69,91.00 351.51,101.36 354.32,92.46 357.14,104.28 359.96,99.70 362.77,105.25 365.59,109.84 368.40,99.28 371.22,98.37 374.03,112.93 376.85,110.38 379.66,109.78 382.48,120.12 385.30,130.48 388.11,120.07 390.93,120.24 393.74,122.91 396.56,121.73 399.37,130.17 402.19,138.98 405.01,146.83 407.82,143.98 410.64,142.61 413.45,143.55 416.27,142.24 419.08,146.52 421.90,148.59 424.72,146.50 427.53,152.98 430.35,154.22 433.16,153.41 435.98,156.28 438.79,147.34 441.61,142.17 444.42,145.10 447.24,147.76 450.06,145.25 452.87,146.78 455.69,150.61 458.50,149.66 461.32,149.67 464.13,148.96 466.95,145.15 469.77,155.46 472.58,156.69 475.40,159.18 478.21,163.11 481.03,161.61 483.84,166.99 486.66,170.14 489.47,172.90 492.29,171.48 495.11,169.92 497.92,172.18 500.74,175.60 503.55,172.57 506.37,172.14 509.18,166.69 512.00,178.00" fill="none" stroke="#f85149" stroke-width="1.8" stroke-linejoin="round"/>
+  <line x1="8" y1="10.51" x2="512" y2="10.51" stroke="#f0883e" stroke-width="1.3" stroke-dasharray="5 4" opacity="0.9"/><text x="11" y="6.51" fill="#f0883e" font-size="10">cost $42,000.00</text><circle cx="512.00" cy="178.00" r="3" fill="#f85149"/><text x="8" y="194" fill="#8b949e" font-size="10">2025-11-13</text><text x="512" y="194" text-anchor="end" fill="#8b949e" font-size="10">2026-07-22</text>
+</svg></div>
+      <div class="imeta">
+        <span>qty 0.1500</span>
+        <span>avg cost $42,000.00</span>
+        <span>value $2,038.43</span>
+        <span style="color:#f85149">P&amp;L -$4,261.57</span>
+      </div>
+    </details><details class="instrument" id="instrument-CASH">
+      <summary><span class="isym">CASH</span><span class="iac">cash</span><span class="iprice">$5,000.00</span><span class="ipct muted">23.9%</span></summary>
+      <div class="imeta">
+        <span>weight 23.9%</span>
+        <span>value $5,000.00</span>
+        <span class="muted">risk-free safe sleeve — no price series</span>
+      </div>
+    </details>
+</section>
+  <section class="panel">
+  <h2>Risk &amp; anti-fragility</h2>
+  <div class="risk-grid">
+    <div class="chart-box"><h3>Convexity curve</h3><svg viewBox="0 0 520 200" width="100%" height="200" role="img" aria-label="convexity curve">
+  <line x1="40" y1="176.00" x2="508" y2="176.00" stroke="#30363d" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="4" y="20" fill="#8b949e" font-size="10">convexity</text>
+  <polyline points="40.00,176.00 133.60,12.00 320.80,176.00 508.00,176.00" fill="none" stroke="#f0883e" stroke-width="2"/>
+  <circle cx="40.00" cy="176.00" r="3" fill="#f0883e"><title>±5% shock: +0</title></circle><circle cx="133.60" cy="12.00" r="3" fill="#f0883e"><title>±10% shock: +3.638e-12</title></circle><circle cx="320.80" cy="176.00" r="3" fill="#f0883e"><title>±20% shock: +0</title></circle><circle cx="508.00" cy="176.00" r="3" fill="#f0883e"><title>±30% shock: +0</title></circle><text x="40.00" y="194" text-anchor="middle" fill="#8b949e" font-size="10">±5%</text><text x="133.60" y="194" text-anchor="middle" fill="#8b949e" font-size="10">±10%</text><text x="320.80" y="194" text-anchor="middle" fill="#8b949e" font-size="10">±20%</text><text x="508.00" y="194" text-anchor="middle" fill="#8b949e" font-size="10">±30%</text>
+</svg>
+      <p class="cap">Payoff response to a symmetric ±price shock. Near-zero for a linear long book; positive convexity comes from optionality.</p></div>
+    <div class="chart-box"><h3>Barbell allocation</h3><svg viewBox="0 0 420 54" width="100%" height="54" role="img" aria-label="barbell allocation">
+  <rect x="2.00" y="2" width="167.66" height="34" fill="#3fb950" rx="2"><title>safe: 40.3%</title></rect><rect x="169.66" y="2" width="207.77" height="34" fill="#f0883e" rx="2"><title>mid: 49.9%</title></rect><rect x="377.43" y="2" width="40.57" height="34" fill="#f85149" rx="2"><title>aggr: 9.8%</title></rect>
+  <text x="85.83" y="50" text-anchor="middle" fill="#8b949e" font-size="10">safe 40%</text><text x="273.54" y="50" text-anchor="middle" fill="#8b949e" font-size="10">mid 50%</text><text x="397.72" y="50" text-anchor="middle" fill="#8b949e" font-size="10">aggr 10%</text>
+</svg>
+      <p class="cap">Weight split into safe / fragile-middle / aggressive-convex sleeves. A thick amber middle drives fragility up.</p></div>
+    <div class="chart-box"><h3>Correlation heatmap</h3><svg viewBox="0 0 326 326" width="100%" height="326" style="max-width:326px;height:auto" role="img" aria-label="correlation heatmap"><text x="92.0" y="60" text-anchor="middle" fill="#8b949e" font-size="9" transform="rotate(-40 92.0 60)">SHY</text><text x="144.0" y="60" text-anchor="middle" fill="#8b949e" font-size="9" transform="rotate(-40 144.0 60)">SPY</text><text x="196.0" y="60" text-anchor="middle" fill="#8b949e" font-size="9" transform="rotate(-40 196.0 60)">AAPL</text><text x="248.0" y="60" text-anchor="middle" fill="#8b949e" font-size="9" transform="rotate(-40 248.0 60)">MSFT</text><text x="300.0" y="60" text-anchor="middle" fill="#8b949e" font-size="9" transform="rotate(-40 300.0 60)">BTC-USD</text><text x="60" y="95.0" text-anchor="end" fill="#8b949e" font-size="9">SHY</text><rect x="66" y="66" width="51" height="51" fill="#3fb950" rx="2"><title>SHY / SHY: +1.00</title></rect><text x="92.0" y="95.0" text-anchor="middle" fill="#c9d1d9" font-size="9">+1.00</text><rect x="118" y="66" width="51" height="51" fill="#2d3038" rx="2"><title>SHY / SPY: -0.01</title></rect><text x="144.0" y="95.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.01</text><rect x="170" y="66" width="51" height="51" fill="#2c3739" rx="2"><title>SHY / AAPL: +0.05</title></rect><text x="196.0" y="95.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.05</text><rect x="222" y="66" width="51" height="51" fill="#2c3639" rx="2"><title>SHY / MSFT: +0.04</title></rect><text x="248.0" y="95.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.04</text><rect x="274" y="66" width="51" height="51" fill="#313139" rx="2"><title>SHY / BTC-USD: -0.03</title></rect><text x="300.0" y="95.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.03</text><text x="60" y="147.0" text-anchor="end" fill="#8b949e" font-size="9">SPY</text><rect x="66" y="118" width="51" height="51" fill="#2d3038" rx="2"><title>SPY / SHY: -0.01</title></rect><text x="92.0" y="147.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.01</text><rect x="118" y="118" width="51" height="51" fill="#3fb950" rx="2"><title>SPY / SPY: +1.00</title></rect><text x="144.0" y="147.0" text-anchor="middle" fill="#c9d1d9" font-size="9">+1.00</text><rect x="170" y="118" width="51" height="51" fill="#2b3238" rx="2"><title>SPY / AAPL: +0.01</title></rect><text x="196.0" y="147.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.01</text><rect x="222" y="118" width="51" height="51" fill="#3c3339" rx="2"><title>SPY / MSFT: -0.08</title></rect><text x="248.0" y="147.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.08</text><rect x="274" y="118" width="51" height="51" fill="#2d3c3a" rx="2"><title>SPY / BTC-USD: +0.08</title></rect><text x="300.0" y="147.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.08</text><text x="60" y="199.0" text-anchor="end" fill="#8b949e" font-size="9">AAPL</text><rect x="66" y="170" width="51" height="51" fill="#2c3739" rx="2"><title>AAPL / SHY: +0.05</title></rect><text x="92.0" y="199.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.05</text><rect x="118" y="170" width="51" height="51" fill="#2b3238" rx="2"><title>AAPL / SPY: +0.01</title></rect><text x="144.0" y="199.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.01</text><rect x="170" y="170" width="51" height="51" fill="#3fb950" rx="2"><title>AAPL / AAPL: +1.00</title></rect><text x="196.0" y="199.0" text-anchor="middle" fill="#c9d1d9" font-size="9">+1.00</text><rect x="222" y="170" width="51" height="51" fill="#353239" rx="2"><title>AAPL / MSFT: -0.05</title></rect><text x="248.0" y="199.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.05</text><rect x="274" y="170" width="51" height="51" fill="#41343a" rx="2"><title>AAPL / BTC-USD: -0.11</title></rect><text x="300.0" y="199.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.11</text><text x="60" y="251.0" text-anchor="end" fill="#8b949e" font-size="9">MSFT</text><rect x="66" y="222" width="51" height="51" fill="#2c3639" rx="2"><title>MSFT / SHY: +0.04</title></rect><text x="92.0" y="251.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.04</text><rect x="118" y="222" width="51" height="51" fill="#3c3339" rx="2"><title>MSFT / SPY: -0.08</title></rect><text x="144.0" y="251.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.08</text><rect x="170" y="222" width="51" height="51" fill="#353239" rx="2"><title>MSFT / AAPL: -0.05</title></rect><text x="196.0" y="251.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.05</text><rect x="222" y="222" width="51" height="51" fill="#3fb950" rx="2"><title>MSFT / MSFT: +1.00</title></rect><text x="248.0" y="251.0" text-anchor="middle" fill="#c9d1d9" font-size="9">+1.00</text><rect x="274" y="222" width="51" height="51" fill="#2b3338" rx="2"><title>MSFT / BTC-USD: +0.02</title></rect><text x="300.0" y="251.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.02</text><text x="60" y="303.0" text-anchor="end" fill="#8b949e" font-size="9">BTC-USD</text><rect x="66" y="274" width="51" height="51" fill="#313139" rx="2"><title>BTC-USD / SHY: -0.03</title></rect><text x="92.0" y="303.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.03</text><rect x="118" y="274" width="51" height="51" fill="#2d3c3a" rx="2"><title>BTC-USD / SPY: +0.08</title></rect><text x="144.0" y="303.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.08</text><rect x="170" y="274" width="51" height="51" fill="#41343a" rx="2"><title>BTC-USD / AAPL: -0.11</title></rect><text x="196.0" y="303.0" text-anchor="middle" fill="#8b949e" font-size="9">-0.11</text><rect x="222" y="274" width="51" height="51" fill="#2b3338" rx="2"><title>BTC-USD / MSFT: +0.02</title></rect><text x="248.0" y="303.0" text-anchor="middle" fill="#8b949e" font-size="9">+0.02</text><rect x="274" y="274" width="51" height="51" fill="#3fb950" rx="2"><title>BTC-USD / BTC-USD: +1.00</title></rect><text x="300.0" y="303.0" text-anchor="middle" fill="#c9d1d9" font-size="9">+1.00</text></svg>
+      <p class="cap">Return correlations, −1 (red) to +1 (green).</p></div>
+    <div class="chart-box"><h3>Underwater / drawdown</h3><svg viewBox="0 0 560 180" width="100%" height="180" preserveAspectRatio="none" role="img" aria-label="drawdown area chart">
+  <defs><linearGradient id="uw" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#f85149" stop-opacity="0.05"/>
+    <stop offset="1" stop-color="#f85149" stop-opacity="0.45"/>
+  </linearGradient></defs>
+  <line x1="8" y1="10.00" x2="552" y2="10.00" stroke="#30363d" stroke-width="1"/>
+  <polygon points="8.00,10.00 8.00,10.00 11.04,10.00 14.08,11.52 17.12,33.52 20.16,45.32 23.20,30.09 26.23,28.48 29.27,30.04 32.31,26.62 35.35,22.97 38.39,35.97 41.43,48.46 44.47,63.21 47.51,53.44 50.55,47.03 53.59,51.66 56.63,55.22 59.66,47.08 62.70,37.93 65.74,43.59 68.78,31.47 71.82,27.27 74.86,32.66 77.90,36.93 80.94,41.81 83.98,29.69 87.02,31.71 90.06,40.00 93.09,46.94 96.13,49.10 99.17,46.08 102.21,36.51 105.25,41.31 108.29,67.11 111.33,62.71 114.37,67.33 117.41,77.68 120.45,84.50 123.49,84.32 126.53,90.34 129.56,79.43 132.60,84.41 135.64,93.17 138.68,90.44 141.72,80.82 144.76,73.89 147.80,82.21 150.84,84.64 153.88,84.89 156.92,72.55 159.96,70.14 162.99,69.74 166.03,69.51 169.07,76.42 172.11,79.54 175.15,57.51 178.19,43.52 181.23,40.37 184.27,43.54 187.31,32.52 190.35,20.78 193.39,32.51 196.42,40.27 199.46,47.77 202.50,49.48 205.54,36.32 208.58,56.40 211.62,51.41 214.66,41.18 217.70,55.12 220.74,45.57 223.78,59.65 226.82,59.33 229.85,53.60 232.89,52.40 235.93,50.04 238.97,55.28 242.01,47.06 245.05,52.38 248.09,44.91 251.13,48.37 254.17,51.80 257.21,43.17 260.25,29.79 263.28,31.08 266.32,30.13 269.36,27.24 272.40,38.87 275.44,32.21 278.48,43.50 281.52,44.25 284.56,48.51 287.60,47.96 290.64,55.02 293.68,62.58 296.72,61.12 299.75,46.29 302.79,32.55 305.83,30.10 308.87,31.93 311.91,45.03 314.95,55.75 317.99,48.57 321.03,40.90 324.07,63.67 327.11,65.94 330.15,63.43 333.18,75.88 336.22,80.38 339.26,67.64 342.30,74.26 345.34,82.66 348.38,79.32 351.42,90.70 354.46,85.92 357.50,96.01 360.54,90.58 363.58,86.27 366.61,77.63 369.65,68.76 372.69,69.63 375.73,74.25 378.77,81.11 381.81,75.62 384.85,87.21 387.89,82.93 390.93,89.37 393.97,89.66 397.01,81.99 400.04,85.93 403.08,100.31 406.12,97.46 409.16,94.49 412.20,101.45 415.24,110.67 418.28,107.54 421.32,111.20 424.36,114.12 427.40,109.16 430.44,110.32 433.47,113.06 436.51,123.88 439.55,119.21 442.59,121.78 445.63,117.88 448.67,116.39 451.71,123.67 454.75,121.89 457.79,118.31 460.83,126.89 463.87,126.61 466.91,129.68 469.94,131.28 472.98,128.29 476.02,118.94 479.06,125.60 482.10,129.16 485.14,124.90 488.18,129.08 491.22,135.97 494.26,137.04 497.30,141.24 500.34,137.72 503.37,133.85 506.41,146.10 509.45,142.24 512.49,145.02 515.53,150.03 518.57,150.06 521.61,155.37 524.65,155.16 527.69,160.00 530.73,157.74 533.77,156.72 536.80,156.31 539.84,159.35 542.88,154.39 545.92,155.51 548.96,150.03 552.00,156.43 552.00,10.00" fill="url(#uw)"/>
+  <polyline points="8.00,10.00 11.04,10.00 14.08,11.52 17.12,33.52 20.16,45.32 23.20,30.09 26.23,28.48 29.27,30.04 32.31,26.62 35.35,22.97 38.39,35.97 41.43,48.46 44.47,63.21 47.51,53.44 50.55,47.03 53.59,51.66 56.63,55.22 59.66,47.08 62.70,37.93 65.74,43.59 68.78,31.47 71.82,27.27 74.86,32.66 77.90,36.93 80.94,41.81 83.98,29.69 87.02,31.71 90.06,40.00 93.09,46.94 96.13,49.10 99.17,46.08 102.21,36.51 105.25,41.31 108.29,67.11 111.33,62.71 114.37,67.33 117.41,77.68 120.45,84.50 123.49,84.32 126.53,90.34 129.56,79.43 132.60,84.41 135.64,93.17 138.68,90.44 141.72,80.82 144.76,73.89 147.80,82.21 150.84,84.64 153.88,84.89 156.92,72.55 159.96,70.14 162.99,69.74 166.03,69.51 169.07,76.42 172.11,79.54 175.15,57.51 178.19,43.52 181.23,40.37 184.27,43.54 187.31,32.52 190.35,20.78 193.39,32.51 196.42,40.27 199.46,47.77 202.50,49.48 205.54,36.32 208.58,56.40 211.62,51.41 214.66,41.18 217.70,55.12 220.74,45.57 223.78,59.65 226.82,59.33 229.85,53.60 232.89,52.40 235.93,50.04 238.97,55.28 242.01,47.06 245.05,52.38 248.09,44.91 251.13,48.37 254.17,51.80 257.21,43.17 260.25,29.79 263.28,31.08 266.32,30.13 269.36,27.24 272.40,38.87 275.44,32.21 278.48,43.50 281.52,44.25 284.56,48.51 287.60,47.96 290.64,55.02 293.68,62.58 296.72,61.12 299.75,46.29 302.79,32.55 305.83,30.10 308.87,31.93 311.91,45.03 314.95,55.75 317.99,48.57 321.03,40.90 324.07,63.67 327.11,65.94 330.15,63.43 333.18,75.88 336.22,80.38 339.26,67.64 342.30,74.26 345.34,82.66 348.38,79.32 351.42,90.70 354.46,85.92 357.50,96.01 360.54,90.58 363.58,86.27 366.61,77.63 369.65,68.76 372.69,69.63 375.73,74.25 378.77,81.11 381.81,75.62 384.85,87.21 387.89,82.93 390.93,89.37 393.97,89.66 397.01,81.99 400.04,85.93 403.08,100.31 406.12,97.46 409.16,94.49 412.20,101.45 415.24,110.67 418.28,107.54 421.32,111.20 424.36,114.12 427.40,109.16 430.44,110.32 433.47,113.06 436.51,123.88 439.55,119.21 442.59,121.78 445.63,117.88 448.67,116.39 451.71,123.67 454.75,121.89 457.79,118.31 460.83,126.89 463.87,126.61 466.91,129.68 469.94,131.28 472.98,128.29 476.02,118.94 479.06,125.60 482.10,129.16 485.14,124.90 488.18,129.08 491.22,135.97 494.26,137.04 497.30,141.24 500.34,137.72 503.37,133.85 506.41,146.10 509.45,142.24 512.49,145.02 515.53,150.03 518.57,150.06 521.61,155.37 524.65,155.16 527.69,160.00 530.73,157.74 533.77,156.72 536.80,156.31 539.84,159.35 542.88,154.39 545.92,155.51 548.96,150.03 552.00,156.43" fill="none" stroke="#f85149" stroke-width="1.5"/>
+  <text x="552" y="175" text-anchor="end" fill="#8b949e" font-size="10">max DD -17.3%</text>
+</svg>
+      <p class="cap">Running peak-to-current loss over the value series.</p></div>
+  </div>
+  <h3 class="frag-h">Fragility drivers</h3>
+  <div class="drivers"><div class="drow"><span class="dk">concentration</span><span class="dbar"><span class="dfill" style="width:16%"></span></span><span class="dv">0.17</span></div><div class="drow"><span class="dk">tail</span><span class="dbar"><span class="dfill" style="width:22%"></span></span><span class="dv">0.21</span></div><div class="drow"><span class="dk">asymmetry</span><span class="dbar"><span class="dfill" style="width:53%"></span></span><span class="dv">0.53</span></div><div class="drow"><span class="dk">barbell</span><span class="dbar"><span class="dfill" style="width:50%"></span></span><span class="dv">0.50</span></div><div class="drow"><span class="dk">drawdown</span><span class="dbar"><span class="dfill" style="width:35%"></span></span><span class="dv">0.35</span></div><div class="drow"><span class="dk">skew</span><span class="dbar"><span class="dfill" style="width:53%"></span></span><span class="dv">0.53</span></div></div>
+  <h3 class="frag-h">Distribution &amp; risk stats</h3>
+  <div class="stats-grid"><div class="stat"><div class="stat-k">Skew</div><div class="stat-v">-0.061</div></div><div class="stat"><div class="stat-k">Excess kurtosis</div><div class="stat-v">0.110</div></div><div class="stat"><div class="stat-k">Tail ratio</div><div class="stat-v">1.00</div></div><div class="stat"><div class="stat-k">ES 95% (daily)</div><div class="stat-v">-2.15%</div></div><div class="stat"><div class="stat-k">VaR 95% (daily)</div><div class="stat-v">-1.56%</div></div><div class="stat"><div class="stat-k">Volatility (ann.)</div><div class="stat-v">15.7%</div></div><div class="stat"><div class="stat-k">Sortino</div><div class="stat-v">-1.81</div></div><div class="stat"><div class="stat-k">HHI</div><div class="stat-v">0.165</div></div><div class="stat"><div class="stat-k">Effective N</div><div class="stat-v">6.07</div></div><div class="stat"><div class="stat-k">Beta vs bench</div><div class="stat-v">0.34</div></div><div class="stat"><div class="stat-k">Stress asymmetry</div><div class="stat-v">-0.0027</div></div><div class="stat"><div class="stat-k">Convexity (±10%)</div><div class="stat-v">0.0000</div></div></div>
+</section>
+  <footer class="foot">
+    All figures are computed deterministically from local price history by
+    <code>scripts/analyze.py</code>. This dashboard is a static, self-contained
+    artifact — no external requests. <strong>Not financial advice.</strong>
+  </footer>
+</div>
+<script>
+// tiny drill-down helper: <details> already works without JS; this only
+// adds a keyboard shortcut to expand/collapse all instrument rows.
+document.addEventListener('keydown', function(e){
+  if (e.key === 'e' || e.key === 'E') {
+    var open = document.querySelectorAll('details.instrument[open]').length === 0;
+    document.querySelectorAll('details.instrument').forEach(function(d){ d.open = open; });
+  }
+});
+</script>
+</body>
+</html>

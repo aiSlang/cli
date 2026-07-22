@@ -10,10 +10,21 @@ Agent frameworks make it easy to demo *one* agent. Real systems compose many —
 
 → Read [Why aiSlang](docs-site/src/why.md) for the full rationale.
 
-## Demo
+## Demo — the `portfolio-pnl` agent
 
-<!-- TODO: replace this placeholder with a demo gif / short screencast + an architecture diagram of the emitted stack. -->
-> 🎬 **Demo coming soon** — a short screencast of `validate → plan → apply → chat`, plus an architecture diagram of the stack `aislang apply` emits. *(placeholder)*
+[**`examples/portfolio-pnl`**](examples/portfolio-pnl/) is the flagship example: a
+local-first, multi-agent **portfolio analyst**. Deterministic Python skills fetch
+prices and compute P&L, risk, and Taleb-style anti-fragility; a rule engine makes
+a reproducible **keep / rebalance** decision; and two RAG-grounded agents
+(**Strategic → Orchestrator**) explain it. The **Visualizer** skill renders this
+self-contained dashboard — overview, positions, per-instrument prices, and a full
+risk / anti-fragility panel:
+
+[![portfolio-pnl dashboard](docs-site/src/images/portfolio-dashboard.png)](examples/portfolio-pnl/sample-dashboard.html)
+
+*(Open [`examples/portfolio-pnl/sample-dashboard.html`](examples/portfolio-pnl/sample-dashboard.html)
+in a browser for the interactive version.)* Browse every example in the
+[**agents catalog**](tools/catalog/agents-catalog.md).
 
 ## Quickstart
 
@@ -23,18 +34,26 @@ Install (detects OS + arch, verifies the SHA-256 checksum, installs the `aislang
 curl -sSfL https://github.com/aiSlang/cli/releases/latest/download/install.sh | sh
 ```
 
-The [full quickstart](docs-site/src/quickstart.md) gives you a ready-to-copy `support-agent.ais`. With that file in place, the loop is:
+The [full quickstart](docs-site/src/quickstart.md) walks through the flagship
+[`portfolio-pnl`](examples/portfolio-pnl/) example end to end. With the repo
+cloned, the core CLI loop against any `.ais` file is:
 
 ```sh
-aislang validate support-agent.ais            # parse + type-check + catalog-check (no network, no writes)
-aislang plan     support-agent.ais            # resolve models, emit the Compose stack + .env.example
-aislang apply    support-agent.ais            # stand up LiteLLM + Jaeger + budget counter in Docker
-aislang chat     support support-agent.ais    # interactive REPL against the deployed agent
-aislang eval     support-agent.ais            # run declared evals → JSON report (exit 1 on a miss)
-aislang destroy  support-agent.ais            # stop + remove containers and volumes (idempotent)
+cd examples/portfolio-pnl
+aislang validate portfolio.ais                    # parse + type-check + catalog-check (no network, no writes)
+aislang skill run fetch_prices portfolio.ais      # deterministic skill: pull prices into the local SQLite DB
+aislang skill run analyze      portfolio.ais      # deterministic skill: P&L / risk / anti-fragility + recommendation
+aislang skill run visualize    portfolio.ais      # deterministic skill: render generated/dashboard.html
+./run.sh                                          # full pipeline: fetch → analyze → dashboard → Strategic → Orchestrator
+aislang chat advise portfolio.ais                 # chat the advisory pipeline directly
 ```
 
-Provider API keys come from a local `.env` — aiSlang never reads real secrets, it only emits a safe-to-commit `.env.example`. Docker is the only hard prerequisite; add `kubectl` / `helm` / `kind` for the Kubernetes target.
+For the classic single-agent loop (`validate → plan → apply → chat → eval → destroy`),
+the [quickstart](docs-site/src/quickstart.md) also links the minimal
+[`support-agent.ais`](examples/support-agent.ais). Provider API keys come from a
+local `.env` — aiSlang never reads real secrets, it only emits a safe-to-commit
+`.env.example`. Docker is the only hard prerequisite; add `kubectl` / `helm` /
+`kind` for the Kubernetes target.
 
 → [Install](docs-site/src/install.md) · [Quickstart](docs-site/src/quickstart.md) · [Deploying stacks](docs-site/src/deploy.md)
 
@@ -58,6 +77,7 @@ The full docs are the single source of truth — they live in **[`docs-site/`](d
 | [Introduction](docs-site/src/introduction.md) | [Why aiSlang](docs-site/src/why.md) | [Install](docs-site/src/install.md) |
 | [Quickstart](docs-site/src/quickstart.md) | [The aiSlang language](docs-site/src/language.md) | [CLI reference](docs-site/src/cli-reference.md) |
 | [Deploying stacks](docs-site/src/deploy.md) | [MCP integration](docs-site/src/mcp.md) | [Observability](docs-site/src/observability.md) |
+| [Agents catalog](docs-site/src/agents.md) | | |
 
 The language reference is [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md); the architectural decisions behind the design are collected in [docs/ARCH-DECISIONS.md](docs/ARCH-DECISIONS.md).
 

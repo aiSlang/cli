@@ -5,13 +5,13 @@ Walks a target directory (``examples/`` by default) for ``*.ais`` files and
 ``aislang.toml`` multi-module manifests, reconstructs each agent / multi-agent
 project's structure — models, prompts, agents, skills, pipelines, RAG stores,
 MCP tools, evals, deploy targets, plus the docs (README / DESIGN / the ``.ais``
-header comment) — and writes it all to a single ``catalog.json``.
+header comment) — and writes it all to a single ``agents-catalog.json``.
 
 That JSON is the source of truth for the second stage (``render_catalog.py`` ->
 ``agents-catalog.md``) and, downstream, for updating docs.aislang.org.
 
     python3 tools/catalog/scan_catalog.py \
-        [--root .] [--target examples] [--out tools/catalog/catalog.json]
+        [--root .] [--target examples] [--out tools/catalog/agents-catalog.json]
 
 Determinism: pure filesystem read + parse, sorted output — same tree in, same
 catalog out.  No network, no aislang binary required.
@@ -409,7 +409,7 @@ def main() -> int:
     repo_root = os.path.dirname(os.path.dirname(here))
     ap_.add_argument("--root", default=repo_root, help="repo root (paths are relative to it)")
     ap_.add_argument("--target", default="examples", help="folder to scan (default: examples)")
-    ap_.add_argument("--out", default=os.path.join(here, "catalog.json"))
+    ap_.add_argument("--out", default=os.path.join(here, "agents-catalog.json"))
     args = ap_.parse_args()
 
     catalog = scan(os.path.abspath(args.root), args.target)

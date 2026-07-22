@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the agents catalog JSON into `agents-catalog.md`.
 
-Takes the `catalog.json` produced by `scan_catalog.py` and emits a single,
+Takes the `agents-catalog.json` produced by `scan_catalog.py` and emits a single,
 human-readable Markdown catalog: an at-a-glance index table followed by one
 richly-detailed section per agent / multi-agent project — description, the
 agents and their models, skills, pipelines, RAG knowledge, MCP tools, evals,
@@ -12,9 +12,9 @@ project renders it — with info-graphics, screenshots, and the site theme — i
 an HTML catalog page).
 
     python3 tools/catalog/render_catalog.py \
-        [--catalog tools/catalog/catalog.json] [--out tools/catalog/agents-catalog.md]
+        [--catalog tools/catalog/agents-catalog.json] [--out tools/catalog/agents-catalog.md]
 
-Deterministic: same catalog.json in, same Markdown out.
+Deterministic: same agents-catalog.json in, same Markdown out.
 """
 from __future__ import annotations
 
@@ -69,10 +69,16 @@ def joincode(items) -> str:
     return ", ".join(f"`{i}`" for i in items) if items else "—"
 
 
+# Base for source links. Default is a repo-relative hop (works from
+# tools/catalog/ on GitHub); set --link-base to an absolute URL for the docs
+# site, where relative paths to files outside the book would 404.
+LINK_BASE = "../../"
+
+
 def repo_link(path: str | None) -> str:
     if not path:
         return "—"
-    return f"[`{path}`](../../{path})"
+    return f"[`{path}`]({LINK_BASE}{path})"
 
 
 # ── section renderers ────────────────────────────────────────────────
@@ -252,12 +258,17 @@ def render(catalog: dict) -> str:
 
 
 def main() -> int:
+    global LINK_BASE
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--catalog", default=os.path.join(here, "catalog.json"))
+    ap.add_argument("--catalog", default=os.path.join(here, "agents-catalog.json"))
     ap.add_argument("--out", default=os.path.join(here, "agents-catalog.md"))
+    ap.add_argument("--link-base", default=LINK_BASE,
+                    help="base for source links (e.g. https://github.com/aiSlang/cli/blob/main/ "
+                         "for the docs site, where relative paths would 404)")
     args = ap.parse_args()
+    LINK_BASE = args.link_base
 
     with open(args.catalog, encoding="utf-8") as fh:
         catalog = json.load(fh)

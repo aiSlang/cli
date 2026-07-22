@@ -3,7 +3,7 @@
 > **Generated** — do not edit by hand. Rebuild with:
 > `python3 tools/catalog/scan_catalog.py && python3 tools/catalog/render_catalog.py`.
 
-Scanned `examples/` on 2026-07-22T10:51:13+00:00 — **16 agents / multi-agent projects**, **26 agents** in total.
+Scanned `examples/` on 2026-07-22T11:46:10+00:00 — **16 agents / multi-agent projects**, **26 agents** in total.
 
 Each entry is a self-contained aiSlang project: declarative capability-based model selection, prompts, agents, deterministic compute skills, RAG knowledge, MCP tools, evals, and a deploy target — all reconstructed straight from the `.ais` / `aislang.toml` source.
 

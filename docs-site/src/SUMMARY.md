@@ -10,3 +10,4 @@
 - [Deploying stacks](./deploy.md)
 - [MCP integration](./mcp.md)
 - [Observability](./observability.md)
+- [Agents catalog](./agents.md)
