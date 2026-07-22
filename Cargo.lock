@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-catalog"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "aislang-core",
  "serde",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-cli"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "aislang-catalog",
  "aislang-compose",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-compose"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "aislang-catalog",
  "aislang-core",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-core"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "chumsky",
  "petgraph",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-k8s"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "aislang-catalog",
  "aislang-compose",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-remote"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-resolver"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "aislang-catalog",
  "aislang-core",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "aislang-runtime"
-version = "0.4.0-dev"
+version = "0.4.0"
 dependencies = [
  "aislang-catalog",
  "aislang-compose",
