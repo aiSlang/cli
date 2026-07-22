@@ -1,3 +1,7 @@
-{"id": "minimal_goal", "input": "Outline a SQLite migration for the aislang store.", "expected_substring": "round-trip"}
-{"id": "explicit_audit", "input": "Frame the v0.3 store.db migration brief.  Cover the three plain-file sources + the audit-trail fields + reversibility.", "expected_substring": "reversibility"}
-{"id": "incremental_scope", "input": "We want to migrate JUST the spend tracking to SQLite first, leaving state + lockfile on plain files for now.  Write the feature spec.", "expected_substring": "spend"}
+# Eval dataset for the DB agent (migration / feature-spec brief).
+# One (input, expected) pair per line; `expected` is the gold-standard short
+# answer — the key tokens a correct brief must contain. metric=f1.
+
+{"id": "minimal_goal", "input": "Outline a SQLite migration for the aislang store.", "expected": "sqlite migration store schema round-trip reversibility"}
+{"id": "explicit_audit", "input": "Frame the v0.3 store.db migration brief.  Cover the three plain-file sources + the audit-trail fields + reversibility.", "expected": "store migration audit trail reversibility three sources"}
+{"id": "incremental_scope", "input": "We want to migrate JUST the spend tracking to SQLite first, leaving state + lockfile on plain files for now.  Write the feature spec.", "expected": "spend tracking migration incremental feature spec"}
