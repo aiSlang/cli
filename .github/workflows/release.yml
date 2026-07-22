@@ -206,11 +206,15 @@ jobs:
 
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<EOF
-          aiSlang $TAG — v0.2 internal milestone.
+          aiSlang $TAG
 
-          See \`PLAN-90-days-v0_2.md\` for the milestone plan.
-          This is a tagged internal release, not a public launch
-          (which is gated on v0.3's docs site).
+          The local + self-hosted \`aislang\` CLI: describe a multi-agent AI
+          system — agents, capability-selected models with fallback and spend
+          caps, prompts, MCP tools, RAG knowledge, evals, and how they compose —
+          in one \`.ais\` file, then type-check it and emit a running, observable,
+          budget-enforced Docker Compose or Kubernetes stack.
+
+          Full quickstart: https://docs.aislang.org/quickstart.html
 
           ## Install
 
@@ -242,8 +246,13 @@ jobs:
           | \`checksums.txt\`                                         | sha256 of every tarball |
           EOF
 
+          # --target pins the release to this run's commit. Without it, gh can
+          # fail with "tag exists locally but has not been pushed" when the
+          # tag-triggered checkout has the tag ref but gh can't confirm it on
+          # the remote (hit on the v0.4.0 run).
           gh release create "$TAG" \
             --draft \
+            --target "$GITHUB_SHA" \
             --title "aislang $TAG" \
             --notes-file "$NOTES_FILE" \
             dist/*.tar.gz dist/checksums.txt dist/install.sh dist/install.ps1
