@@ -75,7 +75,18 @@ planned for a later version.
 
 ## How to run it
 
-The deterministic core needs nothing but `python3` (stdlib only):
+The quickest path is the `Makefile` (run `make help` for all targets):
+
+```sh
+make demo      # offline: seed prices -> analyze -> render generated/dashboard.html
+make eval      # grade the deterministic recommendation engine (no LLM, no network)
+make test      # unit tests + golden eval (sets up a throwaway venv with pytest)
+make run       # full advisory pipeline (needs Docker + a chat model)
+make clean     # remove all regenerable artifacts
+```
+
+Under the hood these are plain scripts. The deterministic core needs nothing but
+`python3` (standard library only — no `pip install`):
 
 ```sh
 python3 scripts/seed_demo.py            # synthetic prices (offline), OR:

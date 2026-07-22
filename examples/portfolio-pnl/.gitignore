@@ -11,6 +11,7 @@ stack.yml
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 .env
 
 # legacy locations (kept ignored in case an old run wrote them at the root)

@@ -409,7 +409,7 @@ agents and their supporting artifacts come next.
 | 6 | Visualizer (skill) | `render_dashboard.py` -> self-contained `dashboard.html` (L1-L4 drill-down). | **Done** |
 | 7 | Orchestrator agent | `advise` pipeline (Strategic -> Orchestrator) + `recommendation` schema + `run.sh`. | **Done** |
 | 8 | Evals | Deterministic golden eval for the recommendation engine (`scripts/eval_recommend.py` + `evals/recommend_cases.jsonl`, in pytest) + agent-faithfulness `eval` blocks (`evals/advise.jsonl`, `evals/strategic_reads.jsonl`). | **Done** |
-| 9 | Packaging | Final polish and distribution. | Next |
+| 9 | Packaging | `Makefile` single entrypoint (`demo` / `eval` / `test` / `run` / `clean` …), stdlib-only compute core, artifacts isolated under `generated/`, committed `sample-dashboard.html`. | **Done** |
 
 ---
 
