@@ -84,8 +84,17 @@ The language reference is [LANGUAGE-SPEC-v0.md](LANGUAGE-SPEC-v0.md); the archit
 ## Next steps
 
 - ⭐ **Star the repo** if you find it useful — it helps other people discover the project.
-- 💬 **Join the community** on [Discord](https://discord.gg/aislang) <!-- TODO: replace with the real invite link --> to ask questions and share what you build.
 - 📖 **Read the full docs** in [`docs-site/`](docs-site/src/SUMMARY.md).
+
+## Privacy Policy
+
+The aiSlang MCP server runs on your machine, started by your MCP client. It reads and writes the `.ais` files and the local
+Docker stacks you point it at, and talks to the LiteLLM proxy configured by `AISLANG_LITELLM_URL` (default
+http://127.0.0.1:4000). It sends no telemetry, keeps no logs outside your project directory, and holds no provider
+credentials — those live in your LiteLLM configuration. Prompts and tool arguments are forwarded only to the model 
+endpoints your stack defines. 
+Contact: support@aislang.org.
+
 
 ## License
 

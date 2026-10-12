@@ -182,7 +182,14 @@ impl AislangServer {
         name = "aislang_ping",
         description = "Health check — returns 'pong'. \
             Verifies the aiSlang MCP server is reachable and the \
-            tool-dispatch pipeline is functional. No side effects."
+            tool-dispatch pipeline is functional. No side effects.",
+        annotations(
+            title             = "Ping the aiSlang server",
+            read_only_hint    = true,
+            destructive_hint  = false,
+            idempotent_hint   = true,
+            open_world_hint   = false,
+        )
     )]
     pub async fn ping(&self) -> String {
         "pong".to_string()
@@ -211,7 +218,14 @@ impl AislangServer {
             source — it documents the grammar, type system, and all \
             resource blocks (project, budget, model, prompt, mcp_server, \
             agent, eval, secret, deploy, and the v0.2 additions main + \
-            principal patterns)."
+            principal patterns).",
+        annotations(
+            title             = "Read the aiSlang language spec",
+            read_only_hint    = true,
+            destructive_hint  = false,
+            idempotent_hint   = true,
+            open_world_hint   = false,
+        )
     )]
     pub async fn lang_spec(&self) -> Result<CallToolResult, RmcpError> {
         const SPEC: &str = include_str!("../../../LANGUAGE-SPEC-v0.md");
@@ -236,7 +250,14 @@ impl AislangServer {
         description = "Returns canonical `.ais` example files.  Call \
             with name=<example_name> to fetch one example, or with no \
             arguments to list available examples.  Available: minimal, \
-            support-agent, support-agent-paid, free-local."
+            support-agent, support-agent-paid, free-local.",
+        annotations(
+            title             = "List or fetch example .ais files",
+            read_only_hint    = true,
+            destructive_hint  = false,
+            idempotent_hint   = true,
+            open_world_hint   = false,
+        )
     )]
     pub async fn examples(&self,
         Parameters(p): Parameters<ExamplesParameters>,
@@ -300,7 +321,14 @@ impl AislangServer {
             JSON. Use this to inspect the structure of an existing or \
             candidate file — every resource block becomes a JSON object \
             with its declared fields. For source-aware diagnostics on a \
-            broken file, use `aislang_validate` instead."
+            broken file, use `aislang_validate` instead.",
+        annotations(
+            title             = "Parse .ais source into its AST",
+            read_only_hint    = true,
+            destructive_hint  = false,
+            idempotent_hint   = true,
+            open_world_hint   = false,
+        )
     )]
     pub async fn describe(&self,
         Parameters(p): Parameters<SourceOnlyParameters>,
@@ -339,7 +367,14 @@ impl AislangServer {
             source.  Returns either a success summary (`OK: …`) or a \
             source-aware diagnostic (`error at line N, column M: …` \
             with a 2-3-line snippet + caret).  No side effects; safe to \
-            call iteratively while drafting source."
+            call iteratively while drafting source.",
+        annotations(
+            title             = "Validate .ais source",
+            read_only_hint    = true,
+            destructive_hint  = false,
+            idempotent_hint   = true,
+            open_world_hint   = false,
+        )
     )]
     pub async fn validate(&self,
         Parameters(p): Parameters<SourceOnlyParameters>,
@@ -416,7 +451,14 @@ impl AislangServer {
             directory containing prompt files referenced by the source; \
             those files must already exist on disk for resolve to \
             succeed (hash-pinning).  For files-not-yet-materialized \
-            flows, write the prompt files first then call this tool."
+            flows, write the prompt files first then call this tool.",
+        annotations(
+            title             = "Plan a stack (dry run)",
+            read_only_hint    = true,
+            destructive_hint  = false,
+            idempotent_hint   = true,
+            open_world_hint   = false,
+        )
     )]
     pub async fn plan(&self,
         Parameters(p): Parameters<PlanParameters>,
@@ -537,10 +579,10 @@ impl AislangServer {
             wall of escaped text the user can't scan before approving.",
         annotations(
             title             = "Deploy aiSlang stack",
-            destructive_hint  = true,
-            idempotent_hint   = false,
-            open_world_hint   = true,
             read_only_hint    = false,
+            destructive_hint  = true,
+            idempotent_hint   = true,
+            open_world_hint   = false,
         )
     )]
     pub async fn apply(&self,
@@ -691,10 +733,10 @@ impl AislangServer {
             Destructive.",
         annotations(
             title             = "Tear down aiSlang stack",
+            read_only_hint    = false,
             destructive_hint  = true,
             idempotent_hint   = true,
-            open_world_hint   = true,
-            read_only_hint    = false,
+            open_world_hint   = false,
         )
     )]
     pub async fn destroy(&self,
@@ -797,10 +839,10 @@ impl AislangServer {
             MCP returns the same information as a single text body.",
         annotations(
             title             = "Inspect aiSlang stack status",
-            destructive_hint  = false,
             read_only_hint    = true,
-            open_world_hint   = true,
+            destructive_hint  = false,
             idempotent_hint   = true,
+            open_world_hint   = false,
         )
     )]
     pub async fn status(&self,
@@ -990,9 +1032,9 @@ impl AislangServer {
             inline `source` makes that preview a wall of escaped text \
             on every turn.",
         annotations(
-            title             = "Send chat turn",
-            destructive_hint  = false,
+            title             = "Send a message to an agent",
             read_only_hint    = false,
+            destructive_hint  = false,
             idempotent_hint   = false,
             open_world_hint   = true,
         )
@@ -1251,9 +1293,9 @@ impl AislangServer {
             (the project dir or .ais file) + `pattern_label` + `user_input`.  \
             Branches (router) are not supported here yet — use the CLI.",
         annotations(
-            title             = "Run pipeline / loop",
-            destructive_hint  = false,
+            title             = "Run a pipeline, loop or agent",
             read_only_hint    = false,
+            destructive_hint  = false,
             idempotent_hint   = false,
             open_world_hint   = true,
         )
@@ -1637,9 +1679,9 @@ impl AislangServer {
             as pretty JSON. Without `eval_label`, every eval block runs \
             and the response is a JSON array of EvalReports.",
         annotations(
-            title             = "Run aiSlang eval",
-            destructive_hint  = false,
+            title             = "Run an evaluation",
             read_only_hint    = false,
+            destructive_hint  = false,
             idempotent_hint   = false,
             open_world_hint   = true,
         )
