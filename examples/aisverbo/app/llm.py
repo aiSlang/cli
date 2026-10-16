@@ -104,7 +104,8 @@ def ask_json(agent: str, payload_obj, cfg: dict) -> dict:
     reply = chat(agent, json.dumps(payload_obj, ensure_ascii=False), cfg)
     obj = extract_last_json_object(reply)
     if obj is None:
-        raise LlmError(f"agent {agent}: no JSON object in the reply")
+        tail = " ".join(reply.split())[-300:]
+        raise LlmError(f"agent {agent}: no JSON object in the reply — {tail}")
     return obj
 
 

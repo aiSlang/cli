@@ -4,6 +4,9 @@ serve:
 test:
 	python3 -m pytest tests -q
 
+plan:
+	aislang plan aisverbo.ais
+
 validate:
 	aislang validate aisverbo.ais
 

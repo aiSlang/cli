@@ -70,6 +70,7 @@
   .side-tab.active{color:var(--amber2);border-color:var(--amber)}
   .tr-pair{border-radius:4px;padding:1px 2px}
   .tr-pair.hl{background:rgba(88,166,255,.22)}
+  #essay-body .s.hl-src{background:rgba(240,136,62,.14);border-radius:3px}
   #tts-status{font-size:12px}
   .pager{display:flex;gap:6px;align-items:center;font-size:13px;margin-top:8px}
 </style>
@@ -157,7 +158,8 @@
                   onclick="translateStory(true)">⟳</button>
           <button class="btn small" onclick="translateSelection()">translate selection</button>
         </div>
-        <div id="trans-body" class="muted" style="margin-top:10px;line-height:1.8">
+        <h2 id="tr-title" style="text-transform:none;font-size:16px;color:var(--fg);margin:10px 0 6px">—</h2>
+        <div id="trans-body" class="muted" style="line-height:1.8">
           Translate the whole story (cached per language) or just the selected fragment.
           Selecting text in the story highlights its counterpart here.</div>
       </div>
@@ -343,17 +345,23 @@ function clearWordSel(ev){
   SELWORD=null;
   document.querySelectorAll('#essay-body .w.sel').forEach(x=>x.classList.remove('sel'));}
 function showEssay(e){ESSAY=e;
+  try{if(e&&e.id)localStorage.setItem('aisverbo-essay',e.id);}catch(_){}
   $('#essay-title').textContent=e.title||'—';
   $('#essay-body').classList.remove('muted');
   $('#essay-body').innerHTML=renderBody(e.body);
   $('#card').innerHTML='Tap a word in the story.';$('#card').classList.add('muted');
+  TR=null;$('#tr-title').textContent='—';
   $('#trans-body').innerHTML='Translate the whole story (cached) or a selected fragment.';
   $('#trans-body').classList.add('muted');}
 function renderBody(md){
-  let h=esc(md).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
-  h=h.replace(/(^|[\s>«“"(])([\p{L}\p{M}][\p{L}\p{M}'’-]*)/gu,
-    (m,pre,w)=>`${pre}<span class="w" onclick="openCard(this)">${w}</span>`);
-  return h.split(/\n{2,}/).map(p=>`<p>${p.replace(/\n/g,'<br/>')}</p>`).join('');}
+  let si=0;
+  const para=t=>splitSentences(t).map(s=>{
+    let h=esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+    h=h.replace(/(^|[\s>«“"(])([\p{L}\p{M}][\p{L}\p{M}'’-]*)/gu,
+      (m,pre,w)=>`${pre}<span class="w" onclick="openCard(this)">${w}</span>`);
+    return `<span class="s" data-si="${si++}">${h.replace(/\n/g,'<br/>')}</span>`;
+  }).join('');
+  return md.split(/\n{2,}/).map(p=>`<p>${para(p)}</p>`).join('');}
 function plainEssay(){return ESSAY?(ESSAY.title+'. '+ESSAY.body.replace(/\*\*/g,'')):'';}
 
 /* ── word card (cached; ⟳ re-asks) ── */
@@ -414,8 +422,19 @@ async function loadConjugation(tense){
       ex.innerHTML=r.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('');
   }catch(e){box.innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 
-/* ── translation (sentence-aligned; whole story cached) ── */
-let TRPAIRS=[];
+/* ── translation: title + whole body per language; the story↔translation
+   substring mapping is DETERMINISTIC — select_subs below — at sentence
+   granularity: both texts are split by one sentence rule, and index
+   ranges map proportionally (monotonic, so it is a bijection between
+   sentence ranges and its own inverse in the other direction) ── */
+let TR=null;           // {title, body}
+const SENT_RE=/[^.!?…\n]+[.!?…]*\s*/gu;
+function splitSentences(t){return ((t||'').match(SENT_RE)||[]).map(s=>s);}
+function mapRange(i,j,nSrc,nDst){      // select_subs at sentence granularity
+  if(!nSrc||!nDst)return [0,0];
+  const a=Math.min(Math.floor(i*nDst/nSrc),nDst-1);
+  const b=Math.min(Math.floor(j*nDst/nSrc),nDst-1);
+  return [a,b];}
 function fillTrLang(){
   $('#tr-lang').innerHTML=Object.entries(STATE.languages).map(([c,n])=>
     `<option value="${c}"${c===STATE.settings.native?' selected':''}>${esc(n)}</option>`).join('');}
@@ -426,7 +445,7 @@ async function translateStory(force){
   $('#trans-body').innerHTML=`<span class="muted">${SPIN}translating the story…</span>`;
   try{
     const r=await post('/api/translate',{essay_id:ESSAY.id,to:$('#tr-lang').value,force:!!force});
-    TRPAIRS=r.pairs;renderPairs();
+    TR=r;renderTranslation();
   }catch(e){$('#trans-body').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 async function translateSelection(){
   const s=(window.getSelection()||'').toString().trim()||SELWORD;
@@ -436,21 +455,41 @@ async function translateSelection(){
   $('#trans-body').innerHTML=`<span class="muted">${SPIN}translating the selection…</span>`;
   try{
     const r=await post('/api/translate',{text:s,to:$('#tr-lang').value});
-    TRPAIRS=r.pairs;renderPairs();
+    $('#tr-title').textContent='(selection)';
+    $('#trans-body').innerHTML=esc(r.body);TR=null;
   }catch(e){$('#trans-body').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
-function renderPairs(){
-  $('#trans-body').innerHTML=TRPAIRS.map((p,i)=>
-    `<span class="tr-pair" data-i="${i}" title="${esc(p[0].replace(/\*\*/g,''))}">${esc(p[1].replace(/\*\*/g,''))} </span>`).join('');}
-function highlightPair(fragment){
-  // map a fragment of the ORIGINAL to its semantic counterpart in the translation
-  if(!TRPAIRS.length||!fragment)return;
-  const f=fragment.toLowerCase();
-  document.querySelectorAll('.tr-pair').forEach(el=>{
-    const src=(TRPAIRS[+el.dataset.i][0]||'').replace(/\*\*/g,'').toLowerCase();
-    el.classList.toggle('hl',src.includes(f));});}
+function renderTranslation(){
+  $('#tr-title').textContent=TR.title||'—';
+  const sents=splitSentences(TR.body);
+  $('#trans-body').innerHTML=sents.map((s,i)=>
+    `<span class="tr-pair" data-ti="${i}">${esc(s)}</span>`).join('');}
+function storySentEls(){return [...document.querySelectorAll('#essay-body .s')];}
+function highlightStoryRange(i,j,on){
+  storySentEls().forEach(el=>{const k=+el.dataset.si;
+    el.classList.toggle('hl-src',on&&k>=i&&k<=j);});}
+function highlightTransRange(i,j){
+  document.querySelectorAll('.tr-pair').forEach(el=>{const k=+el.dataset.ti;
+    el.classList.toggle('hl',k>=i&&k<=j);});}
+function sentIndexOfNode(node,cls){
+  const el=(node.nodeType===1?node:node.parentElement)?.closest('.'+cls);
+  return el?+(el.dataset.si??el.dataset.ti):null;}
 document.addEventListener('selectionchange',()=>{
-  const s=(window.getSelection()||'').toString().trim();
-  if(s&&s.length>2)highlightPair(s.slice(0,120));});
+  const sel=window.getSelection();
+  if(!sel||sel.isCollapsed||!TR)return;
+  const nStory=storySentEls().length,
+        nTr=document.querySelectorAll('.tr-pair').length;
+  // story → translation
+  let a=sentIndexOfNode(sel.anchorNode,'s'),b=sentIndexOfNode(sel.focusNode,'s');
+  if(a!==null&&b!==null){
+    const [i,j]=[Math.min(a,b),Math.max(a,b)];
+    const [x,y]=mapRange(i,j,nStory,nTr);           // select_subs(src→dst)
+    highlightTransRange(x,y);return;}
+  // translation → story (the same mapping, inverse direction)
+  a=sentIndexOfNode(sel.anchorNode,'tr-pair');b=sentIndexOfNode(sel.focusNode,'tr-pair');
+  if(a!==null&&b!==null){
+    const [i,j]=[Math.min(a,b),Math.max(a,b)];
+    const [x,y]=mapRange(i,j,nTr,nStory);           // select_subs(dst→src)
+    highlightStoryRange(x,y,true);}});
 
 /* ── speech: the browser's own synthesis, free and local ── */
 function voiceFor(lang){
@@ -533,7 +572,7 @@ function renderVerbTable(){
          onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">${esc(v.infinitive)}</td>
      <td class="muted" contenteditable spellcheck="false" onblur="editVerb(${v.id},this,'gloss')"
          onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">${esc(v.gloss||'')}</td>
-     <td><button class="btn small" onclick="delVerb(${v.id},${JSON.stringify('')})" data-inf="${esc(v.infinitive)}">✕</button></td></tr>`).join('')
+     <td><button class="btn small" onclick="delVerb(${v.id})">✕</button></td></tr>`).join('')
     ||'<tr><td colspan="3" class="muted">no verbs match</td></tr>';
   $('#v-pager').innerHTML=pages>1?
     `<button class="btn small" ${VPAGE?'':'disabled'} onclick="VPAGE--;renderVerbTable()">‹</button>
@@ -626,7 +665,10 @@ async function saveSettings(){
   await loadState();await loadVocab();}
 
 speechSynthesis.onvoiceschanged=()=>{};      // warm the voice list
-(async function(){await loadState();await loadVocab();})();
+(async function(){await loadState();await loadVocab();
+  try{const id=parseInt(localStorage.getItem('aisverbo-essay'));
+    if(id)await openEssay(id);}catch(_){}
+})();
 </script>
 </body>
 </html>

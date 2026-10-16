@@ -117,12 +117,14 @@ def test_translation_cached_per_essay_and_language(tmp_path, monkeypatch):
     calls = []
     def fake_json(agent, payload, c):
         calls.append(payload["to"])
-        return {"pairs": [["Un viaje", "A trip"],
-                          ["Hoy **voy** al mar.", "Today I go to the sea."]]}
+        assert "**" not in payload["text"]                   # markers never sent
+        return {"title": "A trip", "body": "Today I **go** to the sea."}
     monkeypatch.setattr(serve.llm, "ask_json", fake_json)
     r1 = serve.translate(conn, cfg, "en", essay_id=eid)
     r2 = serve.translate(conn, cfg, "en", essay_id=eid)      # cache hit
     assert r1["cached"] is False and r2["cached"] is True
+    assert r1["body"] == "Today I go to the sea."            # markers never stored
+    assert r1["title"] == "A trip"
     assert calls == ["en"]
     serve.translate(conn, cfg, "de", essay_id=eid)           # its own slot
     assert calls == ["en", "de"]
@@ -220,14 +222,14 @@ def test_essay_export_import_idempotent(tmp_path):
                                   "native_lang": "en", "topic": "mar",
                                   "title": "Viaje", "body": "Hoy **voy**.",
                                   "verbs_csv": "ir", "tenses_csv": "Presente"})
-    dbmod.save_translation(conn, eid, "en", [["Hoy **voy**.", "Today I go."]], "x")
+    dbmod.save_translation(conn, eid, "en", {"title": "Trip", "body": "Today I go."}, "x")
     blob = dbmod.export_essay(conn, eid)
-    assert blob["translations"]["en"][0][1] == "Today I go."
+    assert blob["translations"]["en"] == {"title": "Trip", "body": "Today I go."}
     conn2 = dbmod.connect(str(tmp_path / "eio2.db"))
     r1 = dbmod.import_essay(conn2, blob)
     r2 = dbmod.import_essay(conn2, blob)                      # idempotent
     assert r1["created"] is True and r2["created"] is False and r1["id"] == r2["id"]
-    assert dbmod.get_translation(conn2, r1["id"], "en")[0][1] == "Today I go."
+    assert dbmod.get_translation(conn2, r1["id"], "en")["body"] == "Today I go."
 
 
 def test_migration_preserves_data(tmp_path):
@@ -238,3 +240,15 @@ def test_migration_preserves_data(tmp_path):
     conn2 = dbmod.connect(path)                               # re-open = migrate
     assert [v["infinitive"] for v in dbmod.list_verbs(conn2, "es")] == ["ser"]
     assert conn2.execute("PRAGMA user_version").fetchone()[0] == dbmod.SCHEMA_VERSION
+
+
+def test_legacy_pair_translations_retranslate(tmp_path):
+    conn = dbmod.connect(str(tmp_path / "lg.db"))
+    eid = dbmod.save_essay(conn, {"created_at": "x", "foreign_lang": "es",
+                                  "native_lang": "en", "topic": "t", "title": "T",
+                                  "body": "b", "verbs_csv": "", "tenses_csv": ""})
+    conn.execute("INSERT INTO translations(essay_id, lang, pairs_json, created_at) "
+                 "VALUES(?,?,?,?)", (eid, "en", '[["a","b"]]', "x"))
+    conn.commit()
+    assert dbmod.get_translation(conn, eid, "en") is None    # forces a re-translate
+    assert dbmod.export_essay(conn, eid)["translations"] == {}

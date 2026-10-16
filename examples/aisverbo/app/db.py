@@ -228,13 +228,18 @@ def save_card(conn, word: str, foreign: str, native: str, card: dict, now: str) 
 
 
 # ─── translations (full-essay, sentence-aligned, cached) ─────────────
-def get_translation(conn, essay_id: int, lang: str) -> list | None:
+def get_translation(conn, essay_id: int, lang: str):
     r = conn.execute("SELECT pairs_json FROM translations WHERE essay_id=? "
                      "AND lang=?", (essay_id, lang)).fetchone()
-    return json.loads(r["pairs_json"]) if r else None
+    if not r:
+        return None
+    data = json.loads(r["pairs_json"])
+    # pre-v3 rows stored sentence pairs; the new shape is {"title","body"} —
+    # returning None makes the next request re-translate and overwrite
+    return data if isinstance(data, dict) else None
 
 
-def save_translation(conn, essay_id: int, lang: str, pairs: list, now: str) -> None:
+def save_translation(conn, essay_id: int, lang: str, pairs, now: str) -> None:
     conn.execute("INSERT OR REPLACE INTO translations(essay_id, lang, pairs_json, "
                  "created_at) VALUES(?,?,?,?)",
                  (essay_id, lang, json.dumps(pairs, ensure_ascii=False), now))
@@ -302,8 +307,14 @@ def export_essay(conn, essay_id: int) -> dict:
     r = conn.execute("SELECT * FROM essays WHERE id=?", (essay_id,)).fetchone()
     if not r:
         raise ValueError("unknown essay")
-    translations = {t["lang"]: json.loads(t["pairs_json"]) for t in conn.execute(
-        "SELECT lang, pairs_json FROM translations WHERE essay_id=?", (essay_id,))}
+    translations = {}
+    for t in conn.execute("SELECT lang, pairs_json FROM translations "
+                          "WHERE essay_id=?", (essay_id,)):
+        data = json.loads(t["pairs_json"])
+        if isinstance(data, dict):            # pre-v3 pair lists are not exported
+            translations[t["lang"]] = {
+                "title": (data.get("title") or "").replace("**", ""),
+                "body": (data.get("body") or "").replace("**", "")}
     return {"kind": "aisverbo-essay",
             **{k: r[k] for k in ("created_at", "foreign_lang", "native_lang",
                                  "topic", "title", "body", "verbs_csv",
@@ -328,8 +339,9 @@ def import_essay(conn, data: dict) -> dict:
                                  "topic", "title", "body", "verbs_csv",
                                  "tenses_csv")})
         created = True
-    for lang, pairs in (data.get("translations") or {}).items():
-        if isinstance(pairs, list) and get_translation(conn, eid, lang) is None:
-            save_translation(conn, eid, lang, pairs,
+    for lang, tr in (data.get("translations") or {}).items():
+        if isinstance(tr, dict) and "body" in tr \
+                and get_translation(conn, eid, lang) is None:
+            save_translation(conn, eid, lang, tr,
                              data.get("created_at") or "")
     return {"id": eid, "created": created}

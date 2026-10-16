@@ -106,6 +106,12 @@ story, every word card.
 make test        # offline test suite (the LLM bridge is faked)
 ```
 
+**After editing any prompt in `prompts/`, run `make plan`.** aiSlang pins
+every prompt's content hash in `aislang.lock`, and `aislang chat` refuses a
+drifted prompt ("system prompt hash mismatch") — which surfaces in the app
+as agent errors. `make plan` refreshes the lockfile; no stack restart is
+needed (each chat call reads it fresh).
+
 ## Hosting / sharing (HuggingFace Spaces and beyond)
 
 The app is deliberately split into a **pure-JSON backend** and a **single

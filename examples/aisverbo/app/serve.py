@@ -135,32 +135,40 @@ def word_card(conn, cfg: dict, word: str, sentence: str,
     return {"cached": False, **card}
 
 
+def _plain(text: str) -> str:
+    return (text or "").replace("**", "")
+
+
 def translate(conn, cfg: dict, to: str, essay_id: int | None = None,
               text: str | None = None, force: bool = False) -> dict:
-    """Sentence-aligned translation. A WHOLE essay is cached per language
-    (metadata worth keeping); a selected fragment is translated ad hoc."""
+    """Whole-story translation = TWO items per language (the title and the
+    body, plain text — markdown markers never enter the metadata), cached;
+    a selected fragment is translated ad hoc and not stored. The story ↔
+    translation substring mapping is deterministic and lives in the UI
+    (sentence-granular proportional mapping, bijective both ways)."""
+    title = ""
     if essay_id:
         if not force:
             cached = dbmod.get_translation(conn, essay_id, to)
-            if cached is not None:
-                return {"cached": True, "pairs": cached}
+            if isinstance(cached, dict) and "body" in cached:
+                return {"cached": True, **cached}
         r = conn.execute("SELECT title, body FROM essays WHERE id=?",
                          (essay_id,)).fetchone()
         if not r:
             raise RuntimeError("unknown essay")
-        text = f"{r['title']}\n{r['body']}"
+        title, text = _plain(r["title"]), _plain(r["body"])
     if not (text or "").strip():
         raise RuntimeError("nothing to translate")
     out = llm.ask_json("translator", {
-        "task": "translate", "text": text,
+        "task": "translate", "title": title, "text": _plain(text),
         "lang": cfg["foreign"], "to": to}, cfg)
-    pairs = [p for p in out.get("pairs") or []
-             if isinstance(p, list) and len(p) == 2]
-    if not pairs:
-        raise RuntimeError("the translator returned no sentence pairs")
+    result = {"title": _plain(out.get("title") or ""),
+              "body": _plain(out.get("body") or "")}
+    if not result["body"].strip():
+        raise RuntimeError("the translator returned an empty translation")
     if essay_id:
-        dbmod.save_translation(conn, essay_id, to, pairs, now_iso())
-    return {"cached": False, "pairs": pairs}
+        dbmod.save_translation(conn, essay_id, to, result, now_iso())
+    return {"cached": False, **result}
 
 
 def conjugation(conn, cfg: dict, lemma: str, tense: str,
