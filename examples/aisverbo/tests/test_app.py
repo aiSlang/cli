@@ -65,10 +65,12 @@ def test_essay_uses_selection_and_stores(tmp_path, monkeypatch):
                                [verbs[0]["id"]], [tenses[1]["id"]])
     assert seen["verbs"] == ["ir"] and seen["tenses"] == ["Futuro Simple"]
     assert rep["id"] == 1
-    # empty selection means "all enabled"
-    serve.generate_essay(conn, cfg, "otra vez", [], [])
-    assert seen["verbs"] == ["ir", "comer"]
-    assert len(seen["tenses"]) == 2
+    # the selection is REQUIRED now — an empty one is a clear error
+    try:
+        serve.generate_essay(conn, cfg, "otra vez", [], [])
+        assert False, "expected a selection error"
+    except RuntimeError as e:
+        assert "verb" in str(e)
     # the library finds it by verb and by topic word
     assert len(dbmod.search_essays(conn, "es", "comeré")) >= 1
     assert len(dbmod.search_essays(conn, "es", "viaje")) >= 1
@@ -102,3 +104,54 @@ def test_verb_management(tmp_path):
     rows = dbmod.list_verbs(conn, "es")
     assert [r["infinitive"] for r in rows] == ["ser"]         # trimmed, deduped
     assert dbmod.list_verbs(conn, "fr") == []                 # per-language
+
+
+def test_translation_cached_per_essay_and_language(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "t.db"))
+    cfg = cfg_for(tmp_path)
+    eid = dbmod.save_essay(conn, {
+        "created_at": "now", "foreign_lang": "es", "native_lang": "en",
+        "topic": "mar", "title": "Un viaje",
+        "body": "Hoy **voy** al mar. Mañana **comeré** pescado.",
+        "verbs_csv": "ir,comer", "tenses_csv": "Presente"})
+    calls = []
+    def fake_json(agent, payload, c):
+        calls.append(payload["to"])
+        return {"pairs": [["Un viaje", "A trip"],
+                          ["Hoy **voy** al mar.", "Today I go to the sea."]]}
+    monkeypatch.setattr(serve.llm, "ask_json", fake_json)
+    r1 = serve.translate(conn, cfg, "en", essay_id=eid)
+    r2 = serve.translate(conn, cfg, "en", essay_id=eid)      # cache hit
+    assert r1["cached"] is False and r2["cached"] is True
+    assert calls == ["en"]
+    serve.translate(conn, cfg, "de", essay_id=eid)           # its own slot
+    assert calls == ["en", "de"]
+    r4 = serve.translate(conn, cfg, "en", essay_id=eid, force=True)  # explicit refresh
+    assert r4["cached"] is False and calls == ["en", "de", "en"]
+    # a fragment is ad hoc: translated but never stored
+    serve.translate(conn, cfg, "en", text="Hoy voy al mar.")
+    assert calls[-1] == "en"
+    assert conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0] == 2
+
+
+def test_word_card_force_refresh(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "f.db"))
+    cfg = cfg_for(tmp_path)
+    calls = []
+    monkeypatch.setattr(serve.llm, "ask_json",
+                        lambda a, p, c: calls.append(1) or {"word": p["word"], "lemma": "ir"})
+    serve.word_card(conn, cfg, "voy", "x")
+    serve.word_card(conn, cfg, "voy", "x")
+    assert len(calls) == 1
+    r = serve.word_card(conn, cfg, "voy", "x", force=True)   # the UI's ⟳
+    assert len(calls) == 2 and r["cached"] is False
+
+
+def test_user_added_languages(tmp_path):
+    path = str(tmp_path / "config.json")
+    dbmod.save_config({"languages_extra": {"uk": "Українська"},
+                       "foreign": "uk"}, path)
+    cfg = dbmod.load_config(path)
+    assert cfg["foreign"] == "uk"                            # custom code accepted
+    assert dbmod.all_languages(cfg)["uk"] == "Українська"
+    assert "es" in dbmod.all_languages(cfg)                  # built-ins kept

@@ -35,7 +35,11 @@
   .grow{flex:1}
   .muted{color:var(--muted)}.mono{font-family:ui-monospace,monospace}
   .ok{color:var(--ok)}.err{color:var(--err)}
-  .chips{display:flex;flex-wrap:wrap;gap:6px;max-height:160px;overflow:auto;padding:2px}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--border);
+        border-top-color:var(--amber);border-radius:50%;vertical-align:-2px;
+        animation:spin .8s linear infinite;margin-right:5px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;max-height:150px;overflow:auto;padding:2px}
   .chip{border:1px solid var(--border);border-radius:999px;padding:3px 11px;font-size:13px;
         cursor:pointer;color:var(--muted);user-select:none}
   .chip.on{border-color:var(--amber);color:var(--amber2);background:rgba(240,136,62,.08)}
@@ -60,6 +64,14 @@
   .essay-row b{color:var(--amber2)}
   input[type=range]{width:120px;padding:0}
   .foot{color:var(--muted);font-size:12px;margin-top:18px}
+  .side-tabs{display:flex;gap:4px;margin-bottom:10px}
+  .side-tab{background:none;border:1px solid var(--border);border-radius:6px;
+            color:var(--muted);font-size:12px;padding:4px 11px;cursor:pointer}
+  .side-tab.active{color:var(--amber2);border-color:var(--amber)}
+  .tr-pair{border-radius:4px;padding:1px 2px}
+  .tr-pair.hl{background:rgba(88,166,255,.22)}
+  #tts-status{font-size:12px}
+  .pager{display:flex;gap:6px;align-items:center;font-size:13px;margin-top:8px}
 </style>
 </head>
 <body>
@@ -67,7 +79,7 @@
   <h1>ais<b>Verbo</b> · conjugation by story</h1>
   <span class="pill" id="pair-pill">… → …</span>
   <span style="flex:1"></span>
-  <span class="pill" title="Everything stays on this machine: vocabulary, stories and word cards live in app/generated/. Reading aloud is your browser's own speech synthesis — free and offline-capable.">stories stay local · the browser speaks</span>
+  <span class="pill" title="Everything stays on this machine: vocabulary, stories, translations and word cards live in app/generated/. Reading aloud is your browser's own speech synthesis — free and offline-capable.">stories stay local · the browser speaks</span>
 </header>
 
 <div class="tabs">
@@ -86,13 +98,22 @@
       <span class="job" id="essay-job"></span>
     </div>
     <div style="margin-top:10px">
-      <label>Tenses for this story (none selected = all enabled)</label>
+      <div class="bar">
+        <label class="grow">Tenses for this story — <b id="tsel-n">0</b> selected</label>
+        <button class="btn small" onclick="TSEL.clear();renderTenseChips()">none</button>
+      </div>
       <div class="chips" id="tense-chips"></div>
     </div>
     <div style="margin-top:8px">
-      <div class="bar"><label class="grow">Verbs (none selected = all enabled)</label>
-        <input id="verb-filter" style="width:160px" placeholder="filter…" oninput="renderVerbChips()"/>
-        <button class="btn small" onclick="VSEL.clear();renderVerbChips()">none</button></div>
+      <div class="bar">
+        <label class="grow">Verbs for this story — <b id="vsel-n">0</b> selected (pick from the whole corpus; filter to find)</label>
+        <input id="verb-filter" style="width:150px" placeholder="filter…" oninput="renderVerbChips()"/>
+        <input id="verb-quick" style="width:150px" placeholder="add a verb + select"
+               onkeydown="if(event.key==='Enter')quickAddVerb()"/>
+        <button class="btn small" onclick="quickAddVerb()">add</button>
+        <button class="btn small" title="clear the filter and unselect every verb"
+                onclick="$('#verb-filter').value='';VSEL.clear();renderVerbChips()">none</button>
+      </div>
       <div class="chips" id="verb-chips"></div>
     </div>
   </div>
@@ -102,18 +123,36 @@
         <h2 class="grow" id="essay-title" style="text-transform:none;font-size:17px;color:var(--fg)">—</h2>
         <button class="btn small" onclick="speak(plainEssay())" title="read the whole story">▶ story</button>
         <button class="btn small" onclick="speakSelection()" title="read the selected fragment">▶ selection</button>
-        <button class="btn small" onclick="speechSynthesis.cancel()">■</button>
+        <button class="btn small" onclick="stopSpeech()">■</button>
         <span class="muted" style="font-size:12px">speed</span>
         <input type="range" id="rate" min="0.5" max="1.4" step="0.1" value="0.9"/>
       </div>
-      <div id="essay-body" class="muted">Pick a topic, choose tenses and verbs, and press
+      <div id="tts-status"></div>
+      <div id="essay-body" class="muted">Pick a topic, select tenses and verbs above, and press
         <i>Write the story</i>. Vocabulary verbs come out <strong>bold</strong>; tap any word
-        for its full grammar card; select any fragment and press <span class="mono">▶ selection</span>
-        to hear it at your speed.</div>
+        for its grammar card; select any fragment for pronunciation (▶ selection) or
+        translation (Translation tab on the right).</div>
     </div>
     <div class="panel">
-      <h2>Word card</h2>
-      <div id="card" class="card muted">Tap a word in the story.</div>
+      <div class="side-tabs">
+        <button class="side-tab active" data-side="card" onclick="showSide('card')">Word card</button>
+        <button class="side-tab" data-side="trans" onclick="showSide('trans')">Translation</button>
+      </div>
+      <div id="side-card">
+        <div id="card" class="card muted">Tap a word in the story.</div>
+      </div>
+      <div id="side-trans" style="display:none">
+        <div class="bar">
+          <select id="tr-lang" style="width:150px"></select>
+          <button class="btn small" onclick="translateStory(false)">translate story</button>
+          <button class="btn small" title="ignore the cache and translate again (e.g. after a model change)"
+                  onclick="translateStory(true)">⟳</button>
+          <button class="btn small" onclick="translateSelection()">translate selection</button>
+        </div>
+        <div id="trans-body" class="muted" style="margin-top:10px;line-height:1.8">
+          Translate the whole story (cached per language) or just the selected fragment.
+          Selecting text in the story highlights its counterpart here.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -132,22 +171,26 @@
 
 <!-- ─── VOCABULARY ─── -->
 <div id="tab-vocab">
-  <div class="panel" id="tab-vocab-verbs">
-    <div class="bar"><h2 class="grow">Verbs</h2>
+  <div class="panel">
+    <div class="bar"><h2 class="grow">Verbs — the whole corpus</h2>
+      <input id="v-search" style="width:180px" placeholder="search…" oninput="VPAGE=0;renderVerbTable()"/>
       <input id="v-count" type="number" style="width:90px" title="how many to generate"/>
       <button class="btn" onclick="genVerbs()">Generate top-N</button>
       <span class="job" id="vocab-job"></span></div>
     <div class="bar" style="margin:8px 0">
       <input id="v-new" style="width:200px" placeholder="add a verb (infinitive)"/>
       <input id="v-gloss" style="width:200px" placeholder="gloss (optional)"/>
-      <button class="btn small" onclick="addVerb()">Add</button></div>
-    <table class="list"><thead><tr><th></th><th>infinitive</th><th>gloss</th><th></th></tr></thead>
+      <button class="btn small" onclick="addVerb()">Add</button>
+      <span class="muted" style="font-size:12px">Which verbs go into a story is chosen on the
+        Learn page — this page manages the corpus itself.</span></div>
+    <table class="list"><thead><tr><th>infinitive</th><th>gloss</th><th></th></tr></thead>
       <tbody id="verbs-body"></tbody></table>
+    <div class="pager" id="v-pager"></div>
   </div>
   <div class="panel">
-    <div class="bar"><h2 class="grow">Tenses</h2>
+    <div class="bar"><h2 class="grow">Tenses — the language's inventory</h2>
       <button class="btn" onclick="genTenses()">Generate the inventory</button></div>
-    <table class="list"><thead><tr><th></th><th>tense</th><th>in your language</th><th>used for</th><th>example</th></tr></thead>
+    <table class="list"><thead><tr><th>tense</th><th>in your language</th><th>used for</th><th>example</th><th></th></tr></thead>
       <tbody id="tenses-body"></tbody></table>
   </div>
 </div>
@@ -160,6 +203,11 @@
       <div><label>Explain things to me in</label><select id="s-native"></select></div>
       <div><label>Default vocabulary size</label><input id="s-verb_count" type="number" style="width:110px"/></div>
       <div><label>Story length (words)</label><input id="s-essay_words" type="number" style="width:110px"/></div>
+    </div>
+    <div class="bar" style="margin-top:10px">
+      <div><label>Add a language — code</label><input id="s-lang-code" style="width:90px" placeholder="uk"/></div>
+      <div class="grow"><label>name</label><input id="s-lang-name" placeholder="Українська"/></div>
+      <button class="btn" style="align-self:end" onclick="addLanguage()">Add language</button>
     </div>
   </div>
   <div class="panel"><h2>aiSlang</h2>
@@ -176,60 +224,80 @@
   </div>
 </div>
 
-<div class="foot">The agents (lexicographer · tensesmith · essayist · grammarian) run through the
+<div class="foot">The agents (lexicographer · tensesmith · essayist · grammarian · translator) run through the
   <span class="mono">aisverbo.ais</span> project — budget-capped, model-routed by aiSlang.
-  Word cards are generated once and cached. Not a substitute for a teacher — a tireless companion.</div>
+  Every model result is cached (word cards, story translations); the ⟳ controls re-ask on demand.
+  Not a substitute for a teacher — a tireless companion.</div>
 
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>(s??'').toString().replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const SPIN='<span class="spin"></span>';
 async function api(p){const r=await fetch(p);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 
-let STATE={},VERBS=[],TENSES=[],ESSAY=null,POLL=null;
-const VSEL=new Set(),TSEL=new Set();
+let STATE={},VERBS=[],TENSES=[],ESSAY=null,POLL=null,VPAGE=0;
+const PAGE=100, VSEL=new Set(), TSEL=new Set();
 
 function showTab(n){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===n));
   for(const t of['learn','library','vocab','setup'])$('#tab-'+t).style.display=t===n?'':'none';
   if(n==='library')loadLibrary();
 }
+function showSide(n){
+  document.querySelectorAll('.side-tab').forEach(t=>t.classList.toggle('active',t.dataset.side===n));
+  $('#side-card').style.display=n==='card'?'':'none';
+  $('#side-trans').style.display=n==='trans'?'':'none';
+}
 
 async function loadState(){STATE=await api('/api/state');
   $('#pair-pill').innerHTML=`<b>${esc(STATE.languages[STATE.settings.foreign])}</b> → ${esc(STATE.languages[STATE.settings.native])}`;
   $('#v-count').value=STATE.settings.verb_count;
-  fillSetup();}
+  fillSetup();fillTrLang();}
 async function loadVocab(){
   [VERBS,TENSES]=await Promise.all([api('/api/verbs'),api('/api/tenses')]);
   renderVerbChips();renderTenseChips();renderVerbTable();renderTenseTable();}
 
-/* ── chips (Learn) ── */
+/* ── Learn: per-story selection over the WHOLE corpus ── */
 function renderTenseChips(){
-  $('#tense-chips').innerHTML=TENSES.filter(t=>t.enabled).map(t=>
+  $('#tsel-n').textContent=TSEL.size;
+  $('#tense-chips').innerHTML=TENSES.map(t=>
     `<span class="chip${TSEL.has(t.id)?' on':''}" onclick="tog(TSEL,${t.id});renderTenseChips()"
        title="${esc(t.hint||'')}${t.example?'\n'+esc(t.example):''}">${esc(t.name)}</span>`).join('')
     ||'<span class="muted">no tenses yet — Vocabulary tab → Generate the inventory</span>';}
 function renderVerbChips(){
+  $('#vsel-n').textContent=VSEL.size;
   const f=($('#verb-filter').value||'').toLowerCase();
-  $('#verb-chips').innerHTML=VERBS.filter(v=>v.enabled&&(!f||v.infinitive.includes(f)||(v.gloss||'').toLowerCase().includes(f))).map(v=>
+  const vis=VERBS.filter(v=>!f||v.infinitive.includes(f)||(v.gloss||'').toLowerCase().includes(f));
+  $('#verb-chips').innerHTML=vis.slice(0,400).map(v=>
     `<span class="chip${VSEL.has(v.id)?' on':''}" onclick="tog(VSEL,${v.id});renderVerbChips()"
        title="${esc(v.gloss||'')}">${esc(v.infinitive)}</span>`).join('')
+    +(vis.length>400?`<span class="muted">… ${vis.length-400} more — narrow the filter</span>`:'')
     ||'<span class="muted">no verbs yet — Vocabulary tab → Generate top-N</span>';}
 function tog(set,id){set.has(id)?set.delete(id):set.add(id);}
+async function quickAddVerb(){
+  const inf=$('#verb-quick').value.trim();if(!inf)return;
+  await post('/api/verbs',{action:'add',infinitive:inf});
+  $('#verb-quick').value='';
+  await loadVocab();
+  const v=VERBS.find(x=>x.infinitive===inf.toLowerCase());
+  if(v){VSEL.add(v.id);renderVerbChips();}}
 
 /* ── the story ── */
 async function writeEssay(){
   const topic=$('#topic').value.trim();
   if(!topic)return alert('Give the story a topic first.');
+  if(!VSEL.size)return alert('Select at least one verb for this story.');
+  if(!TSEL.size)return alert('Select at least one tense for this story.');
   try{await post('/api/essay',{topic,verbs:[...VSEL],tenses:[...TSEL]});}
   catch(e){return $('#essay-job').innerHTML=`<span class="err">${esc(e.message)}</span>`;}
   $('#btn-write').disabled=true;pollJobs();}
 function pollJobs(){clearInterval(POLL);POLL=setInterval(async()=>{
   const j=await api('/api/jobs');
   const e=j.essay,v=j.vocab;
-  $('#essay-job').innerHTML=e.running?'<span class="muted">the essayist is writing…</span>'
+  $('#essay-job').innerHTML=e.running?`<span class="muted">${SPIN}the essayist is writing…</span>`
     :e.error?`<span class="err">${esc(e.error)}</span>`:'';
-  $('#vocab-job').innerHTML=v.running?'<span class="muted">generating…</span>'
+  $('#vocab-job').innerHTML=v.running?`<span class="muted">${SPIN}generating…</span>`
     :v.error?`<span class="err">${esc(v.error)}</span>`
     :v.report?`<span class="ok">+${v.report.added} (total ${v.report.total})</span>`:'';
   if(!e.running&&!v.running){clearInterval(POLL);$('#btn-write').disabled=false;
@@ -240,31 +308,37 @@ function showEssay(e){ESSAY=e;
   $('#essay-title').textContent=e.title||'—';
   $('#essay-body').classList.remove('muted');
   $('#essay-body').innerHTML=renderBody(e.body);
-  $('#card').innerHTML='Tap a word in the story.';$('#card').classList.add('muted');}
+  $('#card').innerHTML='Tap a word in the story.';$('#card').classList.add('muted');
+  $('#trans-body').innerHTML='Translate the whole story (cached) or a selected fragment.';
+  $('#trans-body').classList.add('muted');}
 function renderBody(md){
-  // **bold** → strong, then every word becomes tappable
   let h=esc(md).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
   h=h.replace(/(^|[\s>«“"(])([\p{L}\p{M}][\p{L}\p{M}'’-]*)/gu,
     (m,pre,w)=>`${pre}<span class="w" onclick="openCard(this)">${w}</span>`);
   return h.split(/\n{2,}/).map(p=>`<p>${p.replace(/\n/g,'<br/>')}</p>`).join('');}
 function plainEssay(){return ESSAY?(ESSAY.title+'. '+ESSAY.body.replace(/\*\*/g,'')):'';}
 
-/* ── word card ── */
-async function openCard(el){
+/* ── word card (cached; ⟳ re-asks) ── */
+async function openCard(el,force){
   document.querySelectorAll('#essay-body .w.sel').forEach(x=>x.classList.remove('sel'));
-  el.classList.add('sel');
-  const word=el.textContent;
-  const sentence=(el.closest('p')?.textContent||'').slice(0,400);
+  if(el.classList)el.classList.add('sel');
+  showSide('card');
+  const word=el.textContent||el;
+  const sentence=(el.closest?el.closest('p')?.textContent:'' ||'').slice(0,400);
   $('#card').classList.remove('muted');
-  $('#card').innerHTML='<span class="muted">asking the grammarian…</span>';
+  $('#card').innerHTML=`<span class="muted">${SPIN}asking the grammarian…</span>`;
+  highlightPair(word);
   try{
-    const c=await post('/api/card',{word,sentence});
+    const c=await post('/api/card',{word,sentence,force:!!force});
     const conj=(c.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('');
     $('#card').innerHTML=`
       <div class="bar"><b style="font-size:17px">${esc(c.word)}</b>
         <span class="mono muted">${esc(c.ipa||'')}</span>
         <button class="btn small" onclick="speak(${JSON.stringify(c.word)})">▶</button>
-        <span class="grow"></span>${c.cached?'<span class="muted" style="font-size:11px">cached</span>':''}</div>
+        <span class="grow"></span>
+        ${c.cached?'<span class="muted" style="font-size:11px">cached</span>':''}
+        <button class="btn small" title="re-ask the grammarian (ignore the cache)"
+          onclick='openCard(${JSON.stringify(word)},true)'>⟳</button></div>
       <dl style="margin:0">
       <dt>lemma · part of speech</dt><dd><b>${esc(c.lemma||'')}</b> · ${esc(c.pos||'')}</dd>
       <dt>meaning</dt><dd>${esc(c.translation||'')}</dd>
@@ -277,20 +351,70 @@ async function openCard(el){
       </dl>`;
   }catch(e){$('#card').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 
+/* ── translation (sentence-aligned; whole story cached) ── */
+let TRPAIRS=[];
+function fillTrLang(){
+  $('#tr-lang').innerHTML=Object.entries(STATE.languages).map(([c,n])=>
+    `<option value="${c}"${c===STATE.settings.native?' selected':''}>${esc(n)}</option>`).join('');}
+async function translateStory(force){
+  if(!ESSAY||!ESSAY.id)return alert('Write or open a story first.');
+  showSide('trans');
+  $('#trans-body').classList.remove('muted');
+  $('#trans-body').innerHTML=`<span class="muted">${SPIN}translating the story…</span>`;
+  try{
+    const r=await post('/api/translate',{essay_id:ESSAY.id,to:$('#tr-lang').value,force:!!force});
+    TRPAIRS=r.pairs;renderPairs();
+  }catch(e){$('#trans-body').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
+async function translateSelection(){
+  const s=(window.getSelection()||'').toString().trim();
+  if(!s)return alert('Select a fragment in the story first.');
+  showSide('trans');
+  $('#trans-body').classList.remove('muted');
+  $('#trans-body').innerHTML=`<span class="muted">${SPIN}translating the selection…</span>`;
+  try{
+    const r=await post('/api/translate',{text:s,to:$('#tr-lang').value});
+    TRPAIRS=r.pairs;renderPairs();
+  }catch(e){$('#trans-body').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
+function renderPairs(){
+  $('#trans-body').innerHTML=TRPAIRS.map((p,i)=>
+    `<span class="tr-pair" data-i="${i}" title="${esc(p[0].replace(/\*\*/g,''))}">${esc(p[1].replace(/\*\*/g,''))} </span>`).join('');}
+function highlightPair(fragment){
+  // map a fragment of the ORIGINAL to its semantic counterpart in the translation
+  if(!TRPAIRS.length||!fragment)return;
+  const f=fragment.toLowerCase();
+  document.querySelectorAll('.tr-pair').forEach(el=>{
+    const src=(TRPAIRS[+el.dataset.i][0]||'').replace(/\*\*/g,'').toLowerCase();
+    el.classList.toggle('hl',src.includes(f));});}
+document.addEventListener('selectionchange',()=>{
+  const s=(window.getSelection()||'').toString().trim();
+  if(s&&s.length>2)highlightPair(s.slice(0,120));});
+
 /* ── speech: the browser's own synthesis, free and local ── */
 function voiceFor(lang){
   const vs=speechSynthesis.getVoices();
   return vs.find(v=>v.lang.toLowerCase().startsWith(lang))||vs.find(v=>v.lang.slice(0,2)===lang)||null;}
+function ttsStatus(html){$('#tts-status').innerHTML=html;}
 function speak(text){if(!text)return;
   speechSynthesis.cancel();
+  const vs=speechSynthesis.getVoices();
+  if(!vs.length){
+    ttsStatus('<span class="err">this browser has no speech voices — on Linux install '
+      +'<span class="mono">speech-dispatcher</span>/<span class="mono">espeak-ng</span> '
+      +'and restart the browser, or use Chrome/Edge/Safari</span>');return;}
   const u=new SpeechSynthesisUtterance(text);
   u.lang=STATE.settings.foreign;
   const v=voiceFor(STATE.settings.foreign);if(v)u.voice=v;
+  else ttsStatus(`<span class="muted">no ${esc(STATE.settings.foreign)} voice installed — using the default voice</span>`);
   u.rate=parseFloat($('#rate').value)||0.9;
+  u.onstart=()=>ttsStatus(`<span class="muted">${SPIN}speaking (${v?esc(v.name):'default voice'}, ${u.rate}×)…</span>`);
+  u.onend=()=>ttsStatus('');
+  u.onerror=e=>ttsStatus(`<span class="err">speech failed: ${esc(e.error||'unknown')}</span>`);
   speechSynthesis.speak(u);}
+function stopSpeech(){speechSynthesis.cancel();ttsStatus('');}
 function speakSelection(){
   const s=(window.getSelection()||'').toString().trim();
-  speak(s||plainEssay());}
+  if(!s)return ttsStatus('<span class="muted">select a fragment in the story first — playing the whole story</span>')||speak(plainEssay());
+  speak(s);}
 
 /* ── library ── */
 async function loadLibrary(){
@@ -303,20 +427,31 @@ async function loadLibrary(){
     ||'<div class="muted">nothing yet — write your first story in Learn</div>';}
 async function openEssay(id){
   const e=await api('/api/essay?id='+id);
-  showEssay({title:e.title,body:e.body});
+  showEssay({id:e.id,title:e.title,body:e.body});
   showTab('learn');}
 
-/* ── vocabulary tab ── */
+/* ── Vocabulary: the corpus (search + pagination; selection lives in Learn) ── */
+function filteredVerbs(){
+  const f=($('#v-search').value||'').toLowerCase();
+  return VERBS.filter(v=>!f||v.infinitive.includes(f)||(v.gloss||'').toLowerCase().includes(f));}
 function renderVerbTable(){
-  $('#verbs-body').innerHTML=VERBS.map(v=>
-    `<tr><td><input type="checkbox" ${v.enabled?'checked':''} onchange="post('/api/verbs',{action:'toggle',id:${v.id}}).then(loadVocab)"/></td>
-     <td>${esc(v.infinitive)}</td><td class="muted">${esc(v.gloss||'')}</td>
-     <td><button class="btn small" onclick="post('/api/verbs',{action:'delete',id:${v.id}}).then(loadVocab)">✕</button></td></tr>`).join('');}
+  const vis=filteredVerbs();
+  const pages=Math.max(1,Math.ceil(vis.length/PAGE));
+  VPAGE=Math.min(VPAGE,pages-1);
+  $('#verbs-body').innerHTML=vis.slice(VPAGE*PAGE,(VPAGE+1)*PAGE).map(v=>
+    `<tr><td>${esc(v.infinitive)}</td><td class="muted">${esc(v.gloss||'')}</td>
+     <td><button class="btn small" onclick="post('/api/verbs',{action:'delete',id:${v.id}}).then(loadVocab)">✕</button></td></tr>`).join('')
+    ||'<tr><td colspan="3" class="muted">no verbs match</td></tr>';
+  $('#v-pager').innerHTML=pages>1?
+    `<button class="btn small" ${VPAGE?'':'disabled'} onclick="VPAGE--;renderVerbTable()">‹</button>
+     page ${VPAGE+1} / ${pages} · ${vis.length} verbs
+     <button class="btn small" ${VPAGE<pages-1?'':'disabled'} onclick="VPAGE++;renderVerbTable()">›</button>`
+    :`${vis.length} verb(s)`;}
 function renderTenseTable(){
   $('#tenses-body').innerHTML=TENSES.map(t=>
-    `<tr><td><input type="checkbox" ${t.enabled?'checked':''} onchange="post('/api/tenses',{action:'toggle',id:${t.id}}).then(loadVocab)"/></td>
-     <td>${esc(t.name)}</td><td class="muted">${esc(t.native_name||'')}</td>
-     <td class="muted">${esc(t.hint||'')}</td><td class="muted">${esc(t.example||'')}</td></tr>`).join('');}
+    `<tr><td>${esc(t.name)}</td><td class="muted">${esc(t.native_name||'')}</td>
+     <td class="muted">${esc(t.hint||'')}</td><td class="muted">${esc(t.example||'')}</td>
+     <td><button class="btn small" onclick="post('/api/tenses',{action:'delete',id:${t.id}}).then(loadVocab)">✕</button></td></tr>`).join('');}
 async function genVerbs(){
   try{await post('/api/verbs',{action:'generate',count:parseInt($('#v-count').value)||100});pollJobs();}
   catch(e){alert(e.message);}}
@@ -337,6 +472,14 @@ function fillSetup(){
   $('#s-native').value=STATE.settings.native;
   for(const k of['verb_count','essay_words','aislang_bin','chat_timeout'])
     $('#s-'+k).value=STATE.settings[k];}
+async function addLanguage(){
+  const code=$('#s-lang-code').value.trim().toLowerCase(),name=$('#s-lang-name').value.trim();
+  if(!code||!name)return alert('Give both the language code and its name.');
+  const extra={...(STATE.settings.languages_extra||{}),[code]:name};
+  await post('/api/settings',{languages_extra:extra});
+  $('#s-lang-code').value='';$('#s-lang-name').value='';
+  await loadState();
+  $('#setup-ok').textContent=`${name} added.`;setTimeout(()=>$('#setup-ok').textContent='',2500);}
 async function saveSettings(){
   await post('/api/settings',{
     foreign:$('#s-foreign').value,native:$('#s-native').value,
@@ -345,6 +488,7 @@ async function saveSettings(){
     aislang_bin:$('#s-aislang_bin').value.trim(),
     chat_timeout:parseInt($('#s-chat_timeout').value)||240});
   $('#setup-ok').textContent='Saved.';setTimeout(()=>$('#setup-ok').textContent='',2000);
+  VSEL.clear();TSEL.clear();
   await loadState();await loadVocab();}
 
 speechSynthesis.onvoiceschanged=()=>{};      // warm the voice list

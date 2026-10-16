@@ -57,6 +57,7 @@ project "aisverbo" {
   prompt "tensesmith_sys"    { file = "./prompts/tensesmith.md"    version = "1.0.0" }
   prompt "essayist_sys"      { file = "./prompts/essayist.md"      version = "1.0.0" }
   prompt "grammarian_sys"    { file = "./prompts/grammarian.md"    version = "1.0.0" }
+  prompt "translator_sys"    { file = "./prompts/translator.md"    version = "1.0.0" }
 
   ## Vocabulary: the top-N most useful verbs of the target language,
   ## glossed in the learner's native language. Batched by the app.
@@ -85,6 +86,15 @@ project "aisverbo" {
   agent "grammarian" {
     model         = model.scholar
     system_prompt = prompt.grammarian_sys
+    tools         = []
+  }
+
+  ## Sentence-aligned translation of a story (or a selected fragment) —
+  ## the alignment is what lets the UI map a selection in the original to
+  ## its semantic counterpart in the translation. Cached per essay+language.
+  agent "translator" {
+    model         = model.scholar
+    system_prompt = prompt.translator_sys
     tools         = []
   }
 

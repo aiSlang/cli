@@ -15,10 +15,14 @@ driven) into a multi-language web app with a persistent library.
 ## The behavior, end to end
 
 1. **Course** (Setup tab): choose the language you learn (`en es pt fr it
-   de`) and the language explanations should be in. The pairs may coincide —
+   de`, extendable — add any language code+name and it joins every
+   selector) and the language explanations should be in. The pairs may coincide —
    `en → en` is a legitimate course in formal English grammar. Switching
    languages keeps every language's data; switch back any time.
-2. **Vocabulary** (Vocabulary tab): one click generates the **top-N most
+2. **Vocabulary** (Vocabulary tab) — this page manages the CORPUS, not a
+   story's cast: search and paginate the verb list (100 per page, built for
+   1k–5k vocabularies), add or delete verbs and tenses. Which of them go
+   into a story is chosen on the Learn page. one click generates the **top-N most
    frequent verbs** of the course language (N is configurable: 50, 100,
    500…), each glossed in your native language, by the `lexicographer`
    agent — batched 100 per call, already-known verbs excluded, so you can
@@ -27,9 +31,12 @@ driven) into a multi-language web app with a persistent library.
    generates the language's **tense inventory** the same way (name, your-
    language name, a usage hint, an example); untick tenses you are not
    ready for.
-3. **A learning session** (Learn tab): type a topic in any language, chip-
-   select the verbs and tenses to drill (empty selection = everything
-   enabled), press *Write the story*. The `essayist` agent writes a ~180-
+3. **A learning session** (Learn tab): type a topic in any language and
+   chip-select this story's verbs and tenses from the whole corpus —
+   nothing is selected by default and a selection is required; filter to
+   find verbs, quick-add a new verb right there (it joins the corpus and
+   the selection), *none* clears filter and selection. Press *Write the
+   story*. The `essayist` agent writes a ~180-
    word story (length configurable) in the course language that conjugates
    verbs **only in the allowed tenses** and bolds every vocabulary verb.
 4. **Reading & listening**: ▶ plays the whole story; select any fragment
@@ -44,7 +51,13 @@ driven) into a multi-language web app with a persistent library.
    tense, IPA transcription, 2–3 example sentences (each playable),
    synonyms, usage notes. **Cards are cached forever** — each word costs
    one model call per language pair, ever.
-6. **Library** (Library tab): every story is stored. Search by any verb,
+6. **Translation** (right panel, next to the Word card): translate the
+   whole story (sentence-aligned, cached per language — ⟳ re-translates on
+   demand) or just the selected fragment; selecting text in the original
+   highlights its semantic counterpart in the translation. Every model
+   result in the app is cached this way — word cards, story translations —
+   and every cache has an explicit ⟳ to re-ask.
+7. **Library** (Library tab): every story is stored. Search by any verb,
    word form or topic — `comeré` finds every story where you met that
    future form — and reopen it as a full learning session.
 
@@ -56,6 +69,7 @@ driven) into a multi-language web app with a persistent library.
 | `tensesmith` | `scholar` | the language's tense inventory with hints and examples |
 | `essayist` | `author` (own block — tune creativity independently) | the themed story under verb + tense constraints, vocabulary bolded |
 | `grammarian` | `scholar` | the on-demand word card, cached in the DB |
+| `translator` | `scholar` | sentence-aligned story/fragment translation, cached per essay+language |
 
 Budget-capped ($2/day, $0.05/run) and routed by aiSlang; the app shells out
 to `aislang chat <agent> aisverbo.ais` — no SDKs, no direct provider calls.
@@ -102,7 +116,9 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
 ### Cost posture (the app is free of charge for a while)
 
 - **TTS: $0** — browser speech synthesis, every target language, rate
-  control included. (A server-side voice such as Google Cloud TTS can be
+  control included. On Linux the browser needs `speech-dispatcher` /
+  `espeak-ng` installed (the UI says so when no voices are found);
+  Chrome/Edge/Safari ship voices out of the box. (A server-side voice such as Google Cloud TTS can be
   slotted in later as an optional enhancement — or a dedicated TTS model
   hosted on aiSlang Cloud.)
 - **Grammar/story generation**: haiku-class calls behind aiSlang budget

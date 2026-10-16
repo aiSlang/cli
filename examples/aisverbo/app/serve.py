@@ -95,15 +95,12 @@ def generate_tenses(conn, cfg: dict) -> dict:
 def generate_essay(conn, cfg: dict, topic: str,
                    verb_ids: list, tense_ids: list) -> dict:
     lang = cfg["foreign"]
-    verbs = [v for v in dbmod.list_verbs(conn, lang)
-             if v["id"] in set(verb_ids)] or \
-            [v for v in dbmod.list_verbs(conn, lang) if v["enabled"]]
-    tenses = [t for t in dbmod.list_tenses(conn, lang)
-              if t["id"] in set(tense_ids)] or \
-             [t for t in dbmod.list_tenses(conn, lang) if t["enabled"]]
-    if not verbs or not tenses:
-        raise RuntimeError("generate the vocabulary and the tenses first "
-                           "(Vocabulary tab)")
+    verbs = [v for v in dbmod.list_verbs(conn, lang) if v["id"] in set(verb_ids)]
+    tenses = [t for t in dbmod.list_tenses(conn, lang) if t["id"] in set(tense_ids)]
+    if not verbs:
+        raise RuntimeError("select at least one verb for this story")
+    if not tenses:
+        raise RuntimeError("select at least one tense for this story")
     out = llm.ask_json("essayist", {
         "task": "essay", "lang": lang, "native": cfg["native"],
         "topic": topic, "tenses": [t["name"] for t in tenses],
@@ -124,9 +121,10 @@ def generate_essay(conn, cfg: dict, topic: str,
             "tenses": [t["name"] for t in tenses]}
 
 
-def word_card(conn, cfg: dict, word: str, sentence: str) -> dict:
+def word_card(conn, cfg: dict, word: str, sentence: str,
+              force: bool = False) -> dict:
     lang, native = cfg["foreign"], cfg["native"]
-    cached = dbmod.get_card(conn, word, lang, native)
+    cached = None if force else dbmod.get_card(conn, word, lang, native)
     if cached:
         return {"cached": True, **cached}
     card = llm.ask_json("grammarian", {
@@ -135,6 +133,34 @@ def word_card(conn, cfg: dict, word: str, sentence: str) -> dict:
     card.setdefault("word", word)
     dbmod.save_card(conn, word, lang, native, card, now_iso())
     return {"cached": False, **card}
+
+
+def translate(conn, cfg: dict, to: str, essay_id: int | None = None,
+              text: str | None = None, force: bool = False) -> dict:
+    """Sentence-aligned translation. A WHOLE essay is cached per language
+    (metadata worth keeping); a selected fragment is translated ad hoc."""
+    if essay_id:
+        if not force:
+            cached = dbmod.get_translation(conn, essay_id, to)
+            if cached is not None:
+                return {"cached": True, "pairs": cached}
+        r = conn.execute("SELECT title, body FROM essays WHERE id=?",
+                         (essay_id,)).fetchone()
+        if not r:
+            raise RuntimeError("unknown essay")
+        text = f"{r['title']}\n{r['body']}"
+    if not (text or "").strip():
+        raise RuntimeError("nothing to translate")
+    out = llm.ask_json("translator", {
+        "task": "translate", "text": text,
+        "lang": cfg["foreign"], "to": to}, cfg)
+    pairs = [p for p in out.get("pairs") or []
+             if isinstance(p, list) and len(p) == 2]
+    if not pairs:
+        raise RuntimeError("the translator returned no sentence pairs")
+    if essay_id:
+        dbmod.save_translation(conn, essay_id, to, pairs, now_iso())
+    return {"cached": False, "pairs": pairs}
 
 
 # ─── background jobs ─────────────────────────────────────────────────
@@ -197,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = dbmod.load_config()
             if url.path == "/api/state":
                 return self._send(200, {
-                    "settings": cfg, "languages": dbmod.LANGUAGES,
+                    "settings": cfg, "languages": dbmod.all_languages(cfg),
                     "verbs": len(dbmod.list_verbs(conn, cfg["foreign"])),
                     "tenses": len(dbmod.list_tenses(conn, cfg["foreign"])),
                     "essays": conn.execute(
@@ -271,6 +297,11 @@ class Handler(BaseHTTPRequestHandler):
                                  (int(body.get("id") or 0),))
                     conn.commit()
                     return self._send(200, {"ok": True})
+                if act == "delete":
+                    conn.execute("DELETE FROM tenses WHERE id=?",
+                                 (int(body.get("id") or 0),))
+                    conn.commit()
+                    return self._send(200, {"ok": True})
                 return self._send(400, {"error": "unknown action"})
             if url.path == "/api/essay":
                 topic = (body.get("topic") or "").strip()
@@ -283,12 +314,19 @@ class Handler(BaseHTTPRequestHandler):
                                        body.get("tenses") or []),
                                  daemon=True).start()
                 return self._send(202, {"started": True})
+            if url.path == "/api/translate":
+                return self._send(200, translate(
+                    conn, cfg, (body.get("to") or cfg["native"])[:8],
+                    essay_id=body.get("essay_id"),
+                    text=body.get("text"),
+                    force=bool(body.get("force"))))
             if url.path == "/api/card":
                 word = (body.get("word") or "").strip()
                 if not word:
                     return self._send(400, {"error": "word required"})
                 return self._send(200, word_card(conn, cfg, word,
-                                                 body.get("sentence") or ""))
+                                                 body.get("sentence") or "",
+                                                 force=bool(body.get("force"))))
             return self._send(404, {"error": "no such route"})
         except llm.LlmError as exc:
             return self._send(502, {"error": str(exc)})

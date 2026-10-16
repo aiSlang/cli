@@ -16,16 +16,25 @@ GEN_DIR = os.path.join(HERE, "generated")
 DEFAULT_DB = os.path.join(GEN_DIR, "aisverbo.db")
 CONFIG_PATH = os.path.join(GEN_DIR, "config.json")
 
-# the language pairs the UI offers; "foreign" may equal "native" (formal
-# grammar of one's own language is a valid course)
+# the built-in language list; "foreign" may equal "native" (formal grammar
+# of one's own language is a valid course). The user can add any further
+# language in Setup — stored in the config's languages_extra map.
 LANGUAGES = {"en": "English", "es": "Español", "pt": "Português",
              "fr": "Français", "it": "Italiano", "de": "Deutsch"}
+
+
+def all_languages(cfg) -> dict:
+    out = dict(LANGUAGES)
+    extra = cfg.get("languages_extra") or {}
+    out.update({str(k)[:8].lower(): str(v)[:40] for k, v in extra.items() if k})
+    return out
 
 DEFAULT_CONFIG = {
     "foreign": "es",                  # the language being learned
     "native": "en",                   # the learner's language
     "verb_count": 100,                # size of the generated vocabulary
     "essay_words": 180,               # target story length
+    "languages_extra": {},            # user-added languages: {code: name}
     "aislang_bin": "aislang",
     "project_ais": os.path.join(ROOT, "aisverbo.ais"),
     "chat_timeout": 240,
@@ -62,6 +71,13 @@ CREATE TABLE IF NOT EXISTS essays(
   verbs_csv TEXT,
   tenses_csv TEXT
 );
+CREATE TABLE IF NOT EXISTS translations(
+  essay_id INTEGER NOT NULL,
+  lang TEXT NOT NULL,
+  pairs_json TEXT,
+  created_at TEXT,
+  PRIMARY KEY(essay_id, lang)
+);
 CREATE TABLE IF NOT EXISTS cards(
   word TEXT NOT NULL,
   foreign_lang TEXT NOT NULL,
@@ -88,9 +104,10 @@ def load_config(path: str = CONFIG_PATH) -> dict:
             cfg.update(json.load(fh))
     except (OSError, json.JSONDecodeError):
         pass
-    if cfg.get("foreign") not in LANGUAGES:
+    langs = all_languages(cfg)
+    if cfg.get("foreign") not in langs:
         cfg["foreign"] = "es"
-    if cfg.get("native") not in LANGUAGES:
+    if cfg.get("native") not in langs:
         cfg["native"] = "en"
     return cfg
 
@@ -181,4 +198,18 @@ def save_card(conn, word: str, foreign: str, native: str, card: dict, now: str) 
                  "json, created_at) VALUES(?,?,?,?,?)",
                  (word.lower(), foreign, native,
                   json.dumps(card, ensure_ascii=False), now))
+    conn.commit()
+
+
+# ─── translations (full-essay, sentence-aligned, cached) ─────────────
+def get_translation(conn, essay_id: int, lang: str) -> list | None:
+    r = conn.execute("SELECT pairs_json FROM translations WHERE essay_id=? "
+                     "AND lang=?", (essay_id, lang)).fetchone()
+    return json.loads(r["pairs_json"]) if r else None
+
+
+def save_translation(conn, essay_id: int, lang: str, pairs: list, now: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO translations(essay_id, lang, pairs_json, "
+                 "created_at) VALUES(?,?,?,?)",
+                 (essay_id, lang, json.dumps(pairs, ensure_ascii=False), now))
     conn.commit()
