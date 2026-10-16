@@ -123,6 +123,36 @@ def connect(path: str = DEFAULT_DB) -> sqlite3.Connection:
     return conn
 
 
+# hosted limits — the app is free of charge, so one vocabulary generation
+# is capped at 100 verbs and one story at 200 words
+MAX_VERB_COUNT = 100
+MAX_ESSAY_WORDS = 200
+
+_TID_OK = __import__("re").compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def tenant_paths(tid: str | None) -> tuple[str, str]:
+    """(db_path, config_path) of one tenant's isolated data directory.
+    The default tenant 'local' keeps the legacy single-user paths."""
+    if not tid or tid == "local":
+        return DEFAULT_DB, CONFIG_PATH
+    if not _TID_OK.match(tid):
+        raise ValueError("bad tenant id")
+    tdir = os.path.join(GEN_DIR, "tenants", tid)
+    return os.path.join(tdir, "aisverbo.db"), os.path.join(tdir, "config.json")
+
+
+def _clamp(cfg: dict) -> None:
+    try:
+        cfg["verb_count"] = max(1, min(int(cfg.get("verb_count", 100)), MAX_VERB_COUNT))
+    except (TypeError, ValueError):
+        cfg["verb_count"] = 100
+    try:
+        cfg["essay_words"] = max(30, min(int(cfg.get("essay_words", 180)), MAX_ESSAY_WORDS))
+    except (TypeError, ValueError):
+        cfg["essay_words"] = 180
+
+
 def load_config(path: str = CONFIG_PATH) -> dict:
     cfg = dict(DEFAULT_CONFIG)
     try:
@@ -135,12 +165,14 @@ def load_config(path: str = CONFIG_PATH) -> dict:
         cfg["foreign"] = "es"
     if cfg.get("native") not in langs:
         cfg["native"] = "en"
+    _clamp(cfg)
     return cfg
 
 
 def save_config(cfg: Mapping, path: str = CONFIG_PATH) -> dict:
     merged = dict(DEFAULT_CONFIG)
     merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
+    _clamp(merged)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(merged, fh, indent=2, ensure_ascii=False)

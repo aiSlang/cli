@@ -97,7 +97,9 @@ aislang apply    examples/aisverbo/aisverbo.ais     # LiteLLM router + budgets
 cd examples/aisverbo && make serve                  # → http://127.0.0.1:8787
 ```
 
-Standard-library Python only (3.10+). All state lives in `app/generated/`
+The backend is **FastAPI** (`requirements.txt`: fastapi + uvicorn — the
+only dependencies; `make serve` runs uvicorn); the agents bridge, the
+store and the UI are dependency-free as before. All state lives in `app/generated/`
 (SQLite + config, git-ignored; `AISVERBO_DATA=<dir>` relocates it — tests,
 HF persistent storage, a second instance beside a live one). The schema
 migrates in place on open (`PRAGMA user_version`), never dropping data: vocabulary and tenses per language, every
@@ -120,13 +122,40 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
 `speechSynthesis`. That split maps onto three hosting modes:
 
 1. **Local (today)** — the full app next to the aiSlang CLI, as above.
-2. **HuggingFace Docker Space (today, free CPU tier)** — the provided
-   `Dockerfile` runs `aislang apply` + the web server in one container,
-   listening on the `PORT=7860` HF expects. Add `ANTHROPIC_API_KEY` as a
-   Space secret (consumed by the LiteLLM stack); bake the `aislang` binary
-   into the image (see the Dockerfile comments) until a public release
+2. **HuggingFace Docker Space (today, free CPU tier) — the Space type to
+   choose.** The provided `Dockerfile` installs the requirements, runs
+   `aislang apply` + uvicorn on the `PORT=7860` HF expects, and turns on
+   `AISVERBO_MULTI_TENANT=1`. Space secrets to set: `ANTHROPIC_API_KEY`
+   (the LiteLLM stack) and `AISVERBO_SECRET` (the JWT signing secret).
+   Enable persistent storage and point `AISVERBO_DATA=/data` at it, or
+   tenant data dies with the container. Bake the `aislang` binary into
+   the image (see the Dockerfile comments) until a public release
    artifact exists. No PRO subscription required — Docker Spaces have a
-   free tier; Gradio is not needed since the UI is plain HTML.
+   free tier; Gradio buys nothing since the UI is plain HTML.
+
+### Tenancy & auth
+
+- **Tenants**: every browser obtains a signed tenant token at first load
+  (`POST /api/tenant/new`, kept in localStorage) and sends it as
+  `Authorization: Bearer …`; each tenant lives in its own SQLite + config
+  under `generated/tenants/<id>/` — fully isolated vocabulary, stories,
+  settings. In local mode (no `AISVERBO_MULTI_TENANT`) everyone shares
+  the legacy single-user data, so nothing changes for a laptop install.
+  Word-card/conjugation caches are per tenant today; a shared cross-
+  tenant cache is a straightforward follow-up once billing wants it.
+- **Admin**: corpus management (every `POST /api/verbs` and
+  `POST /api/tenses`, and corpus import) requires a JWT with
+  `role=admin` in the `X-Admin-Token` header. Mint yours:
+
+  ```bash
+  AISVERBO_SECRET=<the same secret> python3 app/get_token.py   # 365 days
+  ```
+
+  and paste it into **Setup → Admin token** (stored only in that
+  browser). Reading, story writing, cards, conjugations, translations
+  and story import stay open to every tenant.
+- **Limits** (the app is free of charge): one vocabulary generation ≤
+  **100 verbs**, one story ≤ **200 words** — clamped server-side.
 3. **HuggingFace Static Space (future, free)** — once the aiSlang **Cloud
    API** exists, `ui.html` alone is the deployment: point its `fetch`
    base at the Cloud API and the whole app runs from a free Static Space,

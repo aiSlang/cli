@@ -1,64 +1,82 @@
 #!/usr/bin/env python3
-"""aisVerbo — the web app: learn verb conjugation by story.
+"""aisVerbo — the web app (FastAPI): learn verb conjugation by story.
 
-Routes (JSON unless noted):
-  GET  /                               the single-page UI (app/ui.html)
-  GET  /api/state                      settings + languages + counts
-  POST /api/settings  {foreign,native,verb_count,essay_words,...}
-  GET  /api/verbs                      vocabulary for the chosen language
-  POST /api/verbs     {action: generate|add|toggle|delete, ...}  (generate: background)
-  GET  /api/tenses                     tense inventory for the chosen language
-  POST /api/tenses    {action: generate|toggle}                  (generate: background)
-  POST /api/essay     {topic, verbs:[ids], tenses:[ids]}         (background)
-  GET  /api/essays?q=<word or phrase>  the library, searchable
-  GET  /api/essay?id=N                 one stored essay
-  POST /api/card      {word, sentence}  the grammarian's card (cached)
-  GET  /api/jobs                       background job states
+Routes (JSON unless noted) — unchanged contract from the stdlib version:
+  GET  /                    the single-page UI (app/ui.html)
+  POST /api/tenant/new      a TENANT token (multi-tenant mode mints a fresh
+                            isolated data dir per token; local mode returns
+                            the shared "local" tenant)
+  GET  /api/state           settings + languages + counts
+  POST /api/settings        (verb_count ≤ 100, essay_words ≤ 200 — clamped)
+  GET/POST /api/verbs       corpus — POST requires the ADMIN token
+  GET/POST /api/tenses      corpus — POST requires the ADMIN token
+  POST /api/essay           background job        GET /api/jobs
+  GET  /api/essays?q=       the library           GET /api/essay?id=
+  POST /api/card            the grammarian card (DB-cached; force re-asks)
+  POST /api/conjugation     one lemma in one tense (DB-cached)
+  POST /api/translate       story (cached) or fragment translation
+  GET  /api/export/essay    POST /api/import/essay      (idempotent)
+  GET  /api/export/corpus   POST /api/import/corpus     (idempotent)
 
-Local only by default; `PORT` env (HuggingFace Docker Spaces sets 7860) or
---port override. Reading aloud happens in the BROWSER (speechSynthesis) —
-no server audio, no third-party TTS bill.
+Tenancy: every request may carry `Authorization: Bearer <tenant JWT>`;
+each tenant gets its own SQLite + config under generated/tenants/<tid>/.
+Without a token (or in local mode) the legacy single-user paths serve.
+Admin: corpus-mutating POSTs require `X-Admin-Token: <JWT role=admin>`
+minted by `python3 app/get_token.py`.
+
+PORT env (HuggingFace Docker Spaces sets 7860) or --port override;
+AISVERBO_MULTI_TENANT=1 turns fresh-tenant minting on (the Space mode).
 """
 from __future__ import annotations
 
 import argparse
 import datetime
-import json
 import os
 import sys
 import threading
-import traceback
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import uuid as uuidmod
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth     # noqa: E402
 import db as dbmod      # noqa: E402
 import llm              # noqa: E402
 
 UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+MULTI_TENANT = bool(os.environ.get("AISVERBO_MULTI_TENANT"))
 
 _LOCK = threading.Lock()
-JOBS = {
-    "vocab": {"running": False, "report": None, "error": None},
-    "essay": {"running": False, "report": None, "error": None},
-}
+JOBS: dict = {}          # tenant id -> {"vocab": {...}, "essay": {...}}
+
+
+def _jobs_of(tid: str) -> dict:
+    with _LOCK:
+        jobs = JOBS.setdefault(tid, {})
+        for name in ("vocab", "essay"):
+            jobs.setdefault(name, {"running": False, "report": None, "error": None})
+        return jobs
+
+
+def _job_start(tid: str, name: str) -> bool:
+    with _LOCK:
+        jobs = JOBS.setdefault(tid, {})
+        j = jobs.setdefault(name, {"running": False, "report": None, "error": None})
+        if j["running"]:
+            return False
+        jobs[name] = {"running": True, "report": None, "error": None}
+        return True
+
+
+def _job_end(tid: str, name: str, report=None, error=None) -> None:
+    with _LOCK:
+        JOBS.setdefault(tid, {})[name] = {"running": False, "report": report,
+                                          "error": error}
 
 
 def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-
-def _job_start(name: str) -> bool:
-    with _LOCK:
-        if JOBS[name]["running"]:
-            return False
-        JOBS[name] = {"running": True, "report": None, "error": None}
-        return True
-
-
-def _job_end(name: str, report=None, error=None) -> None:
-    with _LOCK:
-        JOBS[name] = {"running": False, "report": report, "error": error}
 
 
 # ─── agent drivers ───────────────────────────────────────────────────
@@ -195,233 +213,276 @@ def conjugation(conn, cfg: dict, lemma: str, tense: str,
     return {"cached": False, **data}
 
 
-# ─── background jobs ─────────────────────────────────────────────────
-def _vocab_job(what: str, count: int, lang: str | None = None) -> None:
+# ─── tenancy + auth (FastAPI dependencies) ───────────────────────────
+class Ctx:
+    def __init__(self, tid: str):
+        self.tid = tid
+        self.db_path, self.cfg_path = dbmod.tenant_paths(tid)
+
+    def conn(self):
+        return dbmod.connect(self.db_path)
+
+    def cfg(self) -> dict:
+        return dbmod.load_config(self.cfg_path)
+
+
+def get_ctx(authorization: str | None = Header(None)) -> Ctx:
+    if authorization and authorization.lower().startswith("bearer "):
+        payload = auth.verify(authorization[7:])
+        tid = (payload or {}).get("tid")
+        if tid:
+            try:
+                return Ctx(str(tid))
+            except ValueError:
+                raise HTTPException(401, "bad tenant token")
+    if MULTI_TENANT:
+        raise HTTPException(401, "tenant token required — POST /api/tenant/new")
+    return Ctx("local")
+
+
+def require_admin(x_admin_token: str | None = Header(None)) -> dict:
+    payload = auth.verify(x_admin_token or "")
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(401, "corpus management needs the ADMIN token — "
+                                 "mint one with `python3 app/get_token.py` and "
+                                 "paste it into Setup")
+    return payload
+
+
+app = FastAPI(title="aisVerbo", docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(llm.LlmError)
+async def _llm_err(request: Request, exc: llm.LlmError):
+    return JSONResponse(status_code=502, content={"error": str(exc)})
+
+
+@app.exception_handler(RuntimeError)
+async def _runtime_err(request: Request, exc: RuntimeError):
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(HTTPException)
+async def _http_err(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+
+@app.get("/")
+def ui():
+    return FileResponse(UI_PATH, media_type="text/html")
+
+
+@app.post("/api/tenant/new")
+def tenant_new():
+    tid = str(uuidmod.uuid4()) if MULTI_TENANT else "local"
+    return {"token": auth.sign({"tid": tid}), "tid": tid,
+            "multi_tenant": MULTI_TENANT}
+
+
+@app.get("/api/state")
+def state(ctx: Ctx = Depends(get_ctx)):
+    conn, cfg = ctx.conn(), ctx.cfg()
+    return {"settings": cfg, "languages": dbmod.all_languages(cfg),
+            "tenant": ctx.tid, "multi_tenant": MULTI_TENANT,
+            "verbs": len(dbmod.list_verbs(conn, cfg["foreign"])),
+            "tenses": len(dbmod.list_tenses(conn, cfg["foreign"])),
+            "essays": conn.execute(
+                "SELECT COUNT(*) FROM essays WHERE foreign_lang=?",
+                (cfg["foreign"],)).fetchone()[0]}
+
+
+@app.post("/api/settings")
+def settings(body: dict, ctx: Ctx = Depends(get_ctx)):
+    return dbmod.save_config({**ctx.cfg(), **body}, ctx.cfg_path)
+
+
+@app.get("/api/verbs")
+def verbs(lang: str | None = None, ctx: Ctx = Depends(get_ctx)):
+    return dbmod.list_verbs(ctx.conn(), lang or ctx.cfg()["foreign"])
+
+
+@app.get("/api/tenses")
+def tenses(lang: str | None = None, ctx: Ctx = Depends(get_ctx)):
+    return dbmod.list_tenses(ctx.conn(), lang or ctx.cfg()["foreign"])
+
+
+def _vocab_job(ctx: Ctx, what: str, count: int, lang: str | None) -> None:
     try:
-        cfg = dbmod.load_config()
-        conn = dbmod.connect()
+        conn, cfg = ctx.conn(), ctx.cfg()
         if what == "verbs":
             report = generate_verbs(conn, cfg, count, lang)
         else:
             report = generate_tenses(conn, cfg, lang)
-        _job_end("vocab", report={"what": what, **report})
+        _job_end(ctx.tid, "vocab", report={"what": what, **report})
     except Exception as exc:
-        _job_end("vocab", error=f"{type(exc).__name__}: {exc}")
+        _job_end(ctx.tid, "vocab", error=f"{type(exc).__name__}: {exc}")
 
 
-def _essay_job(topic: str, verb_ids: list, tense_ids: list) -> None:
+@app.post("/api/verbs")
+def verbs_post(body: dict, ctx: Ctx = Depends(get_ctx),
+               admin: dict = Depends(require_admin)):
+    conn, cfg = ctx.conn(), ctx.cfg()
+    act = body.get("action")
+    if act == "generate":
+        if not _job_start(ctx.tid, "vocab"):
+            raise HTTPException(409, "a generation is already running")
+        count = min(int(body.get("count") or cfg.get("verb_count", 100)),
+                    dbmod.MAX_VERB_COUNT)
+        threading.Thread(target=_vocab_job,
+                         args=(ctx, "verbs", count, body.get("lang")),
+                         daemon=True).start()
+        return {"started": True, "count": count}
+    if act == "add":
+        return {"added": dbmod.add_verbs(conn, body.get("lang") or cfg["foreign"],
+                                         [{"infinitive": body.get("infinitive"),
+                                           "gloss": body.get("gloss", "")}])}
+    if act == "update":
+        dbmod.update_verb(conn, int(body.get("id") or 0),
+                          body.get("infinitive") or "", body.get("gloss") or "")
+        return {"ok": True}
+    if act == "delete":
+        r = conn.execute("SELECT lang, infinitive FROM verbs WHERE id=?",
+                         (int(body.get("id") or 0),)).fetchone()
+        if r:
+            n = dbmod.verb_references(conn, r["lang"], r["infinitive"])
+            if n:
+                raise HTTPException(409, f"'{r['infinitive']}' is used by {n} "
+                                    "stored story(ies) — keep it, or delete "
+                                    "those stories first.")
+            conn.execute("DELETE FROM verbs WHERE id=?", (int(body.get("id")),))
+            conn.commit()
+        return {"ok": True}
+    raise HTTPException(400, "unknown action")
+
+
+@app.post("/api/tenses")
+def tenses_post(body: dict, ctx: Ctx = Depends(get_ctx),
+                admin: dict = Depends(require_admin)):
+    conn, cfg = ctx.conn(), ctx.cfg()
+    act = body.get("action")
+    if act == "generate":
+        if not _job_start(ctx.tid, "vocab"):
+            raise HTTPException(409, "a generation is already running")
+        threading.Thread(target=_vocab_job,
+                         args=(ctx, "tenses", 0, body.get("lang")),
+                         daemon=True).start()
+        return {"started": True}
+    if act == "toggle":
+        conn.execute("UPDATE tenses SET enabled=1-enabled WHERE id=?",
+                     (int(body.get("id") or 0),))
+        conn.commit()
+        return {"ok": True}
+    if act == "delete":
+        r = conn.execute("SELECT lang, name FROM tenses WHERE id=?",
+                         (int(body.get("id") or 0),)).fetchone()
+        if r:
+            n = dbmod.tense_references(conn, r["lang"], r["name"])
+            if n:
+                raise HTTPException(409, f"'{r['name']}' is used by {n} stored "
+                                    "story(ies) — keep it, or delete those first.")
+            conn.execute("DELETE FROM tenses WHERE id=?", (int(body.get("id")),))
+            conn.commit()
+        return {"ok": True}
+    raise HTTPException(400, "unknown action")
+
+
+def _essay_job(ctx: Ctx, topic: str, verb_ids: list, tense_ids: list) -> None:
     try:
-        cfg = dbmod.load_config()
-        conn = dbmod.connect()
-        report = generate_essay(conn, cfg, topic, verb_ids, tense_ids)
-        _job_end("essay", report=report)
+        report = generate_essay(ctx.conn(), ctx.cfg(), topic, verb_ids, tense_ids)
+        _job_end(ctx.tid, "essay", report=report)
     except Exception as exc:
-        _job_end("essay", error=f"{type(exc).__name__}: {exc}")
+        _job_end(ctx.tid, "essay", error=f"{type(exc).__name__}: {exc}")
 
 
-# ─── HTTP ────────────────────────────────────────────────────────────
-class Handler(BaseHTTPRequestHandler):
-    server_version = "aisVerbo/0.1"
+@app.post("/api/essay")
+def essay_post(body: dict, ctx: Ctx = Depends(get_ctx)):
+    topic = (body.get("topic") or "").strip()
+    if not topic:
+        raise HTTPException(400, "give a topic")
+    if not _job_start(ctx.tid, "essay"):
+        raise HTTPException(409, "a story is already being written")
+    threading.Thread(target=_essay_job,
+                     args=(ctx, topic, body.get("verbs") or [],
+                           body.get("tenses") or []),
+                     daemon=True).start()
+    return {"started": True}
 
-    def _send(self, code: int, body, ctype="application/json; charset=utf-8"):
-        data = body if isinstance(body, (bytes, bytearray)) else \
-            json.dumps(body, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
-    def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
-        if not n:
-            return {}
-        try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
-        except json.JSONDecodeError:
-            return {}
+@app.get("/api/jobs")
+def jobs(ctx: Ctx = Depends(get_ctx)):
+    return _jobs_of(ctx.tid)
 
-    def log_message(self, *a):            # quiet
-        pass
 
-    def do_GET(self):
-        url = urllib.parse.urlparse(self.path)
-        q = urllib.parse.parse_qs(url.query)
-        try:
-            if url.path in ("/", "/index.html"):
-                with open(UI_PATH, "rb") as fh:
-                    return self._send(200, fh.read(), "text/html; charset=utf-8")
-            conn = dbmod.connect()
-            cfg = dbmod.load_config()
-            if url.path == "/api/state":
-                return self._send(200, {
-                    "settings": cfg, "languages": dbmod.all_languages(cfg),
-                    "verbs": len(dbmod.list_verbs(conn, cfg["foreign"])),
-                    "tenses": len(dbmod.list_tenses(conn, cfg["foreign"])),
-                    "essays": conn.execute(
-                        "SELECT COUNT(*) FROM essays WHERE foreign_lang=?",
-                        (cfg["foreign"],)).fetchone()[0]})
-            if url.path == "/api/verbs":
-                return self._send(200, dbmod.list_verbs(
-                    conn, (q.get("lang") or [cfg["foreign"]])[0]))
-            if url.path == "/api/tenses":
-                return self._send(200, dbmod.list_tenses(
-                    conn, (q.get("lang") or [cfg["foreign"]])[0]))
-            if url.path == "/api/export/corpus":
-                lang = (q.get("lang") or [cfg["foreign"]])[0]
-                return self._send(200, dbmod.export_corpus(conn, lang))
-            if url.path == "/api/export/essay":
-                return self._send(200, dbmod.export_essay(
-                    conn, int((q.get("id") or ["0"])[0])))
-            if url.path == "/api/essays":
-                return self._send(200, dbmod.search_essays(
-                    conn, cfg["foreign"], (q.get("q") or [""])[0]))
-            if url.path == "/api/essay":
-                r = conn.execute("SELECT * FROM essays WHERE id=?",
-                                 ((q.get("id") or ["0"])[0],)).fetchone()
-                if not r:
-                    return self._send(404, {"error": "unknown essay"})
-                return self._send(200, dict(r))
-            if url.path == "/api/jobs":
-                with _LOCK:
-                    return self._send(200, JOBS)
-            return self._send(404, {"error": "no such route"})
-        except Exception as exc:
-            traceback.print_exc()
-            return self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+@app.get("/api/essays")
+def essays(q: str = "", ctx: Ctx = Depends(get_ctx)):
+    return dbmod.search_essays(ctx.conn(), ctx.cfg()["foreign"], q)
 
-    def do_POST(self):
-        url = urllib.parse.urlparse(self.path)
-        body = self._body()
-        try:
-            conn = dbmod.connect()
-            cfg = dbmod.load_config()
-            if url.path == "/api/settings":
-                merged = dbmod.save_config({**cfg, **body})
-                return self._send(200, merged)
-            if url.path == "/api/verbs":
-                act = body.get("action")
-                if act == "generate":
-                    if not _job_start("vocab"):
-                        return self._send(409, {"error": "a generation is already running"})
-                    count = int(body.get("count") or cfg.get("verb_count", 100))
-                    threading.Thread(target=_vocab_job,
-                                     args=("verbs", count, body.get("lang")),
-                                     daemon=True).start()
-                    return self._send(202, {"started": True, "count": count})
-                if act == "update":
-                    dbmod.update_verb(conn, int(body.get("id") or 0),
-                                      body.get("infinitive") or "",
-                                      body.get("gloss") or "")
-                    return self._send(200, {"ok": True})
-                if act == "add":
-                    n = dbmod.add_verbs(conn, cfg["foreign"],
-                                        [{"infinitive": body.get("infinitive"),
-                                          "gloss": body.get("gloss", "")}])
-                    return self._send(200, {"added": n})
-                if act == "toggle":
-                    conn.execute("UPDATE verbs SET enabled=1-enabled WHERE id=?",
-                                 (int(body.get("id") or 0),))
-                    conn.commit()
-                    return self._send(200, {"ok": True})
-                if act == "delete":
-                    r = conn.execute("SELECT lang, infinitive FROM verbs WHERE id=?",
-                                     (int(body.get("id") or 0),)).fetchone()
-                    if r:
-                        n = dbmod.verb_references(conn, r["lang"], r["infinitive"])
-                        if n:
-                            return self._send(409, {"error":
-                                f"'{r['infinitive']}' is used by {n} stored "
-                                "story(ies) — deleting it would break their "
-                                "metadata. Keep it, or delete those stories first."})
-                        conn.execute("DELETE FROM verbs WHERE id=?",
-                                     (int(body.get("id") or 0),))
-                        conn.commit()
-                    return self._send(200, {"ok": True})
-                return self._send(400, {"error": "unknown action"})
-            if url.path == "/api/tenses":
-                act = body.get("action")
-                if act == "generate":
-                    if not _job_start("vocab"):
-                        return self._send(409, {"error": "a generation is already running"})
-                    threading.Thread(target=_vocab_job,
-                                     args=("tenses", 0, body.get("lang")),
-                                     daemon=True).start()
-                    return self._send(202, {"started": True})
-                if act == "toggle":
-                    conn.execute("UPDATE tenses SET enabled=1-enabled WHERE id=?",
-                                 (int(body.get("id") or 0),))
-                    conn.commit()
-                    return self._send(200, {"ok": True})
-                if act == "delete":
-                    r = conn.execute("SELECT lang, name FROM tenses WHERE id=?",
-                                     (int(body.get("id") or 0),)).fetchone()
-                    if r:
-                        n = dbmod.tense_references(conn, r["lang"], r["name"])
-                        if n:
-                            return self._send(409, {"error":
-                                f"'{r['name']}' is used by {n} stored "
-                                "story(ies) — keep it, or delete those first."})
-                        conn.execute("DELETE FROM tenses WHERE id=?",
-                                     (int(body.get("id") or 0),))
-                        conn.commit()
-                    return self._send(200, {"ok": True})
-                return self._send(400, {"error": "unknown action"})
-            if url.path == "/api/essay":
-                topic = (body.get("topic") or "").strip()
-                if not topic:
-                    return self._send(400, {"error": "give a topic"})
-                if not _job_start("essay"):
-                    return self._send(409, {"error": "a story is already being written"})
-                threading.Thread(target=_essay_job,
-                                 args=(topic, body.get("verbs") or [],
-                                       body.get("tenses") or []),
-                                 daemon=True).start()
-                return self._send(202, {"started": True})
-            if url.path == "/api/translate":
-                return self._send(200, translate(
-                    conn, cfg, (body.get("to") or cfg["native"])[:8],
-                    essay_id=body.get("essay_id"),
-                    text=body.get("text"),
-                    force=bool(body.get("force"))))
-            if url.path == "/api/conjugation":
-                lemma = (body.get("lemma") or "").strip()
-                tense = (body.get("tense") or "").strip()
-                if not lemma or not tense:
-                    return self._send(400, {"error": "lemma + tense required"})
-                return self._send(200, conjugation(conn, cfg, lemma, tense,
-                                                   force=bool(body.get("force"))))
-            if url.path == "/api/import/corpus":
-                return self._send(200, dbmod.import_corpus(conn, body))
-            if url.path == "/api/import/essay":
-                return self._send(200, dbmod.import_essay(conn, body))
-            if url.path == "/api/card":
-                word = (body.get("word") or "").strip()
-                if not word:
-                    return self._send(400, {"error": "word required"})
-                return self._send(200, word_card(conn, cfg, word,
-                                                 body.get("sentence") or "",
-                                                 force=bool(body.get("force"))))
-            return self._send(404, {"error": "no such route"})
-        except llm.LlmError as exc:
-            return self._send(502, {"error": str(exc)})
-        except Exception as exc:
-            traceback.print_exc()
-            return self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+@app.get("/api/essay")
+def essay_get(id: int = Query(...), ctx: Ctx = Depends(get_ctx)):
+    r = ctx.conn().execute("SELECT * FROM essays WHERE id=?", (id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "unknown essay")
+    return dict(r)
+
+
+@app.post("/api/card")
+def card(body: dict, ctx: Ctx = Depends(get_ctx)):
+    word = (body.get("word") or "").strip()
+    if not word:
+        raise HTTPException(400, "word required")
+    return word_card(ctx.conn(), ctx.cfg(), word, body.get("sentence") or "",
+                     force=bool(body.get("force")))
+
+
+@app.post("/api/conjugation")
+def conjugation_post(body: dict, ctx: Ctx = Depends(get_ctx)):
+    lemma = (body.get("lemma") or "").strip()
+    tense = (body.get("tense") or "").strip()
+    if not lemma or not tense:
+        raise HTTPException(400, "lemma + tense required")
+    return conjugation(ctx.conn(), ctx.cfg(), lemma, tense,
+                       force=bool(body.get("force")))
+
+
+@app.post("/api/translate")
+def translate_post(body: dict, ctx: Ctx = Depends(get_ctx)):
+    return translate(ctx.conn(), ctx.cfg(),
+                     (body.get("to") or ctx.cfg()["native"])[:8],
+                     essay_id=body.get("essay_id"), text=body.get("text"),
+                     force=bool(body.get("force")))
+
+
+@app.get("/api/export/corpus")
+def export_corpus(lang: str | None = None, ctx: Ctx = Depends(get_ctx)):
+    return dbmod.export_corpus(ctx.conn(), lang or ctx.cfg()["foreign"])
+
+
+@app.post("/api/import/corpus")
+def import_corpus(body: dict, ctx: Ctx = Depends(get_ctx),
+                  admin: dict = Depends(require_admin)):
+    return dbmod.import_corpus(ctx.conn(), body)
+
+
+@app.get("/api/export/essay")
+def export_essay(id: int = Query(...), ctx: Ctx = Depends(get_ctx)):
+    return dbmod.export_essay(ctx.conn(), id)
+
+
+@app.post("/api/import/essay")
+def import_essay(body: dict, ctx: Ctx = Depends(get_ctx)):
+    return dbmod.import_essay(ctx.conn(), body)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="aisVerbo web app (local only).")
-    ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("PORT", 8787)))
+    import uvicorn
+    ap = argparse.ArgumentParser(description="aisVerbo web app (FastAPI).")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8787)))
     ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     args = ap.parse_args()
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"aisVerbo → http://{args.host}:{args.port}/")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    print(f"aisVerbo → http://{args.host}:{args.port}/"
+          + ("  [multi-tenant]" if MULTI_TENANT else "  [local]"))
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
 

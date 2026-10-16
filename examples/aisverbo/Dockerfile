@@ -13,6 +13,14 @@ ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH PORT=7860 HOST=0.0.0.0
 WORKDIR /home/user/aisverbo
 
 COPY --chown=user . .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# hosted mode: per-visitor tenant partitions + the shared signing secret
+# (set AISVERBO_SECRET as a Space secret; mint your admin token with the
+# same secret: AISVERBO_SECRET=... python3 app/get_token.py)
+ENV AISVERBO_MULTI_TENANT=1
+# persistent storage (Spaces: Settings -> Persistent storage -> /data)
+# ENV AISVERBO_DATA=/data
 
 # Install the aislang CLI. Until a public release artifact exists, bake the
 # binary into the image next to this Dockerfile (COPY handles it) or set

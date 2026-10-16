@@ -281,3 +281,73 @@ def test_export_carries_cards_and_conjugations(tmp_path):
     assert dbmod.get_conjugation(conn2, "ir", "Futuro Simple", "es", "en")["examples"] == ["Iré."]
     r2 = dbmod.import_essay(conn2, blob)                               # idempotent
     assert r2["cards_added"] == 0 and r2["conjugations_added"] == 0
+
+
+# ─── FastAPI routes: tenancy + admin auth + limits ─────────────────────
+import pytest
+
+
+def _client(tmp_path, monkeypatch, multi=False):
+    httpx = pytest.importorskip("httpx")  # noqa: F841
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("AISVERBO_SECRET", "test-secret")
+    monkeypatch.setattr(dbmod, "GEN_DIR", str(tmp_path))
+    monkeypatch.setattr(dbmod, "DEFAULT_DB", str(tmp_path / "aisverbo.db"))
+    monkeypatch.setattr(dbmod, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(serve, "MULTI_TENANT", multi)
+    return TestClient(serve.app)
+
+
+def _admin_token():
+    import auth
+    return auth.sign({"role": "admin", "sub": "t"})
+
+
+def test_jwt_sign_verify_roundtrip(monkeypatch):
+    monkeypatch.setenv("AISVERBO_SECRET", "s1")
+    import auth
+    tok = auth.sign({"tid": "abc"})
+    assert auth.verify(tok)["tid"] == "abc"
+    assert auth.verify(tok + "x") is None
+    monkeypatch.setenv("AISVERBO_SECRET", "other")
+    assert auth.verify(tok) is None                       # wrong secret
+    import time
+    monkeypatch.setenv("AISVERBO_SECRET", "s1")
+    assert auth.verify(auth.sign({"exp": time.time() - 10})) is None
+
+
+def test_corpus_posts_require_admin(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    r = c.post("/api/verbs", json={"action": "add", "infinitive": "ir"})
+    assert r.status_code == 401 and "ADMIN" in r.json()["error"]
+    r = c.post("/api/tenses", json={"action": "generate"})
+    assert r.status_code == 401
+    ok = c.post("/api/verbs", json={"action": "add", "infinitive": "ir"},
+                headers={"X-Admin-Token": _admin_token()})
+    assert ok.status_code == 200 and ok.json()["added"] == 1
+    # reads and learning stay open
+    assert c.get("/api/verbs").status_code == 200
+    assert c.post("/api/card", json={"word": ""}).status_code == 400
+
+
+def test_multi_tenant_isolation(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch, multi=True)
+    assert c.get("/api/state").status_code == 401         # no token, no data
+    t1 = c.post("/api/tenant/new").json()["token"]
+    t2 = c.post("/api/tenant/new").json()["token"]
+    h1 = {"Authorization": f"Bearer {t1}", "X-Admin-Token": _admin_token()}
+    h2 = {"Authorization": f"Bearer {t2}"}
+    c.post("/api/verbs", json={"action": "add", "infinitive": "ir"}, headers=h1)
+    assert len(c.get("/api/verbs", headers=h1).json()) == 1
+    assert c.get("/api/verbs", headers=h2).json() == []   # isolated partitions
+    s1 = c.get("/api/state", headers=h1).json()
+    s2 = c.get("/api/state", headers=h2).json()
+    assert s1["tenant"] != s2["tenant"]
+
+
+def test_settings_limits_clamped(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    r = c.post("/api/settings", json={"verb_count": 5000, "essay_words": 9999})
+    assert r.json()["verb_count"] == 100 and r.json()["essay_words"] == 200
+    r = c.post("/api/settings", json={"verb_count": -3, "essay_words": 1})
+    assert r.json()["verb_count"] == 1 and r.json()["essay_words"] == 30
