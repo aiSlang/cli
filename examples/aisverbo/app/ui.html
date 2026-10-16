@@ -97,22 +97,30 @@
       <button class="btn accent" id="btn-write" onclick="writeEssay()">Write the story</button>
       <span class="job" id="essay-job"></span>
     </div>
-    <div style="margin-top:10px">
+    <div class="side-tabs" style="margin-top:10px">
+      <button class="side-tab active" data-sel="tenses" onclick="showSel('tenses')">Tenses for this story — <b id="tsel-n">0</b></button>
+      <button class="side-tab" data-sel="verbs" onclick="showSel('verbs')">Verbs for this story — <b id="vsel-n">0</b></button>
+    </div>
+    <div id="sel-tenses">
       <div class="bar">
-        <label class="grow">Tenses for this story — <b id="tsel-n">0</b> selected</label>
-        <button class="btn small" onclick="TSEL.clear();renderTenseChips()">none</button>
+        <span class="muted grow" style="font-size:12px">pick the tenses to drill in this story</span>
+        <button class="btn small" title="unselect every tense" onclick="TSEL.clear();renderTenseChips()">none</button>
       </div>
       <div class="chips" id="tense-chips"></div>
     </div>
-    <div style="margin-top:8px">
+    <div id="sel-verbs" style="display:none">
       <div class="bar">
-        <label class="grow">Verbs for this story — <b id="vsel-n">0</b> selected (pick from the whole corpus; filter to find)</label>
-        <input id="verb-filter" style="width:150px" placeholder="filter…" oninput="renderVerbChips()"/>
+        <span class="muted grow" style="font-size:12px">pick from the whole corpus; filter to find</span>
+        <span style="position:relative;display:inline-block">
+          <input id="verb-filter" style="width:170px;padding-right:24px" placeholder="filter…" oninput="renderVerbChips()"/>
+          <span onclick="$('#verb-filter').value='';renderVerbChips()" title="clear the filter"
+            style="position:absolute;right:7px;top:5px;cursor:pointer;color:var(--muted)">✕</span>
+        </span>
         <input id="verb-quick" style="width:150px" placeholder="add a verb + select"
                onkeydown="if(event.key==='Enter')quickAddVerb()"/>
         <button class="btn small" onclick="quickAddVerb()">add</button>
-        <button class="btn small" title="clear the filter and unselect every verb"
-                onclick="$('#verb-filter').value='';VSEL.clear();renderVerbChips()">none</button>
+        <button class="btn small" title="unselect every verb (the filter stays)"
+                onclick="VSEL.clear();renderVerbChips()">none</button>
       </div>
       <div class="chips" id="verb-chips"></div>
     </div>
@@ -120,7 +128,7 @@
   <div class="layout">
     <div class="panel">
       <div class="bar">
-        <h2 class="grow" id="essay-title" style="text-transform:none;font-size:17px;color:var(--fg)">—</h2>
+        <h2 class="grow" id="essay-title" onclick="clearWordSel()" style="text-transform:none;font-size:17px;color:var(--fg);cursor:default">—</h2>
         <button class="btn small" onclick="speak(plainEssay())" title="read the whole story">▶ story</button>
         <button class="btn small" onclick="speakSelection()" title="read the selected fragment">▶ selection</button>
         <button class="btn small" onclick="stopSpeech()">■</button>
@@ -128,7 +136,7 @@
         <input type="range" id="rate" min="0.5" max="1.4" step="0.1" value="0.9"/>
       </div>
       <div id="tts-status"></div>
-      <div id="essay-body" class="muted">Pick a topic, select tenses and verbs above, and press
+      <div id="essay-body" class="muted" onclick="clearWordSel(event)">Pick a topic, select tenses and verbs above, and press
         <i>Write the story</i>. Vocabulary verbs come out <strong>bold</strong>; tap any word
         for its grammar card; select any fragment for pronunciation (▶ selection) or
         translation (Translation tab on the right).</div>
@@ -143,7 +151,7 @@
       </div>
       <div id="side-trans" style="display:none">
         <div class="bar">
-          <select id="tr-lang" style="width:150px"></select>
+          <select id="tr-lang" style="width:150px" onchange="if(ESSAY&&ESSAY.id)translateStory(false)"></select>
           <button class="btn small" onclick="translateStory(false)">translate story</button>
           <button class="btn small" title="ignore the cache and translate again (e.g. after a model change)"
                   onclick="translateStory(true)">⟳</button>
@@ -164,18 +172,25 @@
       <input class="grow" id="lib-q" placeholder="Search your stories by any verb, word or topic…"
              onkeydown="if(event.key==='Enter')loadLibrary()"/>
       <button class="btn" onclick="loadLibrary()">Search</button>
+      <button class="btn small" onclick="$('#essay-file').click()" title="create a story from an exported JSON (idempotent)">Import story</button>
+      <input type="file" id="essay-file" accept="application/json" style="display:none" onchange="importEssay(this)"/>
     </div>
     <div id="lib-list" style="margin-top:8px"></div>
   </div>
 </div>
 
 <!-- ─── VOCABULARY ─── -->
-<div id="tab-vocab">
+<div id="tab-vocab" style="display:none">
   <div class="panel">
-    <div class="bar"><h2 class="grow">Verbs — the whole corpus</h2>
-      <input id="v-search" style="width:180px" placeholder="search…" oninput="VPAGE=0;renderVerbTable()"/>
+    <div class="bar">
+      <h2 class="grow">Corpus of</h2>
+      <select id="voc-lang" style="width:170px" onchange="loadVocabLang()"></select>
+      <input id="v-search" style="width:160px" placeholder="search…" oninput="VPAGE=0;renderVerbTable()"/>
       <input id="v-count" type="number" style="width:90px" title="how many to generate"/>
       <button class="btn" onclick="genVerbs()">Generate top-N</button>
+      <button class="btn small" onclick="exportCorpus()" title="verbs + tenses of this language as one JSON file">Export</button>
+      <button class="btn small" onclick="$('#corpus-file').click()" title="import a corpus JSON (idempotent)">Import</button>
+      <input type="file" id="corpus-file" accept="application/json" style="display:none" onchange="importCorpus(this)"/>
       <span class="job" id="vocab-job"></span></div>
     <div class="bar" style="margin:8px 0">
       <input id="v-new" style="width:200px" placeholder="add a verb (infinitive)"/>
@@ -183,7 +198,10 @@
       <button class="btn small" onclick="addVerb()">Add</button>
       <span class="muted" style="font-size:12px">Which verbs go into a story is chosen on the
         Learn page — this page manages the corpus itself.</span></div>
-    <table class="list"><thead><tr><th>infinitive</th><th>gloss</th><th></th></tr></thead>
+    <table class="list"><thead><tr>
+      <th style="cursor:pointer" onclick="sortVerbs('infinitive')" title="sort alphabetically; click again to flip">infinitive <span id="so-infinitive"></span></th>
+      <th style="cursor:pointer" onclick="sortVerbs('gloss')" title="sort alphabetically; click again to flip">gloss <span id="so-gloss"></span></th>
+      <th></th></tr></thead>
       <tbody id="verbs-body"></tbody></table>
     <div class="pager" id="v-pager"></div>
   </div>
@@ -236,14 +254,19 @@ const SPIN='<span class="spin"></span>';
 async function api(p){const r=await fetch(p);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 
-let STATE={},VERBS=[],TENSES=[],ESSAY=null,POLL=null,VPAGE=0;
-const PAGE=100, VSEL=new Set(), TSEL=new Set();
+let STATE={},VERBS=[],TENSES=[],ESSAY=null,POLL=null,VPAGE=0,VSORT=null,VDIR=1,SELWORD=null;
+let VOCLANG=null;      // the Vocabulary page's language (defaults to the course)
+const PAGE=20, VSEL=new Set(), TSEL=new Set();
 
 function showTab(n){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===n));
   for(const t of['learn','library','vocab','setup'])$('#tab-'+t).style.display=t===n?'':'none';
   if(n==='library')loadLibrary();
 }
+function showSel(n){
+  document.querySelectorAll('[data-sel]').forEach(t=>t.classList.toggle('active',t.dataset.sel===n));
+  $('#sel-tenses').style.display=n==='tenses'?'':'none';
+  $('#sel-verbs').style.display=n==='verbs'?'':'none';}
 function showSide(n){
   document.querySelectorAll('.side-tab').forEach(t=>t.classList.toggle('active',t.dataset.side===n));
   $('#side-card').style.display=n==='card'?'':'none';
@@ -253,10 +276,20 @@ function showSide(n){
 async function loadState(){STATE=await api('/api/state');
   $('#pair-pill').innerHTML=`<b>${esc(STATE.languages[STATE.settings.foreign])}</b> → ${esc(STATE.languages[STATE.settings.native])}`;
   $('#v-count').value=STATE.settings.verb_count;
-  fillSetup();fillTrLang();}
+  fillSetup();fillTrLang();fillVocLang();}
 async function loadVocab(){
+  // Learn always works on the COURSE language; the Vocabulary page may
+  // browse/generate any language via its own selector
   [VERBS,TENSES]=await Promise.all([api('/api/verbs'),api('/api/tenses')]);
-  renderVerbChips();renderTenseChips();renderVerbTable();renderTenseTable();}
+  renderVerbChips();renderTenseChips();
+  if(!VOCLANG||VOCLANG===STATE.settings.foreign){CVERBS=VERBS;CTENSES=TENSES;renderVerbTable();renderTenseTable();}}
+let CVERBS=[],CTENSES=[];
+async function loadVocabLang(){
+  VOCLANG=$('#voc-lang').value;
+  [CVERBS,CTENSES]=await Promise.all([
+    api('/api/verbs?lang='+VOCLANG),api('/api/tenses?lang='+VOCLANG)]);
+  VPAGE=0;renderVerbTable();renderTenseTable();
+  if(VOCLANG===STATE.settings.foreign){VERBS=CVERBS;TENSES=CTENSES;renderVerbChips();renderTenseChips();}}
 
 /* ── Learn: per-story selection over the WHOLE corpus ── */
 function renderTenseChips(){
@@ -302,8 +335,13 @@ function pollJobs(){clearInterval(POLL);POLL=setInterval(async()=>{
     :v.report?`<span class="ok">+${v.report.added} (total ${v.report.total})</span>`:'';
   if(!e.running&&!v.running){clearInterval(POLL);$('#btn-write').disabled=false;
     if(e.report){showEssay(e.report);}
-    if(v.report){loadVocab();}}
+    if(v.report){loadVocabLangOrDefault();loadVocab();}}
 },1200);}
+function clearWordSel(ev){
+  // clicking empty space or the title drops the tapped-word selection
+  if(ev&&ev.target.closest('.w'))return;
+  SELWORD=null;
+  document.querySelectorAll('#essay-body .w.sel').forEach(x=>x.classList.remove('sel'));}
 function showEssay(e){ESSAY=e;
   $('#essay-title').textContent=e.title||'—';
   $('#essay-body').classList.remove('muted');
@@ -323,33 +361,58 @@ async function openCard(el,force){
   document.querySelectorAll('#essay-body .w.sel').forEach(x=>x.classList.remove('sel'));
   if(el.classList)el.classList.add('sel');
   showSide('card');
-  const word=el.textContent||el;
-  const sentence=(el.closest?el.closest('p')?.textContent:'' ||'').slice(0,400);
+  const word=(el.textContent||el);
+  SELWORD=typeof word==='string'?word:null;
+  const sentence=((el.closest&&el.closest('p'))?el.closest('p').textContent:'').slice(0,400);
   $('#card').classList.remove('muted');
   $('#card').innerHTML=`<span class="muted">${SPIN}asking the grammarian…</span>`;
   highlightPair(word);
   try{
     const c=await post('/api/card',{word,sentence,force:!!force});
-    const conj=(c.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('');
+    CARD=c;
+    const isVerb=/verb/i.test(c.pos||'')&&(c.conjugation||[]).length;
+    const tenseOpts=TENSES.map(t=>`<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
     $('#card').innerHTML=`
       <div class="bar"><b style="font-size:17px">${esc(c.word)}</b>
         <span class="mono muted">${esc(c.ipa||'')}</span>
-        <button class="btn small" onclick="speak(${JSON.stringify(c.word)})">▶</button>
+        <button class="btn small" data-say="${esc(c.word)}" onclick="speak(this.dataset.say)">▶</button>
         <span class="grow"></span>
         ${c.cached?'<span class="muted" style="font-size:11px">cached</span>':''}
         <button class="btn small" title="re-ask the grammarian (ignore the cache)"
-          onclick='openCard(${JSON.stringify(word)},true)'>⟳</button></div>
+          data-w="${esc(word)}" onclick="openCard(this.dataset.w,true)">⟳</button></div>
       <dl style="margin:0">
       <dt>lemma · part of speech</dt><dd><b>${esc(c.lemma||'')}</b> · ${esc(c.pos||'')}</dd>
       <dt>meaning</dt><dd>${esc(c.translation||'')}</dd>
       <dt>this form</dt><dd>${esc(c.analysis||'')}</dd>
       <dt>rule</dt><dd>${esc(c.rule||'')}</dd>
-      ${conj?`<dt>conjugation (this tense)</dt><dd><table>${conj}</table></dd>`:''}
-      ${(c.examples||[]).length?`<dt>examples</dt><dd>${c.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" onclick='speak(${JSON.stringify(x)})'>▶</button></div>`).join('')}</dd>`:''}
+      ${isVerb?`<dt>conjugation in
+          <select id="conj-tense" style="width:auto;display:inline;padding:1px 6px;font-size:12px"
+            onchange="loadConjugation(this.value)">
+            <option value="">this tense</option>${tenseOpts}</select></dt>
+        <dd id="conj-box"><table>${(c.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('')}</table></dd>`:''}
+      ${(c.examples||[]).length?`<dt>examples</dt><dd id="conj-examples">${c.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('')}</dd>`:''}
       ${(c.synonyms||[]).length?`<dt>synonyms</dt><dd>${c.synonyms.map(esc).join(', ')}</dd>`:''}
       ${c.notes?`<dt>notes</dt><dd>${esc(c.notes)}</dd>`:''}
       </dl>`;
   }catch(e){$('#card').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
+let CARD=null;
+async function loadConjugation(tense){
+  if(!CARD)return;
+  const box=$('#conj-box');
+  if(!tense){ // back to the tapped form's own tense
+    box.innerHTML=`<table>${(CARD.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('')}</table>`;
+    const ex=$('#conj-examples');
+    if(ex)ex.innerHTML=(CARD.examples||[]).map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('');
+    return;}
+  box.innerHTML=`<span class="muted">${SPIN}conjugating…</span>`;
+  try{
+    const r=await post('/api/conjugation',{lemma:CARD.lemma,tense});
+    box.innerHTML=`<table>${(r.conjugation||[]).map(p=>`<tr><td class="muted">${esc(p[0])}</td><td>${esc(p[1])}</td></tr>`).join('')}</table>`
+      +(r.notes?`<div class="muted" style="font-size:12px;margin-top:3px">${esc(r.notes)}</div>`:'');
+    const ex=$('#conj-examples');
+    if(ex&&(r.examples||[]).length)
+      ex.innerHTML=r.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('');
+  }catch(e){box.innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 
 /* ── translation (sentence-aligned; whole story cached) ── */
 let TRPAIRS=[];
@@ -366,8 +429,8 @@ async function translateStory(force){
     TRPAIRS=r.pairs;renderPairs();
   }catch(e){$('#trans-body').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 async function translateSelection(){
-  const s=(window.getSelection()||'').toString().trim();
-  if(!s)return alert('Select a fragment in the story first.');
+  const s=(window.getSelection()||'').toString().trim()||SELWORD;
+  if(!s)return alert('Select a fragment (or tap a word) in the story first.');
   showSide('trans');
   $('#trans-body').classList.remove('muted');
   $('#trans-body').innerHTML=`<span class="muted">${SPIN}translating the selection…</span>`;
@@ -420,50 +483,121 @@ function speakSelection(){
 async function loadLibrary(){
   const rows=await api('/api/essays?q='+encodeURIComponent($('#lib-q').value.trim()));
   $('#lib-list').innerHTML=rows.map(r=>
-    `<div class="essay-row" onclick="openEssay(${r.id})">
-       <b>${esc(r.title||r.topic)}</b>
-       <span class="muted" style="font-size:12px"> · ${esc((r.created_at||'').slice(0,10))} · ${esc(r.topic)}</span>
-       <div class="muted" style="font-size:13px">${esc(r.excerpt||'')}…</div></div>`).join('')
+    `<div class="essay-row">
+       <div class="bar"><span class="grow" onclick="openEssay(${r.id})" style="cursor:pointer">
+         <b>${esc(r.title||r.topic)}</b>
+         <span class="muted" style="font-size:12px"> · ${esc((r.created_at||'').slice(0,10))} · ${esc(r.topic)}</span></span>
+         <button class="btn small" onclick="exportEssay(${r.id})" title="this story + its metadata and translations as JSON">Export</button></div>
+       <div class="muted" style="font-size:13px" onclick="openEssay(${r.id})" style="cursor:pointer">${esc(r.excerpt||'')}…</div></div>`).join('')
     ||'<div class="muted">nothing yet — write your first story in Learn</div>';}
+async function exportEssay(id){
+  const data=await api('/api/export/essay?id='+id);
+  dl(`aisverbo-story-${id}.json`,data);}
+async function importEssay(input){
+  const f=input.files[0];if(!f)return;input.value='';
+  try{const data=JSON.parse(await f.text());
+    const r=await post('/api/import/essay',data);
+    alert(r.created?'Story imported.':'This story was already in the library — nothing duplicated.');
+    loadLibrary();}
+  catch(e){alert(e.message);}}
 async function openEssay(id){
   const e=await api('/api/essay?id='+id);
   showEssay({id:e.id,title:e.title,body:e.body});
+  // restore the story's own metadata as the current selection
+  VSEL.clear();TSEL.clear();
+  const vset=new Set((e.verbs_csv||'').split(',').filter(Boolean));
+  const tset=new Set((e.tenses_csv||'').split(',').filter(Boolean));
+  for(const v of VERBS)if(vset.has(v.infinitive))VSEL.add(v.id);
+  for(const t of TENSES)if(tset.has(t.name))TSEL.add(t.id);
+  $('#topic').value=e.topic||'';
+  renderVerbChips();renderTenseChips();
   showTab('learn');}
 
 /* ── Vocabulary: the corpus (search + pagination; selection lives in Learn) ── */
 function filteredVerbs(){
   const f=($('#v-search').value||'').toLowerCase();
-  return VERBS.filter(v=>!f||v.infinitive.includes(f)||(v.gloss||'').toLowerCase().includes(f));}
+  let out=CVERBS.filter(v=>!f||v.infinitive.includes(f)||(v.gloss||'').toLowerCase().includes(f));
+  if(VSORT)out=[...out].sort((a,b)=>VDIR*String(a[VSORT]||'').localeCompare(String(b[VSORT]||'')));
+  return out;}      // unsorted = the lexicographer's frequency order
+function sortVerbs(col){
+  VDIR=VSORT===col?-VDIR:1;VSORT=col;
+  $('#so-infinitive').textContent=col==='infinitive'?(VDIR>0?'▲':'▼'):'';
+  $('#so-gloss').textContent=col==='gloss'?(VDIR>0?'▲':'▼'):'';
+  VPAGE=0;renderVerbTable();}
 function renderVerbTable(){
   const vis=filteredVerbs();
   const pages=Math.max(1,Math.ceil(vis.length/PAGE));
   VPAGE=Math.min(VPAGE,pages-1);
   $('#verbs-body').innerHTML=vis.slice(VPAGE*PAGE,(VPAGE+1)*PAGE).map(v=>
-    `<tr><td>${esc(v.infinitive)}</td><td class="muted">${esc(v.gloss||'')}</td>
-     <td><button class="btn small" onclick="post('/api/verbs',{action:'delete',id:${v.id}}).then(loadVocab)">✕</button></td></tr>`).join('')
+    `<tr><td contenteditable spellcheck="false" onblur="editVerb(${v.id},this,'infinitive')"
+         onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">${esc(v.infinitive)}</td>
+     <td class="muted" contenteditable spellcheck="false" onblur="editVerb(${v.id},this,'gloss')"
+         onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}">${esc(v.gloss||'')}</td>
+     <td><button class="btn small" onclick="delVerb(${v.id},${JSON.stringify('')})" data-inf="${esc(v.infinitive)}">✕</button></td></tr>`).join('')
     ||'<tr><td colspan="3" class="muted">no verbs match</td></tr>';
   $('#v-pager').innerHTML=pages>1?
     `<button class="btn small" ${VPAGE?'':'disabled'} onclick="VPAGE--;renderVerbTable()">‹</button>
      page ${VPAGE+1} / ${pages} · ${vis.length} verbs
      <button class="btn small" ${VPAGE<pages-1?'':'disabled'} onclick="VPAGE++;renderVerbTable()">›</button>`
     :`${vis.length} verb(s)`;}
+async function editVerb(id,el,field){
+  const v=CVERBS.find(x=>x.id===id);if(!v)return;
+  const val=el.textContent.trim();
+  if(val===(v[field]||''))return;
+  if(field==='infinitive'&&!val){el.textContent=v.infinitive;return;}
+  const upd={action:'update',id,infinitive:v.infinitive,gloss:v.gloss||''};
+  upd[field]=val;
+  await post('/api/verbs',upd);
+  v.infinitive=upd.infinitive.toLowerCase();v.gloss=upd.gloss;}
+async function delVerb(id){
+  const v=CVERBS.find(x=>x.id===id);if(!v)return;
+  if(!confirm(`Delete “${v.infinitive}” from the corpus?`))return;
+  try{await post('/api/verbs',{action:'delete',id});await loadVocabLangOrDefault();}
+  catch(e){alert(e.message);}}
+async function delTense(id){
+  const t=CTENSES.find(x=>x.id===id);if(!t)return;
+  if(!confirm(`Delete the tense “${t.name}”?`))return;
+  try{await post('/api/tenses',{action:'delete',id});await loadVocabLangOrDefault();}
+  catch(e){alert(e.message);}}
+async function loadVocabLangOrDefault(){
+  if(VOCLANG&&VOCLANG!==STATE.settings.foreign)await loadVocabLang();else await loadVocab();}
 function renderTenseTable(){
-  $('#tenses-body').innerHTML=TENSES.map(t=>
+  $('#tenses-body').innerHTML=CTENSES.map(t=>
     `<tr><td>${esc(t.name)}</td><td class="muted">${esc(t.native_name||'')}</td>
      <td class="muted">${esc(t.hint||'')}</td><td class="muted">${esc(t.example||'')}</td>
-     <td><button class="btn small" onclick="post('/api/tenses',{action:'delete',id:${t.id}}).then(loadVocab)">✕</button></td></tr>`).join('');}
+     <td><button class="btn small" onclick="delTense(${t.id})">✕</button></td></tr>`).join('');}
 async function genVerbs(){
-  try{await post('/api/verbs',{action:'generate',count:parseInt($('#v-count').value)||100});pollJobs();}
+  try{await post('/api/verbs',{action:'generate',count:parseInt($('#v-count').value)||100,
+                               lang:VOCLANG||STATE.settings.foreign});pollJobs();}
   catch(e){alert(e.message);}}
 async function genTenses(){
-  try{await post('/api/tenses',{action:'generate'});pollJobs();}
+  try{await post('/api/tenses',{action:'generate',lang:VOCLANG||STATE.settings.foreign});pollJobs();}
   catch(e){alert(e.message);}}
+async function exportCorpus(){
+  const lang=VOCLANG||STATE.settings.foreign;
+  const data=await api('/api/export/corpus?lang='+lang);
+  dl(`aisverbo-corpus-${lang}.json`,data);}
+async function importCorpus(input){
+  const f=input.files[0];if(!f)return;input.value='';
+  try{const data=JSON.parse(await f.text());
+    const r=await post('/api/import/corpus',data);
+    alert(`Imported into ${r.lang}: +${r.verbs_added} verbs, +${r.tenses_added} tenses.`);
+    await loadVocabLangOrDefault();await loadVocab();}
+  catch(e){alert(e.message);}}
+function dl(name,obj){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(obj,null,2)],{type:'application/json'}));
+  a.download=name;a.click();URL.revokeObjectURL(a.href);}
 async function addVerb(){
   const inf=$('#v-new').value.trim();if(!inf)return;
   await post('/api/verbs',{action:'add',infinitive:inf,gloss:$('#v-gloss').value.trim()});
   $('#v-new').value='';$('#v-gloss').value='';loadVocab();}
 
 /* ── setup ── */
+function fillVocLang(){
+  const sel=$('#voc-lang');if(!sel)return;
+  sel.innerHTML=Object.entries(STATE.languages).map(([c,n])=>
+    `<option value="${c}"${c===(VOCLANG||STATE.settings.foreign)?' selected':''}>${esc(n)} (${c})</option>`).join('');}
 function fillSetup(){
   for(const id of['s-foreign','s-native']){
     $('#'+id).innerHTML=Object.entries(STATE.languages).map(([c,n])=>

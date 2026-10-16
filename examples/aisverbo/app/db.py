@@ -12,7 +12,9 @@ from typing import Mapping
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)                       # examples/aisverbo
-GEN_DIR = os.path.join(HERE, "generated")
+# AISVERBO_DATA relocates all state (tests, HF Spaces persistent storage,
+# running a second instance next to a live one)
+GEN_DIR = os.environ.get("AISVERBO_DATA") or os.path.join(HERE, "generated")
 DEFAULT_DB = os.path.join(GEN_DIR, "aisverbo.db")
 CONFIG_PATH = os.path.join(GEN_DIR, "config.json")
 
@@ -78,6 +80,15 @@ CREATE TABLE IF NOT EXISTS translations(
   created_at TEXT,
   PRIMARY KEY(essay_id, lang)
 );
+CREATE TABLE IF NOT EXISTS conjugations(
+  lemma TEXT NOT NULL,
+  tense TEXT NOT NULL,
+  foreign_lang TEXT NOT NULL,
+  native_lang TEXT NOT NULL,
+  json TEXT,
+  created_at TEXT,
+  PRIMARY KEY(lemma, tense, foreign_lang, native_lang)
+);
 CREATE TABLE IF NOT EXISTS cards(
   word TEXT NOT NULL,
   foreign_lang TEXT NOT NULL,
@@ -89,11 +100,26 @@ CREATE TABLE IF NOT EXISTS cards(
 """
 
 
+# bump when the schema changes; _migrate upgrades EXISTING databases in
+# place with ALTER/backfill — data is never dropped on upgrade
+SCHEMA_VERSION = 2
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        return
+    # v2: the conjugations table (created by SCHEMA's IF NOT EXISTS) — and
+    # the pattern itself: future versions add ALTERs here, never DROPs
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
 def connect(path: str = DEFAULT_DB) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -213,3 +239,97 @@ def save_translation(conn, essay_id: int, lang: str, pairs: list, now: str) -> N
                  "created_at) VALUES(?,?,?,?)",
                  (essay_id, lang, json.dumps(pairs, ensure_ascii=False), now))
     conn.commit()
+
+
+def update_verb(conn, verb_id: int, infinitive: str, gloss: str) -> None:
+    conn.execute("UPDATE verbs SET infinitive=?, gloss=? WHERE id=?",
+                 (infinitive.strip().lower(), gloss.strip(), verb_id))
+    conn.commit()
+
+
+def verb_references(conn, lang: str, infinitive: str) -> int:
+    """How many stored essays used this verb — a delete guard."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM essays WHERE foreign_lang=? "
+        "AND ','||verbs_csv||',' LIKE ?",
+        (lang, f"%,{infinitive},%")).fetchone()[0]
+
+
+def tense_references(conn, lang: str, name: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM essays WHERE foreign_lang=? "
+        "AND ','||tenses_csv||',' LIKE ?",
+        (lang, f"%,{name},%")).fetchone()[0]
+
+
+# ─── conjugation cache (shared across every story and word card) ─────
+def get_conjugation(conn, lemma: str, tense: str, foreign: str, native: str):
+    r = conn.execute("SELECT json FROM conjugations WHERE lemma=? AND tense=? "
+                     "AND foreign_lang=? AND native_lang=?",
+                     (lemma.lower(), tense, foreign, native)).fetchone()
+    return json.loads(r["json"]) if r else None
+
+
+def save_conjugation(conn, lemma: str, tense: str, foreign: str, native: str,
+                     data: dict, now: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO conjugations(lemma, tense, foreign_lang, "
+                 "native_lang, json, created_at) VALUES(?,?,?,?,?,?)",
+                 (lemma.lower(), tense, foreign, native,
+                  json.dumps(data, ensure_ascii=False), now))
+    conn.commit()
+
+
+# ─── import / export (idempotent on load) ────────────────────────────
+def export_corpus(conn, lang: str) -> dict:
+    return {"kind": "aisverbo-corpus", "lang": lang,
+            "verbs": [{"infinitive": v["infinitive"], "gloss": v["gloss"] or ""}
+                      for v in list_verbs(conn, lang)],
+            "tenses": [{k: t[k] or "" for k in
+                        ("name", "native_name", "hint", "example")}
+                       for t in list_tenses(conn, lang)]}
+
+
+def import_corpus(conn, data: dict) -> dict:
+    lang = (data.get("lang") or "").strip()
+    if not lang:
+        raise ValueError("corpus file has no lang")
+    nv = add_verbs(conn, lang, data.get("verbs") or [])
+    nt = add_tenses(conn, lang, data.get("tenses") or [])
+    return {"lang": lang, "verbs_added": nv, "tenses_added": nt}
+
+
+def export_essay(conn, essay_id: int) -> dict:
+    r = conn.execute("SELECT * FROM essays WHERE id=?", (essay_id,)).fetchone()
+    if not r:
+        raise ValueError("unknown essay")
+    translations = {t["lang"]: json.loads(t["pairs_json"]) for t in conn.execute(
+        "SELECT lang, pairs_json FROM translations WHERE essay_id=?", (essay_id,))}
+    return {"kind": "aisverbo-essay",
+            **{k: r[k] for k in ("created_at", "foreign_lang", "native_lang",
+                                 "topic", "title", "body", "verbs_csv",
+                                 "tenses_csv")},
+            "translations": translations}
+
+
+def import_essay(conn, data: dict) -> dict:
+    """Idempotent: the (foreign_lang, title, body) triple is the identity —
+    re-importing the same file never duplicates the story."""
+    body = (data.get("body") or "").strip()
+    if not body:
+        raise ValueError("essay file has no body")
+    row = conn.execute("SELECT id FROM essays WHERE foreign_lang=? AND title=? "
+                       "AND body=?", (data.get("foreign_lang"),
+                                      data.get("title"), body)).fetchone()
+    if row:
+        eid, created = row["id"], False
+    else:
+        eid = save_essay(conn, {k: data.get(k) for k in
+                                ("created_at", "foreign_lang", "native_lang",
+                                 "topic", "title", "body", "verbs_csv",
+                                 "tenses_csv")})
+        created = True
+    for lang, pairs in (data.get("translations") or {}).items():
+        if isinstance(pairs, list) and get_translation(conn, eid, lang) is None:
+            save_translation(conn, eid, lang, pairs,
+                             data.get("created_at") or "")
+    return {"id": eid, "created": created}

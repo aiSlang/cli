@@ -65,9 +65,9 @@ def _job_end(name: str, report=None, error=None) -> None:
 VOCAB_BATCH = 100          # verbs per lexicographer call
 
 
-def generate_verbs(conn, cfg: dict, count: int) -> dict:
+def generate_verbs(conn, cfg: dict, count: int, lang: str | None = None) -> dict:
     """Top-`count` vocabulary, batched; already-stored verbs are excluded."""
-    lang, native = cfg["foreign"], cfg["native"]
+    lang, native = lang or cfg["foreign"], cfg["native"]
     added = 0
     while added < count:
         have = [v["infinitive"] for v in dbmod.list_verbs(conn, lang)]
@@ -83,8 +83,8 @@ def generate_verbs(conn, cfg: dict, count: int) -> dict:
             "total": len(dbmod.list_verbs(conn, lang))}
 
 
-def generate_tenses(conn, cfg: dict) -> dict:
-    lang = cfg["foreign"]
+def generate_tenses(conn, cfg: dict, lang: str | None = None) -> dict:
+    lang = lang or cfg["foreign"]
     items = llm.ask_json_array("tensesmith", {
         "task": "tenses", "lang": lang, "native": cfg["native"]}, cfg)
     n = dbmod.add_tenses(conn, lang, [i for i in items if isinstance(i, dict)])
@@ -163,15 +163,33 @@ def translate(conn, cfg: dict, to: str, essay_id: int | None = None,
     return {"cached": False, "pairs": pairs}
 
 
+def conjugation(conn, cfg: dict, lemma: str, tense: str,
+                force: bool = False) -> dict:
+    """All six persons of one lemma in one tense, with examples — cached
+    DB-wide, so every story and word card shares one model call."""
+    lang, native = cfg["foreign"], cfg["native"]
+    cached = None if force else dbmod.get_conjugation(conn, lemma, tense,
+                                                      lang, native)
+    if cached:
+        return {"cached": True, **cached}
+    data = llm.ask_json("grammarian", {
+        "task": "conjugation", "lemma": lemma, "tense": tense,
+        "lang": lang, "native": native}, cfg)
+    data.setdefault("lemma", lemma)
+    data.setdefault("tense", tense)
+    dbmod.save_conjugation(conn, lemma, tense, lang, native, data, now_iso())
+    return {"cached": False, **data}
+
+
 # ─── background jobs ─────────────────────────────────────────────────
-def _vocab_job(what: str, count: int) -> None:
+def _vocab_job(what: str, count: int, lang: str | None = None) -> None:
     try:
         cfg = dbmod.load_config()
         conn = dbmod.connect()
         if what == "verbs":
-            report = generate_verbs(conn, cfg, count)
+            report = generate_verbs(conn, cfg, count, lang)
         else:
-            report = generate_tenses(conn, cfg)
+            report = generate_tenses(conn, cfg, lang)
         _job_end("vocab", report={"what": what, **report})
     except Exception as exc:
         _job_end("vocab", error=f"{type(exc).__name__}: {exc}")
@@ -230,9 +248,17 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT COUNT(*) FROM essays WHERE foreign_lang=?",
                         (cfg["foreign"],)).fetchone()[0]})
             if url.path == "/api/verbs":
-                return self._send(200, dbmod.list_verbs(conn, cfg["foreign"]))
+                return self._send(200, dbmod.list_verbs(
+                    conn, (q.get("lang") or [cfg["foreign"]])[0]))
             if url.path == "/api/tenses":
-                return self._send(200, dbmod.list_tenses(conn, cfg["foreign"]))
+                return self._send(200, dbmod.list_tenses(
+                    conn, (q.get("lang") or [cfg["foreign"]])[0]))
+            if url.path == "/api/export/corpus":
+                lang = (q.get("lang") or [cfg["foreign"]])[0]
+                return self._send(200, dbmod.export_corpus(conn, lang))
+            if url.path == "/api/export/essay":
+                return self._send(200, dbmod.export_essay(
+                    conn, int((q.get("id") or ["0"])[0])))
             if url.path == "/api/essays":
                 return self._send(200, dbmod.search_essays(
                     conn, cfg["foreign"], (q.get("q") or [""])[0]))
@@ -265,9 +291,15 @@ class Handler(BaseHTTPRequestHandler):
                     if not _job_start("vocab"):
                         return self._send(409, {"error": "a generation is already running"})
                     count = int(body.get("count") or cfg.get("verb_count", 100))
-                    threading.Thread(target=_vocab_job, args=("verbs", count),
+                    threading.Thread(target=_vocab_job,
+                                     args=("verbs", count, body.get("lang")),
                                      daemon=True).start()
                     return self._send(202, {"started": True, "count": count})
+                if act == "update":
+                    dbmod.update_verb(conn, int(body.get("id") or 0),
+                                      body.get("infinitive") or "",
+                                      body.get("gloss") or "")
+                    return self._send(200, {"ok": True})
                 if act == "add":
                     n = dbmod.add_verbs(conn, cfg["foreign"],
                                         [{"infinitive": body.get("infinitive"),
@@ -279,9 +311,18 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                     return self._send(200, {"ok": True})
                 if act == "delete":
-                    conn.execute("DELETE FROM verbs WHERE id=?",
-                                 (int(body.get("id") or 0),))
-                    conn.commit()
+                    r = conn.execute("SELECT lang, infinitive FROM verbs WHERE id=?",
+                                     (int(body.get("id") or 0),)).fetchone()
+                    if r:
+                        n = dbmod.verb_references(conn, r["lang"], r["infinitive"])
+                        if n:
+                            return self._send(409, {"error":
+                                f"'{r['infinitive']}' is used by {n} stored "
+                                "story(ies) — deleting it would break their "
+                                "metadata. Keep it, or delete those stories first."})
+                        conn.execute("DELETE FROM verbs WHERE id=?",
+                                     (int(body.get("id") or 0),))
+                        conn.commit()
                     return self._send(200, {"ok": True})
                 return self._send(400, {"error": "unknown action"})
             if url.path == "/api/tenses":
@@ -289,7 +330,8 @@ class Handler(BaseHTTPRequestHandler):
                 if act == "generate":
                     if not _job_start("vocab"):
                         return self._send(409, {"error": "a generation is already running"})
-                    threading.Thread(target=_vocab_job, args=("tenses", 0),
+                    threading.Thread(target=_vocab_job,
+                                     args=("tenses", 0, body.get("lang")),
                                      daemon=True).start()
                     return self._send(202, {"started": True})
                 if act == "toggle":
@@ -298,9 +340,17 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                     return self._send(200, {"ok": True})
                 if act == "delete":
-                    conn.execute("DELETE FROM tenses WHERE id=?",
-                                 (int(body.get("id") or 0),))
-                    conn.commit()
+                    r = conn.execute("SELECT lang, name FROM tenses WHERE id=?",
+                                     (int(body.get("id") or 0),)).fetchone()
+                    if r:
+                        n = dbmod.tense_references(conn, r["lang"], r["name"])
+                        if n:
+                            return self._send(409, {"error":
+                                f"'{r['name']}' is used by {n} stored "
+                                "story(ies) — keep it, or delete those first."})
+                        conn.execute("DELETE FROM tenses WHERE id=?",
+                                     (int(body.get("id") or 0),))
+                        conn.commit()
                     return self._send(200, {"ok": True})
                 return self._send(400, {"error": "unknown action"})
             if url.path == "/api/essay":
@@ -320,6 +370,17 @@ class Handler(BaseHTTPRequestHandler):
                     essay_id=body.get("essay_id"),
                     text=body.get("text"),
                     force=bool(body.get("force"))))
+            if url.path == "/api/conjugation":
+                lemma = (body.get("lemma") or "").strip()
+                tense = (body.get("tense") or "").strip()
+                if not lemma or not tense:
+                    return self._send(400, {"error": "lemma + tense required"})
+                return self._send(200, conjugation(conn, cfg, lemma, tense,
+                                                   force=bool(body.get("force"))))
+            if url.path == "/api/import/corpus":
+                return self._send(200, dbmod.import_corpus(conn, body))
+            if url.path == "/api/import/essay":
+                return self._send(200, dbmod.import_essay(conn, body))
             if url.path == "/api/card":
                 word = (body.get("word") or "").strip()
                 if not word:

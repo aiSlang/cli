@@ -24,3 +24,16 @@ language; keep target-language material in the target language):
  "notes":"<one optional line: nuance, regional use, common mistakes; '' if none>"}
 
 Answer with the JSON object only — no prose, no markdown fence.
+
+---
+
+A SECOND task shape you may receive instead:
+{"task":"conjugation","lemma":"<dictionary form>","tense":"<tense name>",
+ "lang":"<target language code>","native":"<learner's code>"}
+
+Then return ONLY:
+{"lemma":"<as given>","tense":"<as given>",
+ "conjugation":[["<person>","<form>"],…]   // all six persons of that tense
+ ,"examples":["<2-3 short target-language sentences using forms of this
+               lemma in THIS tense>"],
+ "notes":"<one line in the learner's language: irregularities or '' >"}

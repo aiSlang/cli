@@ -155,3 +155,86 @@ def test_user_added_languages(tmp_path):
     assert cfg["foreign"] == "uk"                            # custom code accepted
     assert dbmod.all_languages(cfg)["uk"] == "Українська"
     assert "es" in dbmod.all_languages(cfg)                  # built-ins kept
+
+
+def test_corpus_is_language_scoped_and_generation_respects_it(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "l.db"))
+    cfg = cfg_for(tmp_path)                               # course: es
+    seen = []
+    monkeypatch.setattr(serve.llm, "ask_json_array",
+                        lambda a, p, c: seen.append(p["lang"]) or
+                        [{"infinitive": f"v-{p['lang']}", "gloss": "g"}])
+    serve.generate_verbs(conn, cfg, 1)                    # default = course
+    serve.generate_verbs(conn, cfg, 1, lang="fr")         # Vocabulary selector
+    assert seen == ["es", "fr"]
+    assert [v["infinitive"] for v in dbmod.list_verbs(conn, "fr")] == ["v-fr"]
+    assert [v["infinitive"] for v in dbmod.list_verbs(conn, "es")] == ["v-es"]
+
+
+def test_verb_update_and_guarded_delete(tmp_path):
+    conn = dbmod.connect(str(tmp_path / "g.db"))
+    dbmod.add_verbs(conn, "es", [{"infinitive": "comerr", "gloss": ""}])
+    v = dbmod.list_verbs(conn, "es")[0]
+    dbmod.update_verb(conn, v["id"], "comer", "to eat")   # fix the typo, add gloss
+    v2 = dbmod.list_verbs(conn, "es")[0]
+    assert (v2["infinitive"], v2["gloss"]) == ("comer", "to eat")
+    assert dbmod.verb_references(conn, "es", "comer") == 0
+    dbmod.save_essay(conn, {"created_at": "x", "foreign_lang": "es",
+                            "native_lang": "en", "topic": "t", "title": "T",
+                            "body": "b", "verbs_csv": "ir,comer",
+                            "tenses_csv": "Presente"})
+    assert dbmod.verb_references(conn, "es", "comer") == 1   # delete must refuse
+    assert dbmod.tense_references(conn, "es", "Presente") == 1
+
+
+def test_conjugation_cached_shared(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "cj.db"))
+    cfg = cfg_for(tmp_path)
+    calls = []
+    monkeypatch.setattr(serve.llm, "ask_json", lambda a, p, c: calls.append(1) or
+                        {"conjugation": [["yo", "iré"]], "examples": ["Iré."]})
+    r1 = serve.conjugation(conn, cfg, "ir", "Futuro Simple")
+    r2 = serve.conjugation(conn, cfg, "IR", "Futuro Simple")   # lemma-case shared
+    assert r1["cached"] is False and r2["cached"] is True and len(calls) == 1
+    r3 = serve.conjugation(conn, cfg, "ir", "Futuro Simple", force=True)
+    assert r3["cached"] is False and len(calls) == 2
+
+
+def test_corpus_export_import_idempotent(tmp_path):
+    conn = dbmod.connect(str(tmp_path / "io.db"))
+    dbmod.add_verbs(conn, "es", [{"infinitive": "ir", "gloss": "to go"}])
+    dbmod.add_tenses(conn, "es", [{"name": "Presente", "hint": "now"}])
+    blob = dbmod.export_corpus(conn, "es")
+    assert blob["kind"] == "aisverbo-corpus"
+    conn2 = dbmod.connect(str(tmp_path / "io2.db"))
+    r1 = dbmod.import_corpus(conn2, blob)
+    r2 = dbmod.import_corpus(conn2, blob)                     # idempotent
+    assert r1["verbs_added"] == 1 and r2["verbs_added"] == 0
+    assert r2["tenses_added"] == 0
+    assert len(dbmod.list_verbs(conn2, "es")) == 1
+
+
+def test_essay_export_import_idempotent(tmp_path):
+    conn = dbmod.connect(str(tmp_path / "eio.db"))
+    eid = dbmod.save_essay(conn, {"created_at": "x", "foreign_lang": "es",
+                                  "native_lang": "en", "topic": "mar",
+                                  "title": "Viaje", "body": "Hoy **voy**.",
+                                  "verbs_csv": "ir", "tenses_csv": "Presente"})
+    dbmod.save_translation(conn, eid, "en", [["Hoy **voy**.", "Today I go."]], "x")
+    blob = dbmod.export_essay(conn, eid)
+    assert blob["translations"]["en"][0][1] == "Today I go."
+    conn2 = dbmod.connect(str(tmp_path / "eio2.db"))
+    r1 = dbmod.import_essay(conn2, blob)
+    r2 = dbmod.import_essay(conn2, blob)                      # idempotent
+    assert r1["created"] is True and r2["created"] is False and r1["id"] == r2["id"]
+    assert dbmod.get_translation(conn2, r1["id"], "en")[0][1] == "Today I go."
+
+
+def test_migration_preserves_data(tmp_path):
+    path = str(tmp_path / "old.db")
+    conn = dbmod.connect(path)
+    dbmod.add_verbs(conn, "es", [{"infinitive": "ser", "gloss": "to be"}])
+    conn.close()
+    conn2 = dbmod.connect(path)                               # re-open = migrate
+    assert [v["infinitive"] for v in dbmod.list_verbs(conn2, "es")] == ["ser"]
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == dbmod.SCHEMA_VERSION

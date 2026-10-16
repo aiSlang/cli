@@ -20,9 +20,14 @@ driven) into a multi-language web app with a persistent library.
    `en → en` is a legitimate course in formal English grammar. Switching
    languages keeps every language's data; switch back any time.
 2. **Vocabulary** (Vocabulary tab) — this page manages the CORPUS, not a
-   story's cast: search and paginate the verb list (100 per page, built for
-   1k–5k vocabularies), add or delete verbs and tenses. Which of them go
-   into a story is chosen on the Learn page. one click generates the **top-N most
+   story's cast, and has its own LANGUAGE selector (corpora are per
+   language; Generate top-N / Generate the inventory respect it): search,
+   20-per-page pagination, header-click alphabetical sorting (unsorted =
+   the lexicographer's frequency order), inline editing of infinitive and
+   gloss (fix a typo, add a missing gloss), guarded deletion (a verb or
+   tense used by a stored story refuses to go — referential integrity),
+   and one-file Export/Import of the whole corpus (verbs + tenses,
+   idempotent on load). Which items go into a story is chosen on Learn. one click generates the **top-N most
    frequent verbs** of the course language (N is configurable: 50, 100,
    500…), each glossed in your native language, by the `lexicographer`
    agent — batched 100 per call, already-known verbs excluded, so you can
@@ -43,7 +48,10 @@ driven) into a multi-language web app with a persistent library.
    and ▶ selection plays just that; the speed slider goes 0.5×–1.4×. The
    voice is the **browser's own speech synthesis** — free, offline-capable,
    per-language voices, which is also why the UI can run on a static host.
-5. **Tap any word** — not only verbs — and the `grammarian` agent returns
+5. **Tap any word** — not only verbs — the card's conjugation table has a
+   tense dropdown (defaulting to the tapped form's own tense): see the
+   same verb across every tense of the corpus, with fresh examples, each
+   conjugation cached DB-wide like everything else. Tap any word — and the `grammarian` agent returns
    the full card *in your native language*: lemma, part of speech, meaning
    (of the lemma and of this exact form in this sentence), the form
    analysis (tense/mood/person), the rule and suffix pattern that produce
@@ -59,7 +67,11 @@ driven) into a multi-language web app with a persistent library.
    and every cache has an explicit ⟳ to re-ask.
 7. **Library** (Library tab): every story is stored. Search by any verb,
    word form or topic — `comeré` finds every story where you met that
-   future form — and reopen it as a full learning session.
+   future form — and reopen it as a full learning session with the
+   story's own verbs/tenses restored as the current selection. Each story
+   Exports to one JSON (text + metadata + translations) and Imports back
+   idempotently — share a story between installations without re-paying
+   for its generation.
 
 ## The agents (`aisverbo.ais`)
 
@@ -85,7 +97,9 @@ cd examples/aisverbo && make serve                  # → http://127.0.0.1:8787
 ```
 
 Standard-library Python only (3.10+). All state lives in `app/generated/`
-(SQLite + config, git-ignored): vocabulary and tenses per language, every
+(SQLite + config, git-ignored; `AISVERBO_DATA=<dir>` relocates it — tests,
+HF persistent storage, a second instance beside a live one). The schema
+migrates in place on open (`PRAGMA user_version`), never dropping data: vocabulary and tenses per language, every
 story, every word card.
 
 ```bash
