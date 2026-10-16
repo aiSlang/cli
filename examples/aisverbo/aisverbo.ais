@@ -1,0 +1,94 @@
+## aisVerbo — learn verb conjugation by story, not by table.
+##
+## The hardest part of es/en/pt/fr/it/de is the conjugation space (Spanish
+## alone: ~90 unique suffixes across tenses and persons, plus irregulars).
+## Rules and artificial examples don't stick; verbs learned INSIDE a themed
+## story do. aisVerbo turns that into a pipeline:
+##
+##   lexicographer — builds the top-N verb vocabulary for the chosen
+##                   language, glossed in the learner's native language
+##   tensesmith    — the language's tense inventory (name, native name,
+##                   one-line usage hint, an example)
+##   essayist      — a short story on the LEARNER'S topic that uses the
+##                   selected verbs only in the selected tenses, each
+##                   vocabulary verb bolded (the heart of the app — a
+##                   generalization of the Essayist CLI prototype)
+##   grammarian    — the full card for any word the learner taps in a
+##                   story: lemma, form analysis, rule, conjugation row,
+##                   IPA, examples, synonyms — explained in the native
+##                   language, cached forever in the local DB
+##
+## Reading aloud (any fragment, any speed) is the BROWSER's own speech
+## synthesis — client-side and free, so it works even on a static host.
+##
+## ── Run it ───────────────────────────────────────────────────────────
+##   aislang validate examples/aisverbo/aisverbo.ais
+##   aislang apply    examples/aisverbo/aisverbo.ais
+##   python3 examples/aisverbo/app/serve.py     # → http://127.0.0.1:8787
+##
+## The web app stores everything (vocabulary, tenses, essays, word cards)
+## in examples/aisverbo/app/generated/ — local, git-ignored.
+
+project "aisverbo" {
+  budget {
+    hard_cap_per_day = $2
+    hard_cap_per_run = $0.05
+  }
+
+  ## Everything here is short structured output — the cheapest capable
+  ## model wins; local Qwen as the free fallback.
+  model "scholar" {
+    requires    = [chat, reasoning]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_5_5]
+    fallback    = [ollama.qwen3_8b]
+  }
+
+  ## The story writer — its own block so creativity can be tuned (or a
+  ## larger model routed in) without touching the card/list generators.
+  model "author" {
+    requires    = [chat]
+    context_min = 32k
+    prefer      = [anthropic.claude_haiku_5_5]
+    fallback    = [ollama.qwen3_8b]
+  }
+
+  prompt "lexicographer_sys" { file = "./prompts/lexicographer.md" version = "1.0.0" }
+  prompt "tensesmith_sys"    { file = "./prompts/tensesmith.md"    version = "1.0.0" }
+  prompt "essayist_sys"      { file = "./prompts/essayist.md"      version = "1.0.0" }
+  prompt "grammarian_sys"    { file = "./prompts/grammarian.md"    version = "1.0.0" }
+
+  ## Vocabulary: the top-N most useful verbs of the target language,
+  ## glossed in the learner's native language. Batched by the app.
+  agent "lexicographer" {
+    model         = model.scholar
+    system_prompt = prompt.lexicographer_sys
+    tools         = []
+  }
+
+  ## The tense inventory of the target language.
+  agent "tensesmith" {
+    model         = model.scholar
+    system_prompt = prompt.tensesmith_sys
+    tools         = []
+  }
+
+  ## The themed story under verb + tense constraints.
+  agent "essayist" {
+    model         = model.author
+    system_prompt = prompt.essayist_sys
+    tools         = []
+  }
+
+  ## The on-demand word card — form, rule, conjugation, IPA, examples,
+  ## synonyms — in the learner's native language.
+  agent "grammarian" {
+    model         = model.scholar
+    system_prompt = prompt.grammarian_sys
+    tools         = []
+  }
+
+  deploy "local" {
+    target = compose
+  }
+}
