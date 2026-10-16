@@ -136,7 +136,8 @@ def word_card(conn, cfg: dict, word: str, sentence: str,
 
 
 def _plain(text: str) -> str:
-    return (text or "").replace("**", "")
+    # markdown markers and literal "\n" escapes never enter the metadata
+    return (text or "").replace("**", "").replace("\\n", "\n")
 
 
 def translate(conn, cfg: dict, to: str, essay_id: int | None = None,

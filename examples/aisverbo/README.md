@@ -59,13 +59,14 @@ driven) into a multi-language web app with a persistent library.
    tense, IPA transcription, 2–3 example sentences (each playable),
    synonyms, usage notes. **Cards are cached forever** — each word costs
    one model call per language pair, ever.
-6. **Translation** (right panel, next to the Word card): translate the
+6. **Translation** (right panel, next to the Word card, laid out like the
+   story itself — title above body, same paragraph structure): translate the
    whole story (sentence-aligned, cached per language — ⟳ re-translates on
    demand) or just the selected fragment; selecting text in the original
    highlights its semantic counterpart in the translation. Every model
    result in the app is cached this way — word cards, story translations —
    and every cache has an explicit ⟳ to re-ask.
-7. **Library** (Library tab): every story is stored. Search by any verb,
+7. **Stories** (the landing tab): every story is stored. Search by any verb,
    word form or topic — `comeré` finds every story where you met that
    future form — and reopen it as a full learning session with the
    story's own verbs/tenses restored as the current selection. Each story
