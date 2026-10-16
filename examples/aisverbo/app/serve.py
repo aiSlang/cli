@@ -136,8 +136,13 @@ def word_card(conn, cfg: dict, word: str, sentence: str,
 
 
 def _plain(text: str) -> str:
-    # markdown markers and literal "\n" escapes never enter the metadata
-    return (text or "").replace("**", "").replace("\\n", "\n")
+    """Translation metadata is PLAIN prose: no markdown markers, no literal
+    escape sequences, no line breaks — one continuous block. (The UI derives
+    the paragraph layout from the STORY via the select_subs mapping.)"""
+    t = (text or "").replace("**", "").replace("\\n", " ")
+    for ch in ("*", "`", "#", "_"):
+        t = t.replace(ch, "")
+    return " ".join(t.split())
 
 
 def translate(conn, cfg: dict, to: str, essay_id: int | None = None,

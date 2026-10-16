@@ -150,7 +150,7 @@
       <div id="side-card">
         <div id="card" class="card muted">Tap a word in the story.</div>
       </div>
-      <div id="side-trans" style="display:none" onclick="if(!event.target.closest('.tr-pair')&&!event.target.closest('button')&&!event.target.closest('select')){getSelection().removeAllRanges();clearMapping();}">
+      <div id="side-trans" style="display:none" onclick="if(!getSelection().isCollapsed)return;if(!event.target.closest('.tr-pair')&&!event.target.closest('button')&&!event.target.closest('select')){clearMapping();}">
         <div class="bar">
           <select id="tr-lang" style="width:150px" onchange="if(ESSAY&&ESSAY.id)translateStory(false)"></select>
           <button class="btn small" onclick="translateStory(false)">translate story</button>
@@ -344,7 +344,10 @@ function clearMapping(){
   document.querySelectorAll('#essay-body .s.hl-src').forEach(x=>x.classList.remove('hl-src'));}
 function clearWordSel(ev){
   // clicking empty space or the title drops the tapped-word selection AND
-  // every mapping highlight on both sides
+  // every mapping highlight on both sides — but releasing the mouse at the
+  // end of a text selection is NOT a clearing click
+  const sel=window.getSelection();
+  if(sel&&!sel.isCollapsed)return;
   if(ev&&ev.target.closest('.w'))return;
   SELWORD=null;
   document.querySelectorAll('#essay-body .w.sel').forEach(x=>x.classList.remove('sel'));
@@ -358,15 +361,16 @@ function showEssay(e){ESSAY=e;
   TR=null;$('#tr-title').textContent='—';
   $('#trans-body').innerHTML='Translate the whole story (cached) or a selected fragment.';
   $('#trans-body').classList.add('muted');}
+let STORY_PSTARTS=[];
 function renderBody(md){
-  let si=0;
+  let si=0;STORY_PSTARTS=[];
   const para=t=>splitSentences(t).map(s=>{
     let h=esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
     h=h.replace(/(^|[\s>«“"(])([\p{L}\p{M}][\p{L}\p{M}'’-]*)/gu,
       (m,pre,w)=>`${pre}<span class="w" onclick="openCard(this)">${w}</span>`);
     return `<span class="s" data-si="${si++}">${h.replace(/\n/g,'<br/>')}</span>`;
   }).join('');
-  return md.split(/\n{2,}/).map(p=>`<p>${para(p)}</p>`).join('');}
+  return md.split(/\n{2,}/).map(p=>{STORY_PSTARTS.push(si);return `<p>${para(p)}</p>`;}).join('');}
 function plainEssay(){return ESSAY?(ESSAY.title+'. '+ESSAY.body.replace(/\*\*/g,'')):'';}
 
 /* ── word card (cached; ⟳ re-asks) ── */
@@ -405,18 +409,20 @@ async function openCard(el,force){
       ${isVerb?`<dt>conjugation in
           <select id="conj-tense" style="width:auto;display:inline;padding:1px 6px;font-size:12px"
             onchange="loadConjugation(this.value)">
-            <option value="">this tense</option>${tenseOpts}</select></dt>
+            ${c.tense&&!TENSES.some(t=>t.name===c.tense)?`<option value="${esc(c.tense)}">${esc(c.tense)}</option>`:''}
+            ${c.tense?'':'<option value="">this tense</option>'}${tenseOpts}</select></dt>
         <dd id="conj-box"><table>${(c.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('')}</table></dd>`:''}
       ${(c.examples||[]).length?`<dt>examples</dt><dd id="conj-examples">${c.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('')}</dd>`:''}
       ${(c.synonyms||[]).length?`<dt>synonyms</dt><dd>${c.synonyms.map(esc).join(', ')}</dd>`:''}
       ${c.notes?`<dt>notes</dt><dd>${esc(c.notes)}</dd>`:''}
       </dl>`;
+    if(c.tense&&$('#conj-tense'))$('#conj-tense').value=c.tense;
   }catch(e){$('#card').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 let CARD=null;
 async function loadConjugation(tense){
   if(!CARD)return;
   const box=$('#conj-box');
-  if(!tense){ // back to the tapped form's own tense
+  if(!tense||tense===CARD.tense){ // the tapped form's own tense: from the card
     box.innerHTML=`<table>${(CARD.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('')}</table>`;
     const ex=$('#conj-examples');
     if(ex)ex.innerHTML=(CARD.examples||[]).map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('');
@@ -469,13 +475,15 @@ async function translateSelection(){
   }catch(e){$('#trans-body').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 function renderTranslation(){
   $('#tr-title').textContent=TR.title||'—';
-  // same paragraph structure as the story (the translator keeps paragraph
-  // counts aligned); sentence indices stay GLOBAL so select_subs maps
-  // across paragraph boundaries unchanged
-  let ti=0;
-  $('#trans-body').innerHTML=(TR.body||'').split(/\n{2,}/).map(p=>
-    `<p style="margin:0 0 10px">${splitSentences(p).map(s=>
-      `<span class="tr-pair" data-ti="${ti++}">${esc(s)}</span>`).join('')}</p>`).join('');}
+  // the translation is ONE plain block; its paragraph layout is DERIVED
+  // from the story through select_subs: each story paragraph's first
+  // sentence maps to the translated sentence that opens the same paragraph
+  const sents=splitSentences(TR.body);
+  const nStory=storySentEls().length;
+  const starts=new Set(STORY_PSTARTS.map(si=>mapRange(si,si,nStory,sents.length)[0]));
+  $('#trans-body').innerHTML='<p style="margin:0 0 10px">'+sents.map((s,i)=>
+    `${i&&starts.has(i)?'</p><p style="margin:0 0 10px">':''}<span class="tr-pair" data-ti="${i}">${esc(s)}</span>`)
+    .join('')+'</p>';}
 function storySentEls(){return [...document.querySelectorAll('#essay-body .s')];}
 function highlightStoryRange(i,j,on){
   storySentEls().forEach(el=>{const k=+el.dataset.si;

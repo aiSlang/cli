@@ -13,8 +13,8 @@ Return ONLY a JSON object:
  "body":"<the translated text>"}
 
 Rules:
-- PLAIN text only: never copy markdown markers such as ** into the output;
-- translate meaning, not word by word, but keep the text's paragraph
-  structure: the same number of paragraphs (blank-line separated), in the
-  same order, and keep the sentence order within each paragraph;
+- PLAIN text only: one continuous block — no markdown markers (** etc.),
+  no line breaks, no lists, no headings;
+- translate meaning, not word by word, but KEEP THE SENTENCE ORDER of the
+  source (the app aligns the two texts sentence by sentence);
 - answer with the JSON object only — no prose, no markdown fence.

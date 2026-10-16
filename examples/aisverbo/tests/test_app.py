@@ -252,3 +252,32 @@ def test_legacy_pair_translations_retranslate(tmp_path):
     conn.commit()
     assert dbmod.get_translation(conn, eid, "en") is None    # forces a re-translate
     assert dbmod.export_essay(conn, eid)["translations"] == {}
+
+
+def test_plain_translation_is_single_block():
+    assert serve._plain("Hola **mundo**.\n\nOtro *parrafo* `x`.") == "Hola mundo. Otro parrafo x."
+    assert "\\n" not in serve._plain("a \\n\\n b")
+
+
+def test_export_carries_cards_and_conjugations(tmp_path):
+    conn = dbmod.connect(str(tmp_path / "x.db"))
+    eid = dbmod.save_essay(conn, {"created_at": "x", "foreign_lang": "es",
+                                  "native_lang": "en", "topic": "mar",
+                                  "title": "Viaje", "body": "Hoy **voy** al mar.",
+                                  "verbs_csv": "ir", "tenses_csv": "Presente"})
+    dbmod.save_card(conn, "voy", "es", "en",
+                    {"word": "voy", "lemma": "ir", "tense": "Presente"}, "x")
+    dbmod.save_card(conn, "otro", "es", "en", {"word": "otro"}, "x")   # not in story
+    dbmod.save_conjugation(conn, "ir", "Futuro Simple", "es", "en",
+                           {"conjugation": [["yo", "iré"]], "examples": ["Iré."]}, "x")
+    blob = dbmod.export_essay(conn, eid)
+    assert [c["word"] for c in blob["cards"]] == ["voy"]               # story words only
+    assert blob["conjugations"][0]["lemma"] == "ir"                    # via the card's lemma
+    # import into a fresh install: caches filled, never overwritten
+    conn2 = dbmod.connect(str(tmp_path / "y.db"))
+    r1 = dbmod.import_essay(conn2, blob)
+    assert r1["cards_added"] == 1 and r1["conjugations_added"] == 1
+    assert dbmod.get_card(conn2, "voy", "es", "en")["lemma"] == "ir"
+    assert dbmod.get_conjugation(conn2, "ir", "Futuro Simple", "es", "en")["examples"] == ["Iré."]
+    r2 = dbmod.import_essay(conn2, blob)                               # idempotent
+    assert r2["cards_added"] == 0 and r2["conjugations_added"] == 0

@@ -12,6 +12,8 @@ language; keep target-language material in the target language):
  "lemma":"<dictionary form>",
  "pos":"<part of speech>",
  "translation":"<meaning of the lemma, and of this exact form in this sentence>",
+ "tense":"<for a verb: the NAME of the tense this form is in, exactly as
+          the language's grammars call it; empty string for non-verbs>",
  "analysis":"<for a verb: tense, mood, person & number of THIS form; for
              other words: the relevant morphology — one or two lines>",
  "rule":"<the conjugation/grammar rule that produces this form, incl. the

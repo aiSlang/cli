@@ -315,11 +315,34 @@ def export_essay(conn, essay_id: int) -> dict:
             translations[t["lang"]] = {
                 "title": (data.get("title") or "").replace("**", ""),
                 "body": (data.get("body") or "").replace("**", "")}
+    # the story's words anchor its word cards and conjugations — exporting
+    # them moves the whole learned context between installs without paying
+    # the LLM again
+    import re as _re
+    words = {w.lower() for w in _re.findall(r"[\w'’-]+", f"{r['title']} {r['body']}".replace("**", ""), _re.UNICODE)}
+    cards, lemmas = [], set()
+    for c in conn.execute("SELECT word, foreign_lang, native_lang, json "
+                          "FROM cards WHERE foreign_lang=?", (r["foreign_lang"],)):
+        if c["word"] in words:
+            data = json.loads(c["json"])
+            cards.append({"word": c["word"], "native_lang": c["native_lang"],
+                          "card": data})
+            if data.get("lemma"):
+                lemmas.add(str(data["lemma"]).lower())
+    conjugations = [
+        {"lemma": cj["lemma"], "tense": cj["tense"],
+         "native_lang": cj["native_lang"], "data": json.loads(cj["json"])}
+        for cj in conn.execute("SELECT lemma, tense, native_lang, json "
+                               "FROM conjugations WHERE foreign_lang=?",
+                               (r["foreign_lang"],))
+        if cj["lemma"] in lemmas or cj["lemma"] in words]
     return {"kind": "aisverbo-essay",
             **{k: r[k] for k in ("created_at", "foreign_lang", "native_lang",
                                  "topic", "title", "body", "verbs_csv",
                                  "tenses_csv")},
-            "translations": translations}
+            "translations": translations,
+            "cards": cards,
+            "conjugations": conjugations}
 
 
 def import_essay(conn, data: dict) -> dict:
@@ -344,4 +367,30 @@ def import_essay(conn, data: dict) -> dict:
                 and get_translation(conn, eid, lang) is None:
             save_translation(conn, eid, lang, tr,
                              data.get("created_at") or "")
-    return {"id": eid, "created": created}
+    # cards and conjugations: fill the shared caches, never overwrite
+    foreign = data.get("foreign_lang") or ""
+    cards_added = conj_added = 0
+    for c in data.get("cards") or []:
+        if not (isinstance(c, dict) and c.get("word") and isinstance(c.get("card"), dict)):
+            continue
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO cards(word, foreign_lang, native_lang, json, "
+            "created_at) VALUES(?,?,?,?,?)",
+            (str(c["word"]).lower(), foreign, c.get("native_lang") or "en",
+             json.dumps(c["card"], ensure_ascii=False),
+             data.get("created_at") or ""))
+        cards_added += cur.rowcount
+    for cj in data.get("conjugations") or []:
+        if not (isinstance(cj, dict) and cj.get("lemma") and cj.get("tense")):
+            continue
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO conjugations(lemma, tense, foreign_lang, "
+            "native_lang, json, created_at) VALUES(?,?,?,?,?,?)",
+            (str(cj["lemma"]).lower(), cj["tense"], foreign,
+             cj.get("native_lang") or "en",
+             json.dumps(cj.get("data") or {}, ensure_ascii=False),
+             data.get("created_at") or ""))
+        conj_added += cur.rowcount
+    conn.commit()
+    return {"id": eid, "created": created,
+            "cards_added": cards_added, "conjugations_added": conj_added}
