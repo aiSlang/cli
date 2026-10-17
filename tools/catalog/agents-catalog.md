@@ -3,7 +3,7 @@
 > **Generated** — do not edit by hand. Rebuild with:
 > `python3 tools/catalog/scan_catalog.py && python3 tools/catalog/render_catalog.py`.
 
-Scanned `examples/` on 2026-07-22T11:59:02+00:00 — **16 agents / multi-agent projects**, **26 agents** in total.
+Scanned `examples/` on 2026-10-17T14:00:50+00:00 — **17 agents / multi-agent projects**, **31 agents** in total.
 
 Each entry is a self-contained aiSlang project: declarative capability-based model selection, prompts, agents, deterministic compute skills, RAG knowledge, MCP tools, evals, and a deploy target — all reconstructed straight from the `.ais` / `aislang.toml` source.
 
@@ -13,6 +13,7 @@ Each entry is a self-contained aiSlang project: declarative capability-based mod
 |---|---|:-:|:-:|---|
 | [**orchestrator-agent**](#orchestrator-agent) | multi-module | 4 | 1 | 🤝 multi-agent 📚 RAG 🛠 skills ➡️ pipeline 🔁 reflector loop 🐳 compose ✅ evals |
 | [**multi-module-demo**](#multi-module-demo) | multi-module | 2 | 0 | 🤝 multi-agent 🔌 MCP tools |
+| [**aisverbo**](#aisverbo) | single-file | 5 | 0 | 🤝 multi-agent 🐳 compose |
 | [**patterns-router-demo**](#patterns-router-demo) | single-file | 4 | 0 | 🤝 multi-agent 🔌 MCP tools ➡️ pipeline |
 | [**patterns-orchestrator-demo**](#patterns-orchestrator-demo) | single-file | 2 | 0 | 🤝 multi-agent 🔌 MCP tools ➡️ pipeline 🐳 compose |
 | [**portfolio-pnl**](#portfolio-pnl) | single-file | 2 | 3 | 🤝 multi-agent 📚 RAG 🛠 skills ➡️ pipeline 🐳 compose ✅ evals |
@@ -123,6 +124,42 @@ v0.3 Week 16 Mon scaffold — see the sibling `aislang.toml`.
 
 - Source: [`examples/multi-module-demo/aislang.toml`](../../examples/multi-module-demo/aislang.toml) (dir: [`examples/multi-module-demo`](../../examples/multi-module-demo))
 - Modules: `architect` (architect), `coder` (coder)
+
+---
+
+<a id="aisverbo"></a>
+## aisverbo
+
+*single-file* · 🤝 multi-agent 🐳 compose
+
+An aiSlang multi-agent example. The hardest part of learning es / en / pt / fr / it / de is the verb conjugation space — Spanish alone has ~90 unique suffixes across tenses and persons, plus the irregulars. Grammar tables and artificial examples don't stick; the forms you meet inside a story *about something you chose* do. aisVerbo turns that observation into a pipeline: **you pick a topic, the verbs and the tenses — the agents write you a short story that uses exactly those verbs in exactly those tenses — you read it, listen to it at your speed, and tap any word for its full grammar card.**
+
+**Agents**
+
+| Agent | Model | Prompt | Tools | Knowledge |
+|---|---|---|---|---|
+| **lexicographer** | `scholar` | `lexicographer_sys` | — | — |
+| **tensesmith** | `scholar` | `tensesmith_sys` | — | — |
+| **essayist** | `author` | `essayist_sys` | — | — |
+| **grammarian** | `scholar` | `grammarian_sys` | — | — |
+| **translator** | `scholar` | `translator_sys` | — | — |
+
+**Models**
+
+| Model | Requires | Prefer | Fallback |
+|---|---|---|---|
+| **scholar** | `chat`, `reasoning` | `anthropic.claude_haiku_5_5` | `ollama.qwen3_8b` |
+| **author** | `chat` | `anthropic.claude_haiku_5_5` | `ollama.qwen3_8b` |
+
+**Tooling & delivery**
+
+- Deploy: `compose`
+- Prompts: `essayist.md`, `grammarian.md`, `lexicographer.md`, `tensesmith.md`, `translator.md`
+
+**Source & docs**
+
+- Source: [`examples/aisverbo/aisverbo.ais`](../../examples/aisverbo/aisverbo.ais) (dir: [`examples/aisverbo`](../../examples/aisverbo))
+- README: [`examples/aisverbo/README.md`](../../examples/aisverbo/README.md)
 
 ---
 

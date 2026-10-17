@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-07-22T11:59:02+00:00",
+  "generated_at": "2026-10-17T14:00:50+00:00",
   "root": "examples",
-  "count": 16,
+  "count": 17,
   "entries": [
     {
       "models": [
@@ -423,6 +423,146 @@
         "mcp-tools"
       ],
       "description": "v0.3 Week 16 Mon scaffold — see the sibling `aislang.toml`."
+    },
+    {
+      "models": [
+        {
+          "name": "scholar",
+          "requires": [
+            "chat",
+            "reasoning"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_5_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        },
+        {
+          "name": "author",
+          "requires": [
+            "chat"
+          ],
+          "prefer": [
+            "anthropic.claude_haiku_5_5"
+          ],
+          "fallback": [
+            "ollama.qwen3_8b"
+          ],
+          "context_min": "32k",
+          "cost_max": null
+        }
+      ],
+      "prompts": [
+        {
+          "name": "lexicographer_sys",
+          "file": "./prompts/lexicographer.md\" version = \"1.0.0",
+          "version": null
+        },
+        {
+          "name": "tensesmith_sys",
+          "file": "./prompts/tensesmith.md\"    version = \"1.0.0",
+          "version": null
+        },
+        {
+          "name": "essayist_sys",
+          "file": "./prompts/essayist.md\"      version = \"1.0.0",
+          "version": null
+        },
+        {
+          "name": "grammarian_sys",
+          "file": "./prompts/grammarian.md\"    version = \"1.0.0",
+          "version": null
+        },
+        {
+          "name": "translator_sys",
+          "file": "./prompts/translator.md\"    version = \"1.0.0",
+          "version": null
+        }
+      ],
+      "agents": [
+        {
+          "name": "lexicographer",
+          "model": "scholar",
+          "system_prompt": "lexicographer_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "tensesmith",
+          "model": "scholar",
+          "system_prompt": "tensesmith_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "essayist",
+          "model": "author",
+          "system_prompt": "essayist_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "grammarian",
+          "model": "scholar",
+          "system_prompt": "grammarian_sys",
+          "tools": [],
+          "knowledge": []
+        },
+        {
+          "name": "translator",
+          "model": "scholar",
+          "system_prompt": "translator_sys",
+          "tools": [],
+          "knowledge": []
+        }
+      ],
+      "skills": [],
+      "pipelines": [],
+      "loops": [],
+      "vector_stores": [],
+      "mcp_servers": [],
+      "evals": [],
+      "deploy": [
+        {
+          "name": "local",
+          "target": "compose"
+        }
+      ],
+      "id": "aisverbo",
+      "name": "aisverbo",
+      "kind": "single-file",
+      "path": "examples/aisverbo",
+      "entry_file": "examples/aisverbo/aisverbo.ais",
+      "budget": {
+        "hard_cap_per_day": "$2",
+        "hard_cap_per_run": "$0.05"
+      },
+      "docs": {
+        "header": "aisVerbo — learn verb conjugation by story, not by table.\n\nThe hardest part of es/en/pt/fr/it/de is the conjugation space (Spanish\nalone: ~90 unique suffixes across tenses and persons, plus irregulars).\nRules and artificial examples don't stick; verbs learned INSIDE a themed\nstory do. aisVerbo turns that into a pipeline:\n\n  lexicographer — builds the top-N verb vocabulary for the chosen\n                  language, glossed in the learner's native language\n  tensesmith    — the language's tense inventory (name, native name,\n                  one-line usage hint, an example)\n  essayist      — a short story on the LEARNER'S topic that uses the\n                  selected verbs only in the selected tenses, each\n                  vocabulary verb bolded (the heart of the app — a\n                  generalization of the Essayist CLI prototype)\n  grammarian    — the full card for any word the learner taps in a\n                  story: lemma, form analysis, rule, conjugation row,\n                  IPA, examples, synonyms — explained in the native\n                  language, cached forever in the local DB\n\nReading aloud (any fragment, any speed) is the BROWSER's own speech\nsynthesis — client-side and free, so it works even on a static host.\n\n── Run it ───────────────────────────────────────────────────────────\n  aislang validate examples/aisverbo/aisverbo.ais\n  aislang apply    examples/aisverbo/aisverbo.ais\n  python3 examples/aisverbo/app/serve.py     # → http://127.0.0.1:8787\n\nThe web app stores everything (vocabulary, tenses, essays, word cards)\nin examples/aisverbo/app/generated/ — local, git-ignored.",
+        "readme": {
+          "path": "examples/aisverbo/README.md",
+          "title": "aisVerbo — learn verb conjugation by story, not by table",
+          "summary": "An aiSlang multi-agent example. The hardest part of learning es / en / pt / fr / it / de is the verb conjugation space — Spanish alone has ~90 unique suffixes across tenses and persons, plus the irregulars. Grammar tables and artificial examples don't stick; the forms you meet inside a story *about something you chose* do. aisVerbo turns that observation into a pipeline: **you pick a topic, the verbs and the tenses — the agents write you a short story that uses exactly those verbs in exactly those tenses — you read it, listen to it at your speed, and tap any word for its full grammar card.**"
+        }
+      },
+      "prompt_files": [
+        "essayist.md",
+        "grammarian.md",
+        "lexicographer.md",
+        "tensesmith.md",
+        "translator.md"
+      ],
+      "knowledge_files": [],
+      "has_scripts": false,
+      "tags": [
+        "multi-agent",
+        "deploy-compose"
+      ],
+      "description": "An aiSlang multi-agent example. The hardest part of learning es / en / pt / fr / it / de is the verb conjugation space — Spanish alone has ~90 unique suffixes across tenses and persons, plus the irregulars. Grammar tables and artificial examples don't stick; the forms you meet inside a story *about something you chose* do. aisVerbo turns that observation into a pipeline: **you pick a topic, the verbs and the tenses — the agents write you a short story that uses exactly those verbs in exactly those tenses — you read it, listen to it at your speed, and tap any word for its full grammar card.**"
     },
     {
       "models": [
