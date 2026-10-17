@@ -34,5 +34,12 @@ RUN pip install --no-cache-dir --user -r requirements.txt "litellm[proxy]" \
 #  AISVERBO_SECRET=... python3 app/get_token.py)
 ENV AISVERBO_MULTI_TENANT=1
 
+# Newer LiteLLM refuses to boot without a master key. The aislang runtime
+# client sends NO Authorization header (it is built for a keyless loopback
+# proxy), so a master key would 401 every call. Keyless is safe in THIS
+# topology: the proxy binds 127.0.0.1 inside the container and HuggingFace
+# routes only port 7860 — :4000 is unreachable from outside.
+ENV LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY=true
+
 # the LiteLLM proxy (the aiSlang model router) + the web app, one container
 CMD ["sh", "-c", "litellm --config litellm_config.yaml --host 127.0.0.1 --port 4000 & sleep 5 && python3 app/serve.py"]

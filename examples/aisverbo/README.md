@@ -154,7 +154,12 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
       Free Spaces have no persistent disk — tenant data resets on restart;
       paid persistent storage + variable `AISVERBO_DATA=/data` keeps it.
    6. Push. First build installs `litellm[proxy]`; the container then runs
-      the proxy on :4000 and uvicorn on :7860.
+      the proxy on :4000 and uvicorn on :7860. The Dockerfile sets
+      `LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY=true`: newer
+      LiteLLM refuses to boot keyless, but the aislang client sends no
+      Authorization header (a master key would 401 every call), and the
+      proxy is loopback-only inside the container — HF exposes port 7860
+      alone, so :4000 is unreachable from outside.
    7. Mint your admin token with the SAME secret and paste it into Setup:
       `AISVERBO_SECRET=<secret> python3 app/get_token.py`
 
