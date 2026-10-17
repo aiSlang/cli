@@ -123,7 +123,44 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
 
 1. **Local (today)** — the full app next to the aiSlang CLI, as above.
 2. **HuggingFace Docker Space (today, free CPU tier) — the Space type to
-   choose.** The provided `Dockerfile` installs the requirements, runs
+   choose** (create it as Docker → *Blank* template).
+
+   Deploying, step by step — the Space has NO Docker daemon inside, so the
+   LiteLLM proxy runs as a process instead of `aislang apply`'s compose:
+
+   1. Create the Space (Docker → Blank), `git clone` its repo.
+   2. Copy `examples/aisverbo/*` into it (Dockerfile at the repo root).
+   3. Add what aislang-cli's gitignore withholds but the Space NEEDS:
+      `aislang.lock` and `litellm_config.yaml` (both from
+      `aislang plan aisverbo.ais`), and a **linux/amd64** `aislang`
+      binary at `bin/aislang` — use `cargo build --release` and `strip`
+      it (a debug build is ~300 MB), then `git lfs track bin/aislang`.
+      Delete the local `.gitignore` lines that would hide these files.
+      Mind glibc: the Dockerfile's base is trixie because a binary built
+      on a 2024+ distro needs glibc ≥ 2.39.
+   4. KEEP the YAML frontmatter HF generated at the top of the Space's
+      README.md (or prepend ours with):
+
+      ```yaml
+      ---
+      title: aisVerbo
+      emoji: 📚
+      sdk: docker
+      app_port: 7860
+      pinned: false
+      ---
+      ```
+   5. Space settings → Secrets: `ANTHROPIC_API_KEY`, `AISVERBO_SECRET`.
+      Free Spaces have no persistent disk — tenant data resets on restart;
+      paid persistent storage + variable `AISVERBO_DATA=/data` keeps it.
+   6. Push. First build installs `litellm[proxy]`; the container then runs
+      the proxy on :4000 and uvicorn on :7860.
+   7. Mint your admin token with the SAME secret and paste it into Setup:
+      `AISVERBO_SECRET=<secret> python3 app/get_token.py`
+
+   Notes: the `ollama` fallback model simply stays unavailable in the
+   Space (haiku is primary); budget caps from aisverbo.ais are enforced
+   by the proxy config. The provided `Dockerfile` installs the requirements, runs
    `aislang apply` + uvicorn on the `PORT=7860` HF expects, and turns on
    `AISVERBO_MULTI_TENANT=1`. Space secrets to set: `ANTHROPIC_API_KEY`
    (the LiteLLM stack) and `AISVERBO_SECRET` (the JWT signing secret).
