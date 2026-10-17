@@ -42,4 +42,7 @@ ENV AISVERBO_MULTI_TENANT=1
 ENV LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY=true
 
 # the LiteLLM proxy (the aiSlang model router) + the web app, one container
-CMD ["sh", "-c", "litellm --config litellm_config.yaml --host 127.0.0.1 --port 4000 & sleep 5 && python3 app/serve.py"]
+# the generated config enables aislang's otel callback; without the
+# opentelemetry-sdk (and a collector) it only logs a non-blocking error on
+# boot — strip it for a quiet log (idempotent)
+CMD ["sh", "-c", "sed -i -e '/^  callbacks:$/,/^  - otel$/d' litellm_config.yaml; litellm --config litellm_config.yaml --host 127.0.0.1 --port 4000 & sleep 5 && python3 app/serve.py"]

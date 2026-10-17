@@ -351,3 +351,18 @@ def test_settings_limits_clamped(tmp_path, monkeypatch):
     assert r.json()["verb_count"] == 100 and r.json()["essay_words"] == 200
     r = c.post("/api/settings", json={"verb_count": -3, "essay_words": 1})
     assert r.json()["verb_count"] == 1 and r.json()["essay_words"] == 30
+
+
+def test_auth_check_diagnoses_each_failure(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    r = c.get("/api/auth/check").json()
+    assert r["admin_ok"] is False and "no ADMIN token" in r["detail"]
+    r = c.get("/api/auth/check", headers={"X-Admin-Token": "garbage"}).json()
+    assert r["admin_token_received"] and "signature" in r["detail"]
+    import auth
+    r = c.get("/api/auth/check",
+              headers={"X-Admin-Token": auth.sign({"role": "viewer"})}).json()
+    assert "role" in r["detail"]
+    r = c.get("/api/auth/check",
+              headers={"X-Admin-Token": _admin_token()}).json()
+    assert r["admin_ok"] is True and r["detail"] == "ok"

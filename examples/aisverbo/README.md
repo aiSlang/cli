@@ -160,8 +160,19 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
       Authorization header (a master key would 401 every call), and the
       proxy is loopback-only inside the container — HF exposes port 7860
       alone, so :4000 is unreachable from outside.
-   7. Mint your admin token with the SAME secret and paste it into Setup:
-      `AISVERBO_SECRET=<secret> python3 app/get_token.py`
+   7. Mint your admin token **with the SAME secret the Space runs with**
+      and paste it into Setup:
+
+      ```bash
+      AISVERBO_SECRET='<the exact Space secret value>' python3 app/get_token.py
+      ```
+
+      Without the env var, get_token.py silently signs with your LOCAL
+      `generated/secret.key` and the Space rejects it. Debug from the
+      browser: open `<space-url>/api/auth/check` — it reports whether the
+      token arrived and exactly why it failed (wrong secret, wrong role,
+      expired). Mind stray quotes/whitespace when pasting the secret on
+      either side.
 
    Notes: the `ollama` fallback model simply stays unavailable in the
    Space (haiku is primary); budget caps from aisverbo.ais are enforced

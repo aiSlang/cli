@@ -240,12 +240,28 @@ def get_ctx(authorization: str | None = Header(None)) -> Ctx:
     return Ctx("local")
 
 
+def _admin_state(x_admin_token: str | None) -> tuple[dict | None, str]:
+    """(payload, diagnostic) — the diagnostic names the EXACT failure so a
+    hosted deployment can be debugged from the browser alone."""
+    if not x_admin_token:
+        return None, ("no ADMIN token reached the server — paste one into "
+                      "Setup (mint: `python3 app/get_token.py`)")
+    payload = auth.verify(x_admin_token)
+    if payload is None:
+        return None, ("the ADMIN token's signature does not match THIS "
+                      "server's secret (or it expired) — mint it with the "
+                      "same secret the server runs with: "
+                      "AISVERBO_SECRET='<the Space secret>' "
+                      "python3 app/get_token.py")
+    if payload.get("role") != "admin":
+        return None, "the token is valid but its role is not 'admin'"
+    return payload, "ok"
+
+
 def require_admin(x_admin_token: str | None = Header(None)) -> dict:
-    payload = auth.verify(x_admin_token or "")
-    if not payload or payload.get("role") != "admin":
-        raise HTTPException(401, "corpus management needs the ADMIN token — "
-                                 "mint one with `python3 app/get_token.py` and "
-                                 "paste it into Setup")
+    payload, why = _admin_state(x_admin_token)
+    if payload is None:
+        raise HTTPException(401, f"corpus management needs the ADMIN token: {why}")
     return payload
 
 
@@ -277,6 +293,19 @@ def tenant_new():
     tid = str(uuidmod.uuid4()) if MULTI_TENANT else "local"
     return {"token": auth.sign({"tid": tid}), "tid": tid,
             "multi_tenant": MULTI_TENANT}
+
+
+@app.get("/api/auth/check")
+def auth_check(x_admin_token: str | None = Header(None),
+               ctx: Ctx = Depends(get_ctx)):
+    """Zero-secret diagnostics: did the admin token arrive, and is it valid?"""
+    payload, why = _admin_state(x_admin_token)
+    return {"tenant": ctx.tid,
+            "admin_token_received": bool(x_admin_token),
+            "admin_token_length": len(x_admin_token or ""),
+            "admin_ok": payload is not None,
+            "detail": why,
+            "sub": (payload or {}).get("sub")}
 
 
 @app.get("/api/state")
