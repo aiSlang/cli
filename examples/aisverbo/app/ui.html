@@ -80,7 +80,8 @@
   <h1>ais<b>Verbo</b> · conjugation by story</h1>
   <span class="pill" id="pair-pill">… → …</span>
   <span style="flex:1"></span>
-  <span class="pill" title="Everything stays on this machine: vocabulary, stories, translations and word cards live in app/generated/. Reading aloud is your browser's own speech synthesis — free and offline-capable.">stories stay local · the browser speaks</span>
+  <span id="who" class="pill"></span>
+  <span class="pill" title="Signed out (and local runs): the shared PUBLIC profile — its corpus and stories are visible to everyone. Sign in with Hugging Face for your own space. Reading aloud is the browser's own speech synthesis.">public profile unless signed in</span>
 </header>
 
 <div class="tabs">
@@ -177,6 +178,11 @@
       <button class="btn small" onclick="$('#essay-file').click()" title="create a story from an exported JSON (idempotent)">Import story</button>
       <input type="file" id="essay-file" accept="application/json" style="display:none" onchange="importEssay(this)"/>
     </div>
+    <div class="muted" style="font-size:12px;margin:8px 0 2px">
+      aisVerbo is a multi-agent pipeline on <a href="https://aislang.org" target="_blank"
+      rel="noopener" style="color:var(--blue)">aiSlang</a> — the platform where budget-capped
+      agents (lexicographer · essayist · grammarian · translator) write every story below.
+    </div>
     <div id="lib-list" style="margin-top:8px"></div>
   </div>
 </div>
@@ -239,6 +245,12 @@
       <button class="btn" style="align-self:end" onclick="saveAdmin()">Save token</button>
       <span class="ok" id="admin-ok"></span>
     </div>
+    <div class="bar" style="margin-top:8px">
+      <button class="btn" onclick="requestAccess()">Request corpus access (onboarding)</button>
+      <span class="muted" style="font-size:12px">No token yet? This drafts an email to
+        <span class="mono">support@aislang.org</span> — tokens are issued manually for now
+        (a subscription flow will replace this).</span>
+    </div>
   </div>
   <div class="panel"><h2>aiSlang</h2>
     <div class="bar">
@@ -270,10 +282,9 @@ function hdrs(json){
   if(TENANT)h['Authorization']='Bearer '+TENANT;
   if(ADMIN)h['X-Admin-Token']=ADMIN;
   return h;}
-async function ensureTenant(){
-  if(TENANT)return;
-  try{const r=await fetch('/api/tenant/new',{method:'POST'});const j=await r.json();
-    if(j.token){TENANT=j.token;localStorage.setItem('aisverbo-tenant',TENANT);}}catch(_){}}
+function signOut(){
+  try{localStorage.removeItem('aisverbo-tenant');}catch(_){}
+  TENANT='';location.reload();}
 async function api(p){const r=await fetch(p,{headers:hdrs(false)});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:hdrs(true),body:JSON.stringify(b)});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 
@@ -296,7 +307,16 @@ function showSide(n){
   $('#side-trans').style.display=n==='trans'?'':'none';
 }
 
-async function loadState(){STATE=await api('/api/state');
+function renderWho(){
+  const el=$('#who');if(!el)return;
+  if(STATE.user){
+    el.innerHTML=`🤗 <b>${esc(STATE.user)}</b> · <a href="#" onclick="signOut();return false" style="color:var(--muted)">sign out</a>`;
+  }else if(STATE.oauth_available){
+    el.innerHTML=`<a href="/oauth/login" style="color:var(--amber2);text-decoration:none">Sign in with 🤗 Hugging Face</a>`;
+  }else{
+    el.textContent='public profile';
+  }}
+async function loadState(){STATE=await api('/api/state');renderWho();
   $('#pair-pill').innerHTML=`<b>${esc(STATE.languages[STATE.settings.foreign])}</b> → ${esc(STATE.languages[STATE.settings.native])}`;
   $('#v-count').value=STATE.settings.verb_count;
   fillSetup();fillTrLang();fillVocLang();}
@@ -680,6 +700,17 @@ function fillVocLang(){
   const sel=$('#voc-lang');if(!sel)return;
   sel.innerHTML=Object.entries(STATE.languages).map(([c,n])=>
     `<option value="${c}"${c===(VOCLANG||STATE.settings.foreign)?' selected':''}>${esc(n)} (${c})</option>`).join('');}
+function requestAccess(){
+  const who=STATE.user?` (HF user: ${STATE.user})`:'';
+  location.href='mailto:support@aislang.org?subject='+encodeURIComponent('aisVerbo corpus access request')
+    +'&body='+encodeURIComponent(`Hello,
+
+I'd like an admin token for aisVerbo corpus management${who}.
+
+Languages I teach/learn: 
+Intended use: 
+
+Thanks!`);}
 function saveAdmin(){
   ADMIN=$('#s-admin').value.trim();
   try{localStorage.setItem('aisverbo-admin',ADMIN);}catch(_){}
@@ -714,7 +745,7 @@ async function saveSettings(){
   await loadState();await loadVocab();}
 
 speechSynthesis.onvoiceschanged=()=>{};      // warm the voice list
-(async function(){await ensureTenant();await loadState();await loadVocab();
+(async function(){await loadState();await loadVocab();
   loadLibrary();                      // Stories is the landing page
   try{const id=parseInt(localStorage.getItem('aisverbo-essay'));
     if(id)await openEssay(id);        // …unless a story was open: back to it

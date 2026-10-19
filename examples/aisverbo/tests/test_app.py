@@ -330,19 +330,45 @@ def test_corpus_posts_require_admin(tmp_path, monkeypatch):
     assert c.post("/api/card", json={"word": ""}).status_code == 400
 
 
-def test_multi_tenant_isolation(tmp_path, monkeypatch):
+def test_public_fallback_and_user_isolation(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch, multi=True)
-    assert c.get("/api/state").status_code == 401         # no token, no data
-    t1 = c.post("/api/tenant/new").json()["token"]
-    t2 = c.post("/api/tenant/new").json()["token"]
-    h1 = {"Authorization": f"Bearer {t1}", "X-Admin-Token": _admin_token()}
-    h2 = {"Authorization": f"Bearer {t2}"}
-    c.post("/api/verbs", json={"action": "add", "infinitive": "ir"}, headers=h1)
+    import auth
+    # no token -> the shared PUBLIC profile (one dataset for every browser)
+    s = c.get("/api/state").json()
+    assert s["tenant"] == "public" and s["user"] is None
+    c.post("/api/verbs", json={"action": "add", "infinitive": "ir"},
+           headers={"X-Admin-Token": _admin_token()})
+    assert len(c.get("/api/verbs").json()) == 1          # visible anonymously
+    # signed-in users get their own isolated space, keyed by IDENTITY
+    h1 = {"Authorization": "Bearer " + auth.sign({"tid": "hf-alex", "user": "alex"})}
+    h2 = {"Authorization": "Bearer " + auth.sign({"tid": "hf-maria", "user": "maria"})}
+    assert c.get("/api/verbs", headers=h1).json() == []  # not the public data
+    c.post("/api/verbs", json={"action": "add", "infinitive": "ser"},
+           headers={**h1, "X-Admin-Token": _admin_token()})
     assert len(c.get("/api/verbs", headers=h1).json()) == 1
-    assert c.get("/api/verbs", headers=h2).json() == []   # isolated partitions
-    s1 = c.get("/api/state", headers=h1).json()
-    s2 = c.get("/api/state", headers=h2).json()
-    assert s1["tenant"] != s2["tenant"]
+    assert c.get("/api/verbs", headers=h2).json() == []  # isolated from alex
+    assert c.get("/api/state", headers=h1).json()["user"] == "alex"
+    # the same token in ANOTHER browser reaches the same data (identity,
+    # not browser, is the key)
+    assert len(c.get("/api/verbs", headers=dict(h1)).json()) == 1
+
+
+def test_oauth_callback_mints_identity_tenant(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    monkeypatch.setenv("OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("OAUTH_CLIENT_SECRET", "sec")
+    monkeypatch.setattr(serve, "_exchange_code", lambda code, uri: "Alex.Evseenko")
+    r = c.get("/oauth/callback?code=abc")
+    assert r.status_code == 200
+    token = r.text.split("aisverbo-tenant', ")[1].split(")")[0].strip('"')
+    import auth
+    p = auth.verify(token)
+    assert p["tid"] == "hf-Alex-Evseenko"                # sanitized identity
+    assert p["user"] == "Alex.Evseenko"
+    # and /oauth/login redirects to the provider
+    r = c.get("/oauth/login", follow_redirects=False)
+    assert r.status_code == 307 or r.status_code == 302
+    assert "oauth/authorize" in r.headers["location"]
 
 
 def test_settings_limits_clamped(tmp_path, monkeypatch):

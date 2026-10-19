@@ -147,9 +147,14 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
       emoji: 📚
       sdk: docker
       app_port: 7860
+      hf_oauth: true
       pinned: false
       ---
       ```
+
+      `hf_oauth: true` gives the Space an OAuth app (env vars
+      OAUTH_CLIENT_ID/SECRET appear automatically) — the "Sign in with
+      Hugging Face" button in the header uses it.
    5. Space settings → Secrets: `ANTHROPIC_API_KEY`, `AISVERBO_SECRET`.
       Free Spaces have no persistent disk — tenant data resets on restart;
       paid persistent storage + variable `AISVERBO_DATA=/data` keeps it.
@@ -188,12 +193,17 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
 
 ### Tenancy & auth
 
-- **Tenants**: every browser obtains a signed tenant token at first load
-  (`POST /api/tenant/new`, kept in localStorage) and sends it as
-  `Authorization: Bearer …`; each tenant lives in its own SQLite + config
-  under `generated/tenants/<id>/` — fully isolated vocabulary, stories,
-  settings. In local mode (no `AISVERBO_MULTI_TENANT`) everyone shares
-  the legacy single-user data, so nothing changes for a laptop install.
+- **Identity, not browser**: a visitor signed in with Hugging Face
+  (`hf_oauth: true` + the header button) gets a tenant keyed by their HF
+  username — the same data from every browser and device. Everyone else
+  — anonymous Space visitors AND local runs — shares the **public**
+  profile: a predefined corpus and a common story pool, readable and
+  extendable by all, private to no one. The public profile maps to the
+  legacy single-user paths, so a laptop install's data IS the public
+  seed when the data dir ships to a Space (and local behavior is
+  unchanged). Migrating from the earlier per-browser model: a stray
+  `generated/tenants/<uuid>/` folder can simply be renamed to
+  `hf-<your-hf-username>` (or its stories exported and re-imported).
   Word-card/conjugation caches are per tenant today; a shared cross-
   tenant cache is a straightforward follow-up once billing wants it.
 - **Admin**: corpus management (every `POST /api/verbs` and
@@ -205,8 +215,11 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
   ```
 
   and paste it into **Setup → Admin token** (stored only in that
-  browser). Reading, story writing, cards, conjugations, translations
-  and story import stay open to every tenant.
+  browser). Users without a token request one via **Setup → Request
+  corpus access**, which drafts an email to support@aislang.org —
+  tokens are issued manually for now; a payment/subscription flow will
+  replace this. Reading, story writing, cards, conjugations,
+  translations and story import stay open to every tenant.
 - **Limits** (the app is free of charge): one vocabulary generation ≤
   **100 verbs**, one story ≤ **200 words** — clamped server-side.
 3. **HuggingFace Static Space (future, free)** — once the aiSlang **Cloud

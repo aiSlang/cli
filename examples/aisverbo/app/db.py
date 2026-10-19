@@ -128,13 +128,17 @@ def connect(path: str = DEFAULT_DB) -> sqlite3.Connection:
 MAX_VERB_COUNT = 100
 MAX_ESSAY_WORDS = 200
 
-_TID_OK = __import__("re").compile(r"^[A-Za-z0-9-]{1,64}$")
+_TID_OK = __import__("re").compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def tenant_paths(tid: str | None) -> tuple[str, str]:
     """(db_path, config_path) of one tenant's isolated data directory.
-    The default tenant 'local' keeps the legacy single-user paths."""
-    if not tid or tid == "local":
+
+    The shared PUBLIC profile (every visitor without an identity, and every
+    local run) lives at the legacy single-user paths — so a laptop install's
+    corpus and stories ARE the public seed when the same data dir ships to
+    a hosted Space."""
+    if not tid or tid in ("public", "local"):
         return DEFAULT_DB, CONFIG_PATH
     if not _TID_OK.match(tid):
         raise ValueError("bad tenant id")

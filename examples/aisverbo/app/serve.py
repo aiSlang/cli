@@ -215,8 +215,9 @@ def conjugation(conn, cfg: dict, lemma: str, tense: str,
 
 # ─── tenancy + auth (FastAPI dependencies) ───────────────────────────
 class Ctx:
-    def __init__(self, tid: str):
+    def __init__(self, tid: str, user: str | None = None):
         self.tid = tid
+        self.user = user
         self.db_path, self.cfg_path = dbmod.tenant_paths(tid)
 
     def conn(self):
@@ -227,17 +228,21 @@ class Ctx:
 
 
 def get_ctx(authorization: str | None = Header(None)) -> Ctx:
+    """Tenant = the signed-in identity; everyone else shares PUBLIC.
+
+    A signed token (minted by the HF OAuth callback) carries the user's
+    tenant; without one — anonymous Space visitors and local runs alike —
+    the shared public profile serves: its corpus and stories are readable
+    and extendable by everyone, and nothing there is private."""
     if authorization and authorization.lower().startswith("bearer "):
         payload = auth.verify(authorization[7:])
         tid = (payload or {}).get("tid")
         if tid:
             try:
-                return Ctx(str(tid))
+                return Ctx(str(tid), (payload or {}).get("user"))
             except ValueError:
                 raise HTTPException(401, "bad tenant token")
-    if MULTI_TENANT:
-        raise HTTPException(401, "tenant token required — POST /api/tenant/new")
-    return Ctx("local")
+    return Ctx("public")
 
 
 def _admin_state(x_admin_token: str | None) -> tuple[dict | None, str]:
@@ -288,11 +293,77 @@ def ui():
     return FileResponse(UI_PATH, media_type="text/html")
 
 
-@app.post("/api/tenant/new")
-def tenant_new():
-    tid = str(uuidmod.uuid4()) if MULTI_TENANT else "local"
-    return {"token": auth.sign({"tid": tid}), "tid": tid,
-            "multi_tenant": MULTI_TENANT}
+# ─── HF OAuth: tenant = the Hugging Face user, not the browser ────────
+def _oauth_env():
+    cid = os.environ.get("OAUTH_CLIENT_ID")
+    sec = os.environ.get("OAUTH_CLIENT_SECRET")
+    provider = os.environ.get("OPENID_PROVIDER_URL", "https://huggingface.co")
+    return (cid, sec, provider) if cid and sec else None
+
+
+def _exchange_code(code: str, redirect_uri: str) -> str:
+    """OAuth code -> the HF username (split out for tests)."""
+    import base64
+    import json as jsonmod
+    import urllib.parse
+    import urllib.request
+    cid, sec, provider = _oauth_env()
+    basic = base64.b64encode(f"{cid}:{sec}".encode()).decode()
+    req = urllib.request.Request(
+        f"{provider}/oauth/token",
+        data=urllib.parse.urlencode({
+            "grant_type": "authorization_code", "code": code,
+            "redirect_uri": redirect_uri}).encode(),
+        headers={"Authorization": f"Basic {basic}",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        access = jsonmod.loads(resp.read())["access_token"]
+    req2 = urllib.request.Request(f"{provider}/oauth/userinfo",
+                                  headers={"Authorization": f"Bearer {access}"})
+    with urllib.request.urlopen(req2, timeout=20) as resp:
+        info = jsonmod.loads(resp.read())
+    return info.get("preferred_username") or info.get("name") or info["sub"]
+
+
+def _redirect_uri(request: Request) -> str:
+    host = os.environ.get("SPACE_HOST") or request.headers.get(
+        "x-forwarded-host") or request.url.netloc
+    return f"https://{host}/oauth/callback"
+
+
+@app.get("/oauth/login")
+def oauth_login(request: Request):
+    import urllib.parse
+    env = _oauth_env()
+    if not env:
+        raise HTTPException(404, "OAuth is not configured on this install")
+    cid, _sec, provider = env
+    from fastapi.responses import RedirectResponse
+    q = urllib.parse.urlencode({
+        "client_id": cid, "redirect_uri": _redirect_uri(request),
+        "response_type": "code", "scope": "openid profile",
+        "state": "aisverbo"})
+    return RedirectResponse(f"{provider}/oauth/authorize?{q}")
+
+
+@app.get("/oauth/callback")
+def oauth_callback(request: Request, code: str = Query("")):
+    from fastapi.responses import HTMLResponse
+    if not code or not _oauth_env():
+        raise HTTPException(400, "missing code")
+    username = _exchange_code(code, _redirect_uri(request))
+    tid = "hf-" + __import__("re").sub(r"[^A-Za-z0-9_-]", "-", username)[:40]
+    token = auth.sign({"tid": tid, "user": username})
+    return HTMLResponse(f"""<!doctype html><meta charset="utf-8">
+<script>
+  localStorage.setItem('aisverbo-tenant', {json_dumps(token)});
+  location.replace('/');
+</script>signed in — returning…""")
+
+
+def json_dumps(s):
+    import json as jsonmod
+    return jsonmod.dumps(s)
 
 
 @app.get("/api/auth/check")
@@ -312,7 +383,9 @@ def auth_check(x_admin_token: str | None = Header(None),
 def state(ctx: Ctx = Depends(get_ctx)):
     conn, cfg = ctx.conn(), ctx.cfg()
     return {"settings": cfg, "languages": dbmod.all_languages(cfg),
-            "tenant": ctx.tid, "multi_tenant": MULTI_TENANT,
+            "tenant": ctx.tid, "user": ctx.user,
+            "oauth_available": _oauth_env() is not None,
+            "multi_tenant": MULTI_TENANT,
             "verbs": len(dbmod.list_verbs(conn, cfg["foreign"])),
             "tenses": len(dbmod.list_tenses(conn, cfg["foreign"])),
             "essays": conn.execute(
