@@ -36,7 +36,13 @@ driven) into a multi-language web app with a persistent library.
    generates the language's **tense inventory** the same way (name, your-
    language name, a usage hint, an example); untick tenses you are not
    ready for.
-3. **A learning session** (Learn tab): type a topic in any language and
+3. **A learning session** (Learn tab) has two modes. Opening a story
+   from Stories is **read-only** (Story Reader): the tense/verb chips
+   mirror the story's own metadata in a dimmed color and cannot be
+   changed (filtering still works; add/none are disabled). **New
+   story** (Stories page, Story Writer role) opens a blank Learn in
+   creation mode with the bright selection and the full flow. Writers
+   can also delete stories from the Stories list. A learning session: type a topic in any language and
    chip-select this story's verbs and tenses from the whole corpus —
    nothing is selected by default and a selection is required; filter to
    find verbs, quick-add a new verb right there (it joins the corpus and
@@ -206,13 +212,31 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
   `hf-<your-hf-username>` (or its stories exported and re-imported).
   Word-card/conjugation caches are per tenant today; a shared cross-
   tenant cache is a straightforward follow-up once billing wants it.
-- **Admin**: corpus management (every `POST /api/verbs` and
-  `POST /api/tenses`, and corpus import) requires a JWT with
-  `role=admin` in the `X-Admin-Token` header. Mint yours:
+- **Roles** (all via the `X-Admin-Token` header; the legacy `admin`
+  role counts as both):
+
+  | role | may |
+  |---|---|
+  | `story_reader` | the DEFAULT, tokenless: read stories, corpus and every cached card/translation/conjugation — generate nothing |
+  | `story_writer` | create, import and DELETE stories; trigger the LLM extras (uncached cards, conjugations, translations) |
+  | `corpus_admin` | manage verbs/tenses, import a corpus, revoke tokens |
+
+  Every token carries a `sub` naming its holder and is **refused for
+  anyone else**: the server compares `sub` against the OAuth-verified HF
+  username (or `public` when signed out) — the HF sign-in IS the
+  identity verification, no e-mail round-trip needed. The PUBLIC
+  profile's corpus_admin/story_writer tokens belong to the operator and
+  are meant for API/CLI use (curl with `X-Admin-Token`), not for
+  pasting into a shared browser's Setup. Mint:
 
   ```bash
-  AISVERBO_SECRET=<the same secret> python3 app/get_token.py   # 365 days
+  AISVERBO_SECRET=<secret> python3 app/get_token.py                     # corpus_admin, public
+  AISVERBO_SECRET=<secret> python3 app/get_token.py --role story_writer --sub SomeHfUser
   ```
+
+  Every token has a `jti`; **revoke** one with
+  `python3 app/revoke_token.py --token <jwt>` (or `--jti`), or hosted:
+  `POST /api/admin/revoke {token|jti}` with a corpus_admin token.
 
   and paste it into **Setup → Admin token** (stored only in that
   browser). Users without a token request one via **Setup → Request

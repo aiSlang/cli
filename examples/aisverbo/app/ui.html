@@ -43,6 +43,8 @@
   .chip{border:1px solid var(--border);border-radius:999px;padding:3px 11px;font-size:13px;
         cursor:pointer;color:var(--muted);user-select:none}
   .chip.on{border-color:var(--amber);color:var(--amber2);background:rgba(240,136,62,.08)}
+  .ro .chip{cursor:default}
+  .ro .chip.on{border-color:#8a6a4a;color:#b08968;background:rgba(240,136,62,.04)}
   .layout{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(300px,1fr);gap:14px}
   @media(max-width:900px){.layout{grid-template-columns:1fr}}
   #essay-body{font-size:17px;line-height:1.9}
@@ -98,6 +100,7 @@
       <input class="grow" id="topic" placeholder="A topic for today's story — any language (e.g. «un viaje inolvidable», “my first job”)"/>
       <button class="btn accent" id="btn-write" onclick="writeEssay()">Write the story</button>
       <span class="job" id="essay-job"></span>
+      <span id="mode-badge" style="font-size:12px"></span>
     </div>
     <div class="side-tabs" style="margin-top:10px">
       <button class="side-tab active" data-sel="tenses" onclick="showSel('tenses')">Tenses for this story — <b id="tsel-n">0</b></button>
@@ -175,7 +178,8 @@
       <input class="grow" id="lib-q" placeholder="Search your stories by any verb, word or topic — or start a new one in Learn…"
              onkeydown="if(event.key==='Enter')loadLibrary()"/>
       <button class="btn" onclick="loadLibrary()">Search</button>
-      <button class="btn small" onclick="$('#essay-file').click()" title="create a story from an exported JSON (idempotent)">Import story</button>
+      <button class="btn accent" id="btn-new" onclick="newStory()">New story</button>
+      <button class="btn small" onclick="$('#essay-file').click()" title="create a story from an exported JSON (idempotent; Story Writer role)">Import story</button>
       <input type="file" id="essay-file" accept="application/json" style="display:none" onchange="importEssay(this)"/>
     </div>
     <div class="muted" style="font-size:12px;margin:8px 0 2px">
@@ -289,6 +293,7 @@ async function api(p){const r=await fetch(p,{headers:hdrs(false)});const j=await
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:hdrs(true),body:JSON.stringify(b)});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j;}
 
 let STATE={},VERBS=[],TENSES=[],ESSAY=null,POLL=null,VPAGE=0,VSORT=null,VDIR=1,SELWORD=null;
+let MODE='read';   // 'read' (Story Reader) | 'create' (Story Writer, New story)
 let VOCLANG=null;      // the Vocabulary page's language (defaults to the course)
 const PAGE=20, VSEL=new Set(), TSEL=new Set();
 
@@ -317,6 +322,8 @@ function renderWho(){
     el.textContent='public profile';
   }}
 async function loadState(){STATE=await api('/api/state');renderWho();
+  const nb=$('#btn-new');if(nb)nb.title=STATE.can_write?'start a new story'
+    :'needs the Story Writer role — Setup → Request corpus access';
   $('#pair-pill').innerHTML=`<b>${esc(STATE.languages[STATE.settings.foreign])}</b> → ${esc(STATE.languages[STATE.settings.native])}`;
   $('#v-count').value=STATE.settings.verb_count;
   fillSetup();fillTrLang();fillVocLang();}
@@ -335,8 +342,18 @@ async function loadVocabLang(){
   if(VOCLANG===STATE.settings.foreign){VERBS=CVERBS;TENSES=CTENSES;renderVerbChips();renderTenseChips();}}
 
 /* ── Learn: per-story selection over the WHOLE corpus ── */
+function applyMode(){
+  for(const id of['sel-tenses','sel-verbs'])
+    $('#'+id)&&$('#'+id).classList.toggle('ro',MODE==='read');
+  document.querySelectorAll('#sel-tenses .btn, #sel-verbs .btn, #verb-quick')
+    .forEach(el=>el.disabled=(MODE==='read'));
+  const w=$('#btn-write');if(w)w.style.display=MODE==='read'?'none':'';
+  const badge=$('#mode-badge');
+  if(badge)badge.innerHTML=MODE==='read'
+    ?'<span class="muted">read-only — the selections mirror this story\u2019s metadata; use <b>New story</b> (Stories page) to create</span>'
+    :'<span class="ok">creation mode</span>';}
 function renderTenseChips(){
-  $('#tsel-n').textContent=TSEL.size;
+  $('#tsel-n').textContent=TSEL.size;applyMode();
   $('#tense-chips').innerHTML=TENSES.map(t=>
     `<span class="chip${TSEL.has(t.id)?' on':''}" onclick="tog(TSEL,${t.id});renderTenseChips()"
        title="${esc(t.hint||'')}${t.example?'\n'+esc(t.example):''}">${esc(t.name)}</span>`).join('')
@@ -350,14 +367,16 @@ function renderVerbChips(){
        title="${esc(v.gloss||'')}">${esc(v.infinitive)}</span>`).join('')
     +(vis.length>400?`<span class="muted">… ${vis.length-400} more — narrow the filter</span>`:'')
     ||'<span class="muted">no verbs yet — Vocabulary tab → Generate top-N</span>';}
-function tog(set,id){set.has(id)?set.delete(id):set.add(id);}
+function tog(set,id){if(MODE==='read')return;set.has(id)?set.delete(id):set.add(id);}
 async function quickAddVerb(){
   const inf=$('#verb-quick').value.trim();if(!inf)return;
-  await post('/api/verbs',{action:'add',infinitive:inf});
-  $('#verb-quick').value='';
-  await loadVocab();
-  const v=VERBS.find(x=>x.infinitive===inf.toLowerCase());
-  if(v){VSEL.add(v.id);renderVerbChips();}}
+  try{
+    await post('/api/verbs',{action:'add',infinitive:inf});
+    $('#verb-quick').value='';
+    await loadVocab();
+    const v=VERBS.find(x=>x.infinitive===inf.toLowerCase());
+    if(v){VSEL.add(v.id);renderVerbChips();}
+  }catch(e){alert(e.message);}}
 
 /* ── the story ── */
 async function writeEssay(){
@@ -589,9 +608,27 @@ async function loadLibrary(){
        <div class="bar"><span class="grow" onclick="openEssay(${r.id})" style="cursor:pointer">
          <b>${esc(r.title||r.topic)}</b>
          <span class="muted" style="font-size:12px"> · ${esc((r.created_at||'').slice(0,10))} · ${esc(r.topic)}</span></span>
-         <button class="btn small" onclick="exportEssay(${r.id})" title="this story + its metadata and translations as JSON">Export</button></div>
+         <button class="btn small" onclick="exportEssay(${r.id})" title="this story + its metadata and translations as JSON">Export</button>
+         ${STATE.can_write?`<button class="btn small" title="delete this story" onclick="delEssay(${r.id},event)">✕</button>`:''}</div>
        <div class="muted" style="font-size:13px" onclick="openEssay(${r.id})" style="cursor:pointer">${esc(r.excerpt||'')}…</div></div>`).join('')
     ||'<div class="muted">nothing yet — write your first story in Learn</div>';}
+function newStory(){
+  if(!STATE.can_write)return alert('Creating stories needs the Story Writer role — '
+    +'click `Request corpus access (onboarding)` in Setup to get a token.');
+  MODE='create';ESSAY=null;VSEL.clear();TSEL.clear();
+  $('#topic').value='';$('#essay-title').textContent='—';
+  $('#essay-body').classList.add('muted');
+  $('#essay-body').innerHTML='Pick a topic, select tenses and verbs above, and press <i>Write the story</i>.';
+  TR=null;$('#tr-title').textContent='—';
+  $('#card').innerHTML='Tap a word in the story.';$('#card').classList.add('muted');
+  renderVerbChips();renderTenseChips();
+  try{localStorage.removeItem('aisverbo-essay');}catch(_){}
+  showTab('learn');}
+async function delEssay(id,ev){
+  ev&&ev.stopPropagation();
+  if(!confirm('Delete this story (with its translations)?'))return;
+  try{await post('/api/essay/delete',{id});loadLibrary();}
+  catch(e){alert(e.message);}}
 async function exportEssay(id){
   const data=await api('/api/export/essay?id='+id);
   dl(`aisverbo-story-${id}.json`,data);}
@@ -612,6 +649,7 @@ async function openEssay(id){
   for(const v of VERBS)if(vset.has(v.infinitive))VSEL.add(v.id);
   for(const t of TENSES)if(tset.has(t.name))TSEL.add(t.id);
   $('#topic').value=e.topic||'';
+  MODE='read';
   renderVerbChips();renderTenseChips();
   showTab('learn');}
 
@@ -643,14 +681,16 @@ function renderVerbTable(){
      <button class="btn small" ${VPAGE<pages-1?'':'disabled'} onclick="VPAGE++;renderVerbTable()">›</button>`
     :`${vis.length} verb(s)`;}
 async function editVerb(id,el,field){
+  /* inline edits surface auth errors too */
   const v=CVERBS.find(x=>x.id===id);if(!v)return;
   const val=el.textContent.trim();
   if(val===(v[field]||''))return;
   if(field==='infinitive'&&!val){el.textContent=v.infinitive;return;}
   const upd={action:'update',id,infinitive:v.infinitive,gloss:v.gloss||''};
   upd[field]=val;
-  await post('/api/verbs',upd);
-  v.infinitive=upd.infinitive.toLowerCase();v.gloss=upd.gloss;}
+  try{await post('/api/verbs',upd);
+    v.infinitive=upd.infinitive.toLowerCase();v.gloss=upd.gloss;}
+  catch(e){el.textContent=v[field]||'';alert(e.message);}}
 async function delVerb(id){
   const v=CVERBS.find(x=>x.id===id);if(!v)return;
   if(!confirm(`Delete “${v.infinitive}” from the corpus?`))return;
@@ -692,8 +732,10 @@ function dl(name,obj){
   a.download=name;a.click();URL.revokeObjectURL(a.href);}
 async function addVerb(){
   const inf=$('#v-new').value.trim();if(!inf)return;
-  await post('/api/verbs',{action:'add',infinitive:inf,gloss:$('#v-gloss').value.trim()});
-  $('#v-new').value='';$('#v-gloss').value='';loadVocab();}
+  try{
+    await post('/api/verbs',{action:'add',infinitive:inf,gloss:$('#v-gloss').value.trim()});
+    $('#v-new').value='';$('#v-gloss').value='';loadVocab();
+  }catch(e){alert(e.message);}}
 
 /* ── setup ── */
 function fillVocLang(){

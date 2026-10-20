@@ -20,16 +20,27 @@ import auth  # noqa: E402
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Mint an aisVerbo admin JWT.")
-    ap.add_argument("--role", default="admin")
-    ap.add_argument("--sub", default="owner")
+    ap = argparse.ArgumentParser(description="Mint an aisVerbo access JWT.")
+    ap.add_argument("--role", default="corpus_admin",
+                    choices=["corpus_admin", "story_writer"],
+                    help="corpus_admin: manage verbs/tenses; story_writer: "
+                         "generate and delete stories (and LLM extras)")
+    ap.add_argument("--sub", default="public",
+                    help="WHO this token belongs to: the HF username the "
+                         "holder signs in with, or 'public' for the shared "
+                         "profile (a sub-bound token is refused for anyone "
+                         "else — the HF sign-in IS the verification)")
     ap.add_argument("--days", type=float, default=365,
                     help="validity in days (0 = no expiry)")
     args = ap.parse_args()
-    payload = {"role": args.role, "sub": args.sub, "iat": int(time.time())}
+    import uuid
+    jti = str(uuid.uuid4())
+    payload = {"role": args.role, "sub": args.sub, "jti": jti,
+               "iat": int(time.time())}
     if args.days:
         payload["exp"] = int(time.time() + args.days * 86400)
     print(auth.sign(payload))
+    print(f"# jti (keep for revocation): {jti}", file=sys.stderr)
     return 0
 
 

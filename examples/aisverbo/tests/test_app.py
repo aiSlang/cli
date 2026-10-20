@@ -298,9 +298,14 @@ def _client(tmp_path, monkeypatch, multi=False):
     return TestClient(serve.app)
 
 
-def _admin_token():
+def _admin_token(sub="public"):
     import auth
-    return auth.sign({"role": "admin", "sub": "t"})
+    return auth.sign({"role": "corpus_admin", "sub": sub, "jti": f"ja-{sub}"})
+
+
+def _writer_token(sub="public"):
+    import auth
+    return auth.sign({"role": "story_writer", "sub": sub, "jti": f"jw-{sub}"})
 
 
 def test_jwt_sign_verify_roundtrip(monkeypatch):
@@ -319,15 +324,19 @@ def test_jwt_sign_verify_roundtrip(monkeypatch):
 def test_corpus_posts_require_admin(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch)
     r = c.post("/api/verbs", json={"action": "add", "infinitive": "ir"})
-    assert r.status_code == 401 and "ADMIN" in r.json()["error"]
+    assert r.status_code == 401
+    assert "Request corpus access (onboarding)" in r.json()["error"]
     r = c.post("/api/tenses", json={"action": "generate"})
     assert r.status_code == 401
     ok = c.post("/api/verbs", json={"action": "add", "infinitive": "ir"},
                 headers={"X-Admin-Token": _admin_token()})
     assert ok.status_code == 200 and ok.json()["added"] == 1
-    # reads and learning stay open
+    # a WRITER token is not enough for corpus work (role separation)
+    r = c.post("/api/verbs", json={"action": "add", "infinitive": "ser"},
+               headers={"X-Admin-Token": _writer_token()})
+    assert r.status_code == 403 and "corpus_admin" in r.json()["error"]
+    # reads stay open
     assert c.get("/api/verbs").status_code == 200
-    assert c.post("/api/card", json={"word": ""}).status_code == 400
 
 
 def test_public_fallback_and_user_isolation(tmp_path, monkeypatch):
@@ -343,8 +352,13 @@ def test_public_fallback_and_user_isolation(tmp_path, monkeypatch):
     h1 = {"Authorization": "Bearer " + auth.sign({"tid": "hf-alex", "user": "alex"})}
     h2 = {"Authorization": "Bearer " + auth.sign({"tid": "hf-maria", "user": "maria"})}
     assert c.get("/api/verbs", headers=h1).json() == []  # not the public data
+    # a PUBLIC token does not work for a signed-in user (sub binding) …
+    r = c.post("/api/verbs", json={"action": "add", "infinitive": "ser"},
+               headers={**h1, "X-Admin-Token": _admin_token()})
+    assert r.status_code == 401 and "belongs to 'public'" in r.json()["error"]
+    # … their OWN token does
     c.post("/api/verbs", json={"action": "add", "infinitive": "ser"},
-           headers={**h1, "X-Admin-Token": _admin_token()})
+           headers={**h1, "X-Admin-Token": _admin_token(sub="alex")})
     assert len(c.get("/api/verbs", headers=h1).json()) == 1
     assert c.get("/api/verbs", headers=h2).json() == []  # isolated from alex
     assert c.get("/api/state", headers=h1).json()["user"] == "alex"
@@ -382,13 +396,68 @@ def test_settings_limits_clamped(tmp_path, monkeypatch):
 def test_auth_check_diagnoses_each_failure(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch)
     r = c.get("/api/auth/check").json()
-    assert r["admin_ok"] is False and "no ADMIN token" in r["detail"]
+    assert r["ok"] is False and "Request corpus access" in r["detail"]
     r = c.get("/api/auth/check", headers={"X-Admin-Token": "garbage"}).json()
-    assert r["admin_token_received"] and "signature" in r["detail"]
-    import auth
-    r = c.get("/api/auth/check",
-              headers={"X-Admin-Token": auth.sign({"role": "viewer"})}).json()
-    assert "role" in r["detail"]
+    assert r["token_received"] and "signature" in r["detail"]
     r = c.get("/api/auth/check",
               headers={"X-Admin-Token": _admin_token()}).json()
-    assert r["admin_ok"] is True and r["detail"] == "ok"
+    assert r["ok"] is True and r["roles"] == ["corpus_admin"]
+    r = c.get("/api/auth/check",
+              headers={"X-Admin-Token": _writer_token()}).json()
+    assert r["roles"] == ["story_writer"]
+
+
+def test_reader_reads_free_but_generates_nothing(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    # story generation: blocked for readers
+    r = c.post("/api/essay", json={"topic": "el mar", "verbs": [1], "tenses": [1]})
+    assert r.status_code == 401 and "access token" in r.json()["error"]
+    # cached card: free; uncached: blocked
+    conn = dbmod.connect(str(tmp_path / "aisverbo.db"))
+    dbmod.save_card(conn, "voy", "es", "en", {"word": "voy", "lemma": "ir"}, "x")
+    ok = c.post("/api/card", json={"word": "voy"})
+    assert ok.status_code == 200 and ok.json()["cached"] is True
+    r = c.post("/api/card", json={"word": "nuevo"})
+    assert r.status_code == 401 and "Story Writer" in r.json()["error"]
+    r = c.post("/api/translate", json={"text": "hola"})
+    assert r.status_code == 401
+    # state reflects capabilities
+    s = c.get("/api/state").json()
+    assert s["can_write"] is False and s["can_admin"] is False
+    s = c.get("/api/state", headers={"X-Admin-Token": _writer_token()}).json()
+    assert s["can_write"] is True and s["can_admin"] is False
+
+
+def test_writer_deletes_stories_and_admin_does_not(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    conn = dbmod.connect(str(tmp_path / "aisverbo.db"))
+    eid = dbmod.save_essay(conn, {"created_at": "x", "foreign_lang": "es",
+                                  "native_lang": "en", "topic": "t",
+                                  "title": "T", "body": "b",
+                                  "verbs_csv": "", "tenses_csv": ""})
+    dbmod.save_translation(conn, eid, "en", {"title": "T", "body": "b"}, "x")
+    r = c.post("/api/essay/delete", json={"id": eid})
+    assert r.status_code == 401
+    r = c.post("/api/essay/delete", json={"id": eid},
+               headers={"X-Admin-Token": _admin_token()})
+    assert r.status_code == 403                 # corpus admin is NOT a writer
+    r = c.post("/api/essay/delete", json={"id": eid},
+               headers={"X-Admin-Token": _writer_token()})
+    assert r.json()["deleted"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0] == 0
+
+
+def test_token_revocation(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    tok = _writer_token(sub="public")
+    ok = c.get("/api/auth/check", headers={"X-Admin-Token": tok}).json()
+    assert ok["ok"] is True
+    # revoke via the admin API (by token)
+    r = c.post("/api/admin/revoke", json={"token": tok},
+               headers={"X-Admin-Token": _admin_token()})
+    assert r.json()["revoked"] == "jw-public"
+    bad = c.get("/api/auth/check", headers={"X-Admin-Token": tok}).json()
+    assert bad["ok"] is False and "revoked" in bad["detail"]
+    # the admin token itself still works
+    assert c.get("/api/auth/check",
+                 headers={"X-Admin-Token": _admin_token()}).json()["ok"]

@@ -245,29 +245,67 @@ def get_ctx(authorization: str | None = Header(None)) -> Ctx:
     return Ctx("public")
 
 
-def _admin_state(x_admin_token: str | None) -> tuple[dict | None, str]:
-    """(payload, diagnostic) — the diagnostic names the EXACT failure so a
-    hosted deployment can be debugged from the browser alone."""
+# ─── roles ────────────────────────────────────────────────────────────
+# corpus_admin  — manage verbs/tenses, import a corpus, revoke tokens
+# story_writer  — generate/delete/import stories, trigger LLM extras
+#                 (uncached word cards, conjugations, translations)
+# story_reader  — the DEFAULT, tokenless: read everything, generate nothing
+# The legacy "admin" role is honored as both. A token's `sub` names its
+# holder: it is refused unless sub matches the signed-in HF user (or
+# "public" for the anonymous shared profile) — the HF sign-in IS the
+# identity verification, no e-mail loop needed. `jti` enables revocation.
+_ONBOARD_HINT = ("click the `Request corpus access (onboarding)` button "
+                 "in Setup")
+
+
+def _token_state(x_admin_token: str | None, ctx: "Ctx") -> tuple[dict | None, str]:
     if not x_admin_token:
-        return None, ("no ADMIN token reached the server — paste one into "
-                      "Setup (mint: `python3 app/get_token.py`)")
+        return None, f"no access token reached the server — {_ONBOARD_HINT}"
     payload = auth.verify(x_admin_token)
     if payload is None:
-        return None, ("the ADMIN token's signature does not match THIS "
-                      "server's secret (or it expired) — mint it with the "
-                      "same secret the server runs with: "
-                      "AISVERBO_SECRET='<the Space secret>' "
-                      "python3 app/get_token.py")
-    if payload.get("role") != "admin":
-        return None, "the token is valid but its role is not 'admin'"
+        return None, ("the access token's signature does not match THIS "
+                      "server's secret, or it expired — request a fresh one "
+                      f"({_ONBOARD_HINT})")
+    holder = payload.get("sub") or "public"
+    me = ctx.user or "public"
+    if holder not in (me, "owner"):       # pre-RBAC owner tokens stay valid
+        return None, (f"this token belongs to '{holder}' but you are "
+                      f"'{me}' — tokens are per HF login; request your own "
+                      f"({_ONBOARD_HINT})")
+    if dbmod.is_revoked(payload.get("jti")):
+        return None, "this token has been revoked"
     return payload, "ok"
 
 
-def require_admin(x_admin_token: str | None = Header(None)) -> dict:
-    payload, why = _admin_state(x_admin_token)
-    if payload is None:
-        raise HTTPException(401, f"corpus management needs the ADMIN token: {why}")
-    return payload
+def _roles_of(payload: dict | None) -> set:
+    if not payload:
+        return set()
+    role = payload.get("role")
+    if role == "admin":                   # legacy: both powers
+        return {"corpus_admin", "story_writer"}
+    return {role} if role in ("corpus_admin", "story_writer") else set()
+
+
+def require_role(role: str, label: str):
+    def dep(x_admin_token: str | None = Header(None),
+            ctx: Ctx = Depends(get_ctx)) -> dict:
+        payload, why = _token_state(x_admin_token, ctx)
+        if payload is None:
+            raise HTTPException(401, f"{label} needs an access token: {why}")
+        if role not in _roles_of(payload):
+            raise HTTPException(403, f"{label} needs the {role} role — this "
+                                     f"token's role is '{payload.get('role')}'")
+        return payload
+    return dep
+
+
+require_admin = require_role("corpus_admin", "corpus management")
+require_writer = require_role("story_writer", "story creation")
+
+
+def _is_writer(x_admin_token: str | None, ctx: "Ctx") -> bool:
+    payload, _ = _token_state(x_admin_token, ctx)
+    return "story_writer" in _roles_of(payload)
 
 
 app = FastAPI(title="aisVerbo", docs_url=None, redoc_url=None)
@@ -369,21 +407,28 @@ def json_dumps(s):
 @app.get("/api/auth/check")
 def auth_check(x_admin_token: str | None = Header(None),
                ctx: Ctx = Depends(get_ctx)):
-    """Zero-secret diagnostics: did the admin token arrive, and is it valid?"""
-    payload, why = _admin_state(x_admin_token)
-    return {"tenant": ctx.tid,
-            "admin_token_received": bool(x_admin_token),
-            "admin_token_length": len(x_admin_token or ""),
-            "admin_ok": payload is not None,
+    """Zero-secret diagnostics: did the token arrive, and what may it do?"""
+    payload, why = _token_state(x_admin_token, ctx)
+    return {"tenant": ctx.tid, "user": ctx.user,
+            "token_received": bool(x_admin_token),
+            "token_length": len(x_admin_token or ""),
+            "ok": payload is not None,
+            "roles": sorted(_roles_of(payload)),
             "detail": why,
-            "sub": (payload or {}).get("sub")}
+            "sub": (payload or {}).get("sub"),
+            "jti": (payload or {}).get("jti")}
 
 
 @app.get("/api/state")
-def state(ctx: Ctx = Depends(get_ctx)):
+def state(ctx: Ctx = Depends(get_ctx),
+          x_admin_token: str | None = Header(None)):
     conn, cfg = ctx.conn(), ctx.cfg()
+    payload, _why = _token_state(x_admin_token, ctx)
+    roles = _roles_of(payload)
     return {"settings": cfg, "languages": dbmod.all_languages(cfg),
             "tenant": ctx.tid, "user": ctx.user,
+            "can_write": "story_writer" in roles,
+            "can_admin": "corpus_admin" in roles,
             "oauth_available": _oauth_env() is not None,
             "multi_tenant": MULTI_TENANT,
             "verbs": len(dbmod.list_verbs(conn, cfg["foreign"])),
@@ -497,7 +542,8 @@ def _essay_job(ctx: Ctx, topic: str, verb_ids: list, tense_ids: list) -> None:
 
 
 @app.post("/api/essay")
-def essay_post(body: dict, ctx: Ctx = Depends(get_ctx)):
+def essay_post(body: dict, ctx: Ctx = Depends(get_ctx),
+               writer: dict = Depends(require_writer)):
     topic = (body.get("topic") or "").strip()
     if not topic:
         raise HTTPException(400, "give a topic")
@@ -528,31 +574,57 @@ def essay_get(id: int = Query(...), ctx: Ctx = Depends(get_ctx)):
     return dict(r)
 
 
+_READER_MISS = ("this needs a model call, and generating anything needs "
+                "the Story Writer role — cached results stay free; "
+                + _ONBOARD_HINT)
+
+
 @app.post("/api/card")
-def card(body: dict, ctx: Ctx = Depends(get_ctx)):
+def card(body: dict, ctx: Ctx = Depends(get_ctx),
+         x_admin_token: str | None = Header(None)):
     word = (body.get("word") or "").strip()
     if not word:
         raise HTTPException(400, "word required")
-    return word_card(ctx.conn(), ctx.cfg(), word, body.get("sentence") or "",
+    conn, cfg = ctx.conn(), ctx.cfg()
+    if not _is_writer(x_admin_token, ctx):
+        cached = dbmod.get_card(conn, word, cfg["foreign"], cfg["native"])
+        if cached is None:
+            raise HTTPException(401, _READER_MISS)
+        return {"cached": True, **cached}
+    return word_card(conn, cfg, word, body.get("sentence") or "",
                      force=bool(body.get("force")))
 
 
 @app.post("/api/conjugation")
-def conjugation_post(body: dict, ctx: Ctx = Depends(get_ctx)):
+def conjugation_post(body: dict, ctx: Ctx = Depends(get_ctx),
+                     x_admin_token: str | None = Header(None)):
     lemma = (body.get("lemma") or "").strip()
     tense = (body.get("tense") or "").strip()
     if not lemma or not tense:
         raise HTTPException(400, "lemma + tense required")
-    return conjugation(ctx.conn(), ctx.cfg(), lemma, tense,
-                       force=bool(body.get("force")))
+    conn, cfg = ctx.conn(), ctx.cfg()
+    if not _is_writer(x_admin_token, ctx):
+        cached = dbmod.get_conjugation(conn, lemma, tense,
+                                       cfg["foreign"], cfg["native"])
+        if cached is None:
+            raise HTTPException(401, _READER_MISS)
+        return {"cached": True, **cached}
+    return conjugation(conn, cfg, lemma, tense, force=bool(body.get("force")))
 
 
 @app.post("/api/translate")
-def translate_post(body: dict, ctx: Ctx = Depends(get_ctx)):
-    return translate(ctx.conn(), ctx.cfg(),
-                     (body.get("to") or ctx.cfg()["native"])[:8],
-                     essay_id=body.get("essay_id"), text=body.get("text"),
-                     force=bool(body.get("force")))
+def translate_post(body: dict, ctx: Ctx = Depends(get_ctx),
+                   x_admin_token: str | None = Header(None)):
+    conn, cfg = ctx.conn(), ctx.cfg()
+    to = (body.get("to") or cfg["native"])[:8]
+    if not _is_writer(x_admin_token, ctx):
+        eid = body.get("essay_id")
+        cached = dbmod.get_translation(conn, eid, to) if eid else None
+        if not (isinstance(cached, dict) and "body" in cached):
+            raise HTTPException(401, _READER_MISS)
+        return {"cached": True, **cached}
+    return translate(conn, cfg, to, essay_id=body.get("essay_id"),
+                     text=body.get("text"), force=bool(body.get("force")))
 
 
 @app.get("/api/export/corpus")
@@ -572,8 +644,28 @@ def export_essay(id: int = Query(...), ctx: Ctx = Depends(get_ctx)):
 
 
 @app.post("/api/import/essay")
-def import_essay(body: dict, ctx: Ctx = Depends(get_ctx)):
+def import_essay(body: dict, ctx: Ctx = Depends(get_ctx),
+                 writer: dict = Depends(require_writer)):
     return dbmod.import_essay(ctx.conn(), body)
+
+
+@app.post("/api/essay/delete")
+def essay_delete(body: dict, ctx: Ctx = Depends(get_ctx),
+                 writer: dict = Depends(require_writer)):
+    n = dbmod.delete_essay(ctx.conn(), int(body.get("id") or 0))
+    return {"deleted": n}
+
+
+@app.post("/api/admin/revoke")
+def admin_revoke(body: dict, admin: dict = Depends(require_admin)):
+    jti = (body.get("jti") or "").strip()
+    if body.get("token"):
+        p = auth.verify(body["token"]) or {}
+        jti = p.get("jti") or jti
+    if not jti:
+        raise HTTPException(400, "give token or jti")
+    dbmod.revoke_jti(jti, now_iso())
+    return {"revoked": jti}
 
 
 def main() -> int:

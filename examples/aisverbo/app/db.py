@@ -89,6 +89,10 @@ CREATE TABLE IF NOT EXISTS conjugations(
   created_at TEXT,
   PRIMARY KEY(lemma, tense, foreign_lang, native_lang)
 );
+CREATE TABLE IF NOT EXISTS revoked_tokens(
+  jti TEXT PRIMARY KEY,
+  revoked_at TEXT
+);
 CREATE TABLE IF NOT EXISTS cards(
   word TEXT NOT NULL,
   foreign_lang TEXT NOT NULL,
@@ -430,3 +434,26 @@ def import_essay(conn, data: dict) -> dict:
     conn.commit()
     return {"id": eid, "created": created,
             "cards_added": cards_added, "conjugations_added": conj_added}
+
+
+def delete_essay(conn, essay_id: int) -> int:
+    conn.execute("DELETE FROM translations WHERE essay_id=?", (essay_id,))
+    cur = conn.execute("DELETE FROM essays WHERE id=?", (essay_id,))
+    conn.commit()
+    return cur.rowcount
+
+
+# ─── token revocation (global: lives in the DEFAULT database) ────────
+def revoke_jti(jti: str, now: str, path: str = None) -> None:
+    conn = connect(path or DEFAULT_DB)
+    conn.execute("INSERT OR IGNORE INTO revoked_tokens(jti, revoked_at) "
+                 "VALUES(?,?)", (jti, now))
+    conn.commit()
+
+
+def is_revoked(jti: str | None, path: str = None) -> bool:
+    if not jti:
+        return False
+    conn = connect(path or DEFAULT_DB)
+    return conn.execute("SELECT 1 FROM revoked_tokens WHERE jti=?",
+                        (jti,)).fetchone() is not None
