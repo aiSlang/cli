@@ -461,3 +461,68 @@ def test_token_revocation(tmp_path, monkeypatch):
     # the admin token itself still works
     assert c.get("/api/auth/check",
                  headers={"X-Admin-Token": _admin_token()}).json()["ok"]
+
+
+# ─── conjugations own their data; composite keys in responses ──────────
+def test_responses_carry_composite_keys(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "k.db"))
+    cfg = cfg_for(tmp_path)
+    monkeypatch.setattr(serve.llm, "ask_json", lambda a, p, c:
+        {"word": p.get("word", ""), "lemma": "ir", "pos": "verb",
+         "tense": "Presente", "conjugation": [["yo", "voy"]]}  # model may still emit it
+        if p["task"] == "card" else
+        {"conjugation": [["yo", "iré"]], "examples": []})
+    card = serve.word_card(conn, cfg, "Voy", "x")
+    assert (card["word"], card["foreign_lang"], card["native_lang"]) == \
+        ("voy", "es", "en")
+    assert "conjugation" not in card                      # never embedded
+    stored = dbmod.get_card(conn, "voy", "es", "en")
+    assert "conjugation" not in stored                    # nor stored
+    conj = serve.conjugation(conn, cfg, "IR", "Futuro Simple")
+    assert (conj["lemma"], conj["tense"], conj["foreign_lang"],
+            conj["native_lang"]) == ("ir", "Futuro Simple", "es", "en")
+    # cached responses keep the keys too
+    assert serve.word_card(conn, cfg, "voy", "x")["foreign_lang"] == "es"
+    assert serve.conjugation(conn, cfg, "ir", "Futuro Simple")["native_lang"] == "en"
+
+
+def test_v3_migration_moves_embedded_conjugations(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    conn = dbmod.connect(path)
+    conn.execute("INSERT INTO cards(word, foreign_lang, native_lang, json, created_at) "
+                 "VALUES('voy','es','en',?,'x')",
+                 (json.dumps({"word": "voy", "lemma": "ir", "tense": "Presente",
+                              "conjugation": [["yo", "voy"], ["tú", "vas"]],
+                              "examples": ["Voy."]}),))
+    conn.execute(f"PRAGMA user_version = 2")              # pretend pre-v3
+    conn.commit(); conn.close()
+    conn2 = dbmod.connect(path)                           # migration runs
+    card = dbmod.get_card(conn2, "voy", "es", "en")
+    assert "conjugation" not in card and card["lemma"] == "ir"
+    moved = dbmod.get_conjugation(conn2, "ir", "Presente", "es", "en")
+    assert moved["conjugation"] == [["yo", "voy"], ["tú", "vas"]]  # preserved
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == dbmod.SCHEMA_VERSION
+
+
+def test_story_prefills_its_conjugation_matrix(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "p.db"))
+    cfg = cfg_for(tmp_path)
+    calls = []
+    monkeypatch.setattr(serve.llm, "ask_json", lambda a, p, c:
+        calls.append((p.get("task"), p.get("lemma"), p.get("tense"))) or
+        {"conjugation": [["yo", "x"]], "examples": []})
+    dbmod.save_conjugation(conn, "ir", "Presente", "es", "en",
+                           {"conjugation": [["yo", "voy"]]}, "x")  # already cached
+    # call the worker directly (the job spawns it in a thread)
+    class FakeCtx:
+        def __init__(self): pass
+        def conn(self): return conn
+        def cfg(self): return cfg
+    serve._prefill_conjugations(FakeCtx(), ["ir", "comer"],
+                                ["Presente", "Futuro Simple"])
+    done = {(l, t) for _k, l, t in calls}
+    assert ("ir", "Presente") not in done                 # cache respected
+    assert {("ir", "Futuro Simple"), ("comer", "Presente"),
+            ("comer", "Futuro Simple")} <= done           # the rest warmed
+    assert dbmod.get_conjugation(conn, "comer", "Presente", "es", "en")

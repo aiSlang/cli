@@ -18,9 +18,7 @@ language; keep target-language material in the target language):
              other words: the relevant morphology — one or two lines>",
  "rule":"<the conjugation/grammar rule that produces this form, incl. the
          suffix pattern; call out irregularity explicitly if present>",
- "conjugation":[["<person>","<form>"],…]   // for verbs: the six forms of
-                                           // THIS tense; [] for non-verbs
- ,"ipa":"<IPA transcription of the tapped form>",
+ "ipa":"<IPA transcription of the tapped form>",
  "examples":["<2–3 short target-language sentences using this same form>"],
  "synonyms":["<2–4 target-language near-synonyms of the lemma, if any>"],
  "notes":"<one optional line: nuance, regional use, common mistakes; '' if none>"}

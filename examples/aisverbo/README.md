@@ -56,8 +56,13 @@ driven) into a multi-language web app with a persistent library.
    per-language voices, which is also why the UI can run on a static host.
 5. **Tap any word** — not only verbs — the card's conjugation table has a
    tense dropdown (defaulting to the tapped form's own tense): see the
-   same verb across every tense of the corpus, with fresh examples, each
-   conjugation cached DB-wide like everything else. Tap any word — and the `grammarian` agent returns
+   same verb across every tense of the corpus, with fresh examples, every
+   row audible (▶ speaks «yo iré»). Conjugation tables live ONLY in the
+   `conjugations` store — one row per (lemma, tense, language pair),
+   never duplicated inside cards — and writing a story PRE-WARMS the
+   whole verb×tense matrix it drills, so the cards' tables are plain DB
+   reads. API responses carry their full composite key
+   (word/lemma + tense + foreign_lang + native_lang). Tap any word — and the `grammarian` agent returns
    the full card *in your native language*: lemma, part of speech, meaning
    (of the lemma and of this exact form in this sentence), the form
    analysis (tense/mood/person), the rule and suffix pattern that produce

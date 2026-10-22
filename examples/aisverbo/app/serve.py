@@ -142,15 +142,20 @@ def generate_essay(conn, cfg: dict, topic: str,
 def word_card(conn, cfg: dict, word: str, sentence: str,
               force: bool = False) -> dict:
     lang, native = cfg["foreign"], cfg["native"]
+    key = {"word": word.lower(), "foreign_lang": lang, "native_lang": native}
     cached = None if force else dbmod.get_card(conn, word, lang, native)
     if cached:
-        return {"cached": True, **cached}
+        cached.pop("conjugation", None)       # pre-v3 cards may still carry it
+        return {"cached": True, **cached, **key}
     card = llm.ask_json("grammarian", {
         "task": "card", "word": word, "sentence": sentence,
         "lang": lang, "native": native}, cfg)
     card.setdefault("word", word)
+    # conjugation tables live ONLY in the conjugations table (one row per
+    # lemma+tense+langs, shared by every card and story)
+    card.pop("conjugation", None)
     dbmod.save_card(conn, word, lang, native, card, now_iso())
-    return {"cached": False, **card}
+    return {"cached": False, **card, **key}
 
 
 def _plain(text: str) -> str:
@@ -200,17 +205,17 @@ def conjugation(conn, cfg: dict, lemma: str, tense: str,
     """All six persons of one lemma in one tense, with examples — cached
     DB-wide, so every story and word card shares one model call."""
     lang, native = cfg["foreign"], cfg["native"]
+    key = {"lemma": lemma.lower(), "tense": tense,
+           "foreign_lang": lang, "native_lang": native}
     cached = None if force else dbmod.get_conjugation(conn, lemma, tense,
                                                       lang, native)
     if cached:
-        return {"cached": True, **cached}
+        return {"cached": True, **cached, **key}
     data = llm.ask_json("grammarian", {
         "task": "conjugation", "lemma": lemma, "tense": tense,
         "lang": lang, "native": native}, cfg)
-    data.setdefault("lemma", lemma)
-    data.setdefault("tense", tense)
     dbmod.save_conjugation(conn, lemma, tense, lang, native, data, now_iso())
-    return {"cached": False, **data}
+    return {"cached": False, **data, **key}
 
 
 # ─── tenancy + auth (FastAPI dependencies) ───────────────────────────
@@ -533,10 +538,30 @@ def tenses_post(body: dict, ctx: Ctx = Depends(get_ctx),
     raise HTTPException(400, "unknown action")
 
 
+def _prefill_conjugations(ctx: Ctx, verbs: list, tenses: list) -> None:
+    """Warm the conjugations cache for every (verb, tense) the story drills,
+    so each Word card's table is a plain DB read — best effort, skips what
+    is already cached, never blocks the story report."""
+    try:
+        conn, cfg = ctx.conn(), ctx.cfg()
+        for v in verbs:
+            for t in tenses:
+                try:
+                    conjugation(conn, cfg, v, t)
+                except Exception:
+                    pass                    # one miss never stops the rest
+    except Exception:
+        pass
+
+
 def _essay_job(ctx: Ctx, topic: str, verb_ids: list, tense_ids: list) -> None:
     try:
         report = generate_essay(ctx.conn(), ctx.cfg(), topic, verb_ids, tense_ids)
         _job_end(ctx.tid, "essay", report=report)
+        threading.Thread(target=_prefill_conjugations,
+                         args=(ctx, report.get("verbs") or [],
+                               report.get("tenses") or []),
+                         daemon=True).start()
     except Exception as exc:
         _job_end(ctx.tid, "essay", error=f"{type(exc).__name__}: {exc}")
 
@@ -590,7 +615,10 @@ def card(body: dict, ctx: Ctx = Depends(get_ctx),
         cached = dbmod.get_card(conn, word, cfg["foreign"], cfg["native"])
         if cached is None:
             raise HTTPException(401, _READER_MISS)
-        return {"cached": True, **cached}
+        cached.pop("conjugation", None)
+        return {"cached": True, **cached,
+                "word": cached.get("word", word.lower()),
+                "foreign_lang": cfg["foreign"], "native_lang": cfg["native"]}
     return word_card(conn, cfg, word, body.get("sentence") or "",
                      force=bool(body.get("force")))
 
@@ -608,7 +636,8 @@ def conjugation_post(body: dict, ctx: Ctx = Depends(get_ctx),
                                        cfg["foreign"], cfg["native"])
         if cached is None:
             raise HTTPException(401, _READER_MISS)
-        return {"cached": True, **cached}
+        return {"cached": True, **cached, "lemma": lemma.lower(), "tense": tense,
+                "foreign_lang": cfg["foreign"], "native_lang": cfg["native"]}
     return conjugation(conn, cfg, lemma, tense, force=bool(body.get("force")))
 
 

@@ -451,7 +451,7 @@ async function openCard(el,force){
   try{
     const c=await post('/api/card',{word,sentence,force:!!force});
     CARD=c;
-    const isVerb=/verb/i.test(c.pos||'')&&(c.conjugation||[]).length;
+    const isVerb=/verb/i.test(c.pos||'')&&c.lemma;
     const tenseOpts=TENSES.map(t=>`<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
     $('#card').innerHTML=`
       <div class="bar"><b style="font-size:17px">${esc(c.word)}</b>
@@ -470,27 +470,34 @@ async function openCard(el,force){
           <select id="conj-tense" style="width:auto;display:inline;padding:1px 6px;font-size:12px"
             onchange="loadConjugation(this.value)">
             ${c.tense&&!TENSES.some(t=>t.name===c.tense)?`<option value="${esc(c.tense)}">${esc(c.tense)}</option>`:''}
-            ${c.tense?'':'<option value="">this tense</option>'}${tenseOpts}</select></dt>
-        <dd id="conj-box"><table>${(c.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('')}</table></dd>`:''}
+            ${c.tense?'':'<option value="">— pick a tense —</option>'}${tenseOpts}</select></dt>
+        <dd id="conj-box" class="muted">…</dd>`:''}
       ${(c.examples||[]).length?`<dt>examples</dt><dd id="conj-examples">${c.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('')}</dd>`:''}
       ${(c.synonyms||[]).length?`<dt>synonyms</dt><dd>${c.synonyms.map(esc).join(', ')}</dd>`:''}
       ${c.notes?`<dt>notes</dt><dd>${esc(c.notes)}</dd>`:''}
       </dl>`;
-    if(c.tense&&$('#conj-tense'))$('#conj-tense').value=c.tense;
+    if($('#conj-tense')){
+      if(c.tense)$('#conj-tense').value=c.tense;
+      // the table itself lives in the conjugations store — pre-warmed per
+      // story, so for the story's own tenses this is a cached read
+      if(c.tense)loadConjugation(c.tense);
+    }
   }catch(e){$('#card').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 let CARD=null;
+function conjRows(rows){
+  // every entry is audible: ▶ speaks "person form" (e.g. «yo iré»)
+  return `<table>${(rows||[]).map(p=>
+    `<tr><td class="muted">${esc(p[0])}</td><td>${esc(p[1])}</td>
+     <td style="border:none"><button class="btn small" data-say="${esc(p[0]+' '+p[1])}"
+       onclick="speak(this.dataset.say)">▶</button></td></tr>`).join('')}</table>`;}
 async function loadConjugation(tense){
-  if(!CARD)return;
+  if(!CARD||!tense)return;
   const box=$('#conj-box');
-  if(!tense||tense===CARD.tense){ // the tapped form's own tense: from the card
-    box.innerHTML=`<table>${(CARD.conjugation||[]).map(r=>`<tr><td class="muted">${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join('')}</table>`;
-    const ex=$('#conj-examples');
-    if(ex)ex.innerHTML=(CARD.examples||[]).map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('');
-    return;}
+  box.classList.remove('muted');
   box.innerHTML=`<span class="muted">${SPIN}conjugating…</span>`;
   try{
     const r=await post('/api/conjugation',{lemma:CARD.lemma,tense});
-    box.innerHTML=`<table>${(r.conjugation||[]).map(p=>`<tr><td class="muted">${esc(p[0])}</td><td>${esc(p[1])}</td></tr>`).join('')}</table>`
+    box.innerHTML=conjRows(r.conjugation)
       +(r.notes?`<div class="muted" style="font-size:12px;margin-top:3px">${esc(r.notes)}</div>`:'');
     const ex=$('#conj-examples');
     if(ex&&(r.examples||[]).length)

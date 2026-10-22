@@ -106,14 +106,39 @@ CREATE TABLE IF NOT EXISTS cards(
 
 # bump when the schema changes; _migrate upgrades EXISTING databases in
 # place with ALTER/backfill — data is never dropped on upgrade
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
         return
-    # v2: the conjugations table (created by SCHEMA's IF NOT EXISTS) — and
-    # the pattern itself: future versions add ALTERs here, never DROPs
+    # v3: a card's embedded "conjugation" duplicated the conjugations table
+    # row for (lemma, tense, langs) — MOVE it there (never overwrite), then
+    # strip it from the card json. The conjugations table is the only owner.
+    for r in conn.execute("SELECT word, foreign_lang, native_lang, json, "
+                          "created_at FROM cards").fetchall():
+        try:
+            card = json.loads(r["json"])
+        except json.JSONDecodeError:
+            continue
+        conj = card.pop("conjugation", None)
+        if conj is None:
+            continue
+        lemma = str(card.get("lemma") or "").strip().lower()
+        tense = str(card.get("tense") or "").strip()
+        if conj and lemma and tense:
+            conn.execute(
+                "INSERT OR IGNORE INTO conjugations(lemma, tense, foreign_lang, "
+                "native_lang, json, created_at) VALUES(?,?,?,?,?,?)",
+                (lemma, tense, r["foreign_lang"], r["native_lang"],
+                 json.dumps({"conjugation": conj,
+                             "examples": card.get("examples") or [],
+                             "notes": ""}, ensure_ascii=False),
+                 r["created_at"]))
+        conn.execute("UPDATE cards SET json=? WHERE word=? AND foreign_lang=? "
+                     "AND native_lang=?",
+                     (json.dumps(card, ensure_ascii=False),
+                      r["word"], r["foreign_lang"], r["native_lang"]))
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
