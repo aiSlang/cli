@@ -769,7 +769,13 @@ Intended use:
 
 Thanks!`);}
 async function saveAdmin(){
-  ADMIN=$('#s-admin').value.trim();
+  // tolerate sloppy pastes: terminal copies often drag the "# jti …"
+  // comment along, and a single-line input CONCATENATES the lines —
+  // extract the first JWT-shaped run from whatever was pasted
+  const raw=$('#s-admin').value.trim();
+  const m=raw.match(/[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/);
+  ADMIN=m?m[0]:raw;
+  $('#s-admin').value=ADMIN;
   try{localStorage.setItem('aisverbo-admin',ADMIN);}catch(_){}
   await loadState();        // capabilities (can_write/can_admin) follow NOW,
                             // not on the next page reload
