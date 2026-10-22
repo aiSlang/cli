@@ -180,6 +180,12 @@
 
 <!-- ─── LIBRARY ─── -->
 <div id="tab-library">
+  <div class="muted" style="font-size:13px;margin:4px 2px 10px">
+    aisVerbo is a multi-agent pipeline on <a href="https://aislang.org" target="_blank"
+    rel="noopener" style="color:var(--blue)">aiSlang</a> — the platform where budget-capped
+    agents (lexicographer · tensesmith · essayist · grammarian · translator · philologist)
+    write and analyze every story below.
+  </div>
   <div class="panel">
     <div class="bar">
       <input class="grow" id="lib-q" placeholder="Search your stories by any verb, word or topic — or start a new one in Learn…"
@@ -188,11 +194,6 @@
       <button class="btn accent" id="btn-new" onclick="newStory()">New story</button>
       <button class="btn small" onclick="$('#essay-file').click()" title="create a story from an exported JSON (idempotent; Story Writer role)">Import story</button>
       <input type="file" id="essay-file" accept="application/json" style="display:none" onchange="importEssay(this)"/>
-    </div>
-    <div class="muted" style="font-size:12px;margin:8px 0 2px">
-      aisVerbo is a multi-agent pipeline on <a href="https://aislang.org" target="_blank"
-      rel="noopener" style="color:var(--blue)">aiSlang</a> — the platform where budget-capped
-      agents (lexicographer · essayist · grammarian · translator) write every story below.
     </div>
     <div id="lib-list" style="margin-top:8px"></div>
   </div>
@@ -396,12 +397,22 @@ async function quickAddVerb(){
 /* ── the story ── */
 function pastePlain(ev){
   // pasted text enters as PLAIN text — a copied book page or lyrics site
-  // must not drag its markup into the story body
+  // must not drag its markup into the story body. Inserted as a raw TEXT
+  // node (the .paste area is white-space:pre-wrap): execCommand would turn
+  // the \n\n paragraph breaks into <div>s whose innerText collapses to
+  // single \n, gluing the stored story into one block
   const b=$('#essay-body');
   if(b.contentEditable!=='true')return;
   ev.preventDefault();
   const t=(ev.clipboardData||window.clipboardData).getData('text/plain');
-  document.execCommand('insertText',false,t);}
+  const sel=window.getSelection();
+  if(!sel.rangeCount){b.append(document.createTextNode(t));return;}
+  const range=sel.getRangeAt(0);
+  range.deleteContents();
+  const node=document.createTextNode(t);
+  range.insertNode(node);
+  range.setStartAfter(node);range.collapse(true);
+  sel.removeAllRanges();sel.addRange(range);}
 async function writeEssay(){
   const topic=$('#topic').value.trim();
   const b=$('#essay-body');
@@ -865,7 +876,7 @@ speechSynthesis.onvoiceschanged=()=>{};      // warm the voice list
   loadLibrary();                      // Stories is the landing page
   try{const id=parseInt(localStorage.getItem('aisverbo-essay'));
     if(id)await openEssay(id);        // …unless a story was open: back to it
-  }catch(_){}
+  }catch(_){try{localStorage.removeItem('aisverbo-essay');}catch(__){}}
 })();
 </script>
 </body>

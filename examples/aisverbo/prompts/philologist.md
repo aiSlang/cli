@@ -14,7 +14,8 @@ You receive ONE JSON payload:
 Return ONLY a JSON object:
 {"title":"<a short title for the text, in its own language, max 8 words>",
  "verbs":[{"infinitive":"<lemma, lowercase>",
-           "gloss":"<its meaning in the learner's language>"}],
+           "gloss":"<its meaning in the learner's language>",
+           "forms":["<each inflected form of this verb EXACTLY as it appears in the text>"]}],
  "tenses":["<tense name>", ...]}
 
 Rules:
@@ -22,6 +23,9 @@ Rules:
   infinitive, each listed once; skip auxiliaries only when they merely build
   a compound form of another listed verb (haber in «ha comido» → list comer,
   not haber; but list haber when it is used on its own);
+- forms: the verb's surface forms copied VERBATIM from the text — same
+  casing, same accents, single words only (for a compound form give the
+  participle/gerund word) — they are used to highlight the verbs in place;
 - tenses: every tense/form the text actually conjugates a verb in. When a
   tense matches an entry of known_tenses, repeat that entry's name EXACTLY,
   character for character — never a re-spelling, re-casing or translation of

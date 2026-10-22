@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import re
 import sys
 import threading
 import uuid as uuidmod
@@ -176,11 +177,23 @@ def analyze_essay(conn, cfg: dict, cfg_path: str, text: str,
         inf = v["infinitive"].strip().lower()
         if inf not in infs:
             infs.append(inf)
+    # bold every verb form the philologist spotted — **md-bold**, the same
+    # highlight generated stories get from the essayist; the text is
+    # otherwise verbatim
+    forms: list[str] = []
+    for v in verbs:
+        for f in v.get("forms") or []:
+            f = str(f).strip()
+            if f and f.lower() not in (x.lower() for x in forms):
+                forms.append(f)
+    for f in sorted(forms, key=len, reverse=True):
+        text = re.sub(r"(?<![\w*])" + re.escape(f) + r"(?![\w*])",
+                      lambda m: f"**{m.group(0)}**", text)
     if words > int(cfg.get("essay_words", 180)):
         cfg["essay_words"] = words      # Setup reflects the actual length
         dbmod.save_config(cfg, cfg_path)
     title = (topic or out.get("title") or "").strip() \
-        or " ".join(text.split()[:6])
+        or " ".join(text.replace("**", " ").split()[:6])
     eid = dbmod.save_essay(conn, {
         "created_at": now_iso(), "foreign_lang": lang,
         "native_lang": native, "topic": topic or title, "title": title,

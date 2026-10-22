@@ -606,16 +606,21 @@ def test_pasted_text_analyzed_into_story(tmp_path, monkeypatch):
         seen["agent"] = agent
         seen.update(payload)
         return {"title": "Caminante no hay camino",
-                "verbs": [{"infinitive": "ir", "gloss": "to go"},
+                "verbs": [{"infinitive": "ser", "gloss": "to be",
+                           "forms": ["son"]},
                           {"infinitive": "soñar", "gloss": "to dream"}],
                 "tenses": ["Presente de Indicativo", "pretérito imperfecto"]}
     monkeypatch.setattr(serve.llm, "ask_json", fake_json)
-    text = "Caminante, son tus huellas el camino y nada más. " * 8
+    text = ("Caminante, son tus huellas el camino y nada más. " * 4
+            + "\n\n" + "Caminante, no hay camino, se hace camino al andar. " * 4)
     rep = serve.analyze_essay(conn, cfg, cfg_path, text, "")
     assert seen["agent"] == "philologist"
     assert seen["known_tenses"] == ["presente de indicativo"]
     assert rep["title"] == "Caminante no hay camino"
-    assert rep["body"] == text.strip()                     # verbatim, no LLM rewrite
+    # verbatim except the **bold** verb-form highlight; paragraphs preserved
+    assert "**son**" in rep["body"] and "sonar" not in rep["body"]
+    assert rep["body"].replace("**", "") == text.strip()
+    assert "\n\n" in rep["body"]
     # the known tense is referenced in its Corpus spelling; the new one
     # joined the Corpus (metadata must always reference Corpus items)
     assert rep["tenses"] == ["presente de indicativo", "pretérito imperfecto"]
