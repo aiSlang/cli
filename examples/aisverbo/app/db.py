@@ -153,9 +153,10 @@ def connect(path: str = DEFAULT_DB) -> sqlite3.Connection:
 
 
 # hosted limits — the app is free of charge, so one vocabulary generation
-# is capped at 100 verbs and one story at 200 words
+# is capped at 100 verbs and one story at 1000 words (room for a pasted
+# fragment of classical literature or song lyrics)
 MAX_VERB_COUNT = 100
-MAX_ESSAY_WORDS = 200
+MAX_ESSAY_WORDS = 1000
 
 _TID_OK = __import__("re").compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -252,6 +253,19 @@ def list_tenses(conn, lang: str) -> list[dict]:
         "SELECT * FROM tenses WHERE lang=? ORDER BY id", (lang,))]
 
 
+def canonical_tense(conn, lang: str, name: str) -> str:
+    """The Corpus spelling of a tense name, matched case- and
+    whitespace-insensitively — so an agent answer never mints a
+    `Presente de indicativo` next to the corpus's `presente de
+    indicativo`. A tense the corpus does not know passes through as-is."""
+    want = " ".join((name or "").split()).lower()
+    if want:
+        for t in list_tenses(conn, lang):
+            if " ".join(t["name"].split()).lower() == want:
+                return t["name"]
+    return (name or "").strip()
+
+
 # ─── essays ──────────────────────────────────────────────────────────
 def save_essay(conn, rec: Mapping) -> int:
     cur = conn.execute(
@@ -334,7 +348,10 @@ def tense_references(conn, lang: str, name: str) -> int:
 
 # ─── conjugation cache (shared across every story and word card) ─────
 def get_conjugation(conn, lemma: str, tense: str, foreign: str, native: str):
-    r = conn.execute("SELECT json FROM conjugations WHERE lemma=? AND tense=? "
+    # tense matched case-insensitively: rows cached before tense names were
+    # canonicalized against the corpus may carry a different casing
+    r = conn.execute("SELECT json FROM conjugations WHERE lemma=? "
+                     "AND tense=? COLLATE NOCASE "
                      "AND foreign_lang=? AND native_lang=?",
                      (lemma.lower(), tense, foreign, native)).fetchone()
     return json.loads(r["json"]) if r else None

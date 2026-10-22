@@ -139,6 +139,57 @@ def generate_essay(conn, cfg: dict, topic: str,
             "tenses": [t["name"] for t in tenses]}
 
 
+def analyze_essay(conn, cfg: dict, cfg_path: str, text: str,
+                  topic: str) -> dict:
+    """The reverse of generate_essay: a pasted EXISTING text (classical
+    literature, song lyrics) becomes a story. The philologist recreates the
+    metadata a learner otherwise sets by hand — every verb lemma and every
+    tense the text uses — with tense names canonicalized against the Corpus;
+    verbs (and tenses) the Corpus lacks are added to it, so the story's
+    metadata always references Corpus items."""
+    lang, native = cfg["foreign"], cfg["native"]
+    text = text.strip()
+    words = len(text.split())
+    if words > dbmod.MAX_ESSAY_WORDS:
+        raise RuntimeError(
+            f"the pasted text is {words} words — the limit is "
+            f"{dbmod.MAX_ESSAY_WORDS}. Cut it down and paste the fragment "
+            "again.")
+    out = llm.ask_json("philologist", {
+        "task": "analyze", "lang": lang, "native": native, "text": text,
+        "known_tenses": [t["name"] for t in dbmod.list_tenses(conn, lang)]},
+        cfg)
+    verbs = [v for v in (out.get("verbs") or [])
+             if isinstance(v, dict) and (v.get("infinitive") or "").strip()]
+    if not verbs:
+        raise RuntimeError("the philologist found no verbs in the pasted "
+                           f"text — is it really in «{lang}»?")
+    tenses: list[str] = []
+    for name in out.get("tenses") or []:
+        c = dbmod.canonical_tense(conn, lang, str(name))
+        if c and c not in tenses:
+            tenses.append(c)
+    dbmod.add_verbs(conn, lang, verbs)                    # INSERT OR IGNORE
+    dbmod.add_tenses(conn, lang, [{"name": t} for t in tenses])
+    infs: list[str] = []
+    for v in verbs:
+        inf = v["infinitive"].strip().lower()
+        if inf not in infs:
+            infs.append(inf)
+    if words > int(cfg.get("essay_words", 180)):
+        cfg["essay_words"] = words      # Setup reflects the actual length
+        dbmod.save_config(cfg, cfg_path)
+    title = (topic or out.get("title") or "").strip() \
+        or " ".join(text.split()[:6])
+    eid = dbmod.save_essay(conn, {
+        "created_at": now_iso(), "foreign_lang": lang,
+        "native_lang": native, "topic": topic or title, "title": title,
+        "body": text,
+        "verbs_csv": ",".join(infs), "tenses_csv": ",".join(tenses)})
+    return {"id": eid, "title": title, "body": text,
+            "verbs": infs, "tenses": tenses}
+
+
 def word_card(conn, cfg: dict, word: str, sentence: str,
               force: bool = False) -> dict:
     lang, native = cfg["foreign"], cfg["native"]
@@ -146,6 +197,8 @@ def word_card(conn, cfg: dict, word: str, sentence: str,
     cached = None if force else dbmod.get_card(conn, word, lang, native)
     if cached:
         cached.pop("conjugation", None)       # pre-v3 cards may still carry it
+        if cached.get("tense"):               # pre-canonicalization casing
+            cached["tense"] = dbmod.canonical_tense(conn, lang, cached["tense"])
         return {"cached": True, **cached, **key}
     card = llm.ask_json("grammarian", {
         "task": "card", "word": word, "sentence": sentence,
@@ -154,6 +207,10 @@ def word_card(conn, cfg: dict, word: str, sentence: str,
     # conjugation tables live ONLY in the conjugations table (one row per
     # lemma+tense+langs, shared by every card and story)
     card.pop("conjugation", None)
+    # the card's tense references the Corpus item, never a re-spelling of it
+    # («Presente de indicativo» → the corpus's «presente de indicativo»)
+    if card.get("tense"):
+        card["tense"] = dbmod.canonical_tense(conn, lang, card["tense"])
     dbmod.save_card(conn, word, lang, native, card, now_iso())
     return {"cached": False, **card, **key}
 
@@ -205,6 +262,7 @@ def conjugation(conn, cfg: dict, lemma: str, tense: str,
     """All six persons of one lemma in one tense, with examples — cached
     DB-wide, so every story and word card shares one model call."""
     lang, native = cfg["foreign"], cfg["native"]
+    tense = dbmod.canonical_tense(conn, lang, tense)
     key = {"lemma": lemma.lower(), "tense": tense,
            "foreign_lang": lang, "native_lang": native}
     cached = None if force else dbmod.get_conjugation(conn, lemma, tense,
@@ -554,22 +612,36 @@ def tenses_post(body: dict, ctx: Ctx = Depends(get_ctx),
 def _prefill_conjugations(ctx: Ctx, verbs: list, tenses: list) -> None:
     """Warm the conjugations cache for every (verb, tense) the story drills,
     so each Word card's table is a plain DB read — best effort, skips what
-    is already cached, never blocks the story report."""
+    is already cached, never blocks the story report. Capped: a pasted
+    classic can carry dozens of verbs × tenses, and every cache miss is a
+    model call — the rest fills lazily as cards are opened."""
     try:
         conn, cfg = ctx.conn(), ctx.cfg()
+        budget = 60
         for v in verbs:
             for t in tenses:
+                if budget <= 0:
+                    return
                 try:
-                    conjugation(conn, cfg, v, t)
+                    if dbmod.get_conjugation(conn, v, t, cfg["foreign"],
+                                             cfg["native"]) is None:
+                        budget -= 1
+                        conjugation(conn, cfg, v, t)
                 except Exception:
                     pass                    # one miss never stops the rest
     except Exception:
         pass
 
 
-def _essay_job(ctx: Ctx, topic: str, verb_ids: list, tense_ids: list) -> None:
+def _essay_job(ctx: Ctx, topic: str, verb_ids: list, tense_ids: list,
+               text: str = "") -> None:
     try:
-        report = generate_essay(ctx.conn(), ctx.cfg(), topic, verb_ids, tense_ids)
+        if text.strip():        # pasted existing text → analyze, don't write
+            report = analyze_essay(ctx.conn(), ctx.cfg(), ctx.cfg_path,
+                                   text, topic)
+        else:
+            report = generate_essay(ctx.conn(), ctx.cfg(), topic,
+                                    verb_ids, tense_ids)
         _job_end(ctx.tid, "essay", report=report)
         threading.Thread(target=_prefill_conjugations,
                          args=(ctx, report.get("verbs") or [],
@@ -583,13 +655,19 @@ def _essay_job(ctx: Ctx, topic: str, verb_ids: list, tense_ids: list) -> None:
 def essay_post(body: dict, ctx: Ctx = Depends(get_ctx),
                writer: dict = Depends(require_writer)):
     topic = (body.get("topic") or "").strip()
-    if not topic:
-        raise HTTPException(400, "give a topic")
+    text = (body.get("text") or "").strip()
+    if not topic and not text:
+        raise HTTPException(400, "give a topic — or paste an existing text "
+                                 "into the story area")
+    if text and len(text.split()) > dbmod.MAX_ESSAY_WORDS:
+        raise HTTPException(400, f"the pasted text is {len(text.split())} "
+                            f"words — the limit is {dbmod.MAX_ESSAY_WORDS}. "
+                            "Cut it down and paste the fragment again.")
     if not _job_start(ctx.tid, "essay"):
         raise HTTPException(409, "a story is already being written")
     threading.Thread(target=_essay_job,
                      args=(ctx, topic, body.get("verbs") or [],
-                           body.get("tenses") or []),
+                           body.get("tenses") or [], text),
                      daemon=True).start()
     return {"started": True}
 
@@ -629,6 +707,9 @@ def card(body: dict, ctx: Ctx = Depends(get_ctx),
         if cached is None:
             raise _reader_miss_error(x_admin_token, ctx)
         cached.pop("conjugation", None)
+        if cached.get("tense"):
+            cached["tense"] = dbmod.canonical_tense(conn, cfg["foreign"],
+                                                    cached["tense"])
         return {"cached": True, **cached,
                 "word": cached.get("word", word.lower()),
                 "foreign_lang": cfg["foreign"], "native_lang": cfg["native"]}
@@ -645,6 +726,7 @@ def conjugation_post(body: dict, ctx: Ctx = Depends(get_ctx),
         raise HTTPException(400, "lemma + tense required")
     conn, cfg = ctx.conn(), ctx.cfg()
     if not _is_writer(x_admin_token, ctx):
+        tense = dbmod.canonical_tense(conn, cfg["foreign"], tense)
         cached = dbmod.get_conjugation(conn, lemma, tense,
                                        cfg["foreign"], cfg["native"])
         if cached is None:

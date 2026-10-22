@@ -52,6 +52,12 @@
   #essay-body .w{cursor:pointer;border-radius:3px}
   #essay-body .w:hover{background:rgba(88,166,255,.18)}
   #essay-body .w.sel{background:rgba(88,166,255,.3)}
+  /* creation mode: the empty story area takes a pasted existing text */
+  #essay-body.paste{outline:1px dashed var(--line);border-radius:6px;
+    min-height:140px;padding:8px 10px;white-space:pre-wrap}
+  #essay-body.paste:focus{outline-color:var(--blue)}
+  #essay-body.paste:empty::before{content:attr(data-placeholder);
+    color:var(--muted);pointer-events:none}
   .card dt{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px;margin-top:9px}
   .card dd{margin:1px 0 0}
   .card table{border-collapse:collapse;margin-top:3px}
@@ -141,7 +147,8 @@
         <input type="range" id="rate" min="0.5" max="1.4" step="0.1" value="0.9"/>
       </div>
       <div id="tts-status"></div>
-      <div id="essay-body" class="muted" onclick="clearWordSel(event)">Pick a topic, select tenses and verbs above, and press
+      <div id="essay-body" class="muted" onclick="clearWordSel(event)" onpaste="pastePlain(event)">Pick a topic, paste an existing
+        story, or select tenses and verbs above to generate it from scratch, and press
         <i>Write the story</i>. Vocabulary verbs come out <strong>bold</strong>; tap any word
         for its grammar card; select any fragment for pronunciation (▶ selection) or
         translation (Translation tab on the right).</div>
@@ -232,7 +239,7 @@
       <div><label>I am learning</label><select id="s-foreign"></select></div>
       <div><label>Explain things to me in</label><select id="s-native"></select></div>
       <div><label>Default vocabulary size</label><input id="s-verb_count" type="number" style="width:110px"/></div>
-      <div><label>Story length (words)</label><input id="s-essay_words" type="number" style="width:110px"/></div>
+      <div><label>Story length (words)</label><input id="s-essay_words" type="number" min="30" max="1000" style="width:110px"/></div>
     </div>
     <div class="bar" style="margin-top:10px">
       <div><label>Add a language — code</label><input id="s-lang-code" style="width:90px" placeholder="uk"/></div>
@@ -387,24 +394,52 @@ async function quickAddVerb(){
   }catch(e){alert(e.message);}}
 
 /* ── the story ── */
+function pastePlain(ev){
+  // pasted text enters as PLAIN text — a copied book page or lyrics site
+  // must not drag its markup into the story body
+  const b=$('#essay-body');
+  if(b.contentEditable!=='true')return;
+  ev.preventDefault();
+  const t=(ev.clipboardData||window.clipboardData).getData('text/plain');
+  document.execCommand('insertText',false,t);}
 async function writeEssay(){
   const topic=$('#topic').value.trim();
-  if(!topic)return alert('Give the story a topic first.');
+  const b=$('#essay-body');
+  const pasted=b.contentEditable==='true'?b.innerText.trim():'';
+  if(pasted){           // an existing text → the philologist, not the essayist
+    const wc=pasted.split(/\s+/).filter(Boolean).length;
+    if(wc>1000)return alert(`The pasted text is ${wc} words — the limit is 1000. Cut it down.`);
+    try{await post('/api/essay',{topic,text:pasted});}
+    catch(e){return $('#essay-job').innerHTML=`<span class="err">${esc(e.message)}</span>`;}
+    $('#btn-write').disabled=true;pollJobs();return;}
+  if(!topic)return alert('Give the story a topic — or paste an existing text into the story area.');
   if(!VSEL.size)return alert('Select at least one verb for this story.');
   if(!TSEL.size)return alert('Select at least one tense for this story.');
   try{await post('/api/essay',{topic,verbs:[...VSEL],tenses:[...TSEL]});}
   catch(e){return $('#essay-job').innerHTML=`<span class="err">${esc(e.message)}</span>`;}
   $('#btn-write').disabled=true;pollJobs();}
+async function syncMetaFromReport(r){
+  // a pasted text's metadata comes back from the server (and may have
+  // ADDED corpus verbs/tenses) — reload the corpus, then mirror the
+  // story's verbs and tenses as the current selection
+  if(!(r.verbs||[]).length&&!(r.tenses||[]).length)return;
+  await loadVocab();
+  VSEL.clear();TSEL.clear();
+  const vs=new Set((r.verbs||[]).map(s=>String(s).toLowerCase()));
+  const ts=new Set((r.tenses||[]).map(s=>String(s).toLowerCase()));
+  for(const v of VERBS)if(vs.has(v.infinitive))VSEL.add(v.id);
+  for(const t of TENSES)if(ts.has(t.name.toLowerCase()))TSEL.add(t.id);
+  renderVerbChips();renderTenseChips();}
 function pollJobs(){clearInterval(POLL);POLL=setInterval(async()=>{
   const j=await api('/api/jobs');
   const e=j.essay,v=j.vocab;
-  $('#essay-job').innerHTML=e.running?`<span class="muted">${SPIN}the essayist is writing…</span>`
+  $('#essay-job').innerHTML=e.running?`<span class="muted">${SPIN}working on the story…</span>`
     :e.error?`<span class="err">${esc(e.error)}</span>`:'';
   $('#vocab-job').innerHTML=v.running?`<span class="muted">${SPIN}generating…</span>`
     :v.error?`<span class="err">${esc(v.error)}</span>`
     :v.report?`<span class="ok">+${v.report.added} (total ${v.report.total})</span>`:'';
   if(!e.running&&!v.running){clearInterval(POLL);$('#btn-write').disabled=false;
-    if(e.report){showEssay(e.report);}
+    if(e.report){showEssay(e.report);syncMetaFromReport(e.report);}
     if(v.report){loadVocabLangOrDefault();loadVocab();}}
 },1200);}
 function clearMapping(){
@@ -423,6 +458,8 @@ function clearWordSel(ev){
 function showEssay(e){ESSAY=e;
   try{if(e&&e.id)localStorage.setItem('aisverbo-essay',e.id);}catch(_){}
   $('#essay-title').textContent=e.title||'—';
+  $('#essay-body').contentEditable='false';
+  $('#essay-body').classList.remove('paste');
   $('#essay-body').classList.remove('muted');
   $('#essay-body').innerHTML=renderBody(e.body);
   $('#card').innerHTML='Tap a word in the story.';$('#card').classList.add('muted');
@@ -460,6 +497,12 @@ async function openCard(el,force){
     const c=await post('/api/card',{word,sentence,force:!!force});
     CARD=c;
     const isVerb=/verb/i.test(c.pos||'')&&c.lemma;
+    // the drop-down lists the CORPUS tenses; the card's own tense is matched
+    // case-insensitively onto them (the server canonicalizes new cards, this
+    // also covers cards cached before that) — an extra option appears only
+    // for a form the corpus genuinely lacks
+    const tmatch=c.tense&&TENSES.find(t=>t.name.toLowerCase()===String(c.tense).toLowerCase());
+    const cardTense=tmatch?tmatch.name:(c.tense||'');
     const tenseOpts=TENSES.map(t=>`<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
     $('#card').innerHTML=`
       <div class="bar"><b style="font-size:17px">${esc(c.word)}</b>
@@ -477,18 +520,18 @@ async function openCard(el,force){
       ${isVerb?`<dt>conjugation in
           <select id="conj-tense" style="width:auto;display:inline;padding:1px 6px;font-size:12px"
             onchange="loadConjugation(this.value)">
-            ${c.tense&&!TENSES.some(t=>t.name===c.tense)?`<option value="${esc(c.tense)}">${esc(c.tense)}</option>`:''}
-            ${c.tense?'':'<option value="">— pick a tense —</option>'}${tenseOpts}</select></dt>
+            ${cardTense&&!tmatch?`<option value="${esc(cardTense)}">${esc(cardTense)}</option>`:''}
+            ${cardTense?'':'<option value="">— pick a tense —</option>'}${tenseOpts}</select></dt>
         <dd id="conj-box" class="muted">…</dd>`:''}
       ${(c.examples||[]).length?`<dt>examples</dt><dd id="conj-examples">${c.examples.map(x=>`<div>· ${esc(x)} <button class="btn small" data-say="${esc(x)}" onclick="speak(this.dataset.say)">▶</button></div>`).join('')}</dd>`:''}
       ${(c.synonyms||[]).length?`<dt>synonyms</dt><dd>${c.synonyms.map(esc).join(', ')}</dd>`:''}
       ${c.notes?`<dt>notes</dt><dd>${esc(c.notes)}</dd>`:''}
       </dl>`;
     if($('#conj-tense')){
-      if(c.tense)$('#conj-tense').value=c.tense;
+      if(cardTense)$('#conj-tense').value=cardTense;
       // the table itself lives in the conjugations store — pre-warmed per
       // story, so for the story's own tenses this is a cached read
-      if(c.tense)loadConjugation(c.tense);
+      if(cardTense)loadConjugation(cardTense);
     }
   }catch(e){$('#card').innerHTML=`<span class="err">${esc(e.message)}</span>`;}}
 let CARD=null;
@@ -632,8 +675,14 @@ function newStory(){
     +'click `Request corpus access (onboarding)` in Setup to get a token.');
   MODE='create';ESSAY=null;VSEL.clear();TSEL.clear();
   $('#topic').value='';$('#essay-title').textContent='—';
-  $('#essay-body').classList.add('muted');
-  $('#essay-body').innerHTML='Pick a topic, select tenses and verbs above, and press <i>Write the story</i>.';
+  // the empty story area is EDITABLE in creation mode: paste a fragment of
+  // an existing book or lyrics and the philologist recreates the metadata
+  const b=$('#essay-body');
+  b.innerHTML='';b.classList.remove('muted');b.classList.add('paste');
+  b.contentEditable='true';
+  b.dataset.placeholder='Pick a topic, paste an existing story here, or '
+    +'select tenses and verbs above to generate it from scratch — then '
+    +'press “Write the story”.';
   TR=null;$('#tr-title').textContent='—';
   $('#card').innerHTML='Tap a word in the story.';$('#card').classList.add('muted');
   renderVerbChips();renderTenseChips();

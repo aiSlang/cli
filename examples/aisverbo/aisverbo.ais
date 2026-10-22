@@ -58,6 +58,7 @@ project "aisverbo" {
   prompt "essayist_sys"      { file = "./prompts/essayist.md"      version = "1.0.0" }
   prompt "grammarian_sys"    { file = "./prompts/grammarian.md"    version = "1.0.0" }
   prompt "translator_sys"    { file = "./prompts/translator.md"    version = "1.0.0" }
+  prompt "philologist_sys"   { file = "./prompts/philologist.md"   version = "1.0.0" }
 
   ## Vocabulary: the top-N most useful verbs of the target language,
   ## glossed in the learner's native language. Batched by the app.
@@ -95,6 +96,15 @@ project "aisverbo" {
   agent "translator" {
     model         = model.scholar
     system_prompt = prompt.translator_sys
+    tools         = []
+  }
+
+  ## The reverse of the essayist: a pasted EXISTING text (classical
+  ## literature, lyrics) in, the story metadata out — every verb lemma and
+  ## every tense the text uses, named exactly as the corpus names them.
+  agent "philologist" {
+    model         = model.scholar
+    system_prompt = prompt.philologist_sys
     tools         = []
   }
 

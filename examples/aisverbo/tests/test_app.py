@@ -388,7 +388,7 @@ def test_oauth_callback_mints_identity_tenant(tmp_path, monkeypatch):
 def test_settings_limits_clamped(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch)
     r = c.post("/api/settings", json={"verb_count": 5000, "essay_words": 9999})
-    assert r.json()["verb_count"] == 100 and r.json()["essay_words"] == 200
+    assert r.json()["verb_count"] == 100 and r.json()["essay_words"] == 1000
     r = c.post("/api/settings", json={"verb_count": -3, "essay_words": 1})
     assert r.json()["verb_count"] == 1 and r.json()["essay_words"] == 30
 
@@ -568,3 +568,76 @@ def test_writer_token_creates_cards_and_translations(tmp_path, monkeypatch):
           "X-Admin-Token": _writer_token(sub="public")}
     r = c.post("/api/card", json={"word": "nuevo"}, headers=h1)
     assert r.status_code == 401 and "belongs to 'public'" in r.json()["error"]
+
+
+def test_tense_canonicalized_in_cards_and_conjugations(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "ct.db"))
+    cfg = cfg_for(tmp_path)
+    dbmod.add_tenses(conn, "es", [{"name": "presente de indicativo"}])
+    monkeypatch.setattr(serve.llm, "ask_json", lambda a, p, c: {
+        "lemma": "ir", "pos": "verb", "tense": "Presente de Indicativo",
+        "translation": "to go"})
+    card = serve.word_card(conn, cfg, "voy", "yo voy")
+    assert card["tense"] == "presente de indicativo"       # the Corpus form
+    assert dbmod.get_card(conn, "voy", "es", "en")["tense"] == \
+        "presente de indicativo"                           # stored canonical
+    # conjugations: one cached row serves every casing of the tense name
+    calls = []
+    monkeypatch.setattr(serve.llm, "ask_json", lambda a, p, c:
+                        calls.append(1) or {"conjugation": [["yo", "voy"]]})
+    r1 = serve.conjugation(conn, cfg, "ir", "Presente De Indicativo")
+    assert r1["tense"] == "presente de indicativo"
+    r2 = serve.conjugation(conn, cfg, "ir", "PRESENTE DE INDICATIVO")
+    assert r2["cached"] and len(calls) == 1
+    # an unknown form passes through untouched (no corpus item to reference)
+    assert dbmod.canonical_tense(conn, "es", "gerundio compuesto") == \
+        "gerundio compuesto"
+
+
+def test_pasted_text_analyzed_into_story(tmp_path, monkeypatch):
+    conn = dbmod.connect(str(tmp_path / "pa.db"))
+    cfg_path = str(tmp_path / "config.json")
+    cfg = dbmod.save_config({"foreign": "es", "native": "en",
+                             "essay_words": 60}, cfg_path)
+    dbmod.add_verbs(conn, "es", [{"infinitive": "ir", "gloss": "to go"}])
+    dbmod.add_tenses(conn, "es", [{"name": "presente de indicativo"}])
+    seen = {}
+    def fake_json(agent, payload, c):
+        seen["agent"] = agent
+        seen.update(payload)
+        return {"title": "Caminante no hay camino",
+                "verbs": [{"infinitive": "ir", "gloss": "to go"},
+                          {"infinitive": "soñar", "gloss": "to dream"}],
+                "tenses": ["Presente de Indicativo", "pretérito imperfecto"]}
+    monkeypatch.setattr(serve.llm, "ask_json", fake_json)
+    text = "Caminante, son tus huellas el camino y nada más. " * 8
+    rep = serve.analyze_essay(conn, cfg, cfg_path, text, "")
+    assert seen["agent"] == "philologist"
+    assert seen["known_tenses"] == ["presente de indicativo"]
+    assert rep["title"] == "Caminante no hay camino"
+    assert rep["body"] == text.strip()                     # verbatim, no LLM rewrite
+    # the known tense is referenced in its Corpus spelling; the new one
+    # joined the Corpus (metadata must always reference Corpus items)
+    assert rep["tenses"] == ["presente de indicativo", "pretérito imperfecto"]
+    assert [t["name"] for t in dbmod.list_tenses(conn, "es")] == [
+        "presente de indicativo", "pretérito imperfecto"]
+    assert "soñar" in [v["infinitive"] for v in dbmod.list_verbs(conn, "es")]
+    # Setup's story length rose to the pasted text's actual length
+    wc = len(text.strip().split())
+    assert wc > 60 and dbmod.load_config(cfg_path)["essay_words"] == wc
+    # the story is stored and searchable like any generated one
+    assert len(dbmod.search_essays(conn, "es", "huellas")) == 1
+    # over the 1000-word cap → a clear "cut it down" error
+    with pytest.raises(RuntimeError, match="limit is 1000"):
+        serve.analyze_essay(conn, cfg, cfg_path, "palabra " * 1001, "")
+
+
+def test_essay_route_accepts_text_and_enforces_cap(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    h = {"X-Admin-Token": _writer_token()}
+    # neither a topic nor a text → 400
+    r = c.post("/api/essay", json={}, headers=h)
+    assert r.status_code == 400 and "paste" in r.json()["error"]
+    # an oversized paste is refused synchronously, before any job starts
+    r = c.post("/api/essay", json={"text": "palabra " * 1001}, headers=h)
+    assert r.status_code == 400 and "1000" in r.json()["error"]
