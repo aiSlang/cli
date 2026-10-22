@@ -42,6 +42,10 @@ def main() -> int:
         payload["exp"] = int(time.time() + args.days * 86400)
     print(auth.sign(payload))
     print(f"# jti (keep for revocation): {jti}", file=sys.stderr)
+    src = ("the AISVERBO_SECRET env var — only servers started with the SAME "
+           "value accept it" if os.environ.get("AISVERBO_SECRET")
+           else "the local auto-generated secret.key")
+    print(f"# signed with: {src}", file=sys.stderr)
     return 0
 
 
