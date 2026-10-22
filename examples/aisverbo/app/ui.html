@@ -768,11 +768,15 @@ Languages I teach/learn:
 Intended use: 
 
 Thanks!`);}
-function saveAdmin(){
+async function saveAdmin(){
   ADMIN=$('#s-admin').value.trim();
   try{localStorage.setItem('aisverbo-admin',ADMIN);}catch(_){}
-  $('#admin-ok').textContent=ADMIN?'Saved to this browser.':'Cleared.';
-  setTimeout(()=>$('#admin-ok').textContent='',2500);}
+  await loadState();        // capabilities (can_write/can_admin) follow NOW,
+                            // not on the next page reload
+  $('#admin-ok').textContent=ADMIN
+    ?`Saved. roles: ${[STATE.can_admin&&'corpus_admin',STATE.can_write&&'story_writer'].filter(Boolean).join(', ')||'none recognized — check /api/auth/check'}`
+    :'Cleared.';
+  setTimeout(()=>$('#admin-ok').textContent='',5000);}
 function fillSetup(){
   if($('#s-admin'))$('#s-admin').value=ADMIN;
   for(const id of['s-foreign','s-native']){
