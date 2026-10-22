@@ -239,6 +239,25 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
   AISVERBO_SECRET=<secret> python3 app/get_token.py --role story_writer --sub SomeHfUser
   ```
 
+  **Token cookbook** (the four standard tokens):
+
+  | where | who | mint | use |
+  |---|---|---|---|
+  | local box | you, everything | `python3 app/get_token.py --role all --sub public` (no env var — it signs with the local `generated/secret.key` your local server verifies with) | paste into Setup at 127.0.0.1:8787 |
+  | Space, anonymous visitors | everyone | **no token** — `story_reader` is the tokenless default | nothing to do |
+  | Space, the operator (public corpus + stories) | you, signed **out** | `AISVERBO_SECRET='<Space secret>' python3 app/get_token.py --role all --sub public` | keep it secret; use via curl (`-H "X-Admin-Token: …"`) or paste into Setup in a private browser while signed out — `sub=public` tokens only work on the public profile, and "only yours" is by possession (revocable by jti) |
+  | Space, you as an ordinary user | your own tenant | `AISVERBO_SECRET='<Space secret>' python3 app/get_token.py --role story_writer --sub <YourHfUsername>` | sign in with HF first; the token is refused for anyone else (sub is checked against the OAuth identity) |
+
+  `--sub` must be the HF username exactly as HF reports it (check
+  `/api/auth/check` or the header after signing in). Pasting a new token
+  into Setup simply replaces which one THIS browser sends — old tokens
+  stay valid until they expire or are revoked (tokens are stateless; no
+  registry). For a true fresh start, **rotate the AISVERBO_SECRET** once:
+  every previously minted token — including pre-jti ones that cannot be
+  individually revoked — dies instantly, then mint the set above with
+  the new secret. Locally, deleting `generated/secret.key` does the same
+  (it regenerates).
+
   Every token has a `jti`; **revoke** one with
   `python3 app/revoke_token.py --token <jwt>` (or `--jti`), or hosted:
   `POST /api/admin/revoke {token|jti}` with a corpus_admin token.

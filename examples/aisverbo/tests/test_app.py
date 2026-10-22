@@ -526,3 +526,22 @@ def test_story_prefills_its_conjugation_matrix(tmp_path, monkeypatch):
     assert {("ir", "Futuro Simple"), ("comer", "Presente"),
             ("comer", "Futuro Simple")} <= done           # the rest warmed
     assert dbmod.get_conjugation(conn, "comer", "Presente", "es", "en")
+
+
+def test_all_role_token_grants_both(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    import auth
+    tok = auth.sign({"role": "all", "sub": "public", "jti": "j-all"})
+    r = c.post("/api/verbs", json={"action": "add", "infinitive": "ir"},
+               headers={"X-Admin-Token": tok})
+    assert r.status_code == 200                           # corpus power
+    conn = dbmod.connect(str(tmp_path / "aisverbo.db"))
+    eid = dbmod.save_essay(conn, {"created_at": "x", "foreign_lang": "es",
+                                  "native_lang": "en", "topic": "t",
+                                  "title": "T", "body": "b",
+                                  "verbs_csv": "", "tenses_csv": ""})
+    r = c.post("/api/essay/delete", json={"id": eid},
+               headers={"X-Admin-Token": tok})
+    assert r.json()["deleted"] == 1                       # writer power
+    s = c.get("/api/state", headers={"X-Admin-Token": tok}).json()
+    assert s["can_write"] and s["can_admin"]

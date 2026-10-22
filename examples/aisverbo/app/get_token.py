@@ -22,9 +22,10 @@ import auth  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description="Mint an aisVerbo access JWT.")
     ap.add_argument("--role", default="corpus_admin",
-                    choices=["corpus_admin", "story_writer"],
+                    choices=["corpus_admin", "story_writer", "all"],
                     help="corpus_admin: manage verbs/tenses; story_writer: "
-                         "generate and delete stories (and LLM extras)")
+                         "generate and delete stories (and LLM extras); "
+                         "all: both — the operator token")
     ap.add_argument("--sub", default="public",
                     help="WHO this token belongs to: the HF username the "
                          "holder signs in with, or 'public' for the shared "

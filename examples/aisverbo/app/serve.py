@@ -286,7 +286,7 @@ def _roles_of(payload: dict | None) -> set:
     if not payload:
         return set()
     role = payload.get("role")
-    if role == "admin":                   # legacy: both powers
+    if role in ("admin", "all"):          # the operator token: both powers
         return {"corpus_admin", "story_writer"}
     return {role} if role in ("corpus_admin", "story_writer") else set()
 
