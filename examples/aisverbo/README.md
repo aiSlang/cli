@@ -141,14 +141,17 @@ static `ui.html`** whose only runtime needs are `fetch` and the browser's
 
    1. Create the Space (Docker → Blank), `git clone` its repo.
    2. Copy `examples/aisverbo/*` into it (Dockerfile at the repo root).
-   3. Add what aislang-cli's gitignore withholds but the Space NEEDS:
-      `aislang.lock` and `litellm_config.yaml` (both from
-      `aislang plan aisverbo.ais`), and a **linux/amd64** `aislang`
-      binary at `bin/aislang` — use `cargo build --release` and `strip`
-      it (a debug build is ~300 MB), then `git lfs track bin/aislang`.
-      Delete the local `.gitignore` lines that would hide these files.
-      Mind glibc: the Dockerfile's base is trixie because a binary built
-      on a 2024+ distro needs glibc ≥ 2.39.
+   3. Add the one file aislang-cli's gitignore withholds but the Space
+      NEEDS: a **linux/amd64** `aislang` binary at `bin/aislang` — use
+      `cargo build --release` and `strip` it (a debug build is ~300 MB),
+      then `git lfs track bin/aislang`. Do NOT ship `aislang.lock` or
+      `litellm_config.yaml` (delete them from the Space repo if an older
+      deploy added them): the container regenerates both at boot with
+      `aislang plan`, so the lockfile's prompt hashes can never drift
+      from the `prompts/` you actually pushed — a stale shipped lock
+      once broke every grammarian call with "system prompt hash
+      mismatch". Mind glibc: the Dockerfile's base is trixie because a
+      binary built on a 2024+ distro needs glibc ≥ 2.39.
    4. KEEP the YAML frontmatter HF generated at the top of the Space's
       README.md (or prepend ours with):
 
