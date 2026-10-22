@@ -97,6 +97,9 @@ def chat(agent: str, payload: str, cfg: dict) -> str:
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-400:]
         raise LlmError(f"aislang chat {agent}: exit {proc.returncode}: {tail}")
+    # keep stderr for error reporting: a failed step often prints its reason
+    # there while exiting 0 with an empty stdout
+    chat.last_stderr = (proc.stderr or "").strip()
     return proc.stdout
 
 
@@ -105,7 +108,9 @@ def ask_json(agent: str, payload_obj, cfg: dict) -> dict:
     obj = extract_last_json_object(reply)
     if obj is None:
         tail = " ".join(reply.split())[-300:]
-        raise LlmError(f"agent {agent}: no JSON object in the reply — {tail}")
+        err = " ".join(getattr(chat, "last_stderr", "").split())[-300:]
+        raise LlmError(f"agent {agent}: no JSON object in the reply — "
+                       f"stdout: {tail or '(empty)'} | stderr: {err or '(empty)'}")
     return obj
 
 

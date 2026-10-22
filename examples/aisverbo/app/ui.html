@@ -320,8 +320,16 @@ function renderWho(){
     el.innerHTML=`<a href="/oauth/login" style="color:var(--amber2);text-decoration:none">Sign in with 🤗 Hugging Face</a>`;
   }else{
     el.textContent='public profile';
-  }}
-async function loadState(){STATE=await api('/api/state');renderWho();
+  }
+  el.title='tenant: '+(STATE.tenant||'public');}
+async function loadState(){STATE=await api('/api/state');
+  // self-heal stale tenant tokens: a token the server ignored (old secret,
+  // old per-browser era) or one without an OAuth identity routes requests
+  // to an orphan partition and breaks the sub check — drop it
+  if(TENANT&&(STATE.tenant==='public'||!STATE.user)){
+    try{localStorage.removeItem('aisverbo-tenant');}catch(_){}
+    TENANT='';STATE=await api('/api/state');}
+  renderWho();
   const nb=$('#btn-new');if(nb)nb.title=STATE.can_write?'start a new story'
     :'needs the Story Writer role — Setup → Request corpus access';
   $('#pair-pill').innerHTML=`<b>${esc(STATE.languages[STATE.settings.foreign])}</b> → ${esc(STATE.languages[STATE.settings.native])}`;

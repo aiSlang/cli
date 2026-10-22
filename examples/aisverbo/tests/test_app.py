@@ -545,3 +545,26 @@ def test_all_role_token_grants_both(tmp_path, monkeypatch):
     assert r.json()["deleted"] == 1                       # writer power
     s = c.get("/api/state", headers={"X-Admin-Token": tok}).json()
     assert s["can_write"] and s["can_admin"]
+
+
+def test_writer_token_creates_cards_and_translations(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(serve.llm, "ask_json", lambda a, p, c2:
+        {"word": p.get("word"), "lemma": "ir", "pos": "verb", "tense": "Presente"}
+        if p.get("task") == "card" else
+        {"title": "T", "body": "Translated."})
+    h = {"X-Admin-Token": _writer_token()}
+    r = c.post("/api/card", json={"word": "voy", "sentence": "x"}, headers=h)
+    assert r.status_code == 200 and r.json()["cached"] is False
+    r = c.post("/api/translate", json={"text": "hola"}, headers=h)
+    assert r.status_code == 200 and r.json()["body"] == "Translated."
+    # an ADMIN-only token is refused with the ROLE reason, not "no token"
+    r = c.post("/api/card", json={"word": "nuevo"},
+               headers={"X-Admin-Token": _admin_token()})
+    assert r.status_code == 403 and "story_writer" in r.json()["error"]
+    # a sub-mismatched token names the mismatch, not the role
+    import auth
+    h1 = {"Authorization": "Bearer " + auth.sign({"tid": "hf-alex", "user": "alex"}),
+          "X-Admin-Token": _writer_token(sub="public")}
+    r = c.post("/api/card", json={"word": "nuevo"}, headers=h1)
+    assert r.status_code == 401 and "belongs to 'public'" in r.json()["error"]

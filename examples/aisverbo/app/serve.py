@@ -313,6 +313,19 @@ def _is_writer(x_admin_token: str | None, ctx: "Ctx") -> bool:
     return "story_writer" in _roles_of(payload)
 
 
+def _reader_miss_error(x_admin_token: str | None, ctx: "Ctx") -> HTTPException:
+    """When generation is refused, say WHY the presented token (if any) did
+    not count as a writer — a sub mismatch must not masquerade as a
+    missing-role situation."""
+    if x_admin_token:
+        payload, why = _token_state(x_admin_token, ctx)
+        if payload is None:
+            return HTTPException(401, f"your token was not accepted: {why}")
+        return HTTPException(403, "generating needs the story_writer role — "
+                                  f"this token's role is '{payload.get('role')}'")
+    return HTTPException(401, _READER_MISS)
+
+
 app = FastAPI(title="aisVerbo", docs_url=None, redoc_url=None)
 
 
@@ -614,7 +627,7 @@ def card(body: dict, ctx: Ctx = Depends(get_ctx),
     if not _is_writer(x_admin_token, ctx):
         cached = dbmod.get_card(conn, word, cfg["foreign"], cfg["native"])
         if cached is None:
-            raise HTTPException(401, _READER_MISS)
+            raise _reader_miss_error(x_admin_token, ctx)
         cached.pop("conjugation", None)
         return {"cached": True, **cached,
                 "word": cached.get("word", word.lower()),
@@ -635,7 +648,7 @@ def conjugation_post(body: dict, ctx: Ctx = Depends(get_ctx),
         cached = dbmod.get_conjugation(conn, lemma, tense,
                                        cfg["foreign"], cfg["native"])
         if cached is None:
-            raise HTTPException(401, _READER_MISS)
+            raise _reader_miss_error(x_admin_token, ctx)
         return {"cached": True, **cached, "lemma": lemma.lower(), "tense": tense,
                 "foreign_lang": cfg["foreign"], "native_lang": cfg["native"]}
     return conjugation(conn, cfg, lemma, tense, force=bool(body.get("force")))
@@ -650,7 +663,7 @@ def translate_post(body: dict, ctx: Ctx = Depends(get_ctx),
         eid = body.get("essay_id")
         cached = dbmod.get_translation(conn, eid, to) if eid else None
         if not (isinstance(cached, dict) and "body" in cached):
-            raise HTTPException(401, _READER_MISS)
+            raise _reader_miss_error(x_admin_token, ctx)
         return {"cached": True, **cached}
     return translate(conn, cfg, to, essay_id=body.get("essay_id"),
                      text=body.get("text"), force=bool(body.get("force")))
