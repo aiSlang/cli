@@ -630,8 +630,11 @@ def test_pasted_text_analyzed_into_story(tmp_path, monkeypatch):
     # Setup's story length rose to the pasted text's actual length
     wc = len(text.strip().split())
     assert wc > 60 and dbmod.load_config(cfg_path)["essay_words"] == wc
-    # the story is stored and searchable like any generated one
-    assert len(dbmod.search_essays(conn, "es", "huellas")) == 1
+    # the story is stored and searchable like any generated one, and the
+    # library excerpt is PLAIN — the **bold** markers never reach the list
+    hits = dbmod.search_essays(conn, "es", "huellas")
+    assert len(hits) == 1
+    assert "son" in hits[0]["excerpt"] and "**" not in hits[0]["excerpt"]
     # over the 1000-word cap → a clear "cut it down" error
     with pytest.raises(RuntimeError, match="limit is 1000"):
         serve.analyze_essay(conn, cfg, cfg_path, "palabra " * 1001, "")

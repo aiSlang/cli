@@ -30,18 +30,21 @@
 ## in examples/aisverbo/app/generated/ — local, git-ignored.
 
 project "aisverbo" {
+  ## Sized for pasted classics: a 1000-word analysis + its conjugation
+  ## pre-warm burns more than the old $0.05/run allowed.
   budget {
-    hard_cap_per_day = $2
-    hard_cap_per_run = $0.05
+    hard_cap_per_day = $5
+    hard_cap_per_run = $0.20
   }
 
   ## Everything here is short structured output — the cheapest capable
-  ## model wins; local Qwen as the free fallback.
+  ## model wins; the previous Haiku as the fallback (a local Ollama does
+  ## not deploy on the hosted Space).
   model "scholar" {
     requires    = [chat, reasoning]
     context_min = 32k
     prefer      = [anthropic.claude_haiku_5_5]
-    fallback    = [ollama.qwen3_8b]
+    fallback    = [anthropic.claude_haiku_4_5]
   }
 
   ## The story writer — its own block so creativity can be tuned (or a
@@ -50,7 +53,7 @@ project "aisverbo" {
     requires    = [chat]
     context_min = 32k
     prefer      = [anthropic.claude_haiku_5_5]
-    fallback    = [ollama.qwen3_8b]
+    fallback    = [anthropic.claude_haiku_4_5]
   }
 
   prompt "lexicographer_sys" { file = "./prompts/lexicographer.md" version = "1.0.0" }

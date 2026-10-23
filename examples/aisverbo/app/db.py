@@ -280,7 +280,8 @@ def search_essays(conn, lang: str, q: str = "") -> list[dict]:
     """Newest first; `q` matches the title, body, topic or the verb list —
     so any verb or keyword finds every story it appears in."""
     sql = ("SELECT id, created_at, foreign_lang, native_lang, topic, title, "
-           "substr(body, 1, 160) excerpt FROM essays WHERE foreign_lang=?")
+           "substr(replace(body, '**', ''), 1, 160) excerpt "
+           "FROM essays WHERE foreign_lang=?")
     args: list = [lang]
     if q.strip():
         sql += (" AND (title LIKE ? OR body LIKE ? OR topic LIKE ? "

@@ -46,7 +46,16 @@
   .ro .chip{cursor:default}
   .ro .chip.on{border-color:#8a6a4a;color:#b08968;background:rgba(240,136,62,.04)}
   .layout{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(300px,1fr);gap:14px}
-  @media(max-width:900px){.layout{grid-template-columns:1fr}}
+  /* a long story scrolls INSIDE its panel, and the Word card / Translation
+     panel sticks beside it with a scrollbar of its own — the page itself
+     never carries the story's length, so the grammar content for the
+     selected word stays in view */
+  #essay-body{max-height:62vh;overflow-y:auto;overscroll-behavior:contain;padding-right:6px}
+  .layout>.panel:last-child{position:sticky;top:10px;align-self:start;
+    max-height:calc(100vh - 20px);overflow-y:auto;overscroll-behavior:contain}
+  @media(max-width:900px){.layout{grid-template-columns:1fr}
+    #essay-body{max-height:none}
+    .layout>.panel:last-child{position:static;max-height:none}}
   #essay-body{font-size:17px;line-height:1.9}
   #essay-body strong{color:var(--amber2)}
   #essay-body .w{cursor:pointer;border-radius:3px}
@@ -278,7 +287,7 @@
   </div>
 </div>
 
-<div class="foot">The agents (lexicographer · tensesmith · essayist · grammarian · translator) run through the
+<div class="foot">The agents (lexicographer · tensesmith · essayist · grammarian · translator · philologist) run through the
   <span class="mono">aisverbo.ais</span> project — budget-capped, model-routed by aiSlang.
   Every model result is cached (word cards, story translations); the ⟳ controls re-ask on demand.
   Not a substitute for a teacher — a tireless companion.</div>
