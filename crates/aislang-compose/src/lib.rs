@@ -343,6 +343,19 @@ fn build_litellm_service(resolved: &ResolvedProject, output_dir: &Path)
                "http://jaeger:4318".to_string());
     env.insert("OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
                "http/protobuf".to_string());
+
+    // LiteLLM ≥ Sept 2026 refuses to boot keyless: without
+    // LITELLM_MASTER_KEY the proxy exits 3 at startup ("refused to
+    // start: no master key is set"), so a fresh pull of the floating
+    // `main-stable` tag breaks the whole stack at `aislang apply`.
+    // Keyless IS the v0.2 design: `aislang chat` sends NO
+    // Authorization header (a master key would 401 every call), and
+    // the proxy binds the Compose-internal network + a loopback port
+    // mapping.  Opt in to keyless explicitly — same override the
+    // aisVerbo Space Dockerfile ships.
+    env.insert("LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY"
+                   .to_string(),
+               "true".to_string());
     env.insert("OTEL_SERVICE_NAME".to_string(),
                "litellm".to_string());
 

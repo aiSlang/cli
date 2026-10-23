@@ -256,6 +256,21 @@ pub fn build_litellm(
                 value: resolved.catalog_version.clone(),
             }];
             env.extend(otel_env_vars("litellm", deploy_label));
+            // LiteLLM ≥ Sept 2026 refuses to boot keyless: without
+            // LITELLM_MASTER_KEY the proxy exits 3 at startup
+            // ("refused to start: no master key is set"), which put
+            // the k8s-smoke litellm pod in CrashLoopBackOff on every
+            // fresh `main-stable` pull.  Keyless IS the v0.2 design:
+            // the aislang runtime client sends NO Authorization
+            // header (a master key would 401 every call), and the
+            // litellm Service is ClusterIP — unreachable from outside
+            // the cluster.  So opt in to keyless explicitly, the same
+            // override the aisVerbo Space Dockerfile ships.
+            env.push(EnvVar {
+                name:  "LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY"
+                    .to_string(),
+                value: "true".to_string(),
+            });
             // W26 — when the project uses any `ollama/` model, point LiteLLM
             // at the shared in-cluster OSS inference pool.  The router config
             // already renders those models with `api_base:
