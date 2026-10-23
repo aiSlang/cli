@@ -47,7 +47,7 @@
       "cost_output_per_1k_tokens": "$0.004",
       "latency_p95": "1500ms",
       "residency": ["us", "eu"],
-      "deprecated": true
+      "deprecated": false
     },
     {
       "id": "openai.gpt_4o",
